@@ -49,9 +49,14 @@ build also works against system packages. See
   from the overlay port in `vcpkg-overlays/libvfio-user/` (it is not in
   the vcpkg registry). Pulls in `json-c`, plus `cmocka`, which upstream's
   meson build requires unconditionally.
-- **Notes**: detected with `pkg_check_modules(... QUIET ...)`. When it is
-  absent, `AK_HAS_LIBVFIO_USER` is `OFF` and the device-server targets are
-  not defined; the libraries and tests are unaffected. C++ code includes it
+- **Notes**: detected through `libvfio-user.pc`. Upstream v0.8 installs no
+  `.pc` file, so the overlay port generates one (json-c under `Requires:`,
+  since the library is static); a plain upstream `meson install` is found by
+  a `find_path`/`find_library` fallback instead. `AK_VFIO_USER` (`AUTO`,
+  `ON`, `OFF`) controls a missing library: under `AUTO`, the default, the
+  device servers are skipped with a warning and `AK_HAS_LIBVFIO_USER` is
+  `OFF`, unless the vcpkg `vfio-user` feature is installed, in which case
+  configure fails. C++ code includes it
   only through `src/oar/vfu/libvfio_user.hpp`, which maps the headers' C11
   `_Static_assert` to `static_assert` for the include.
 

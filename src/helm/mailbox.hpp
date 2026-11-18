@@ -22,7 +22,9 @@
 //   0x300  EVT_SLOT     256 bytes, host writes, device reads
 //
 // Slot layout (256 bytes):
-//   0x00  header (24 bytes)
+//   0x00  header (24 bytes):
+//           0x00 magic u32 | 0x04 version u16 | 0x06 type u16 | 0x08 seq u64
+//           0x10 body_len u16 | 0x12 key_id u16 | 0x14 reserved (4 bytes, zero)
 //   0x18  body   (up to 168 bytes; body_len says how much is meaningful)
 //   0xC0  Ed25519 signature (64 bytes) over bytes [0x00, 0xC0) -- commands only
 
@@ -35,7 +37,9 @@
 namespace ak::helm::mailbox {
 
 inline constexpr std::uint32_t magic = 0x424D'4B41;  // "AKMB" read as little-endian bytes
-inline constexpr std::uint16_t protocol_version = 1;
+// Version 2 assigned key_id (two of version 1's six reserved header bytes).
+// Nothing speaks version 1 any more, so decode accepts version 2 only.
+inline constexpr std::uint16_t protocol_version = 2;
 
 namespace reg {
 inline constexpr std::size_t magic = 0x000;
@@ -54,7 +58,18 @@ inline constexpr std::size_t header_size = 24;
 inline constexpr std::size_t signature_size = 64;
 inline constexpr std::size_t signature_offset = slot_size - signature_size;  // 0xC0
 inline constexpr std::size_t max_body = signature_offset - header_size;      // 168
-inline constexpr std::size_t header_reserved_size = 6;
+inline constexpr std::size_t header_key_id_offset = 0x12;
+inline constexpr std::size_t header_reserved_offset = 0x14;
+inline constexpr std::size_t header_reserved_size = header_size - header_reserved_offset;  // 4
+
+// Which controller signing key signed a command
+// (.kiro/specs/controller-interface/ Requirement 1.3). It sits inside the
+// signed bytes [0x00, 0xC0), so hull picks the verification key from data
+// the signature covers, never from the unsigned envelope around the slot.
+// Commands carry a non-zero key ID; responses and events are not signed and
+// carry no_key_id.
+using KeyId = std::uint16_t;
+inline constexpr KeyId no_key_id = 0;
 
 using Slot = std::array<std::byte, slot_size>;
 
@@ -94,6 +109,7 @@ struct Header {
     Type type{Type::response};
     std::uint64_t seq{0};
     std::uint16_t body_len{0};
+    KeyId key_id{no_key_id};
 };
 
 // A message copied out of a slot. Owns its bytes, so it stays valid after
@@ -114,6 +130,7 @@ enum class DecodeError : std::uint8_t {
     unknown_type,
     body_too_long,
     reserved_not_zero,  // reserved header bytes or bytes past body_len are non-zero
+    bad_key_id,         // a command with no_key_id, or a response/event with a key ID
 };
 
 [[nodiscard]] auto to_string(DecodeError e) noexcept -> const char*;

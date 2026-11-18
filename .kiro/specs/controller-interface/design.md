@@ -28,10 +28,15 @@ MapUpdate {
 }
 ```
 
-`key_id` is carried in the slot's reserved header bytes as well, so hull
-can pick the verification key without trusting the envelope wrapper. (This
-requires assigning two of the six reserved header bytes in a mailbox
-protocol version 2 — tracked as a helm task.)
+`key_id` is carried in the slot header as well, so hull can pick the
+verification key without trusting the envelope wrapper. Mailbox protocol
+version 2 assigns it two of version 1's six reserved header bytes: a
+little-endian u16 at slot offset 0x12, inside the signed range
+`[0x00, 0xC0)`, followed by four reserved zero bytes. Commands must carry
+a non-zero `key_id` (0 means "unsigned"); responses and events, which are
+not signed, must carry 0. A slot that breaks either rule is rejected
+before signature verification. The envelope's `key_id` must equal the
+slot's; helm may check this, but hull trusts only the slot.
 
 ## Placement inputs
 

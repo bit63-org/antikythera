@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 #include "common/wire.hpp"
@@ -36,16 +37,24 @@ constexpr std::uint64_t destroy_vm_id = 5;
 constexpr std::uint8_t unknown_destroy_flag = 0x02;
 
 constexpr std::size_t documented_max_body = 168;
+constexpr std::uint16_t documented_version = 2;
+constexpr std::size_t documented_reserved_size = 4;
+
+constexpr mb::KeyId sample_key = 1;
+constexpr mb::KeyId rotated_key = 0xBEEF;
 
 // Byte offsets inside the slot header (see mailbox.hpp).
 constexpr std::size_t magic_offset = 0;
 constexpr std::size_t version_offset = 4;
 constexpr std::size_t type_offset = 6;
 constexpr std::size_t body_len_offset = 16;
+constexpr std::size_t key_id_offset = 18;
 constexpr std::size_t reserved_offset = 20;
+constexpr std::size_t last_reserved_offset = 23;
 
 constexpr std::byte not_magic{'X'};
-constexpr std::byte unsupported_version{2};
+constexpr std::byte retired_version{1};
+constexpr std::byte future_version{3};
 constexpr std::byte unknown_type_byte{0xEE};
 constexpr std::byte nonzero{1};
 
@@ -79,12 +88,14 @@ auto destroy_vm_body(std::uint64_t vm, std::uint8_t flags) -> std::vector<std::b
     return b;
 }
 
-auto slot_for(mb::Type type, std::span<const std::byte> body, std::uint64_t seq = first_seq)
-    -> mb::Slot {
+// Commands get sample_key by default; responses and events get no key.
+auto slot_for(mb::Type type, std::span<const std::byte> body, std::uint64_t seq = first_seq,
+              std::optional<mb::KeyId> key = std::nullopt) -> mb::Slot {
     mb::Header h;
     h.type = type;
     h.seq = seq;
     h.body_len = static_cast<std::uint16_t>(body.size());
+    h.key_id = key.value_or(mb::is_command(type) ? sample_key : mb::no_key_id);
     auto s = mb::encode(h, body, sig());
     BOOST_REQUIRE(s.has_value());
     return *s;
@@ -97,6 +108,11 @@ BOOST_AUTO_TEST_CASE(layout_constants_fit_the_slot,
     static_assert(mb::header_size + mb::max_body + mb::signature_size == mb::slot_size);
     static_assert(mb::reg::evt_slot + mb::slot_size <= mb::reg::bar0_size);
     BOOST_TEST(mb::max_body == documented_max_body);
+    BOOST_TEST(mb::protocol_version == documented_version);
+    BOOST_TEST(mb::header_key_id_offset == key_id_offset);
+    BOOST_TEST(mb::header_reserved_offset == reserved_offset);
+    BOOST_TEST(mb::header_reserved_size == documented_reserved_size);
+    static_assert(mb::header_reserved_offset + mb::header_reserved_size == mb::header_size);
 }
 
 BOOST_AUTO_TEST_CASE(magic_is_akmb_in_little_endian,
@@ -130,9 +146,13 @@ BOOST_AUTO_TEST_CASE(rejects_bad_header_fields, *boost::unit_test::timeout(unit_
     bad_magic[magic_offset] = not_magic;
     BOOST_TEST((mb::decode(bad_magic).error() == DecodeError::bad_magic));
 
-    auto bad_version = s;
-    bad_version[version_offset] = unsupported_version;
-    BOOST_TEST((mb::decode(bad_version).error() == DecodeError::bad_version));
+    auto v1 = s;
+    v1[version_offset] = retired_version;
+    BOOST_TEST((mb::decode(v1).error() == DecodeError::bad_version));
+
+    auto v3 = s;
+    v3[version_offset] = future_version;
+    BOOST_TEST((mb::decode(v3).error() == DecodeError::bad_version));
 
     auto bad_type = s;
     bad_type[type_offset] = unknown_type_byte;
@@ -143,9 +163,55 @@ BOOST_AUTO_TEST_CASE(rejects_bad_header_fields, *boost::unit_test::timeout(unit_
     long_body[body_len_offset] = std::byte{mb::max_body + 1};
     BOOST_TEST((mb::decode(long_body).error() == DecodeError::body_too_long));
 
-    auto reserved = s;
-    reserved[reserved_offset] = nonzero;
-    BOOST_TEST((mb::decode(reserved).error() == DecodeError::reserved_not_zero));
+    for (std::size_t off = reserved_offset; off <= last_reserved_offset; ++off) {
+        auto reserved = s;
+        reserved[off] = nonzero;
+        BOOST_TEST((mb::decode(reserved).error() == DecodeError::reserved_not_zero));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(key_id_is_little_endian_in_the_signed_header,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto s = slot_for(mb::Type::list_vms, {}, first_seq, rotated_key);
+    BOOST_TEST((s[key_id_offset] == std::byte{0xEF}));
+    BOOST_TEST((s[key_id_offset + 1] == std::byte{0xBE}));
+    static_assert(key_id_offset + sizeof(mb::KeyId) <= mb::signature_offset);
+
+    auto msg = mb::decode(s);
+    BOOST_REQUIRE(msg.has_value());
+    BOOST_TEST(msg->header.key_id == rotated_key);
+}
+
+BOOST_AUTO_TEST_CASE(commands_need_a_key_id, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // A command slot with its key ID cleared does not decode.
+    auto s = slot_for(mb::Type::destroy_vm, destroy_vm_body(destroy_vm_id, 0));
+    s[key_id_offset] = std::byte{0};
+    s[key_id_offset + 1] = std::byte{0};
+    BOOST_TEST((mb::decode(s).error() == DecodeError::bad_key_id));
+
+    // Nor will encode produce one.
+    mb::Header h;
+    h.type = mb::Type::list_vms;
+    h.key_id = mb::no_key_id;
+    BOOST_TEST((mb::encode(h, {}, sig()).error() == DecodeError::bad_key_id));
+}
+
+BOOST_AUTO_TEST_CASE(responses_and_events_carry_no_key_id,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    for (const auto type : {mb::Type::response, mb::Type::vm_exited, mb::Type::device_released,
+                            mb::Type::host_fault, mb::Type::scrub_done}) {
+        auto s = slot_for(type, {});
+        BOOST_REQUIRE(mb::decode(s).has_value());
+        BOOST_TEST(mb::decode(s)->header.key_id == mb::no_key_id);
+
+        s[key_id_offset] = std::byte{sample_key};
+        BOOST_TEST((mb::decode(s).error() == DecodeError::bad_key_id));
+
+        mb::Header h;
+        h.type = type;
+        h.key_id = sample_key;
+        BOOST_TEST((mb::encode(h, {}, sig()).error() == DecodeError::bad_key_id));
+    }
 }
 
 BOOST_AUTO_TEST_CASE(rejects_hidden_bytes_after_body,

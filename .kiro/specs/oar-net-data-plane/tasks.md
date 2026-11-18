@@ -1,6 +1,6 @@
 # Implementation Plan — oar-net: the network data plane
 
-## Status: 3/11 tasks complete
+## Status: 4/11 tasks complete
 
 ## Tasks
 
@@ -16,7 +16,9 @@
 - [ ] 5. Shared virtio core: PCI capabilities, split virtqueue with bounds
   checks, fuzz target. _Requirements: 1.4_
 - [ ] 6. VirtioNetFunction on vfio-user. _Requirements: 1_
-- [ ] 7. MappingTable with atomic snapshots and `map_update` handling.
+- [x] 7. MappingTable with atomic snapshots and `map_update` handling
+  (`src/oar/net/mapping_table.*`), tests, fuzz target. Takes a decoded
+  `MapUpdate`; the wire codec and signature check are controller task 2.
   _Requirements: 2.5, 8_
 - [ ] 8. VSwitch: local forwarding, broadcast replication, ARP/ND proxy,
   dead VPC. _Requirements: 2, 7_

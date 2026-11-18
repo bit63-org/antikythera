@@ -24,6 +24,18 @@ target_link_libraries(ak_helm
   PUBLIC ak::common
   PRIVATE ak::warnings ak::hardening)
 
+# hull: host-agent command authentication (Ed25519 signatures and sequence
+# numbers). OpenSSL is required: it is the only Ed25519 implementation here.
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+add_library(ak_hull
+  hull/command_auth.cpp
+  hull/sequence_tracker.cpp
+  hull/signature_verifier.cpp)
+add_library(ak::hull ALIAS ak_hull)
+target_link_libraries(ak_hull
+  PUBLIC ak::common ak::helm OpenSSL::Crypto
+  PRIVATE ak::warnings ak::hardening)
+
 # vfio-user device servers, built against libvfio-user (the `vfio-user`
 # vcpkg feature, vcpkg-overlays/libvfio-user).
 #

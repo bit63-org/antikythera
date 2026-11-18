@@ -1,0 +1,30 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "antikythera",
+  "version": "0.1.0",
+  "description": "Minimal-attack-surface VM host with a PCIe backplane of control-plane and data-plane roles",
+  "homepage": "https://github.com/crawlins/antikythera",
+  "license": "Apache-2.0",
+  "builtin-baseline": "9a7f7340a6c5f11f24c3d59f85e07143feb84e06",
+  "dependencies": [
+    {
+      "name": "boost-test",
+      "version>=": "1.89.0"
+    },
+    {
+      "name": "openssl",
+      "version>=": "3.6.5"
+    }
+  ],
+  "features": {
+    "vfio-user": {
+      "description": "Build the vfio-user device servers (test device now; virtio-net, virtio-blk and the mailbox later). Pulls in libvfio-user from vcpkg-overlays/libvfio-user. Linux only. Backs AK_HAS_LIBVFIO_USER.",
+      "dependencies": [
+        {
+          "name": "libvfio-user",
+          "platform": "linux"
+        }
+      ]
+    }
+  }
+}

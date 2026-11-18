@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg-configuration.schema.json",
+  "registries": [
+    {
+      "kind": "git",
+      "repository": "https://github.com/microsoft/vcpkg",
+      "baseline": "e182cb4dd2df2ab02f66a1aabd5f35bbdc9522c7",
+      "packages": [
+        "openssl"
+      ]
+    }
+  ],
+  "overlay-ports": [
+    "./vcpkg-overlays/libvfio-user"
+  ]
+}

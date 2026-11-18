@@ -16,38 +16,56 @@ constexpr std::uint8_t flag_critical = 0x40;
 constexpr std::uint8_t option_length_mask = 0x1F;
 constexpr std::uint8_t nic_pair_length_words = 4;  // 16 bytes of data
 
-constexpr bool valid_src(NicId id) noexcept { return id != nic_invalid && id != nic_broadcast; }
-constexpr bool valid_dst(NicId id) noexcept { return id != nic_invalid; }
+constexpr auto valid_src(NicId id) noexcept -> bool {
+    return id != nic_invalid && id != nic_broadcast;
+}
+constexpr auto valid_dst(NicId id) noexcept -> bool {
+    return id != nic_invalid;
+}
 
 }  // namespace
 
-const char* to_string(DecodeError e) noexcept {
+auto to_string(DecodeError e) noexcept -> const char* {
     switch (e) {
-        case DecodeError::truncated: return "truncated";
-        case DecodeError::bad_version: return "bad_version";
-        case DecodeError::options_overrun: return "options_overrun";
-        case DecodeError::bad_option_length: return "bad_option_length";
-        case DecodeError::unknown_critical_option: return "unknown_critical_option";
-        case DecodeError::critical_flag_mismatch: return "critical_flag_mismatch";
-        case DecodeError::missing_nic_pair: return "missing_nic_pair";
-        case DecodeError::duplicate_nic_pair: return "duplicate_nic_pair";
-        case DecodeError::invalid_nic_id: return "invalid_nic_id";
-        case DecodeError::bad_protocol: return "bad_protocol";
-        case DecodeError::inner_frame_too_short: return "inner_frame_too_short";
+        case DecodeError::truncated:
+            return "truncated";
+        case DecodeError::bad_version:
+            return "bad_version";
+        case DecodeError::options_overrun:
+            return "options_overrun";
+        case DecodeError::bad_option_length:
+            return "bad_option_length";
+        case DecodeError::unknown_critical_option:
+            return "unknown_critical_option";
+        case DecodeError::critical_flag_mismatch:
+            return "critical_flag_mismatch";
+        case DecodeError::missing_nic_pair:
+            return "missing_nic_pair";
+        case DecodeError::duplicate_nic_pair:
+            return "duplicate_nic_pair";
+        case DecodeError::invalid_nic_id:
+            return "invalid_nic_id";
+        case DecodeError::bad_protocol:
+            return "bad_protocol";
+        case DecodeError::inner_frame_too_short:
+            return "inner_frame_too_short";
     }
     return "unknown";
 }
 
-const char* to_string(EncodeError e) noexcept {
+auto to_string(EncodeError e) noexcept -> const char* {
     switch (e) {
-        case EncodeError::vni_out_of_range: return "vni_out_of_range";
-        case EncodeError::invalid_nic_id: return "invalid_nic_id";
-        case EncodeError::inner_frame_too_short: return "inner_frame_too_short";
+        case EncodeError::vni_out_of_range:
+            return "vni_out_of_range";
+        case EncodeError::invalid_nic_id:
+            return "invalid_nic_id";
+        case EncodeError::inner_frame_too_short:
+            return "inner_frame_too_short";
     }
     return "unknown";
 }
 
-std::expected<Packet, DecodeError> decode(std::span<const std::byte> udp_payload) noexcept {
+auto decode(std::span<const std::byte> udp_payload) noexcept -> std::expected<Packet, DecodeError> {
     wire::Reader r{udp_payload};
 
     // Base header. Every read below is bounds-checked; map any truncation to
@@ -63,7 +81,8 @@ std::expected<Packet, DecodeError> decode(std::span<const std::byte> udp_payload
     if ((*b0 >> version_shift) != 0) {
         return std::unexpected(DecodeError::bad_version);
     }
-    const std::size_t opt_bytes = std::size_t{static_cast<std::uint8_t>(*b0 & opt_len_mask)} * 4;
+    const std::size_t opt_bytes =
+        std::size_t{static_cast<std::uint8_t>(*b0 & opt_len_mask)} * bytes_per_word;
     const bool oam = (*b1 & flag_oam) != 0;
     const bool critical_flag = (*b1 & flag_critical) != 0;
 
@@ -73,7 +92,7 @@ std::expected<Packet, DecodeError> decode(std::span<const std::byte> udp_payload
     }
 
     Packet pkt;
-    pkt.vni = *vni_word >> 8;  // low byte is reserved: ignored on receipt
+    pkt.vni = *vni_word >> vni_shift;  // low byte is reserved: ignored on receipt
     pkt.oam = oam;
     pkt.protocol = *proto;
 
@@ -86,7 +105,8 @@ std::expected<Packet, DecodeError> decode(std::span<const std::byte> udp_payload
         if (!cls || !type || !len_byte) {
             return std::unexpected(DecodeError::truncated);
         }
-        const std::size_t data_len = std::size_t{static_cast<std::uint8_t>(*len_byte & option_length_mask)} * 4;
+        const std::size_t data_len =
+            std::size_t{static_cast<std::uint8_t>(*len_byte & option_length_mask)} * bytes_per_word;
         auto data = opt_reader.bytes(data_len);
         if (!data) {
             return std::unexpected(DecodeError::truncated);
@@ -96,7 +116,7 @@ std::expected<Packet, DecodeError> decode(std::span<const std::byte> udp_payload
         saw_critical = saw_critical || critical;
 
         if (*cls == option_class && *type == option_type_nic_pair) {
-            if (data_len != std::size_t{nic_pair_length_words} * 4) {
+            if (data_len != std::size_t{nic_pair_length_words} * bytes_per_word) {
                 return std::unexpected(DecodeError::bad_option_length);
             }
             if (pkt.nics) {
@@ -135,8 +155,8 @@ std::expected<Packet, DecodeError> decode(std::span<const std::byte> udp_payload
     return pkt;
 }
 
-std::expected<std::vector<std::byte>, EncodeError> encode(const EncodeParams& params,
-                                                          std::span<const std::byte> inner_frame) {
+auto encode(const EncodeParams& params, std::span<const std::byte> inner_frame)
+    -> std::expected<std::vector<std::byte>, EncodeError> {
     if (params.vni > vni_max) {
         return std::unexpected(EncodeError::vni_out_of_range);
     }
@@ -151,11 +171,11 @@ std::expected<std::vector<std::byte>, EncodeError> encode(const EncodeParams& pa
     out.reserve(base_header_size + nic_pair_option_size + inner_frame.size());
     wire::Writer w{out};
 
-    constexpr std::uint8_t opt_len_words = nic_pair_option_size / 4;
+    constexpr auto opt_len_words = static_cast<std::uint8_t>(nic_pair_option_size / bytes_per_word);
     w.u8(opt_len_words);  // Ver = 0
     w.u8(static_cast<std::uint8_t>(flag_critical | (params.oam ? flag_oam : 0)));
     w.be16(protocol_ethernet);
-    w.be32(params.vni << 8);  // reserved low byte = 0
+    w.be32(params.vni << vni_shift);  // reserved low byte = 0
 
     w.be16(option_class);
     w.u8(option_type_nic_pair);

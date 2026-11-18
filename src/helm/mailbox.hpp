@@ -54,6 +54,7 @@ inline constexpr std::size_t header_size = 24;
 inline constexpr std::size_t signature_size = 64;
 inline constexpr std::size_t signature_offset = slot_size - signature_size;  // 0xC0
 inline constexpr std::size_t max_body = signature_offset - header_size;      // 168
+inline constexpr std::size_t header_reserved_size = 6;
 
 using Slot = std::array<std::byte, slot_size>;
 
@@ -73,7 +74,7 @@ enum class Type : std::uint16_t {
     rewrap_volume = 0x0024,
     create_network = 0x0030,  // VPC
     delete_network = 0x0031,
-    gpu_vf_config = 0x0040,   // reserved: GPU support is designed, not yet built
+    gpu_vf_config = 0x0040,  // reserved: GPU support is designed, not yet built
 
     // Responses (host agent -> control plane).
     response = 0x0100,
@@ -82,10 +83,10 @@ enum class Type : std::uint16_t {
     vm_exited = 0x0200,
     device_released = 0x0201,  // slot/function reset done; control plane wipes or scrubs next
     host_fault = 0x0202,
-    scrub_done = 0x0203,       // reserved for GPU scrub
+    scrub_done = 0x0203,  // reserved for GPU scrub
 };
 
-[[nodiscard]] bool is_command(Type t) noexcept;
+[[nodiscard]] auto is_command(Type t) noexcept -> bool;
 
 struct Header {
     std::uint32_t magic{mailbox::magic};
@@ -102,7 +103,7 @@ struct Message {
     std::array<std::byte, max_body> body{};
     std::array<std::byte, signature_size> signature{};
 
-    [[nodiscard]] std::span<const std::byte> body_bytes() const noexcept {
+    [[nodiscard]] auto body_bytes() const noexcept -> std::span<const std::byte> {
         return std::span{body}.first(header.body_len);
     }
 };
@@ -115,15 +116,16 @@ enum class DecodeError : std::uint8_t {
     reserved_not_zero,  // reserved header bytes or bytes past body_len are non-zero
 };
 
-[[nodiscard]] const char* to_string(DecodeError e) noexcept;
+[[nodiscard]] auto to_string(DecodeError e) noexcept -> const char*;
 
 // Strict decode of one slot. Rejects anything not exactly well-formed;
 // does not check signatures or sequence numbers (the agent does both).
-[[nodiscard]] std::expected<Message, DecodeError> decode(const Slot& slot) noexcept;
+[[nodiscard]] auto decode(const Slot& slot) noexcept -> std::expected<Message, DecodeError>;
 
 // Encodes a message into a slot, zero-filling everything unused.
-[[nodiscard]] std::expected<Slot, DecodeError> encode(const Header& header, std::span<const std::byte> body,
-                                                      std::span<const std::byte, signature_size> signature);
+[[nodiscard]] auto encode(const Header& header, std::span<const std::byte> body,
+                          std::span<const std::byte, signature_size> signature)
+    -> std::expected<Slot, DecodeError>;
 
 // ---- Command bodies -------------------------------------------------------
 
@@ -138,6 +140,9 @@ struct CreateVm {
     BootMode boot_mode{BootMode::volume};
 };
 
+inline constexpr std::uint8_t destroy_flag_persist_volumes = 0x01;
+inline constexpr std::uint8_t destroy_flags_known = destroy_flag_persist_volumes;
+
 struct DestroyVm {
     std::uint64_t vm_id{0};
     bool persist_volumes{false};
@@ -149,9 +154,11 @@ enum class BodyError : std::uint8_t {
     invalid_field,
 };
 
-[[nodiscard]] const char* to_string(BodyError e) noexcept;
+[[nodiscard]] auto to_string(BodyError e) noexcept -> const char*;
 
-[[nodiscard]] std::expected<CreateVm, BodyError> decode_create_vm(const Message& msg) noexcept;
-[[nodiscard]] std::expected<DestroyVm, BodyError> decode_destroy_vm(const Message& msg) noexcept;
+[[nodiscard]] auto decode_create_vm(const Message& msg) noexcept
+    -> std::expected<CreateVm, BodyError>;
+[[nodiscard]] auto decode_destroy_vm(const Message& msg) noexcept
+    -> std::expected<DestroyVm, BodyError>;
 
 }  // namespace ak::helm::mailbox

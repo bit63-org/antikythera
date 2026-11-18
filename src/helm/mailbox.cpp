@@ -12,12 +12,11 @@ namespace ak::helm::mailbox {
 
 namespace {
 
-constexpr std::size_t header_reserved = 6;
 constexpr std::size_t create_vm_body_len = 16;
 constexpr std::size_t destroy_vm_body_len = 9;
 constexpr std::uint16_t max_vcpus = 1024;
 
-constexpr bool known_type(std::uint16_t raw) noexcept {
+constexpr auto known_type(std::uint16_t raw) noexcept -> bool {
     switch (static_cast<Type>(raw)) {
         case Type::create_vm:
         case Type::destroy_vm:
@@ -43,35 +42,45 @@ constexpr bool known_type(std::uint16_t raw) noexcept {
     return false;
 }
 
-bool all_zero(std::span<const std::byte> b) noexcept {
+auto all_zero(std::span<const std::byte> b) noexcept -> bool {
     return std::ranges::all_of(b, [](std::byte x) { return x == std::byte{0}; });
 }
 
 }  // namespace
 
-bool is_command(Type t) noexcept { return std::to_underlying(t) < std::to_underlying(Type::response); }
+auto is_command(Type t) noexcept -> bool {
+    return std::to_underlying(t) < std::to_underlying(Type::response);
+}
 
-const char* to_string(DecodeError e) noexcept {
+auto to_string(DecodeError e) noexcept -> const char* {
     switch (e) {
-        case DecodeError::bad_magic: return "bad_magic";
-        case DecodeError::bad_version: return "bad_version";
-        case DecodeError::unknown_type: return "unknown_type";
-        case DecodeError::body_too_long: return "body_too_long";
-        case DecodeError::reserved_not_zero: return "reserved_not_zero";
+        case DecodeError::bad_magic:
+            return "bad_magic";
+        case DecodeError::bad_version:
+            return "bad_version";
+        case DecodeError::unknown_type:
+            return "unknown_type";
+        case DecodeError::body_too_long:
+            return "body_too_long";
+        case DecodeError::reserved_not_zero:
+            return "reserved_not_zero";
     }
     return "unknown";
 }
 
-const char* to_string(BodyError e) noexcept {
+auto to_string(BodyError e) noexcept -> const char* {
     switch (e) {
-        case BodyError::wrong_type: return "wrong_type";
-        case BodyError::wrong_length: return "wrong_length";
-        case BodyError::invalid_field: return "invalid_field";
+        case BodyError::wrong_type:
+            return "wrong_type";
+        case BodyError::wrong_length:
+            return "wrong_length";
+        case BodyError::invalid_field:
+            return "invalid_field";
     }
     return "unknown";
 }
 
-std::expected<Message, DecodeError> decode(const Slot& slot) noexcept {
+auto decode(const Slot& slot) noexcept -> std::expected<Message, DecodeError> {
     wire::Reader r{slot};
     // The slot is a fixed 256 bytes, so none of these header reads can fail.
     Message msg;
@@ -80,7 +89,7 @@ std::expected<Message, DecodeError> decode(const Slot& slot) noexcept {
     const std::uint16_t raw_type = *r.le16();
     msg.header.seq = *r.le64();
     msg.header.body_len = *r.le16();
-    const auto reserved = *r.bytes(header_reserved);
+    const auto reserved = *r.bytes(header_reserved_size);
 
     if (msg.header.magic != magic) {
         return std::unexpected(DecodeError::bad_magic);
@@ -105,12 +114,14 @@ std::expected<Message, DecodeError> decode(const Slot& slot) noexcept {
         return std::unexpected(DecodeError::reserved_not_zero);
     }
     std::ranges::copy(body_region, msg.body.begin());
-    std::ranges::copy(std::span{slot}.subspan(signature_offset, signature_size), msg.signature.begin());
+    std::ranges::copy(std::span{slot}.subspan(signature_offset, signature_size),
+                      msg.signature.begin());
     return msg;
 }
 
-std::expected<Slot, DecodeError> encode(const Header& header, std::span<const std::byte> body,
-                                        std::span<const std::byte, signature_size> signature) {
+auto encode(const Header& header, std::span<const std::byte> body,
+            std::span<const std::byte, signature_size> signature)
+    -> std::expected<Slot, DecodeError> {
     if (body.size() > max_body || header.body_len != body.size()) {
         return std::unexpected(DecodeError::body_too_long);
     }
@@ -130,7 +141,7 @@ std::expected<Slot, DecodeError> encode(const Header& header, std::span<const st
     return slot;
 }
 
-std::expected<CreateVm, BodyError> decode_create_vm(const Message& msg) noexcept {
+auto decode_create_vm(const Message& msg) noexcept -> std::expected<CreateVm, BodyError> {
     if (msg.header.type != Type::create_vm) {
         return std::unexpected(BodyError::wrong_type);
     }
@@ -153,7 +164,7 @@ std::expected<CreateVm, BodyError> decode_create_vm(const Message& msg) noexcept
     return out;
 }
 
-std::expected<DestroyVm, BodyError> decode_destroy_vm(const Message& msg) noexcept {
+auto decode_destroy_vm(const Message& msg) noexcept -> std::expected<DestroyVm, BodyError> {
     if (msg.header.type != Type::destroy_vm) {
         return std::unexpected(BodyError::wrong_type);
     }
@@ -165,10 +176,10 @@ std::expected<DestroyVm, BodyError> decode_destroy_vm(const Message& msg) noexce
     DestroyVm out;
     out.vm_id = *r.le64();
     const std::uint8_t flags = *r.u8();
-    if (out.vm_id == 0 || (flags & 0xFEu) != 0) {
+    if (out.vm_id == 0 || (flags & static_cast<std::uint8_t>(~destroy_flags_known)) != 0) {
         return std::unexpected(BodyError::invalid_field);
     }
-    out.persist_volumes = (flags & 0x01u) != 0;
+    out.persist_volumes = (flags & destroy_flag_persist_volumes) != 0;
     return out;
 }
 

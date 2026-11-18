@@ -68,6 +68,11 @@ constexpr auto known_type(std::uint16_t raw) noexcept -> bool {
     return false;
 }
 
+// Commands must name their signing key; unsigned messages must not.
+auto key_id_fits(Type type, KeyId key_id) noexcept -> bool {
+    return is_command(type) ? key_id != no_key_id : key_id == no_key_id;
+}
+
 auto all_zero(std::span<const std::byte> b) noexcept -> bool {
     return std::ranges::all_of(b, [](std::byte x) { return x == std::byte{0}; });
 }
@@ -422,6 +427,8 @@ auto to_string(DecodeError e) noexcept -> const char* {
             return "body_too_long";
         case DecodeError::reserved_not_zero:
             return "reserved_not_zero";
+        case DecodeError::bad_key_id:
+            return "bad_key_id";
     }
     return "unknown";
 }
@@ -449,6 +456,7 @@ auto decode(const Slot& slot) noexcept -> std::expected<Message, DecodeError> {
     const std::uint16_t raw_type = *r.le16();
     msg.header.seq = *r.le64();
     msg.header.body_len = *r.le16();
+    msg.header.key_id = *r.le16();
     const auto reserved = *r.bytes(header_reserved_size);
 
     if (msg.header.magic != magic) {
@@ -466,6 +474,9 @@ auto decode(const Slot& slot) noexcept -> std::expected<Message, DecodeError> {
     }
     if (!all_zero(reserved)) {
         return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (!key_id_fits(msg.header.type, msg.header.key_id)) {
+        return std::unexpected(DecodeError::bad_key_id);
     }
 
     const auto body_region = std::span{slot}.subspan(header_size, max_body);
@@ -488,6 +499,9 @@ auto encode(const Header& header, std::span<const std::byte> body,
     if (!known_type(std::to_underlying(header.type))) {
         return std::unexpected(DecodeError::unknown_type);
     }
+    if (!key_id_fits(header.type, header.key_id)) {
+        return std::unexpected(DecodeError::bad_key_id);
+    }
     Slot slot{};
     wire::SpanWriter w{slot};
     // Fixed-size slot: these writes cannot overflow.
@@ -496,6 +510,7 @@ auto encode(const Header& header, std::span<const std::byte> body,
     (void)w.write(std::to_underlying(header.type), wire::Order::little);
     (void)w.write(header.seq, wire::Order::little);
     (void)w.write(header.body_len, wire::Order::little);
+    (void)w.write(header.key_id, wire::Order::little);
     std::ranges::copy(body, slot.begin() + header_size);
     std::ranges::copy(signature, slot.begin() + signature_offset);
     return slot;

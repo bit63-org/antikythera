@@ -1,11 +1,12 @@
 # Implementation Plan — Controller interface and the kythira EC2 integration
 
-## Status: 0/7 tasks complete
+## Status: 1/7 tasks complete
 
 ## Tasks
 
-- [ ] 1. Mailbox protocol v2: assign `key_id` in the reserved header bytes.
-  _Requirements: 1.3_
+- [x] 1. Mailbox protocol v2: assign `key_id` in the reserved header bytes.
+  _Requirements: 1.3_ (`key_id` u16 at slot offset 0x12; non-zero on
+  commands, zero on responses and events; version 1 is no longer accepted.)
 - [ ] 2. Envelope and MapUpdate codecs in `src/proto/`, tests, fuzz targets,
   signing test vectors. _Requirements: 1, 5.2_
 - [ ] 3. helm ControllerLink over mTLS with reconnect and reconciliation.

@@ -41,8 +41,9 @@ agent.
 ### SignatureVerifier
 
 OpenSSL EVP Ed25519 verify over slot bytes `[0, 0xC0)`. Public keys are a
-compiled-in table (supports rotation: up to N keys, each with a key ID in
-the envelope's reserved bytes — see `controller-interface`).
+compiled-in table (supports rotation: up to N keys, selected by the
+`key_id` field of the signed slot header, mailbox protocol v2 — see
+`controller-interface`).
 
 ### VmSupervisor
 

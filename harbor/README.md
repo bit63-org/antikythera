@@ -13,7 +13,7 @@ sudo apt-get install cloud-image-utils openssh-client ninja-build meson pkg-conf
     libglib2.0-dev libpixman-1-dev libslirp-dev python3-venv flex bison
 harbor/deps.sh            # pinned QEMU 10.2.4 + verified Ubuntu 24.04 image into harbor/.prefix
 vcpkg install --x-feature=vfio-user
-cmake -B build -G Ninja && cmake --build build   # builds build/src/ak-testdev
+cmake -B build -G Ninja -DAK_VFIO_USER=ON && cmake --build build   # builds build/src/ak-testdev
 harbor/check-host.sh
 ```
 

@@ -9,6 +9,10 @@ upstream at tag `v0.8` (commit `37491ed9af828fc161238dacd82e83ea35a09f87`).
   client/server test turned off.
 - **cmocka:** upstream's `meson.build` requires it unconditionally, even
   though only its own unit tests use it.
+- **pkg-config:** upstream installs no `libvfio-user.pc`, so the portfile
+  writes one (skipped if upstream ever ships its own). On static triplets
+  json-c and `-pthread` are public (`Requires:`/`Libs:`), because CMake's
+  `pkg_check_modules(IMPORTED_TARGET)` ignores the `.private` fields.
 - **Removed from the package:** sample binaries under `bin/`.
 
 This is third-party content, so per the copyright-header rules the portfile

@@ -24,6 +24,18 @@ target_link_libraries(ak_oar_net
   PUBLIC ak::common
   PRIVATE ak::warnings ak::hardening)
 
+# oar/virtio: the shared virtio device core (guest memory, split virtqueue,
+# modern PCI capabilities and common configuration), written once and bound
+# to vfio-user or pci-epf by each device.
+add_library(ak_oar_virtio
+  oar/virtio/guest_memory.cpp
+  oar/virtio/pci.cpp
+  oar/virtio/split_queue.cpp)
+add_library(ak::oar_virtio ALIAS ak_oar_virtio)
+target_link_libraries(ak_oar_virtio
+  PUBLIC ak::common
+  PRIVATE ak::warnings ak::hardening)
+
 # OpenSSL is required: AES-256-GCM key wrapping and OPENSSL_cleanse in the
 # helm key store, and Ed25519 in hull (the only implementation here). CI
 # builds against Ubuntu 24.04's OpenSSL 3.0, so 3.0 is the configure floor.

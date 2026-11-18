@@ -1,6 +1,6 @@
 # Implementation Plan — oar-net: the network data plane
 
-## Status: 4/11 tasks complete
+## Status: 5/11 tasks complete
 
 ## Tasks
 
@@ -13,8 +13,15 @@
   trailing return types, test timeouts, named constants). _Requirements: 9_
 - [ ] 4. Kernel Geneve interop test in a network namespace.
   _Requirements: 9.2_
-- [ ] 5. Shared virtio core: PCI capabilities, split virtqueue with bounds
-  checks, fuzz target. _Requirements: 1.4_
+- [x] 5. Shared virtio core: PCI capabilities, split virtqueue with bounds
+  checks, fuzz target. _Requirements: 1.4_ — `src/oar/virtio/`:
+  `GuestMemory` (registered DMA regions, no straddling), `SplitQueue`
+  (copy-once descriptor walk, indirect tables, chain budget, in-flight
+  tracking, event-index suppression; errors latch the queue broken), and
+  `CommonConfig` + `encode_capability` (spec 4.1 register model with
+  feature negotiation and the status machine). Fuzz: `fuzz_virtqueue`,
+  `fuzz_virtio_pci`. Packed rings, the notify/ISR/device-config BAR
+  handling and the transport binding come with VirtioNetFunction (task 6).
 - [ ] 6. VirtioNetFunction on vfio-user. _Requirements: 1_
 - [x] 7. MappingTable with atomic snapshots and `map_update` handling
   (`src/oar/net/mapping_table.*`), tests, fuzz target. Takes a decoded

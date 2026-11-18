@@ -1,6 +1,6 @@
 # Implementation Plan — oar-net: the network data plane
 
-## Status: 2/11 tasks complete
+## Status: 3/11 tasks complete
 
 ## Tasks
 
@@ -9,8 +9,8 @@
   _Requirements: 3, 4.1, 9.1_
 - [x] 2. Ingress policy against a `MappingView` (`src/oar/net/vtep_policy.*`),
   tests. _Requirements: 4.2, 4.3_
-- [ ] 3. Bring existing code to the steering standards (`_member` naming,
-  test timeouts). _Requirements: 9_
+- [x] 3. Bring existing code to the steering standards (`_member` naming,
+  trailing return types, test timeouts, named constants). _Requirements: 9_
 - [ ] 4. Kernel Geneve interop test in a network namespace.
   _Requirements: 9.2_
 - [ ] 5. Shared virtio core: PCI capabilities, split virtqueue with bounds

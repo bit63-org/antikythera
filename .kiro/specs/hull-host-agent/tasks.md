@@ -19,8 +19,12 @@
   and `authenticate()` (decode, signature, sequence). The compiled-in key
   table arrives with the agent binary (task 3); `authenticate()` takes the
   key ID from the signed slot header (mailbox protocol v2).
-- [ ] 6. Resource allocator: cores (whole, SMT-aware) and 1 GiB pages.
-  _Requirements: 6.1, 8.1_
+- [x] 6. Resource allocator: cores (whole, SMT-aware) and 1 GiB pages.
+  _Requirements: 6.1, 8.1_ — `src/hull/`: `CpuTopology` (strict cpulist
+  parser, fuzzed; sysfs SMT siblings, isolated CPUs, free 1 GiB pages) and
+  `ResourceAllocator` (whole cores, only cores fully in the isolated set,
+  memory rounded up to whole GiB, refusal without partial allocation).
+  Not NUMA-aware yet: one pool of cores and pages.
 - [ ] 7. Jail construction (namespaces, cgroup, Landlock, UID).
   _Requirements: 6.1, 9.1_
 - [ ] 8. VmSupervisor: create/destroy with Cloud Hypervisor; reset and

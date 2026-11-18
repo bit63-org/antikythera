@@ -17,4 +17,5 @@ endfunction()
 
 ak_add_fuzzer(fuzz_geneve  fuzz_geneve.cpp  ak::oar_net)
 ak_add_fuzzer(fuzz_mailbox fuzz_mailbox.cpp ak::helm)
+ak_add_fuzzer(fuzz_mctp    fuzz_mctp.cpp    ak::helm)
 ak_add_fuzzer(fuzz_command_auth fuzz_command_auth.cpp ak::hull)

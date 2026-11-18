@@ -1,6 +1,6 @@
 # Implementation Plan — oar-blk: the storage data plane
 
-## Status: 1/8 tasks complete
+## Status: 2/8 tasks complete
 
 ## Tasks
 
@@ -8,8 +8,12 @@
   — `src/oar/blk/xts_cipher.*`: OpenSSL `aes-256-xts` over 512-byte or
   4 KiB data units, tweak = data unit number; tests carry IEEE 1619
   vectors 10-14 and 4 KiB cross-checks.
-- [ ] 2. KeySlot with zeroization, locked memory, no core dumps.
+- [x] 2. KeySlot with zeroization, locked memory, no core dumps.
   _Requirements: 2.2, 2.3_
+  — `src/oar/blk/key_slot.*`: one key per slot in its own page, mlocked,
+  `MADV_DONTDUMP` and `MADV_WIPEONFORK`, wiped with `OPENSSL_cleanse` on
+  drop and destruction; `harden_process()` sets `RLIMIT_CORE` 0 and
+  `PR_SET_DUMPABLE` 0. Tests check the page flags in `/proc/self/smaps`.
 - [ ] 3. virtio-blk request parser with bounds checks and fuzz target.
   _Requirements: 6_
 - [ ] 4. VirtioBlkFunction on the shared virtio core (vfio-user).

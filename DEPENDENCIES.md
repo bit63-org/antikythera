@@ -80,6 +80,18 @@ build also works against system packages. See
   (see `cmake/CompilerLauncher.cmake`). CI uses sccache against kythira's
   shared OCI bucket. A missing cache never fails a build.
 
+## Claude Code cloud sessions
+
+Cloud containers run Ubuntu 24.04, whose default GCC 13 is too old.
+`.claude/hooks/session-start.sh` runs at session start (only when
+`CLAUDE_CODE_REMOTE=true`) and installs from the Ubuntu archive: GCC 14,
+Clang 19 with clang-tidy 19 and the libFuzzer runtime, CMake, Ninja,
+Boost.Test 1.83, OpenSSL and shellcheck, plus clang-format 22.1.5 from
+PyPI. It exports `CC=gcc-14`, `CXX=g++-14` and `CMAKE_GENERATOR=Ninja`,
+so `cmake -S . -B build && cmake --build build && ctest --test-dir build`
+works with no vcpkg step. Packages already present are skipped, so a warm
+container starts in well under a second.
+
 ## harbor (virt-on-virt prototype)
 
 Needed only on the workstation that runs harbor; none of these are build

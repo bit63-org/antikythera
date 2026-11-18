@@ -47,6 +47,8 @@ ak_add_test(proto_envelope_test   SOURCES proto_envelope_test.cpp   LIBS ak::pro
 ak_add_test(proto_map_update_test SOURCES proto_map_update_test.cpp LIBS ak::proto)
 ak_add_test(proto_vectors_test    SOURCES proto_vectors_test.cpp    LIBS ak::proto ak::hull)
 ak_add_test(key_store_test     SOURCES key_store_test.cpp     LIBS ak::helm)
+ak_add_test(virtqueue_test    SOURCES virtqueue_test.cpp    LIBS ak::oar_virtio)
+ak_add_test(virtio_pci_test   SOURCES virtio_pci_test.cpp   LIBS ak::oar_virtio)
 
 # Python tests for the tooling around the C++ tree (the hull kernel config
 # checker). Skipped, not failed, when no interpreter is found.

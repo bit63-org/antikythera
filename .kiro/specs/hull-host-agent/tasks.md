@@ -7,7 +7,9 @@
 - [ ] 1. Kernel config fragment for harbor L1 (permissive: includes IP for
   debugging) and the target `hull.config` (strict). _Requirements: 2_
 - [ ] 2. Phase-1 check script for L1: IOMMU groups, ATS state, ACS on
-  ports, secondary bus reset reaching the device server. _Requirements: 5.2_
+  ports, reset reaching the device server. Written as
+  `harbor/l1/phase1-check.sh` (harbor task 4); not yet run.
+  _Requirements: 5.2_
 - [ ] 3. Init binary: mounts, `vfio-pci` binding by allow-list, IOMMU group
   check. _Requirements: 3.1, 5.1, 5.2_
 - [ ] 4. MailboxClient over VFIO (BAR0 mmap, MSI-X eventfd, no DMA).

@@ -45,17 +45,29 @@ response. Each step is idempotent on retry by sequence number.
            assign                 VM release / detach
  free ───────────────► assigned ───────────────────► releasing
   ▲                                                     │ hull: DEVICE_RELEASED
-  │  oar: clean ok                                      ▼
-  └──────────────────────────────────────────────── cleaning
-                                                        │ timeout / error
-                                                        ▼
-                                  slot power-cycle ok ◄─ faulted
+  │  oar: clean ok (NIC, blk) / SCRUB_DONE (GPU)        ▼
+  └──────────────────────────────────────────────── cleaning ◄────────┐
+                                                        │ error /      │ slot power-cycle ok
+                                                        ▼ timeout      │
+            releasing: reset failed / timeout ──────► faulted ─────────┘
 ```
 
 Types: `nic_vf`, `blk_fn`, `gpu_whole`, `gpu_vf`. Cleaning action by type:
 NIC → dead VPC + clear queues/MAC; blk → drop key from memory; GPU →
 scrub VRAM (manager VM or scrubber VM). Implemented as a table-driven state
-machine so illegal transitions are unrepresentable and testable.
+machine (`src/helm/device_pool.hpp`, `transition_table`) so illegal
+transitions are refused without side effects and testable exhaustively.
+
+Decisions made in the implementation:
+
+- GPU functions leave `cleaning` only on `SCRUB_DONE`; NIC and blk
+  functions only on the role's clean confirmation.
+- A power-cycled `faulted` function returns to `cleaning`, not `free`: a
+  power cycle does not guarantee a wipe (VRAM in particular).
+- A function added from a role's inventory starts in `cleaning`, since helm
+  cannot know what a previous boot left in it.
+- A function stays owned by its VM through `releasing`, until hull confirms
+  the reset; only the owning VM can release it.
 
 ### KeyStore
 

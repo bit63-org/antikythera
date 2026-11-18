@@ -6,7 +6,7 @@
 
 - [x] 1. Reserve protocol message types (`gpu_vf_config`, `scrub_done`).
   _Requirements: 2.2_
-- [ ] 2. Device-pool types and the scrub cleaning action in helm (lands with
+- [x] 2. Device-pool types and the scrub cleaning action in helm (lands with
   helm task 4). _Requirements: 2.2, 3_
 - [ ] 3. Backplane provisions captured in `backplane-hardware`.
   _Requirements: 5_

@@ -10,13 +10,14 @@
 # Board processes start before QEMU: that ordering is harbor's stand-in for
 # helm's power sequencing (slots ready before the host leaves reset).
 #
-# Usage: harbor/l1/run.sh [--name srv1] [--slots N] [--topology switch|rootports]
+# Usage: harbor/l1/run.sh [--name srv1] [--slots N] [--topology rootports|switch]
 #                         [--mem 4G] [--cpus 4] [--ssh-port 2222]
 #
 # Topologies:
+#   rootports  one pcie-root-port per slot (default)
 #   switch     root port -> x3130 upstream -> one xio3130 downstream per slot
-#   rootports  one pcie-root-port per slot (fallback if the emulated switch
-#              ports lack ACS and merge IOMMU groups)
+#              (opt-in: QEMU 10.2's emulated xio3130 downstream ports have no
+#              ACS, so each endpoint shares an IOMMU group with its port)
 
 set -euo pipefail
 # shellcheck source=harbor/lib.sh
@@ -24,7 +25,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 name="srv1"
 slots=2
-topology="switch"
+topology="rootports"
 mem="4G"
 cpus=4
 ssh_port=2222

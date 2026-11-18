@@ -20,8 +20,8 @@ harbor/check-host.sh
 Run:
 
 ```bash
-harbor/phase1.sh                       # 2 slots behind an emulated PCIe switch
-harbor/phase1.sh --topology rootports  # fallback: one root port per slot
+harbor/phase1.sh                       # 2 slots, one PCIe root port each
+harbor/phase1.sh --topology switch     # opt-in: slots behind an emulated PCIe switch
 harbor/phase1.sh --keep                # leave L1 running to poke at it
 ```
 

@@ -14,8 +14,11 @@
   check. _Requirements: 3.1, 5.1, 5.2_
 - [ ] 4. MailboxClient over VFIO (BAR0 mmap, MSI-X eventfd, no DMA).
   _Requirements: 3_
-- [ ] 5. SignatureVerifier (OpenSSL Ed25519) and sequence tracking.
-  _Requirements: 4_
+- [x] 5. SignatureVerifier (OpenSSL Ed25519) and sequence tracking.
+  _Requirements: 4_ — `src/hull/`: `SignatureVerifier`, `SequenceTracker`
+  and `authenticate()` (decode, signature, sequence). The compiled-in key
+  table arrives with the agent binary (task 3); the key ID comes from the
+  header once mailbox protocol v2 lands (controller-interface task 1).
 - [ ] 6. Resource allocator: cores (whole, SMT-aware) and 1 GiB pages.
   _Requirements: 6.1, 8.1_
 - [ ] 7. Jail construction (namespaces, cgroup, Landlock, UID).

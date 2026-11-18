@@ -64,16 +64,29 @@ log "L1 is up with the IOMMU enabled"
 
 scp "${common_opts[@]}" -P "${ssh_port}" \
     "${HARBOR_DIR}/l1/phase1-check.sh" "${HARBOR_DIR}/l1/testdev_mmio.py" harbor@127.0.0.1:
+
+# Each board process logs a reset when QEMU attaches and when L1 boots or
+# reboots, so remember how far each slot log has got before the in-L1
+# checks run; the host-side reset check below only reads what follows.
+declare -a log_offsets=()
+for ((i = 0; i < slots; i++)); do
+    log_offsets[i]="$(stat -c %s "${RUN_DIR}/${name}/slot${i}.log" 2>/dev/null || echo 0)"
+done
+
 status=0
 l1 "sudo bash ./phase1-check.sh ${slots}" || status=$?
 
 # The in-L1 reset check only sees RESET_COUNT; confirm from the other side
-# that each board process logged the reset it was sent.
+# that each board process logged the reset it was sent during the checks
+# (resets logged before log_offsets was taken do not count).
 for ((i = 0; i < slots; i++)); do
-    if grep -q 'reset type=' "${RUN_DIR}/${name}/slot${i}.log"; then
-        echo "PASS  slot ${i}: board process logged a reset"
+    slot_log="${RUN_DIR}/${name}/slot${i}.log"
+    # Process substitution, not a pipe: under pipefail, grep -q exiting on
+    # the first match could SIGPIPE tail and turn a pass into a fail.
+    if grep -q 'reset type=' < <(tail -c "+$((log_offsets[i] + 1))" "${slot_log}" 2>/dev/null); then
+        echo "PASS  slot ${i}: board process logged a reset during the checks"
     else
-        echo "FAIL  slot ${i}: board process logged no reset"
+        echo "FAIL  slot ${i}: board process logged no reset during the checks"
         status=1
     fi
 done

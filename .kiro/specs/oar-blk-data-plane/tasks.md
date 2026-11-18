@@ -1,6 +1,6 @@
 # Implementation Plan — oar-blk: the storage data plane
 
-## Status: 2/8 tasks complete
+## Status: 3/8 tasks complete
 
 ## Tasks
 
@@ -14,8 +14,13 @@
   `MADV_DONTDUMP` and `MADV_WIPEONFORK`, wiped with `OPENSSL_cleanse` on
   drop and destruction; `harden_process()` sets `RLIMIT_CORE` 0 and
   `PR_SET_DUMPABLE` 0. Tests check the page flags in `/proc/self/smaps`.
-- [ ] 3. virtio-blk request parser with bounds checks and fuzz target.
+- [x] 3. virtio-blk request parser with bounds checks and fuzz target.
   _Requirements: 6_
+  — `src/oar/blk/request_parser.*`: IN, OUT, FLUSH and GET_ID over any
+  descriptor layout (header copied out once); shape, block-size length
+  and alignment, overflow-safe sector range, seg_max and transfer caps;
+  UNSUPP for other types. `fuzz/fuzz_blk_request.cpp` checks that
+  accepted I/O stays inside the volume and parsing never writes.
 - [ ] 4. VirtioBlkFunction on the shared virtio core (vfio-user).
   _Requirements: 1_
 - [ ] 5. File backend with volume metadata header. _Requirements: 3.1_

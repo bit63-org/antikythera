@@ -72,16 +72,19 @@ struct Fixture {
     }();
     SequenceTracker sequence;
 
+    // `key` goes in the slot header; responses and events carry no key ID.
     [[nodiscard]] auto command(const TestSigner& by, std::uint64_t seq,
-                               mb::Type type = mb::Type::create_vm) const -> mb::Slot {
+                               mb::Type type = mb::Type::create_vm, KeyId key = controller) const
+        -> mb::Slot {
         const auto body = create_vm_body();
-        return by.signed_slot(
-            {.type = type, .seq = seq, .body_len = static_cast<std::uint16_t>(body.size())}, body);
+        return by.signed_slot({.type = type,
+                               .seq = seq,
+                               .body_len = static_cast<std::uint16_t>(body.size()),
+                               .key_id = mb::is_command(type) ? key : mb::no_key_id},
+                              body);
     }
 
-    auto auth(const mb::Slot& slot, KeyId key = controller) {
-        return ak::hull::authenticate(slot, key, verifier, sequence);
-    }
+    auto auth(const mb::Slot& slot) { return ak::hull::authenticate(slot, verifier, sequence); }
 };
 
 auto failure(AuthFailure f) -> AuthError {
@@ -151,8 +154,8 @@ BOOST_AUTO_TEST_CASE(forgery_does_not_consume_sequence,
 }
 
 BOOST_AUTO_TEST_CASE(rejects_unknown_key_id, *boost::unit_test::timeout(unit_timeout_seconds)) {
-    BOOST_TEST(
-        (auth(command(signer, first_seq), other_key).error() == failure(AuthFailure::unknown_key)));
+    BOOST_TEST((auth(command(signer, first_seq, mb::Type::create_vm, other_key)).error() ==
+                failure(AuthFailure::unknown_key)));
     BOOST_TEST(sequence.last_accepted() == 0);
 }
 

@@ -32,6 +32,8 @@ constexpr KeyId key_a = 1;
 constexpr KeyId key_b = 2;
 constexpr KeyId key_c = 3;
 constexpr KeyId absent_key = 0x7777;
+// Header key ID for sample slots; verify_slot() is told the key explicitly.
+constexpr KeyId sample_key_id = key_a;
 constexpr std::byte flip{0x01};
 constexpr std::uint64_t sample_seq = 9;
 constexpr std::uint8_t body_fill = 0x5C;
@@ -61,7 +63,8 @@ auto sample_slot(const TestSigner& signer) -> mb::Slot {
     std::vector<std::byte> body(sample_body_len, std::byte{body_fill});
     return signer.signed_slot({.type = mb::Type::create_vm,
                                .seq = sample_seq,
-                               .body_len = static_cast<std::uint16_t>(body.size())},
+                               .body_len = static_cast<std::uint16_t>(body.size()),
+                               .key_id = sample_key_id},
                               body);
 }
 

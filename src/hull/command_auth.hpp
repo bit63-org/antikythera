@@ -40,11 +40,11 @@ struct AuthError {
 // the slot decodes, is a command and carries a valid signature, so neither
 // garbage nor a forgery can consume sequence numbers.
 //
-// `key_id` names the verification key. Mailbox protocol v1 has no field for
-// it, so the agent passes its single configured key ID; protocol v2 moves it
-// into the reserved header bytes (controller-interface task 1).
-[[nodiscard]] auto authenticate(const helm::mailbox::Slot& slot, KeyId key_id,
-                                const SignatureVerifier& verifier, SequenceTracker& sequence)
+// The verification key is the one named by the slot header's key_id
+// (mailbox protocol v2), which lies inside the signed bytes: a slot that
+// names a different key than the one that signed it fails verification.
+[[nodiscard]] auto authenticate(const helm::mailbox::Slot& slot, const SignatureVerifier& verifier,
+                                SequenceTracker& sequence)
     -> std::expected<helm::mailbox::Message, AuthError>;
 
 }  // namespace ak::hull

@@ -1,6 +1,6 @@
 # Implementation Plan — helm: the control-plane role
 
-## Status: 3/12 tasks complete
+## Status: 4/12 tasks complete
 
 ## Tasks
 
@@ -10,7 +10,7 @@
 - [x] 2. Bring existing code to the steering standards: `_member` naming,
   trailing return types, `BOOST_AUTO_TEST_CASE` timeouts, named constants
   in source and tests. _Requirements: 10_
-- [ ] 3. Remaining command bodies: `ATTACH_DEVICE`, `DETACH_DEVICE`,
+- [x] 3. Remaining command bodies: `ATTACH_DEVICE`, `DETACH_DEVICE`,
   volume commands, `CREATE_NETWORK`/`DELETE_NETWORK`, `GPU_VF_CONFIG`
   (reserved), events. _Requirements: 1, 3.5_
 - [x] 4. DevicePool table-driven state machine with exhaustive transition

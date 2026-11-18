@@ -55,6 +55,8 @@ constexpr std::byte bad_policy{3};
 constexpr std::uint8_t too_long_timeout = 0x59;  // low byte of 601 (0x0259)
 constexpr std::uint8_t too_long_timeout_hi = 0x02;
 
+constexpr mb::KeyId sample_key = 1;
+
 auto sig() -> std::array<std::byte, mb::signature_size> {
     return {};
 }
@@ -64,6 +66,8 @@ auto message(mb::Type type, std::span<const std::byte> body) -> mb::Message {
     h.type = type;
     h.seq = sample_seq;
     h.body_len = static_cast<std::uint16_t>(body.size());
+    // Protocol v2: commands name their signing key, responses and events don't.
+    h.key_id = mb::is_command(type) ? sample_key : mb::no_key_id;
     auto slot = mb::encode(h, body, sig());
     BOOST_REQUIRE(slot.has_value());
     auto msg = mb::decode(*slot);

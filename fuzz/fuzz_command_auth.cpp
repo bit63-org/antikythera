@@ -49,8 +49,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     mb::Slot slot{};
     std::ranges::copy(input.first(std::min(size, slot.size())), slot.begin());
     ak::hull::SequenceTracker sequence;
-    if (ak::hull::authenticate(slot, fuzz_key_id, verifier, sequence) ||
-        sequence.last_accepted() != 0) {
+    if (ak::hull::authenticate(slot, verifier, sequence) || sequence.last_accepted() != 0) {
         std::abort();
     }
 

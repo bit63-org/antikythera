@@ -43,7 +43,7 @@ auto to_string(AuthFailure f) noexcept -> const char* {
     return "unknown";
 }
 
-auto authenticate(const mb::Slot& slot, KeyId key_id, const SignatureVerifier& verifier,
+auto authenticate(const mb::Slot& slot, const SignatureVerifier& verifier,
                   SequenceTracker& sequence) -> std::expected<mb::Message, AuthError> {
     auto msg = mb::decode(slot);
     if (!msg) {
@@ -52,7 +52,7 @@ auto authenticate(const mb::Slot& slot, KeyId key_id, const SignatureVerifier& v
     if (!mb::is_command(msg->header.type)) {
         return std::unexpected(AuthError{.failure = AuthFailure::not_a_command});
     }
-    if (auto ok = verifier.verify_slot(slot, key_id); !ok) {
+    if (auto ok = verifier.verify_slot(slot, msg->header.key_id); !ok) {
         return std::unexpected(AuthError{.failure = to_failure(ok.error())});
     }
     if (auto ok = sequence.accept(msg->header.seq); !ok) {

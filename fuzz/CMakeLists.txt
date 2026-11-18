@@ -1,0 +1,19 @@
+# Copyright (c) 2026 Clark Rawlins
+# SPDX-License-Identifier: Apache-2.0
+
+# libFuzzer targets: one per parser that sees untrusted bytes.
+#   cmake -B build-fuzz -DCMAKE_CXX_COMPILER=clang++ -DAK_FUZZ=ON -DAK_SANITIZE=ON -DAK_TESTS=OFF
+#   build-fuzz/fuzz/fuzz_geneve -max_total_time=60
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  message(FATAL_ERROR "AK_FUZZ=ON requires Clang (libFuzzer)")
+endif()
+
+function(ak_add_fuzzer name source lib)
+  add_executable(${name} ${source})
+  target_link_libraries(${name} PRIVATE ${lib} ak::warnings)
+  target_compile_options(${name} PRIVATE -fsanitize=fuzzer)
+  target_link_options(${name} PRIVATE -fsanitize=fuzzer)
+endfunction()
+
+ak_add_fuzzer(fuzz_geneve  fuzz_geneve.cpp  ak::oar_net)
+ak_add_fuzzer(fuzz_mailbox fuzz_mailbox.cpp ak::helm)

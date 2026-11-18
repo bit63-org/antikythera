@@ -1,0 +1,16 @@
+{
+  "name": "libvfio-user",
+  "version-string": "0.8",
+  "description": "Framework for emulating PCI devices in userspace over the vfio-user protocol",
+  "homepage": "https://github.com/nutanix/libvfio-user",
+  "license": "BSD-3-Clause",
+  "supports": "linux",
+  "dependencies": [
+    "cmocka",
+    "json-c",
+    {
+      "name": "vcpkg-tool-meson",
+      "host": true
+    }
+  ]
+}

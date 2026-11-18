@@ -1,15 +1,15 @@
 # Implementation Plan — helm: the control-plane role
 
-## Status: 1/12 tasks complete
+## Status: 2/12 tasks complete
 
 ## Tasks
 
 - [x] 1. Mailbox codec: BAR0 layout, slot header, strict decode/encode,
   `CREATE_VM` / `DESTROY_VM` bodies, unit tests, fuzz target
   (`src/helm/mailbox.*`). _Requirements: 1.1, 1.4, 10.1_
-- [ ] 2. Bring existing code to the steering standards: `_member` naming,
-  `BOOST_AUTO_TEST_CASE` timeouts, named constants in tests.
-  _Requirements: 10_
+- [x] 2. Bring existing code to the steering standards: `_member` naming,
+  trailing return types, `BOOST_AUTO_TEST_CASE` timeouts, named constants
+  in source and tests. _Requirements: 10_
 - [ ] 3. Remaining command bodies: `ATTACH_DEVICE`, `DETACH_DEVICE`,
   volume commands, `CREATE_NETWORK`/`DELETE_NETWORK`, `GPU_VF_CONFIG`
   (reserved), events. _Requirements: 1, 3.5_

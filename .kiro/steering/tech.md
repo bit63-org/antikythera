@@ -14,6 +14,9 @@ inclusion: always
 - C++20 modules are not used; `CMAKE_CXX_SCAN_FOR_MODULES` is off.
 - Code style follows `cpp-coding-standards.md` and tests follow
   `test-execution-standards.md`, both inherited from kythira.
+- Formatting: clang-format 22.1.5 (kythira's pinned PyPI version).
+  Static analysis: clang-tidy 19 with kythira's `.clang-tidy` (clang-tidy
+  18 cannot parse code that uses libstdc++'s `std::expected`).
 
 ## C++23 usage
 

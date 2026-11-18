@@ -17,7 +17,7 @@ antikythera/
 │   ├── hull/              host agent (ak::hull)                    [planned]
 │   ├── oar/
 │   │   ├── net/           network data plane (ak::oar::net)
-│   │   ├── blk/           storage data plane (ak::oar::blk)        [planned]
+│   │   ├── blk/           storage data plane (ak::oar::blk)
 │   │   ├── gpu/           GPU data plane (ak::oar::gpu)            [designed]
 │   │   ├── virtio/        shared virtio device core                [planned]
 │   │   ├── vfu/           libvfio-user adapter (harbor transport)

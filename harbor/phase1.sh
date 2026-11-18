@@ -7,7 +7,10 @@
 # the in-L1 checks, confirm each board process saw a reset, tear down.
 # Exits non-zero on any failure (Requirement 6.1).
 #
-# Usage: harbor/phase1.sh [--slots N] [--topology switch|rootports] [--keep]
+# Usage: harbor/phase1.sh [--slots N] [--topology rootports|switch] [--keep]
+#   --topology  rootports (default) or switch; see harbor/l1/run.sh. The
+#               switch topology fails the IOMMU-group checks on QEMU 10.2
+#               because its emulated switch downstream ports have no ACS.
 #   --keep  leave the server running afterwards for manual inspection
 
 set -euo pipefail
@@ -16,7 +19,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 name="phase1"
 slots=2
-topology="switch"
+topology="rootports"
 keep=0
 ssh_port=2222
 while [[ $# -gt 0 ]]; do

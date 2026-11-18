@@ -1,10 +1,13 @@
 # Implementation Plan — oar-blk: the storage data plane
 
-## Status: 0/8 tasks complete
+## Status: 1/8 tasks complete
 
 ## Tasks
 
-- [ ] 1. XtsCipher wrapper with IEEE 1619 vectors. _Requirements: 2.1, 7.1_
+- [x] 1. XtsCipher wrapper with IEEE 1619 vectors. _Requirements: 2.1, 7.1_
+  — `src/oar/blk/xts_cipher.*`: OpenSSL `aes-256-xts` over 512-byte or
+  4 KiB data units, tweak = data unit number; tests carry IEEE 1619
+  vectors 10-14 and 4 KiB cross-checks.
 - [ ] 2. KeySlot with zeroization, locked memory, no core dumps.
   _Requirements: 2.2, 2.3_
 - [ ] 3. virtio-blk request parser with bounds checks and fuzz target.

@@ -16,3 +16,5 @@ compile_commands.json
 crash-*
 leak-*
 timeout-*
+__pycache__/
+*.py[cod]

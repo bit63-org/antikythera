@@ -1,0 +1,121 @@
+# Copyright (c) 2026 Clark Rawlins
+# SPDX-License-Identifier: Apache-2.0
+#
+# Pull-request and main-branch CI on GitHub-hosted ubuntu-24.04 runners.
+# Toolchains and libraries come from the Ubuntu archive (system Boost 1.83,
+# OpenSSL 3.0), the same set .claude/hooks/session-start.sh installs, so no
+# vcpkg bootstrap and no build cache: the tree builds in about a minute.
+# The OCI build cache stays an accelerant for later (needs real-cloud spend).
+#
+# Job names are the check names main's branch protection requires:
+#   build (gcc-14)     GCC 14 Debug build + ctest
+#   build (clang-19)   Clang 19 Debug + ASan/UBSan + libFuzzer build, ctest,
+#                      and a short smoke run of every fuzz target
+#   lint               clang-format, clang-tidy, shellcheck
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CMAKE_GENERATOR: Ninja
+  # Pinned to match .claude/hooks/session-start.sh; .clang-format uses
+  # options newer than Ubuntu's clang-format-19.
+  CLANG_FORMAT_VERSION: "22.1.5"
+
+jobs:
+  build:
+    name: build (${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc-14
+            cxx: g++-14
+            packages: g++-14
+            cmake_flags: ""
+          - compiler: clang-19
+            cxx: clang++-19
+            packages: clang-19 libclang-rt-19-dev
+            cmake_flags: -DAK_SANITIZE=ON -DAK_FUZZ=ON
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            ${{ matrix.packages }} cmake ninja-build libboost-test-dev libssl-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DAK_COMPILER_LAUNCHER=none \
+            -DAK_VFIO_USER=OFF \
+            ${{ matrix.cmake_flags }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --parallel 4
+
+      - name: Fuzz smoke
+        if: matrix.compiler == 'clang-19'
+        run: |
+          for f in build/fuzz/fuzz_*; do
+            [ -x "$f" ] || continue
+            echo "::group::$(basename "$f")"
+            "$f" -max_total_time=20 -print_final_stats=1
+            echo "::endgroup::"
+          done
+
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            clang-19 clang-tidy-19 cmake ninja-build libboost-test-dev libssl-dev shellcheck
+          python3 -m pip install -q --user "clang-format==${CLANG_FORMAT_VERSION}"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: clang-format
+        run: |
+          clang-format --version
+          git ls-files -z '*.cpp' '*.hpp' '*.h' '*.cc' \
+            | xargs -0 clang-format --dry-run --Werror
+
+      - name: shellcheck
+        run: git ls-files -z '*.sh' | xargs -0 shellcheck
+
+      - name: clang-tidy
+        run: |
+          cmake -S . -B build-tidy \
+            -DCMAKE_CXX_COMPILER=clang++-19 \
+            -DAK_COMPILER_LAUNCHER=none \
+            -DAK_VFIO_USER=OFF
+          # Only translation units in compile_commands.json: files behind a
+          # disabled option (the vfio-user servers) have no compile command.
+          run-clang-tidy-19 -p build-tidy -clang-tidy-binary clang-tidy-19 \
+            -quiet "$PWD/(src|tests|fuzz)/"

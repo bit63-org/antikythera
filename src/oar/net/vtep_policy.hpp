@@ -39,20 +39,20 @@ struct NicBinding {
 class MappingView {
 public:
     virtual ~MappingView() = default;
-    [[nodiscard]] virtual std::optional<NicBinding> lookup(geneve::NicId id) const = 0;
+    [[nodiscard]] virtual auto lookup(geneve::NicId id) const -> std::optional<NicBinding> = 0;
     // True if the NIC is attached to a function on this VTEP.
-    [[nodiscard]] virtual bool is_local(geneve::NicId id) const = 0;
+    [[nodiscard]] virtual auto is_local(geneve::NicId id) const -> bool = 0;
 
 protected:
     MappingView() = default;
     MappingView(const MappingView&) = default;
-    MappingView& operator=(const MappingView&) = default;
+    auto operator=(const MappingView&) -> MappingView& = default;
     MappingView(MappingView&&) = default;
-    MappingView& operator=(MappingView&&) = default;
+    auto operator=(MappingView&&) -> MappingView& = default;
 };
 
 enum class PolicyError : std::uint8_t {
-    oam_not_data,         // OAM packets are handled by the VTEP, never delivered
+    oam_not_data,  // OAM packets are handled by the VTEP, never delivered
     unknown_src,
     src_wrong_vni,
     src_wrong_vtep,
@@ -64,11 +64,11 @@ enum class PolicyError : std::uint8_t {
     broadcast_not_group,  // broadcast NIC ID but unicast inner destination MAC
 };
 
-[[nodiscard]] const char* to_string(PolicyError e) noexcept;
+[[nodiscard]] auto to_string(PolicyError e) noexcept -> const char*;
 
 // Returns the destination (a local NIC, or nic_broadcast) on success.
-[[nodiscard]] std::expected<geneve::NicId, PolicyError> check_ingress(const geneve::Packet& pkt,
-                                                                     const Ipv6Address& outer_src,
-                                                                     const MappingView& mappings);
+[[nodiscard]] auto check_ingress(const geneve::Packet& pkt, const Ipv6Address& outer_src,
+                                 const MappingView& mappings)
+    -> std::expected<geneve::NicId, PolicyError>;
 
 }  // namespace ak::oar::net

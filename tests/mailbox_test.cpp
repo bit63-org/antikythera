@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
+// .kiro/specs/helm-control-plane/ Requirements 1 and 10.1.
+
 #define BOOST_TEST_MODULE mailbox_test
 #include <boost/test/unit_test.hpp>
 
@@ -10,20 +12,55 @@
 
 #include "common/wire.hpp"
 #include "helm/mailbox.hpp"
+#include "test_support.hpp"
 
 namespace mb = ak::helm::mailbox;
+using ak::test::unit_timeout_seconds;
 using mb::DecodeError;
 
 namespace {
 
-std::array<std::byte, mb::signature_size> sig(std::uint8_t fill = 0xA5) {
+constexpr std::uint8_t signature_fill = 0xA5;
+constexpr std::uint64_t first_seq = 1;
+constexpr std::uint64_t later_seq = 77;
+
+constexpr std::uint64_t sample_vm = 42;
+constexpr std::uint16_t sample_vcpus = 4;
+constexpr std::uint32_t sample_memory_mib = 8192;
+constexpr std::uint8_t boot_volume = 1;
+constexpr std::uint8_t boot_unknown = 9;
+constexpr std::uint8_t reserved_zero = 0;
+constexpr std::uint8_t reserved_set = 1;
+constexpr std::uint16_t too_many_vcpus = 2000;
+constexpr std::uint64_t destroy_vm_id = 5;
+constexpr std::uint8_t unknown_destroy_flag = 0x02;
+
+constexpr std::size_t documented_max_body = 168;
+
+// Byte offsets inside the slot header (see mailbox.hpp).
+constexpr std::size_t magic_offset = 0;
+constexpr std::size_t version_offset = 4;
+constexpr std::size_t type_offset = 6;
+constexpr std::size_t body_len_offset = 16;
+constexpr std::size_t reserved_offset = 20;
+
+constexpr std::byte not_magic{'X'};
+constexpr std::byte unsupported_version{2};
+constexpr std::byte unknown_type_byte{0xEE};
+constexpr std::byte nonzero{1};
+
+constexpr std::uint16_t inconsistent_body_len = 3;
+constexpr std::size_t short_body_size = 2;
+
+auto sig() -> std::array<std::byte, mb::signature_size> {
     std::array<std::byte, mb::signature_size> s{};
-    s.fill(std::byte{fill});
+    s.fill(std::byte{signature_fill});
     return s;
 }
 
-std::vector<std::byte> create_vm_body(std::uint64_t vm, std::uint16_t vcpus, std::uint32_t mib, std::uint8_t boot = 1,
-                                      std::uint8_t rsvd = 0) {
+auto create_vm_body(std::uint64_t vm, std::uint16_t vcpus, std::uint32_t mib,
+                    std::uint8_t boot = boot_volume, std::uint8_t rsvd = reserved_zero)
+    -> std::vector<std::byte> {
     std::vector<std::byte> b;
     ak::wire::Writer w{b};
     w.le64(vm);
@@ -34,7 +71,16 @@ std::vector<std::byte> create_vm_body(std::uint64_t vm, std::uint16_t vcpus, std
     return b;
 }
 
-mb::Slot slot_for(mb::Type type, std::span<const std::byte> body, std::uint64_t seq = 1) {
+auto destroy_vm_body(std::uint64_t vm, std::uint8_t flags) -> std::vector<std::byte> {
+    std::vector<std::byte> b;
+    ak::wire::Writer w{b};
+    w.le64(vm);
+    w.u8(flags);
+    return b;
+}
+
+auto slot_for(mb::Type type, std::span<const std::byte> body, std::uint64_t seq = first_seq)
+    -> mb::Slot {
     mb::Header h;
     h.type = type;
     h.seq = seq;
@@ -46,107 +92,112 @@ mb::Slot slot_for(mb::Type type, std::span<const std::byte> body, std::uint64_t 
 
 }  // namespace
 
-BOOST_AUTO_TEST_CASE(layout_constants_fit_the_slot) {
+BOOST_AUTO_TEST_CASE(layout_constants_fit_the_slot,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
     static_assert(mb::header_size + mb::max_body + mb::signature_size == mb::slot_size);
     static_assert(mb::reg::evt_slot + mb::slot_size <= mb::reg::bar0_size);
-    BOOST_TEST(mb::max_body == 168u);
+    BOOST_TEST(mb::max_body == documented_max_body);
 }
 
-BOOST_AUTO_TEST_CASE(magic_is_akmb_in_little_endian) {
+BOOST_AUTO_TEST_CASE(magic_is_akmb_in_little_endian,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
     const auto s = slot_for(mb::Type::list_vms, {});
-    BOOST_TEST((s[0] == std::byte{'A'}));
-    BOOST_TEST((s[1] == std::byte{'K'}));
-    BOOST_TEST((s[2] == std::byte{'M'}));
-    BOOST_TEST((s[3] == std::byte{'B'}));
+    BOOST_TEST((s[magic_offset + 0] == std::byte{'A'}));
+    BOOST_TEST((s[magic_offset + 1] == std::byte{'K'}));
+    BOOST_TEST((s[magic_offset + 2] == std::byte{'M'}));
+    BOOST_TEST((s[magic_offset + 3] == std::byte{'B'}));
 }
 
-BOOST_AUTO_TEST_CASE(round_trip_create_vm) {
-    const auto body = create_vm_body(42, 4, 8192);
-    const auto s = slot_for(mb::Type::create_vm, body, 77);
+BOOST_AUTO_TEST_CASE(round_trip_create_vm, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto body = create_vm_body(sample_vm, sample_vcpus, sample_memory_mib);
+    const auto s = slot_for(mb::Type::create_vm, body, later_seq);
     auto msg = mb::decode(s);
     BOOST_REQUIRE(msg.has_value());
-    BOOST_TEST(msg->header.seq == 77u);
+    BOOST_TEST(msg->header.seq == later_seq);
     BOOST_TEST(mb::is_command(msg->header.type));
     BOOST_TEST((msg->signature == sig()));
     auto cmd = mb::decode_create_vm(*msg);
     BOOST_REQUIRE(cmd.has_value());
-    BOOST_TEST(cmd->vm_id == 42u);
-    BOOST_TEST(cmd->vcpus == 4u);
-    BOOST_TEST(cmd->memory_mib == 8192u);
+    BOOST_TEST(cmd->vm_id == sample_vm);
+    BOOST_TEST(cmd->vcpus == sample_vcpus);
+    BOOST_TEST(cmd->memory_mib == sample_memory_mib);
 }
 
-BOOST_AUTO_TEST_CASE(rejects_bad_header_fields) {
-    auto s = slot_for(mb::Type::list_vms, {});
+BOOST_AUTO_TEST_CASE(rejects_bad_header_fields, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto s = slot_for(mb::Type::list_vms, {});
+
     auto bad_magic = s;
-    bad_magic[0] = std::byte{'X'};
+    bad_magic[magic_offset] = not_magic;
     BOOST_TEST((mb::decode(bad_magic).error() == DecodeError::bad_magic));
 
     auto bad_version = s;
-    bad_version[4] = std::byte{2};
+    bad_version[version_offset] = unsupported_version;
     BOOST_TEST((mb::decode(bad_version).error() == DecodeError::bad_version));
 
     auto bad_type = s;
-    bad_type[6] = std::byte{0xEE};
-    bad_type[7] = std::byte{0xEE};
+    bad_type[type_offset] = unknown_type_byte;
+    bad_type[type_offset + 1] = unknown_type_byte;
     BOOST_TEST((mb::decode(bad_type).error() == DecodeError::unknown_type));
 
     auto long_body = s;
-    long_body[16] = std::byte{mb::max_body + 1};
+    long_body[body_len_offset] = std::byte{mb::max_body + 1};
     BOOST_TEST((mb::decode(long_body).error() == DecodeError::body_too_long));
 
     auto reserved = s;
-    reserved[20] = std::byte{1};
+    reserved[reserved_offset] = nonzero;
     BOOST_TEST((mb::decode(reserved).error() == DecodeError::reserved_not_zero));
 }
 
-BOOST_AUTO_TEST_CASE(rejects_hidden_bytes_after_body) {
-    const auto body = create_vm_body(42, 4, 8192);
+BOOST_AUTO_TEST_CASE(rejects_hidden_bytes_after_body,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto body = create_vm_body(sample_vm, sample_vcpus, sample_memory_mib);
     auto s = slot_for(mb::Type::create_vm, body);
-    s[mb::header_size + body.size()] = std::byte{1};
+    s[mb::header_size + body.size()] = nonzero;
     BOOST_TEST((mb::decode(s).error() == DecodeError::reserved_not_zero));
 }
 
-BOOST_AUTO_TEST_CASE(create_vm_validates_fields) {
-    const auto check = [](std::vector<std::byte> body, mb::BodyError want) {
+BOOST_AUTO_TEST_CASE(create_vm_validates_fields, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto check = [](const std::vector<std::byte>& body, mb::BodyError want) {
         auto msg = mb::decode(slot_for(mb::Type::create_vm, body));
         BOOST_REQUIRE(msg.has_value());
         auto r = mb::decode_create_vm(*msg);
         BOOST_REQUIRE(!r.has_value());
         BOOST_TEST((r.error() == want));
     };
-    check(create_vm_body(0, 4, 8192), mb::BodyError::invalid_field);
-    check(create_vm_body(1, 0, 8192), mb::BodyError::invalid_field);
-    check(create_vm_body(1, 2000, 8192), mb::BodyError::invalid_field);
-    check(create_vm_body(1, 4, 0), mb::BodyError::invalid_field);
-    check(create_vm_body(1, 4, 8192, 9), mb::BodyError::invalid_field);
-    check(create_vm_body(1, 4, 8192, 1, 1), mb::BodyError::invalid_field);
-    auto short_body = create_vm_body(1, 4, 8192);
+    check(create_vm_body(0, sample_vcpus, sample_memory_mib), mb::BodyError::invalid_field);
+    check(create_vm_body(sample_vm, 0, sample_memory_mib), mb::BodyError::invalid_field);
+    check(create_vm_body(sample_vm, too_many_vcpus, sample_memory_mib),
+          mb::BodyError::invalid_field);
+    check(create_vm_body(sample_vm, sample_vcpus, 0), mb::BodyError::invalid_field);
+    check(create_vm_body(sample_vm, sample_vcpus, sample_memory_mib, boot_unknown),
+          mb::BodyError::invalid_field);
+    check(create_vm_body(sample_vm, sample_vcpus, sample_memory_mib, boot_volume, reserved_set),
+          mb::BodyError::invalid_field);
+    auto short_body = create_vm_body(sample_vm, sample_vcpus, sample_memory_mib);
     short_body.pop_back();
     check(short_body, mb::BodyError::wrong_length);
 }
 
-BOOST_AUTO_TEST_CASE(destroy_vm_flags) {
-    std::vector<std::byte> body;
-    ak::wire::Writer w{body};
-    w.le64(5);
-    w.u8(0x01);
-    auto msg = mb::decode(slot_for(mb::Type::destroy_vm, body));
+BOOST_AUTO_TEST_CASE(destroy_vm_flags, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto msg = mb::decode(slot_for(
+        mb::Type::destroy_vm, destroy_vm_body(destroy_vm_id, mb::destroy_flag_persist_volumes)));
     BOOST_REQUIRE(msg.has_value());
     auto cmd = mb::decode_destroy_vm(*msg);
     BOOST_REQUIRE(cmd.has_value());
     BOOST_TEST(cmd->persist_volumes);
 
-    body.back() = std::byte{0x02};
-    msg = mb::decode(slot_for(mb::Type::destroy_vm, body));
+    msg = mb::decode(
+        slot_for(mb::Type::destroy_vm, destroy_vm_body(destroy_vm_id, unknown_destroy_flag)));
     BOOST_REQUIRE(msg.has_value());
     BOOST_TEST((mb::decode_destroy_vm(*msg).error() == mb::BodyError::invalid_field));
     BOOST_TEST((mb::decode_create_vm(*msg).error() == mb::BodyError::wrong_type));
 }
 
-BOOST_AUTO_TEST_CASE(encode_rejects_inconsistent_body_len) {
+BOOST_AUTO_TEST_CASE(encode_rejects_inconsistent_body_len,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
     mb::Header h;
     h.type = mb::Type::list_vms;
-    h.body_len = 3;
-    std::vector<std::byte> body(2);
+    h.body_len = inconsistent_body_len;
+    std::vector<std::byte> body(short_body_size);
     BOOST_TEST(!mb::encode(h, body, sig()).has_value());
 }

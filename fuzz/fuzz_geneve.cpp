@@ -17,18 +17,27 @@ namespace {
 namespace net = ak::oar::net;
 namespace geneve = ak::oar::net::geneve;
 
+// Synthetic mapping: about a third of NIC IDs are unknown, odd IDs are local,
+// and the VNI and MAC are derived from the ID so policy checks can pass.
+constexpr std::uint64_t unknown_every = 3;
+constexpr std::uint64_t local_bit = 1;
+constexpr std::uint64_t byte_mask = 0xFF;
+constexpr std::size_t mac_last = 5;
+
 class Table final : public net::MappingView {
 public:
-    [[nodiscard]] std::optional<net::NicBinding> lookup(geneve::NicId id) const override {
-        if (id.value % 3 == 0) {
+    [[nodiscard]] auto lookup(geneve::NicId id) const -> std::optional<net::NicBinding> override {
+        if (id.value % unknown_every == 0) {
             return std::nullopt;
         }
         net::NicBinding b{};
         b.vni = static_cast<std::uint32_t>(id.value & geneve::vni_max);
-        b.mac[5] = static_cast<std::byte>(id.value & 0xFF);
+        b.mac[mac_last] = static_cast<std::byte>(id.value & byte_mask);
         return b;
     }
-    [[nodiscard]] bool is_local(geneve::NicId id) const override { return (id.value & 1) != 0; }
+    [[nodiscard]] auto is_local(geneve::NicId id) const -> bool override {
+        return (id.value & local_bit) != 0;
+    }
 };
 
 }  // namespace
@@ -43,12 +52,14 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     (void)net::check_ingress(*pkt, net::Ipv6Address{}, table);
 
     if (!pkt->oam) {
-        auto again = geneve::encode({.vni = pkt->vni, .nics = *pkt->nics, .oam = false}, pkt->inner);
+        auto again =
+            geneve::encode({.vni = pkt->vni, .nics = *pkt->nics, .oam = false}, pkt->inner);
         if (!again) {
             std::abort();  // decode accepted something encode refuses
         }
         auto round = geneve::decode(*again);
-        if (!round || round->vni != pkt->vni || round->nics != pkt->nics || round->inner.size() != pkt->inner.size()) {
+        if (!round || round->vni != pkt->vni || round->nics != pkt->nics ||
+            round->inner.size() != pkt->inner.size()) {
             std::abort();
         }
     }

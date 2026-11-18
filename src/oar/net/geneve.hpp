@@ -38,10 +38,12 @@ inline constexpr std::uint16_t option_class = 0xFF41;
 inline constexpr std::uint8_t option_type_critical_bit = 0x80;
 inline constexpr std::uint8_t option_type_nic_pair = option_type_critical_bit | 0x01;
 
+inline constexpr std::size_t bytes_per_word = 4;  // Opt Len and option Length count 4-byte words
 inline constexpr std::size_t base_header_size = 8;
 inline constexpr std::size_t nic_pair_option_size = 20;  // 4-byte option header + 16 bytes data
 inline constexpr std::size_t ethernet_header_size = 14;
 inline constexpr std::uint32_t vni_max = 0x00FF'FFFF;
+inline constexpr unsigned vni_shift = 8;  // VNI occupies the top 24 bits of its 32-bit word
 
 // Controller-assigned 64-bit NIC identifier. 0 is invalid; all-ones as a
 // destination means "broadcast within the VNI".
@@ -82,10 +84,11 @@ enum class DecodeError : std::uint8_t {
     inner_frame_too_short,    // inner Ethernet frame shorter than its header
 };
 
-[[nodiscard]] const char* to_string(DecodeError e) noexcept;
+[[nodiscard]] auto to_string(DecodeError e) noexcept -> const char*;
 
 // Structural decode of a Geneve UDP payload.
-[[nodiscard]] std::expected<Packet, DecodeError> decode(std::span<const std::byte> udp_payload) noexcept;
+[[nodiscard]] auto decode(std::span<const std::byte> udp_payload) noexcept
+    -> std::expected<Packet, DecodeError>;
 
 // What a sending VTEP supplies. `src` must come from the VF the frame
 // arrived on -- never from anything the guest wrote.
@@ -101,10 +104,10 @@ enum class EncodeError : std::uint8_t {
     inner_frame_too_short,
 };
 
-[[nodiscard]] const char* to_string(EncodeError e) noexcept;
+[[nodiscard]] auto to_string(EncodeError e) noexcept -> const char*;
 
 // Builds a complete Geneve UDP payload: base header, NIC-pair option, frame.
-[[nodiscard]] std::expected<std::vector<std::byte>, EncodeError> encode(
-    const EncodeParams& params, std::span<const std::byte> inner_frame);
+[[nodiscard]] auto encode(const EncodeParams& params, std::span<const std::byte> inner_frame)
+    -> std::expected<std::vector<std::byte>, EncodeError>;
 
 }  // namespace ak::oar::net::geneve

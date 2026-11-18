@@ -15,7 +15,8 @@ namespace mb = ak::helm::mailbox;
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
     mb::Slot slot{};
-    std::copy_n(reinterpret_cast<const std::byte*>(data), std::min(size, slot.size()), slot.begin());
+    std::copy_n(reinterpret_cast<const std::byte*>(data), std::min(size, slot.size()),
+                slot.begin());
     auto msg = mb::decode(slot);
     if (!msg) {
         return 0;

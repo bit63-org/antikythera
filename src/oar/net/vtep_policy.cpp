@@ -13,7 +13,7 @@ constexpr std::size_t dst_mac_offset = 0;
 constexpr std::size_t src_mac_offset = 6;
 constexpr std::byte group_bit{0x01};
 
-MacAddress mac_at(std::span<const std::byte> frame, std::size_t offset) noexcept {
+auto mac_at(std::span<const std::byte> frame, std::size_t offset) noexcept -> MacAddress {
     MacAddress mac{};
     std::copy_n(frame.begin() + static_cast<std::ptrdiff_t>(offset), mac.size(), mac.begin());
     return mac;
@@ -21,24 +21,34 @@ MacAddress mac_at(std::span<const std::byte> frame, std::size_t offset) noexcept
 
 }  // namespace
 
-const char* to_string(PolicyError e) noexcept {
+auto to_string(PolicyError e) noexcept -> const char* {
     switch (e) {
-        case PolicyError::oam_not_data: return "oam_not_data";
-        case PolicyError::unknown_src: return "unknown_src";
-        case PolicyError::src_wrong_vni: return "src_wrong_vni";
-        case PolicyError::src_wrong_vtep: return "src_wrong_vtep";
-        case PolicyError::src_mac_mismatch: return "src_mac_mismatch";
-        case PolicyError::unknown_dst: return "unknown_dst";
-        case PolicyError::dst_not_local: return "dst_not_local";
-        case PolicyError::dst_wrong_vni: return "dst_wrong_vni";
-        case PolicyError::dst_mac_mismatch: return "dst_mac_mismatch";
-        case PolicyError::broadcast_not_group: return "broadcast_not_group";
+        case PolicyError::oam_not_data:
+            return "oam_not_data";
+        case PolicyError::unknown_src:
+            return "unknown_src";
+        case PolicyError::src_wrong_vni:
+            return "src_wrong_vni";
+        case PolicyError::src_wrong_vtep:
+            return "src_wrong_vtep";
+        case PolicyError::src_mac_mismatch:
+            return "src_mac_mismatch";
+        case PolicyError::unknown_dst:
+            return "unknown_dst";
+        case PolicyError::dst_not_local:
+            return "dst_not_local";
+        case PolicyError::dst_wrong_vni:
+            return "dst_wrong_vni";
+        case PolicyError::dst_mac_mismatch:
+            return "dst_mac_mismatch";
+        case PolicyError::broadcast_not_group:
+            return "broadcast_not_group";
     }
     return "unknown";
 }
 
-std::expected<geneve::NicId, PolicyError> check_ingress(const geneve::Packet& pkt, const Ipv6Address& outer_src,
-                                                        const MappingView& mappings) {
+auto check_ingress(const geneve::Packet& pkt, const Ipv6Address& outer_src,
+                   const MappingView& mappings) -> std::expected<geneve::NicId, PolicyError> {
     // decode() guarantees non-OAM packets carry a NIC pair and a full
     // Ethernet header; re-check rather than trust a caller-built Packet.
     if (pkt.oam || !pkt.nics || pkt.inner.size() < geneve::ethernet_header_size) {

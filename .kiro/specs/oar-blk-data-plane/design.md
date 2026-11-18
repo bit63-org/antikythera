@@ -24,7 +24,10 @@
   size, and descriptor chain shapes before any I/O.
 - **KeySlot** — holds at most one `ScopedKey`-equivalent; zeroizes on
   `drop_key`, FLR, detach, or process exit (`OPENSSL_cleanse`, locked
-  memory, excluded from core dumps with `MADV_DONTDUMP`).
+  memory, excluded from core dumps with `MADV_DONTDUMP`). The key page is
+  also `MADV_WIPEONFORK`, so forked helpers never inherit it. A second
+  `deliver_key` without a `drop_key` is refused and keeps the held key.
+  `harden_process()` disables core dumps and ptrace for the whole role.
 - **XtsCipher** — OpenSSL EVP `aes-256-xts`, 512-byte or 4 KiB data units.
   The tweak is the data unit number, little-endian (IEEE 1619): for 4 KiB
   units that is the 4 KiB block index, i.e. the 512-byte sector number

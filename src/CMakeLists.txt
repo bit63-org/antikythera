@@ -68,8 +68,10 @@ target_link_libraries(ak_hull
   PUBLIC ak::common ak::helm OpenSSL::Crypto
   PRIVATE ak::warnings ak::hardening)
 
-# oar-blk: AES-256-XTS volume encryption (storage data plane).
+# oar-blk: AES-256-XTS volume encryption and the locked key slot (storage
+# data plane).
 add_library(ak_oar_blk
+  oar/blk/key_slot.cpp
   oar/blk/xts_cipher.cpp)
 add_library(ak::oar_blk ALIAS ak_oar_blk)
 target_link_libraries(ak_oar_blk

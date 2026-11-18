@@ -15,8 +15,9 @@ target_link_libraries(ak_oar_net
   PUBLIC ak::common
   PRIVATE ak::warnings ak::hardening)
 
-# helm: control-plane mailbox protocol.
+# helm: control-plane mailbox protocol and device pool.
 add_library(ak_helm
+  helm/device_pool.cpp
   helm/mailbox.cpp)
 add_library(ak::helm ALIAS ak_helm)
 target_link_libraries(ak_helm

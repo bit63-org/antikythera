@@ -1,6 +1,6 @@
 # Implementation Plan — helm: the control-plane role
 
-## Status: 2/12 tasks complete
+## Status: 3/12 tasks complete
 
 ## Tasks
 
@@ -13,8 +13,9 @@
 - [ ] 3. Remaining command bodies: `ATTACH_DEVICE`, `DETACH_DEVICE`,
   volume commands, `CREATE_NETWORK`/`DELETE_NETWORK`, `GPU_VF_CONFIG`
   (reserved), events. _Requirements: 1, 3.5_
-- [ ] 4. DevicePool table-driven state machine with exhaustive transition
-  tests. _Requirements: 3, 10.2_
+- [x] 4. DevicePool table-driven state machine with exhaustive transition
+  tests, GPU types and the `scrub_done` cleaning path
+  (`src/helm/device_pool.*`). _Requirements: 3, 10.2_
 - [ ] 5. MCTP framing codec (SMBus binding header + vendor message types),
   tests, fuzz target. _Requirements: 5.2, 10.1_
 - [ ] 6. OarLink with `SocketBinding` and `InProcessBinding`.

@@ -21,7 +21,12 @@
 - **VirtioBlkFunction** — virtio-blk on the shared core; `VIRTIO_BLK_T_IN`,
   `T_OUT`, `T_FLUSH`, `T_GET_ID`; discard later.
 - **RequestParser** — validates header, sector range against the volume
-  size, and descriptor chain shapes before any I/O.
+  size, and descriptor chain shapes before any I/O. It takes the readable
+  and writable buffers of a chain the shared virtqueue already validated,
+  so it does not depend on the virtio core. Lengths and start sectors
+  must be whole logical blocks (512 B or 4 KiB, matching the XTS data
+  unit); a request without a writable status byte cannot be completed
+  and is left to the transport to treat as a broken chain.
 - **KeySlot** — holds at most one `ScopedKey`-equivalent; zeroizes on
   `drop_key`, FLR, detach, or process exit (`OPENSSL_cleanse`, locked
   memory, excluded from core dumps with `MADV_DONTDUMP`). The key page is

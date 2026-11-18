@@ -25,10 +25,12 @@ target_link_libraries(ak_helm
   PRIVATE ak::warnings ak::hardening)
 
 # hull: host-agent command authentication (Ed25519 signatures and sequence
-# numbers). OpenSSL is required: it is the only Ed25519 implementation here.
+# numbers) and the core / huge-page allocator. OpenSSL is required: it is the only Ed25519 implementation here.
 find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
 add_library(ak_hull
   hull/command_auth.cpp
+  hull/cpu_topology.cpp
+  hull/resource_allocator.cpp
   hull/sequence_tracker.cpp
   hull/signature_verifier.cpp)
 add_library(ak::hull ALIAS ak_hull)

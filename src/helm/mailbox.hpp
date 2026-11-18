@@ -31,6 +31,8 @@
 #include <cstdint>
 #include <expected>
 #include <span>
+#include <variant>
+#include <vector>
 
 namespace ak::helm::mailbox {
 
@@ -138,6 +140,7 @@ struct CreateVm {
     std::uint16_t vcpus{0};
     std::uint32_t memory_mib{0};
     BootMode boot_mode{BootMode::volume};
+    friend auto operator==(const CreateVm&, const CreateVm&) -> bool = default;
 };
 
 inline constexpr std::uint8_t destroy_flag_persist_volumes = 0x01;
@@ -146,12 +149,14 @@ inline constexpr std::uint8_t destroy_flags_known = destroy_flag_persist_volumes
 struct DestroyVm {
     std::uint64_t vm_id{0};
     bool persist_volumes{false};
+    friend auto operator==(const DestroyVm&, const DestroyVm&) -> bool = default;
 };
 
 enum class BodyError : std::uint8_t {
     wrong_type,
     wrong_length,
     invalid_field,
+    reserved_type,  // the type is reserved in the protocol and has no body yet
 };
 
 [[nodiscard]] auto to_string(BodyError e) noexcept -> const char*;
@@ -160,5 +165,248 @@ enum class BodyError : std::uint8_t {
     -> std::expected<CreateVm, BodyError>;
 [[nodiscard]] auto decode_destroy_vm(const Message& msg) noexcept
     -> std::expected<DestroyVm, BodyError>;
+
+// Every other body. Layouts are listed field by field; all integers are
+// little-endian and every reserved byte must be zero. Identifiers (VM,
+// volume, NIC) are controller-assigned and never zero.
+
+// A PCIe function on the backplane: which slot, which function in it, and
+// what kind of function the command expects it to be. hull checks all three
+// against its boot inventory (hull-host-agent Requirement 5.4).
+//   slot u8 | device_type u8 | function u16  (4 bytes)
+enum class DeviceType : std::uint8_t {
+    nic_vf = 1,
+    blk_fn = 2,
+    gpu_whole = 3,  // reserved: GPU support is designed, not yet built
+    gpu_vf = 4,     // reserved
+};
+
+struct DeviceRef {
+    std::uint8_t slot{0};
+    DeviceType type{DeviceType::nic_vf};
+    std::uint16_t function{0};
+
+    friend auto operator==(const DeviceRef&, const DeviceRef&) -> bool = default;
+};
+
+// What hull does when the guest has not ejected a function by the timeout
+// (hull-host-agent Requirement 7.2).
+enum class DetachPolicy : std::uint8_t {
+    force = 1,       // hot-unplug anyway
+    destroy_vm = 2,  // destroy the whole VM
+};
+
+inline constexpr std::uint16_t max_detach_timeout_s = 600;
+inline constexpr std::uint32_t max_volume_gib = 65536;  // 64 TiB
+inline constexpr std::uint32_t max_vni = 0xFF'FFFF;     // VNIs are 24 bits
+
+// LIST_VMS: empty body.
+struct ListVms {
+    friend auto operator==(const ListVms&, const ListVms&) -> bool = default;
+};
+
+// VM_STATUS: vm_id u64  (8 bytes)
+struct VmStatus {
+    std::uint64_t vm_id{0};
+    friend auto operator==(const VmStatus&, const VmStatus&) -> bool = default;
+};
+
+// ATTACH_DEVICE: vm_id u64 | device (4)  (12 bytes)
+// Storage functions are attached only with ATTACH_VOLUME, which is what
+// makes helm deliver the volume key, so device.type must not be blk_fn.
+struct AttachDevice {
+    std::uint64_t vm_id{0};
+    DeviceRef device;
+    friend auto operator==(const AttachDevice&, const AttachDevice&) -> bool = default;
+};
+
+// DETACH_DEVICE: vm_id u64 | device (4) | timeout_s u16 | policy u8 | rsvd u8
+// (16 bytes). device.type must not be blk_fn; 1 <= timeout_s <= 600.
+struct DetachDevice {
+    std::uint64_t vm_id{0};
+    DeviceRef device;
+    std::uint16_t timeout_s{0};
+    DetachPolicy policy{DetachPolicy::force};
+    friend auto operator==(const DetachDevice&, const DetachDevice&) -> bool = default;
+};
+
+// CREATE_VOLUME: volume_id u64 | owner_vm u64 | size_gib u32  (20 bytes)
+// 1 <= size_gib <= 65536.
+struct CreateVolume {
+    std::uint64_t volume_id{0};
+    std::uint64_t owner_vm{0};
+    std::uint32_t size_gib{0};
+    friend auto operator==(const CreateVolume&, const CreateVolume&) -> bool = default;
+};
+
+// DELETE_VOLUME: volume_id u64  (8 bytes)
+struct DeleteVolume {
+    std::uint64_t volume_id{0};
+    friend auto operator==(const DeleteVolume&, const DeleteVolume&) -> bool = default;
+};
+
+// ATTACH_VOLUME: volume_id u64 | vm_id u64 | device (4)  (20 bytes)
+// device.type must be blk_fn.
+struct AttachVolume {
+    std::uint64_t volume_id{0};
+    std::uint64_t vm_id{0};
+    DeviceRef device;
+    friend auto operator==(const AttachVolume&, const AttachVolume&) -> bool = default;
+};
+
+// DETACH_VOLUME: volume_id u64 | vm_id u64 | device (4) | timeout_s u16 |
+// policy u8 | rsvd u8  (24 bytes). device.type must be blk_fn.
+struct DetachVolume {
+    std::uint64_t volume_id{0};
+    std::uint64_t vm_id{0};
+    DeviceRef device;
+    std::uint16_t timeout_s{0};
+    DetachPolicy policy{DetachPolicy::force};
+    friend auto operator==(const DetachVolume&, const DetachVolume&) -> bool = default;
+};
+
+// REWRAP_VOLUME: volume_id u64 | from_vm u64 | to_vm u64  (24 bytes)
+// Names the current owner as well as the new one, so a stale or reordered
+// command cannot move a volume it no longer describes. from_vm != to_vm.
+struct RewrapVolume {
+    std::uint64_t volume_id{0};
+    std::uint64_t from_vm{0};
+    std::uint64_t to_vm{0};
+    friend auto operator==(const RewrapVolume&, const RewrapVolume&) -> bool = default;
+};
+
+// CREATE_NETWORK / DELETE_NETWORK: vni u32  (4 bytes), 1 <= vni <= 0xFFFFFF.
+struct CreateNetwork {
+    std::uint32_t vni{0};
+    friend auto operator==(const CreateNetwork&, const CreateNetwork&) -> bool = default;
+};
+
+struct DeleteNetwork {
+    std::uint32_t vni{0};
+    friend auto operator==(const DeleteNetwork&, const DeleteNetwork&) -> bool = default;
+};
+
+// GPU_VF_CONFIG has no body yet: decoding it fails with reserved_type.
+
+// ---- Response body --------------------------------------------------------
+
+// Values are part of the wire protocol: never renumber.
+enum class Status : std::uint16_t {
+    ok = 0,
+    accepted = 1,  // long operation started; completion is reported by event
+    bad_signature = 2,
+    stale_sequence = 3,
+    malformed = 4,
+    unknown_vm = 5,
+    unknown_device = 6,
+    unknown_volume = 7,
+    insufficient_resources = 8,
+    conflict = 9,  // e.g. the device is already assigned
+    timed_out = 10,
+    internal_error = 11,
+    unsupported = 12,
+};
+
+inline constexpr std::size_t response_fixed_size = 12;
+inline constexpr std::size_t max_response_payload = max_body - response_fixed_size;
+
+// RESPONSE: in_reply_to u64 | command u16 | status u16 | payload
+// in_reply_to is the command's sequence number and command its type. A
+// payload is allowed only on an `ok` reply to LIST_VMS or VM_STATUS; its
+// format belongs to those commands and is decoded by their callers.
+struct Response {
+    std::uint64_t in_reply_to{0};
+    Type command{Type::list_vms};
+    Status status{Status::ok};
+    std::uint8_t payload_len{0};
+    std::array<std::byte, max_response_payload> payload{};
+
+    [[nodiscard]] auto payload_bytes() const noexcept -> std::span<const std::byte> {
+        return std::span{payload}.first(payload_len);
+    }
+    friend auto operator==(const Response&, const Response&) -> bool = default;
+};
+
+// ---- Event bodies ---------------------------------------------------------
+
+enum class ExitReason : std::uint8_t {
+    guest_shutdown = 1,  // the guest powered off
+    guest_fault = 2,     // triple fault, panic notifier, watchdog
+    vmm_failure = 3,     // the VMM process died or was killed
+};
+
+// VM_EXITED: vm_id u64 | exit_status u32 | reason u8 | rsvd u8  (14 bytes)
+// Sent for an exit hull did not cause (hull-host-agent Requirement 6.4).
+struct VmExited {
+    std::uint64_t vm_id{0};
+    std::uint32_t exit_status{0};
+    ExitReason reason{ExitReason::guest_shutdown};
+    friend auto operator==(const VmExited&, const VmExited&) -> bool = default;
+};
+
+enum class ResetResult : std::uint8_t {
+    ok = 0,
+    failed = 1,  // helm moves the function to faulted (Requirement 3.4)
+};
+
+// DEVICE_RELEASED: vm_id u64 | device (4) | reset u8 | rsvd u8  (14 bytes)
+// vm_id is the VM that held the function.
+struct DeviceReleased {
+    std::uint64_t vm_id{0};
+    DeviceRef device;
+    ResetResult reset{ResetResult::ok};
+    friend auto operator==(const DeviceReleased&, const DeviceReleased&) -> bool = default;
+};
+
+enum class FaultCode : std::uint16_t {
+    iommu_fault = 1,
+    machine_check = 2,
+    agent_restarted = 3,
+    device_lost = 4,  // a function vanished or stopped responding
+    resources_exhausted = 5,
+};
+
+inline constexpr std::uint8_t no_slot = 0xFF;
+
+// HOST_FAULT: code u16 | slot u8 | rsvd u8 | detail u64  (12 bytes)
+// slot is the backplane slot involved, or 0xFF for none; detail is
+// fault-specific (e.g. the faulting IOVA) and opaque to the codec.
+struct HostFault {
+    FaultCode code{FaultCode::iommu_fault};
+    std::uint8_t slot{no_slot};
+    std::uint64_t detail{0};
+    friend auto operator==(const HostFault&, const HostFault&) -> bool = default;
+};
+
+enum class ScrubResult : std::uint8_t {
+    ok = 0,
+    failed = 1,
+};
+
+// SCRUB_DONE (reserved for GPU scrub): device (4) | result u8 | rsvd u8
+// (6 bytes). device.type must be gpu_whole or gpu_vf.
+struct ScrubDone {
+    DeviceRef device;
+    ScrubResult result{ScrubResult::ok};
+    friend auto operator==(const ScrubDone&, const ScrubDone&) -> bool = default;
+};
+
+// ---- Any body -------------------------------------------------------------
+
+using Body =
+    std::variant<ListVms, VmStatus, CreateVm, DestroyVm, AttachDevice, DetachDevice, CreateVolume,
+                 DeleteVolume, AttachVolume, DetachVolume, RewrapVolume, CreateNetwork,
+                 DeleteNetwork, Response, VmExited, DeviceReleased, HostFault, ScrubDone>;
+
+// Decodes and validates the body of any message according to its type.
+[[nodiscard]] auto decode_body(const Message& msg) noexcept -> std::expected<Body, BodyError>;
+
+// The message type a body travels under.
+[[nodiscard]] auto type_of(const Body& body) noexcept -> Type;
+
+// Encodes a body to its wire bytes. Does not validate: a body that decode_body
+// would reject encodes to bytes that decode_body rejects. For every body that
+// decode_body accepts, encode_body(*decode_body(msg)) == msg.body_bytes().
+[[nodiscard]] auto encode_body(const Body& body) -> std::vector<std::byte>;
 
 }  // namespace ak::helm::mailbox

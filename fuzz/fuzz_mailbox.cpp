@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-// Fuzzes the mailbox slot decoder and every command-body decoder, and checks
-// that an accepted slot re-encodes to identical bytes.
+// Fuzzes the mailbox slot decoder and every body decoder, and checks that an
+// accepted slot, and an accepted body, re-encode to identical bytes.
 
 #include <algorithm>
 #include <cstddef>
@@ -23,6 +23,14 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     }
     (void)mb::decode_create_vm(*msg);
     (void)mb::decode_destroy_vm(*msg);
+
+    if (auto body = mb::decode_body(*msg)) {
+        const auto bytes = mb::encode_body(*body);
+        if (mb::type_of(*body) != msg->header.type ||
+            !std::ranges::equal(bytes, msg->body_bytes())) {
+            std::abort();
+        }
+    }
 
     auto again = mb::encode(msg->header, msg->body_bytes(), msg->signature);
     if (!again || *again != slot) {

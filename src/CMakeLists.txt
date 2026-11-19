@@ -53,8 +53,11 @@ target_link_libraries(ak_tls
 
 # helm: control-plane mailbox protocol, device pool, MCTP sideband framing,
 # OarLink (sideband protocol and its transport bindings), key store, the
-# ControllerLink and the PowerSequencer (with harbor's process backplane).
+# ControllerLink, the CommandRouter, the audit log and the PowerSequencer
+# (with harbor's process backplane).
 add_library(ak_helm
+  helm/audit_log.cpp
+  helm/command_router.cpp
   helm/controller_link.cpp
   helm/device_pool.cpp
   helm/key_store.cpp

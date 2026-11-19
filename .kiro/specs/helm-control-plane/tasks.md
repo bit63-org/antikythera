@@ -1,6 +1,6 @@
 # Implementation Plan — helm: the control-plane role
 
-## Status: 8/12 tasks complete
+## Status: 10/12 tasks complete
 
 ## Tasks
 
@@ -28,13 +28,22 @@
   `src/helm/secure_element.*`, `src/helm/scoped_key.*`), unit tests,
   wrapped-key fuzz target. _Requirements: 4_
 - [ ] 8. MailboxDevice as a vfio-user server (harbor). _Requirements: 1_
-- [ ] 9. CommandRouter with compensation and timeouts. _Requirements: 3, 9_
+- [x] 9. CommandRouter with compensation and timeouts. _Requirements: 3, 9_
+  (`src/helm/command_router.*`: sequencing and retries, one command in
+  the mailbox, creative steps before relay and destructive steps after
+  hull's ok, compensation, timeouts, release and cleaning deadlines; pool
+  event `attach_failed`. See design "CommandRouter". NIC VPC/MAC/NIC ID
+  come from a configured lookup until a signed command carries them.)
 - [x] 10. PowerSequencer (harbor: process orchestration and L1 launch).
   _Requirements: 6_ (`src/helm/power_sequencer.*`: boot order, single-slot
   power cycles, recovery after boot, over a `Backplane`; harbor's
   `ProcessBackplane` runs board processes and the L1 QEMU. See design
   "PowerSequencer".)
-- [ ] 11. Audit log and status reporting. _Requirements: 9.2, 9.3_
+- [x] 11. Audit log and status reporting. _Requirements: 9.2, 9.3_
+  (`src/helm/audit_log.*`, hash-chained append-only file with a strict,
+  fuzzed verifier; the router reports outcomes, pool transitions, VM
+  exits, host faults and map versions, and builds the inventory
+  snapshot. See design "Audit log".)
 - [ ] 12. harbor CI: both placements. _Requirements: 7, 10.3_
 
 ## Deferred

@@ -56,6 +56,9 @@ auto expected_next(FunctionType type, FunctionState from, PoolEvent event)
             if (event == PoolEvent::release) {
                 return FunctionState::releasing;
             }
+            if (event == PoolEvent::attach_failed) {
+                return FunctionState::cleaning;
+            }
             break;
         case FunctionState::releasing:
             if (event == PoolEvent::device_released) {
@@ -363,4 +366,36 @@ BOOST_AUTO_TEST_CASE(invariants_hold_under_random_events,
             after.state == FunctionState::assigned || after.state == FunctionState::releasing;
         BOOST_REQUIRE(after.owner.has_value() == held);
     }
+}
+
+BOOST_AUTO_TEST_CASE(a_failed_attach_goes_back_through_cleaning,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    for (const auto type : ak::helm::all_function_types) {
+        BOOST_TEST_CONTEXT(to_string(type)) {
+            auto pool = pool_with(fn_a, type, FunctionState::assigned);
+            BOOST_TEST((*pool.apply(fn_a, PoolEvent::attach_failed) == FunctionState::cleaning));
+            BOOST_TEST(!pool.find(fn_a)->owner.has_value());
+            BOOST_TEST(!pool.first_free(type).has_value());
+            BOOST_REQUIRE(pool.apply(fn_a, finish_cleaning(type)));
+            BOOST_TEST((pool.first_free(type) == fn_a));
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(function_ids_pack_slot_and_number,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    constexpr std::uint8_t slot = 0xAB;
+    constexpr std::uint16_t number = 0xCDEF;
+    constexpr auto id = ak::helm::make_function_id(slot, number);
+    static_assert(ak::helm::slot_of(id) == slot);
+    static_assert(ak::helm::function_number_of(id) == number);
+    BOOST_TEST(static_cast<std::uint32_t>(id) == 0x00AB'CDEFU);
+
+    DevicePool pool;
+    BOOST_REQUIRE(pool.add(fn_b, FunctionType::gpu_vf));
+    BOOST_REQUIRE(pool.add(fn_a, FunctionType::nic_vf));
+    const auto all = pool.all();
+    BOOST_REQUIRE(all.size() == 2U);
+    BOOST_TEST((all.at(0).id == fn_a));
+    BOOST_TEST((all.at(1).type == FunctionType::gpu_vf));
 }

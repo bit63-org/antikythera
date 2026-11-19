@@ -1460,6 +1460,10 @@ BOOST_AUTO_TEST_CASE(answers_nd_for_gateway, *boost::unit_test::timeout(unit_tim
     for (const auto& f : port_a.frames) {
         BOOST_TEST(std::ranges::equal(std::span{f}.subspan(mac_size, mac_size), gw_mac()));
     }
+    // R is set for the gateway (a router), clear for the metadata address.
+    constexpr std::size_t na_flags = ethernet_header_size + nb::ipv6_header_size + 4;
+    BOOST_TEST(std::to_integer<int>(port_a.frames[0][na_flags]) == 0xe0);
+    BOOST_TEST(std::to_integer<int>(port_a.frames[1][na_flags]) == 0x60);
     BOOST_TEST(sw.counters().nd_replies == 2);
 }
 

@@ -427,7 +427,9 @@ auto VSwitch::handle_gateway_nd(geneve::NicId src, const NicBinding& binding,
     if (ns->target_ip != gateway_link_local(cfg->gateway_mac) && ns->target_ip != metadata_ipv6) {
         return false;
     }
-    if (deliver(src, neighbor::build_neighbor_advertisement(*ns, cfg->gateway_mac))) {
+    // The gateway's own address is a router's; the metadata address is not.
+    const bool router = ns->target_ip != metadata_ipv6;
+    if (deliver(src, neighbor::build_neighbor_advertisement(*ns, cfg->gateway_mac, router))) {
         ++_counters.nd_replies;
     }
     return true;

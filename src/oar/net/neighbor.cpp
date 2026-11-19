@@ -20,7 +20,8 @@ constexpr unsigned ip_version_shift = 28;
 constexpr std::uint32_t ip_version_6 = 6;
 constexpr std::size_t icmpv6_checksum_offset = 2;
 constexpr std::size_t nd_reserved_size = 4;
-constexpr std::uint32_t na_flags_solicited_override = 0x6000'0000;  // S | O, R clear
+constexpr std::uint32_t na_flags_solicited_override = 0x6000'0000;  // S | O
+constexpr std::uint32_t na_flag_router = 0x8000'0000;               // R
 constexpr std::uint8_t nd_option_source_lladdr = 1;
 constexpr std::uint8_t nd_option_target_lladdr = 2;
 constexpr std::uint8_t nd_option_unit = 8;  // option Length counts 8-byte units
@@ -257,8 +258,8 @@ auto build_arp_reply(const ArpPacket& request, const MacAddress& target_mac)
     return out;
 }
 
-auto build_neighbor_advertisement(const NeighborSolicitation& ns, const MacAddress& target_mac)
-    -> std::vector<std::byte> {
+auto build_neighbor_advertisement(const NeighborSolicitation& ns, const MacAddress& target_mac,
+                                  bool router) -> std::vector<std::byte> {
     constexpr std::size_t message_size = nd_message_size + nd_option_unit;
     std::vector<std::byte> out;
     out.reserve(geneve::ethernet_header_size + ipv6_header_size + message_size);
@@ -274,7 +275,7 @@ auto build_neighbor_advertisement(const NeighborSolicitation& ns, const MacAddre
     w.u8(icmpv6_neighbor_advertisement);
     w.u8(0);
     w.be16(0);  // checksum, filled below
-    w.be32(na_flags_solicited_override);
+    w.be32(na_flags_solicited_override | (router ? na_flag_router : 0U));
     w.bytes(ns.target_ip);
     w.u8(nd_option_target_lladdr);
     w.u8(nd_lladdr_option_units);

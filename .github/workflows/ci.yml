@@ -12,6 +12,10 @@
 #   build (clang-19)   Clang 19 Debug + ASan/UBSan + libFuzzer build, ctest,
 #                      and a short smoke run of every fuzz target
 #   lint               clang-format, clang-tidy, shellcheck
+#   kernel-config      resolves the hull and harbor L1 kernel fragments
+#                      against a real kernel tree, checks the result and
+#                      builds the strict kernel (about two minutes; not
+#                      yet a required check)
 
 name: ci
 
@@ -119,3 +123,27 @@ jobs:
           # disabled option (the vfio-user servers) have no compile command.
           run-clang-tidy-19 -p build-tidy -clang-tidy-binary clang-tidy-19 \
             -quiet "$PWD/(src|tests|fuzz)/"
+
+  kernel-config:
+    name: kernel-config
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu's linux-source package: signed by the archive, and the same
+      # tree a cloud thread can install, so local and CI results match.
+      - name: Install kernel source
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            linux-source-6.8.0 flex bison bc libelf-dev libssl-dev
+          mkdir -p "$RUNNER_TEMP/linux"
+          tar -xjf /usr/src/linux-source-6.8.0/linux-source-6.8.0.tar.bz2 \
+            -C "$RUNNER_TEMP/linux" --strip-components=1
+
+      - name: hull (strict), resolve and build
+        run: harbor/kernel/build.sh --src "$RUNNER_TEMP/linux" --variant hull --build
+
+      - name: l1-debug
+        run: harbor/kernel/build.sh --src "$RUNNER_TEMP/linux" --variant l1-debug

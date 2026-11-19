@@ -1,11 +1,18 @@
 # Implementation Plan — hull: the minimal host and its agent
 
-## Status: 0/11 tasks complete
+## Status: 3/11 tasks complete
 
 ## Tasks
 
-- [ ] 1. Kernel config fragment for harbor L1 (permissive: includes IP for
-  debugging) and the target `hull.config` (strict). _Requirements: 2_
+- [x] 1. Kernel config fragment for harbor L1 (permissive: includes IP for
+  debugging) and the target `hull.config` (strict). _Requirements: 2_ —
+  `harbor/kernel/`: `hull.config`, `x86_64.config`, `l1-debug.config`,
+  `build.sh` (allnoconfig + fragments) and `check-config.py`, which
+  checks the resolved .config against the fragments and Requirements
+  2.2/2.3. CI resolves both variants against Ubuntu's linux-source-6.8.0
+  and builds the strict kernel, which boots under QEMU (TCG) to the
+  missing-init panic with the IOMMU in strict mode and VFIO loaded. The
+  2.4 command line comes with the UKI (task 10).
 - [ ] 2. Phase-1 check script for L1: IOMMU groups, ATS state, ACS on
   ports, reset reaching the device server. Written as
   `harbor/l1/phase1-check.sh` (harbor task 4); not yet run.

@@ -45,3 +45,12 @@ ak_add_test(proto_envelope_test   SOURCES proto_envelope_test.cpp   LIBS ak::pro
 ak_add_test(proto_map_update_test SOURCES proto_map_update_test.cpp LIBS ak::proto)
 ak_add_test(proto_vectors_test    SOURCES proto_vectors_test.cpp    LIBS ak::proto ak::hull)
 ak_add_test(key_store_test     SOURCES key_store_test.cpp     LIBS ak::helm)
+
+# Python tests for the tooling around the C++ tree (the hull kernel config
+# checker). Skipped, not failed, when no interpreter is found.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME kernel_config_test
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/kernel_config_test.py -v)
+  set_tests_properties(kernel_config_test PROPERTIES TIMEOUT 60)
+endif()

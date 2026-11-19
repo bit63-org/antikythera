@@ -121,3 +121,14 @@ dependencies. `harbor/check-host.sh` checks them all.
 - **cloud-image-utils** (`cloud-localds`) to build the cloud-init seed.
 - **OpenSSH client** to reach L1 during phases 1 to 5 (the strict hull
   image of phase 6 has no network stack).
+
+### hull kernel source
+- **Status**: needed only to resolve or build the hull kernel
+  (`harbor/kernel/build.sh`); not a build dependency of the C++ tree.
+- **Version**: any tree from **6.8** on. CI and cloud threads use
+  Ubuntu 24.04's `linux-source-6.8.0` package (signed by the archive);
+  the kernel version the UKI pins is chosen with hull task 10.
+- **Prerequisites**: `flex`, `bison` and `bc` to resolve the config; a
+  full build (`--build`) also needs `libelf-dev` and `libssl-dev`.
+- **Python 3** runs `harbor/kernel/check-config.py` and its test
+  (`tests/kernel_config_test.py`, skipped by CTest without Python).

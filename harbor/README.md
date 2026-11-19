@@ -48,3 +48,4 @@ It exits non-zero on any failure. On failure the logs stay in
 | `l1/run.sh`, `l1/stop.sh` | start and stop one server (board processes, then QEMU) |
 | `l1/phase1-check.sh`, `l1/testdev_mmio.py` | the checks that run inside L1 |
 | `phase1.sh` | phase 1 end to end |
+| `kernel/` | hull kernel fragments (strict `hull.config`, per-arch, `l1-debug.config`), resolver and checker; see [`kernel/README.md`](kernel/README.md) |

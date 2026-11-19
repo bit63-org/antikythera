@@ -39,6 +39,59 @@ and turns it into: device-pool reservations, oar requests (prepare the
 function), then a mailbox command to hull, then pool commits on hull's
 response. Each step is idempotent on retry by sequence number.
 
+Built in `src/helm/command_router.*`. Decisions made in the implementation:
+
+- Retries. A sequence number at or below the highest accepted is never
+  relayed. A retry of a finished command gets its recorded outcome
+  reported again; a retry of one still queued or in flight is ignored;
+  anything else is `stale_sequence`.
+- One command in the mailbox at a time (Requirement 1.5); the rest wait
+  in a bounded queue, and a full queue refuses with
+  `insufficient_resources` without consuming the sequence number.
+- Creative steps before relay, destructive steps after hull's ok.
+  Reserving a function, preparing it on its role, creating a VM or volume
+  key and delivering a volume key happen before the slot goes to the
+  mailbox, each with a compensation. Releasing functions, destroying
+  keys (`DELETE_VOLUME`, `DESTROY_VM` without `persist_volumes`) and
+  `REWRAP_VOLUME` wait for hull's `ok`/`accepted`, which means hull has
+  verified the controller's signature: a forged or replayed envelope can
+  never crypto-erase anything.
+- helm checks preconditions it owns before relaying (volume owner and
+  attachment, function type and state, `REWRAP_VOLUME`'s `from_vm`) and
+  answers a violation itself. Malformed slots are refused as `malformed`,
+  `GPU_VF_CONFIG` as `unsupported`.
+- A failed attach (role refused, hull answered with an error, mailbox
+  write failed) drops a delivered key and moves the function
+  `assigned → cleaning` (pool event `attach_failed`): hull never handed
+  it to the VM, but the role may hold the VM's configuration or key.
+- Timeouts report `timed_out` and do nothing else: reservations stay
+  held, since hull may have applied the command, and destructive steps
+  never run. A late response is audited and dropped.
+- hull is the authority on what a VM holds: a `DEVICE_RELEASED` for a
+  function still `assigned` to that VM (the event overtook the
+  `DESTROY_VM` response) releases it first.
+- Cleaning: NIC and storage functions are cleaned synchronously over the
+  sideband; GPU functions wait for `SCRUB_DONE`. A function waiting in
+  `releasing` or GPU `cleaning` past its timeout is faulted.
+- ATTACH_DEVICE for a NIC VF carries no VPC, MAC or NIC ID in mailbox v2,
+  so the router takes them from a lookup helm is configured with and
+  refuses the attach as `unsupported` without one. Open question: a
+  signed command should carry them (a mailbox v3 body change).
+
+### Audit log
+
+`src/helm/audit_log.*`. One ASCII line per record, fields in a fixed
+order (`n= t= ev= [seq=] [cmd=] [status=] [vm=] [vol=] [fn=] [count=]
+h=`), where `h` is SHA-256 over the previous record's `h` and this line
+up to ` h=`. The file is opened `O_APPEND`, created `0600`, and refused
+if it is a symlink, not a regular file, group/other accessible, or does
+not verify; a restart continues the same chain. The record type has no
+field that can hold key material, only IDs. The router audits every
+accepted, refused, relayed, answered and timed-out command and every key
+operation, and does not relay a command whose relay record could not be
+written. `verify_audit_log` is strict (canonical form, consecutive
+indices, every hash) and fuzzed.
+
 ### DevicePool
 
 ```

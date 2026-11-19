@@ -17,6 +17,12 @@
 //                                                            ▼
 //            cleaning ◄── slot power-cycle ok ──────────── faulted
 //
+// An attach that fails after helm reserved and prepared the function (the
+// role refused, or hull answered with an error) moves it from `assigned`
+// straight to `cleaning` (attach_failed): hull never handed it to the VM,
+// so there is no reset to wait for, but the role may already hold the
+// VM's configuration or volume key, so it is cleaned before reuse.
+//
 // Every legal move is one row of `transition_table`; anything not in the
 // table is illegal and leaves the function untouched. A power-cycled
 // function goes back through `cleaning` rather than straight to `free`:
@@ -76,12 +82,14 @@ enum class PoolEvent : std::uint8_t {
     clean_failed,      // data-plane role reported a cleaning error
     timed_out,         // reset or cleaning did not finish in time
     power_cycle_done,  // PowerSequencer: slot power-cycle succeeded
+    attach_failed,     // CommandRouter: an attach failed after the function was prepared
 };
 
 inline constexpr std::array all_pool_events{
-    PoolEvent::assign,       PoolEvent::release,    PoolEvent::device_released,
-    PoolEvent::reset_failed, PoolEvent::clean_done, PoolEvent::scrub_done,
-    PoolEvent::clean_failed, PoolEvent::timed_out,  PoolEvent::power_cycle_done,
+    PoolEvent::assign,        PoolEvent::release,    PoolEvent::device_released,
+    PoolEvent::reset_failed,  PoolEvent::clean_done, PoolEvent::scrub_done,
+    PoolEvent::clean_failed,  PoolEvent::timed_out,  PoolEvent::power_cycle_done,
+    PoolEvent::attach_failed,
 };
 
 // What the data-plane role must do to a function in `cleaning`.
@@ -124,6 +132,8 @@ struct Transition {
 inline constexpr std::array transition_table{
     Transition{FunctionState::free, PoolEvent::assign, any_type, FunctionState::assigned},
     Transition{FunctionState::assigned, PoolEvent::release, any_type, FunctionState::releasing},
+    Transition{FunctionState::assigned, PoolEvent::attach_failed, any_type,
+               FunctionState::cleaning},
     Transition{FunctionState::releasing, PoolEvent::device_released, any_type,
                FunctionState::cleaning},
     Transition{FunctionState::releasing, PoolEvent::reset_failed, any_type, FunctionState::faulted},
@@ -143,6 +153,19 @@ inline constexpr std::array transition_table{
 enum class FunctionId : std::uint32_t {
 };
 using VmId = std::uint64_t;
+
+// A function's pool ID from its backplane slot and its number in that slot
+// (design, data models: FunctionId { slot, fn }): slot in bits 16-23.
+[[nodiscard]] constexpr auto make_function_id(std::uint8_t slot, std::uint16_t fn) noexcept
+    -> FunctionId {
+    return FunctionId{(static_cast<std::uint32_t>(slot) << 16U) | fn};
+}
+[[nodiscard]] constexpr auto slot_of(FunctionId id) noexcept -> std::uint8_t {
+    return static_cast<std::uint8_t>(static_cast<std::uint32_t>(id) >> 16U);
+}
+[[nodiscard]] constexpr auto function_number_of(FunctionId id) noexcept -> std::uint16_t {
+    return static_cast<std::uint16_t>(static_cast<std::uint32_t>(id) & 0xFFFFU);
+}
 
 enum class PoolError : std::uint8_t {
     unknown_function,
@@ -174,7 +197,7 @@ public:
     // goes back to `cleaning`.
     auto power_cycle_done(FunctionId id) -> std::expected<CleaningAction, PoolError>;
     // Any other event (reset_failed, clean_done, scrub_done, clean_failed,
-    // timed_out). Rejects assign and release, which need a VM.
+    // timed_out, attach_failed). Rejects assign and release, which need a VM.
     auto apply(FunctionId id, PoolEvent event) -> std::expected<FunctionState, PoolError>;
 
     // Releases every function `vm` holds (DESTROY_VM). Returns them in id order.
@@ -182,6 +205,8 @@ public:
 
     [[nodiscard]] auto find(FunctionId id) const -> std::optional<FunctionInfo>;
     [[nodiscard]] auto held_by(VmId vm) const -> std::vector<FunctionId>;
+    // Every function, in id order.
+    [[nodiscard]] auto all() const -> std::vector<FunctionInfo>;
     // First free function of `type`, in id order.
     [[nodiscard]] auto first_free(FunctionType type) const -> std::optional<FunctionId>;
     [[nodiscard]] auto size() const noexcept -> std::size_t { return _functions.size(); }

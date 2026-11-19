@@ -112,6 +112,8 @@ auto to_string(PoolEvent e) noexcept -> const char* {
             return "timed_out";
         case PoolEvent::power_cycle_done:
             return "power_cycle_done";
+        case PoolEvent::attach_failed:
+            return "attach_failed";
     }
     return "unknown";
 }
@@ -249,6 +251,15 @@ auto DevicePool::held_by(VmId vm) const -> std::vector<FunctionId> {
         }
     }
     return ids;
+}
+
+auto DevicePool::all() const -> std::vector<FunctionInfo> {
+    std::vector<FunctionInfo> out;
+    out.reserve(_functions.size());
+    for (const auto& [id, entry] : _functions) {
+        out.push_back(FunctionInfo{id, entry.type, entry.state, entry.owner});
+    }
+    return out;
 }
 
 auto DevicePool::first_free(FunctionType type) const -> std::optional<FunctionId> {

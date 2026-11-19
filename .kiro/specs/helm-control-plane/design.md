@@ -135,6 +135,29 @@ Per-slot PERST#, power enable, link-ready input; host PERST#/power. Boot
 order: slots up → link-ready or timeout → host released. In harbor it
 launches/kills board processes and then launches the L1 QEMU.
 
+Built in `src/helm/power_sequencer.*` over a `Backplane` interface (slot
+power and PERST#, slot link-ready, host power and PERST#). Decisions made
+in the implementation:
+
+- Boot holds the host, powers every slot, and waits for all of them
+  together up to one `link_timeout`. A slot without link by then is
+  powered off again, so a half-trained link is never on the host's bus,
+  and faulted. The host is released either way: the device tree it
+  enumerates is fixed, just without that slot.
+- `power_cycle` touches only its slot. `check` faults a ready slot whose
+  link dropped and retries up to `max_recoveries` power cycles. The
+  sequencer tells an observer (`on_slot_ready`, `on_slot_recovered`,
+  `on_slot_faulted`); helm's wiring reads the role's inventory into the
+  CommandRouter on ready and calls `slot_power_cycled` on recovery, so
+  functions return to the pool only after cleaning (Requirement 6.3).
+- Time is injected (clock and sleep) so the sequence is unit-tested
+  without waiting.
+- harbor's `ProcessBackplane`: slot power is a board process
+  (`posix_spawn`), link-ready is that process alive with its ready path
+  (its sideband socket) present, and host power is the L1 QEMU process.
+  A stale ready path is removed before each launch; power-off sends
+  SIGTERM, waits a grace period, then SIGKILLs, and always reaps.
+
 ### ControllerLink
 
 See `controller-interface` (design "ControllerLink"). Verifies envelope

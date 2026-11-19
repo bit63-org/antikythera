@@ -42,6 +42,7 @@ ak_add_test(request_parser_test     SOURCES request_parser_test.cpp     LIBS ak:
 ak_add_test(virtio_blk_function_test SOURCES virtio_blk_function_test.cpp LIBS ak::oar_blk)
 ak_add_test(mailbox_test      SOURCES mailbox_test.cpp      LIBS ak::helm)
 ak_add_test(device_pool_test  SOURCES device_pool_test.cpp  LIBS ak::helm)
+ak_add_test(power_sequencer_test SOURCES power_sequencer_test.cpp LIBS ak::helm)
 ak_add_test(mailbox_bodies_test SOURCES mailbox_bodies_test.cpp LIBS ak::helm)
 ak_add_test(mctp_test         SOURCES mctp_test.cpp         LIBS ak::helm)
 ak_add_test(signature_verifier_test SOURCES signature_verifier_test.cpp LIBS ak::hull)

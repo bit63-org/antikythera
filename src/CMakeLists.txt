@@ -52,8 +52,8 @@ target_link_libraries(ak_tls
   PRIVATE OpenSSL::SSL OpenSSL::Crypto ak::warnings ak::hardening)
 
 # helm: control-plane mailbox protocol, device pool, MCTP sideband framing,
-# OarLink (sideband protocol and its transport bindings), key store and the
-# ControllerLink.
+# OarLink (sideband protocol and its transport bindings), key store, the
+# ControllerLink and the PowerSequencer (with harbor's process backplane).
 add_library(ak_helm
   helm/controller_link.cpp
   helm/device_pool.cpp
@@ -62,6 +62,7 @@ add_library(ak_helm
   helm/mctp.cpp
   helm/oar_link.cpp
   helm/oar_protocol.cpp
+  helm/power_sequencer.cpp
   helm/scoped_key.cpp
   helm/secure_element.cpp
   helm/sideband_binding.cpp)

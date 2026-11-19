@@ -219,25 +219,51 @@ auto vtep(std::string_view s) -> std::expected<proto::VtepAddress, std::string> 
     return std::unexpected("bad VTEP address");
 }
 
-auto map_entry(std::string_view s) -> std::expected<proto::MapEntry, std::string> {
-    const auto c1 = s.find(',');
-    const auto c2 = c1 == std::string_view::npos ? c1 : s.find(',', c1 + 1);
-    if (c2 == std::string_view::npos) {
-        return std::unexpected("map entry must be NIC,MAC,VTEP");
+auto split(std::string_view s, char sep) -> std::vector<std::string_view> {
+    std::vector<std::string_view> out;
+    for (std::size_t start = 0;;) {
+        const auto at = s.find(sep, start);
+        out.push_back(s.substr(start, at == std::string_view::npos ? at : at - start));
+        if (at == std::string_view::npos) {
+            return out;
+        }
+        start = at + 1;
     }
-    auto nic = number<std::uint64_t>(s.substr(0, c1), "NIC id");
-    auto m = mac(s.substr(c1 + 1, c2 - c1 - 1));
-    auto v = vtep(s.substr(c2 + 1));
+}
+
+// NIC,MAC,VTEP[,GUEST_IP ...]: one mapping entry and the guest addresses
+// (IPv4 or IPv6) its NIC owns, appended to `m`.
+auto add_map_entry(std::string_view s, SendMapUpdate& m) -> std::expected<void, std::string> {
+    const auto fields = split(s, ',');
+    if (fields.size() < 3) {
+        return std::unexpected("map entry must be NIC,MAC,VTEP[,GUEST_IP ...]");
+    }
+    auto nic = number<std::uint64_t>(fields[0], "NIC id");
+    auto addr = mac(fields[1]);
+    auto v = vtep(fields[2]);
     if (!nic) {
         return std::unexpected(nic.error());
     }
-    if (!m) {
-        return std::unexpected(m.error());
+    if (!addr) {
+        return std::unexpected(addr.error());
     }
     if (!v) {
         return std::unexpected(v.error());
     }
-    return proto::MapEntry{.nic_id = *nic, .mac = *m, .owner_vtep = *v};
+    m.entries.push_back({.nic_id = *nic, .mac = *addr, .owner_vtep = *v});
+    for (const auto ip : std::span{fields}.subspan(3)) {
+        const std::string text{ip};
+        proto::GuestIpv4 g4{.nic_id = *nic, .address = {}};
+        proto::GuestIpv6 g6{.nic_id = *nic, .address = {}};
+        if (inet_pton(AF_INET, text.c_str(), g4.address.data()) == 1) {
+            m.ipv4.push_back(g4);
+        } else if (inet_pton(AF_INET6, text.c_str(), g6.address.data()) == 1) {
+            m.ipv6.push_back(g6);
+        } else {
+            return std::unexpected("bad guest address " + text);
+        }
+    }
+    return {};
 }
 
 constexpr std::array status_names{
@@ -486,7 +512,8 @@ auto parse_line(std::string_view line) -> std::expected<std::optional<Action>, s
     }
     if (verb == "map-update") {
         if (args.size() < 2) {
-            return std::unexpected("map-update: want VNI VERSION [NIC,MAC,VTEP ...]");
+            return std::unexpected(
+                "map-update: want VNI VERSION [NIC,MAC,VTEP[,GUEST_IP ...] ...]");
         }
         auto vni = number<std::uint32_t>(args[0], "VNI");
         auto version = number<std::uint64_t>(args[1], "mapping version");
@@ -496,15 +523,18 @@ auto parse_line(std::string_view line) -> std::expected<std::optional<Action>, s
         if (!version) {
             return std::unexpected(version.error());
         }
-        SendMapUpdate m{.vni = *vni, .map_version = *version, .entries = {}};
+        SendMapUpdate m{
+            .vni = *vni, .map_version = *version, .entries = {}, .ipv4 = {}, .ipv6 = {}};
         for (const auto e : args.subspan(2)) {
-            auto entry = map_entry(e);
-            if (!entry) {
-                return std::unexpected(entry.error());
+            if (auto ok = add_map_entry(e, m); !ok) {
+                return std::unexpected(ok.error());
             }
-            m.entries.push_back(*entry);
         }
+        // The frame's canonical order; duplicates are left for the encoder
+        // to refuse.
         std::ranges::sort(m.entries, {}, &proto::MapEntry::nic_id);
+        std::ranges::sort(m.ipv4, std::ranges::lexicographical_compare, &proto::GuestIpv4::address);
+        std::ranges::sort(m.ipv6, std::ranges::lexicographical_compare, &proto::GuestIpv6::address);
         return std::optional<Action>{std::move(m)};
     }
     auto body = command(verb, args);
@@ -735,6 +765,8 @@ auto TestController::run(const Action& action) -> std::expected<void, std::strin
                                          .vni = a.vni,
                                          .map_version = a.map_version,
                                          .entries = a.entries,
+                                         .ipv4 = a.ipv4,
+                                         .ipv6 = a.ipv6,
                                          .signature = {}};
                 auto frame = _signer.map_update(m);
                 if (!frame) {

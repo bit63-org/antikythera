@@ -1,6 +1,6 @@
 # Implementation Plan — Controller interface and the kythira EC2 integration
 
-## Status: 5/7 tasks complete
+## Status: 6/8 tasks complete
 
 ## Tasks
 
@@ -28,6 +28,11 @@
   Ed25519 signer that reproduces `src/proto/test_vectors.hpp`, a script
   language for commands, mapping updates and expected outcomes, and the
   mTLS server side of the ControllerLink. See `harbor/README.md`.)
+- [x] 9. MapUpdate format v2: guest IPv4 and IPv6 addresses per NIC for
+  oar-net's ARP/ND proxy. _Requirements: 4, 5_ (Sorted, unique, unicast,
+  each owned by a NIC in the same frame; vectors regenerated; harbor's
+  `map-update` takes `NIC,MAC,VTEP[,GUEST_IP ...]`. See design
+  "Envelope".)
 - [ ] 6. Draft the kythira `ec2-compatible-api` spec in the kythira
   repository, from Requirement 6. _Requirements: 6_
 - [ ] 7. End-to-end: AWS CLI `run-instances` against kythira, landing in a

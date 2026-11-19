@@ -60,7 +60,7 @@ create-network 0x55
 expect ok
 create-vm 0x1001 2 1024
 expect accepted
-map-update 0x55 1 0x10,02:00:00:00:00:10,fd00::1
+map-update 0x55 1 0x10,02:00:00:00:00:10,fd00::1,10.0.0.16   # NIC,MAC,VTEP[,GUEST_IP ...]
 wait map_applied
 ```
 

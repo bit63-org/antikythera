@@ -69,8 +69,10 @@
   with another NIC's sender MAC or IP and NS with a foreign source
   link-layer option dropped, DAD probes never answered. Fuzz:
   `fuzz_vswitch` (parsers, and isolation invariants over frame streams).
-  Not yet: the controller's map_update carries no guest IP addresses, so
-  helm has no wire source for `set_neighbors()`; NA spoofing checks; the
+  The controller's map_update (format v2) carries the guest addresses
+  for `set_neighbors()`; the role handler that applies a frame to both
+  the MappingTable and the VSwitch is not written yet. Not yet: NA
+  spoofing checks; the
   VSwitch is not wired into `ak-oar-net` (it serves one NIC; task 9 adds
   the Vtep runtime that drives both).
 - [ ] 9. Vtep runtime: UDP sockets, OAM keepalives, drop counters.

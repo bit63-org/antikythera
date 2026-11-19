@@ -3,7 +3,7 @@
 
 // Fuzzes the MapUpdate decoder: an accepted frame must re-encode to
 // identical bytes (the encoding is canonical) and its entries must satisfy
-// the invariants oar-net's MappingTable relies on.
+// the invariants oar-net's MappingTable and ARP/ND proxy rely on.
 
 #include <algorithm>
 #include <cstddef>
@@ -24,7 +24,13 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         m->entries.size() > ak::proto::max_map_entries ||
         !std::ranges::is_sorted(m->entries, std::ranges::less{}, &ak::proto::MapEntry::nic_id) ||
         std::ranges::adjacent_find(m->entries, std::ranges::equal_to{},
-                                   &ak::proto::MapEntry::nic_id) != m->entries.end()) {
+                                   &ak::proto::MapEntry::nic_id) != m->entries.end() ||
+        m->ipv4.size() > ak::proto::max_guest_addresses ||
+        m->ipv6.size() > ak::proto::max_guest_addresses ||
+        std::ranges::adjacent_find(m->ipv4, std::ranges::equal_to{},
+                                   &ak::proto::GuestIpv4::address) != m->ipv4.end() ||
+        std::ranges::adjacent_find(m->ipv6, std::ranges::equal_to{},
+                                   &ak::proto::GuestIpv6::address) != m->ipv6.end()) {
         std::abort();
     }
     return 0;

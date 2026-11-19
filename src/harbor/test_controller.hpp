@@ -36,7 +36,9 @@
 //   rewrap-volume VOLUME FROM_VM TO_VM
 //   create-network VNI
 //   delete-network VNI
-//   map-update VNI VERSION [NIC,MAC,VTEP ...]   e.g. 0x10,02:00:00:00:00:10,fd00::1
+//   map-update VNI VERSION [NIC,MAC,VTEP[,GUEST_IP ...] ...]
+//                        e.g. 0x10,02:00:00:00:00:10,fd00::1,10.0.0.5,fd12::5
+//                        (guest IPs are what the ARP/ND proxy answers for)
 //   expect STATUS        the last command's outcome must be STATUS
 //                        (ok, accepted, bad_signature, stale_sequence, ...)
 //   wait KIND            wait for a report of KIND (inventory, command_outcome,
@@ -110,6 +112,8 @@ struct SendMapUpdate {
     std::uint32_t vni{0};
     std::uint64_t map_version{0};
     std::vector<proto::MapEntry> entries;
+    std::vector<proto::GuestIpv4> ipv4;
+    std::vector<proto::GuestIpv6> ipv6;
 };
 struct ExpectOutcome {
     proto::CommandStatus status{proto::CommandStatus::ok};

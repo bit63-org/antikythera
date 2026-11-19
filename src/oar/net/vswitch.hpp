@@ -46,8 +46,9 @@
 // ARP/ND proxy addresses come from helm through set_neighbors(), keyed by
 // VNI because VPCs may reuse address space. An entry names a NIC; the reply
 // carries that NIC's MAC from the current snapshot, so a NIC that leaves the
-// VNI stops being answered for at once. The controller's map_update does
-// not carry guest addresses yet, so helm has no wire source for them today.
+// VNI stops being answered for at once. The addresses arrive in the same
+// signed map_update frame as the mapping (proto::MapUpdate ipv4 and ipv6,
+// format v2).
 //
 // Threading: a VSwitch belongs to one data-plane thread. transmit(),
 // receive(), attach(), detach() and set_neighbors() must all be called from

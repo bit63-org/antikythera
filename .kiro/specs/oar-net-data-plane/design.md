@@ -49,6 +49,11 @@ K keepalives are reported to helm.
 
 Implements `MappingView`. Populated only by helm `map_update` messages
 (versioned per VNI, applied atomically by swapping an immutable snapshot).
+A `map_update` frame (format v2, `src/proto/map_update.hpp`) also lists
+the guest IPv4 and IPv6 addresses each NIC owns; the role hands those to
+`VSwitch::set_neighbors()` as that VNI's complete `NeighborUpdate`, after
+the mapping itself is applied, so the ARP/ND proxy and the mapping always
+come from the same signed frame.
 
 ### Tunnel
 

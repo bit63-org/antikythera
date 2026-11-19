@@ -128,9 +128,134 @@ forwards unmodified over OarLink (`group_policy`), checked like
 `map_update` (target server, key ID, Ed25519 signature, version newer
 than the applied one). helm polls meters with `group_usage`.
 
+### IP awareness
+
+Requirements 11–13. `src/oar/net/packet.*` parses a guest frame once:
+
+```
+struct ParsedPacket {
+    std::uint16_t ethertype;            // IPv4 or IPv6 only
+    IpFamily family;
+    IpAddress src, dst;                 // 4 or 16 bytes, network order
+    std::uint8_t protocol;              // final next-header / IPv4 protocol
+    std::uint8_t hop_limit;             // TTL or hop limit
+    bool fragment, first_fragment;      // L4 present only when !fragment || first
+    std::optional<L4> l4;               // ports (TCP/UDP) or type/code (ICMP/ICMPv6)
+    std::span<const std::byte> l3;      // the IP header onward, total-length bounded
+    std::span<const std::byte> payload; // after the L4 header
+};
+```
+
+Rules: untagged Ethernet; IPv4 version 4, IHL ≥ 5, total length within
+the frame (trailing Ethernet padding ignored), header checksum not
+verified (the receiver's stack does, and a bad one cannot pass the source
+check any better); IPv6 version 6, payload length within the frame, at
+most 8 extension headers (hop-by-hop only first; routing, fragment,
+destination options, AH by length), anything else ends the walk as the
+upper-layer protocol. TCP needs data offset ≥ 5 within the packet, UDP a
+length that matches the IP payload, ICMP/ICMPv6 four bytes. Errors are a
+`PacketError` enum, each counted (`tx_drop_malformed`).
+
+Each IPv4/IPv6 neighbor table entry already names its NIC, so the source
+check is one lookup: `table.ipv4[src] == source NIC`. A source is `own`,
+`local_only` (Requirement 11.4) or `spoofed`.
+
+Transmit order, after the existing dead-VPC, length and source-MAC checks:
+
+1. EtherType: ARP goes to the ARP handler (which now also requires the
+   sender IP to be the NIC's or `0.0.0.0`); IPv4/IPv6 are parsed; anything
+   else is `tx_drop_ethertype`.
+2. Parse; failure is `tx_drop_malformed`.
+3. Classify the source; `spoofed` is `tx_drop_ip_spoofed`.
+4. Router-only messages (RA, redirect, UDP source port 67/547 to a client
+   port) are `tx_drop_router_msg`.
+5. Local responders, which consume what they match: DHCPv4 (UDP 68→67),
+   ICMPv6 RS, NS (gateway target, then the existing proxy), DHCPv6
+   (UDP 546→547), then the metadata intercept.
+6. `local_only` packets left are `tx_drop_link_local`.
+7. Destination MAC is the gateway MAC: `tx_drop_no_route`.
+8. Group frame: group policy; admitted frames also need an IP multicast
+   destination (`tx_drop_ip_dst`).
+9. Unicast: destination NIC by MAC as today, then its address table must
+   hold the IP destination (`tx_drop_ip_dst`), then deliver or send.
+
+NA target checks run in step 5's ND handling (`tx_drop_neighbor_spoofed`).
+Receive runs steps 1–3 and 9's address check on the inner frame against
+the receiving VTEP's tables (`rx_drop_ethertype`, `rx_drop_malformed`,
+`rx_drop_ip_spoofed`, `rx_drop_ip_dst`) before delivery.
+
+The address tables are the ones `set_neighbors()` holds (fed from
+MapUpdate v2 by `NetRole`), so the ARP/ND proxy and the source check can
+never disagree, and a VNI whose map carries no addresses carries no IP.
+
+### VPC gateway: DHCP and router advertisements
+
+`VSwitch::set_vpc_config(vni, VpcConfig)`:
+
+```
+struct VpcConfig {
+    MacAddress gateway_mac;              // locally administered unicast
+    Ipv4Prefix ipv4;                     // e.g. 10.0.0.0/16, length 8..30
+    Ipv4Address ipv4_gateway;            // inside ipv4, not network/broadcast
+    std::optional<Ipv6Prefix> ipv6;      // a /64
+    std::vector<Ipv4Address> dns4;       // ≤ 4
+    std::vector<Ipv6Address> dns6;       // ≤ 4
+    std::string domain;                  // ≤ 253 bytes, DNS name syntax
+    std::uint32_t lease_seconds;         // 60 .. 2^31-1
+};
+```
+
+Validated whole (`VpcConfigError`); an empty optional clears the VNI. The
+interface MTU comes from the NIC, not the config: `attach()` takes the
+MTU its function advertises (set by the MTU plan), so DHCP option 26 and
+the RA MTU option always match `VIRTIO_NET_F_MTU`.
+
+DHCPv4 (`src/oar/net/dhcp4.*`): parse BOOTP + options (RFC 2131/2132,
+option overload ignored, at most 1500 bytes of options), build replies.
+Stateless: the reply is a pure function of the message, the mapping and
+the config. Server identifier = gateway address; replies go to the NIC's
+MAC with IP destination `255.255.255.255` when the broadcast flag is set
+or `ciaddr` is zero, else `ciaddr`; source is the gateway address and
+MAC. T1 = lease/2, T2 = lease × 7/8. Address: the NIC's lowest IPv4 guest
+address inside the prefix; a NIC with none gets no answer
+(`dhcp4_no_address`). A future MapUpdate flag marking the primary
+address replaces "lowest".
+
+Router advertisements and DHCPv6 (`src/oar/net/dhcp6.*`): the gateway's
+link-local address is `fe80::` + EUI-64(gateway MAC); the server DUID is
+DUID-LL (type 3, hardware type 1) of the gateway MAC. RAs: hop limit 64,
+M and O set, router lifetime 1800 s, prefix information (L=1, A=0,
+lifetimes infinite), MTU, source link-layer address. `VSwitch::poll(now)`,
+called by the Vtep runtime's loop, sends an unsolicited RA to each
+attached NIC in a VNI with an IPv6 prefix every 200 s (and right after
+attach). DHCPv6 lifetimes: preferred = valid = lease, T1/T2 as DHCPv4.
+
+### Metadata intercept
+
+`MetadataEndpoint` (an interface, like `Underlay`):
+
+```
+class MetadataEndpoint {
+    virtual auto deliver(geneve::NicId nic, std::span<const std::byte> ip_packet) -> void = 0;
+};
+VSwitch::set_metadata_endpoint(MetadataEndpoint*);
+VSwitch::inject_metadata(geneve::NicId nic, std::span<const std::byte> ip_packet) -> bool;
+```
+
+The endpoint receives the IP packet (no Ethernet header) and the trusted
+NIC ID. `inject_metadata` wraps a reply in Ethernet (gateway MAC → NIC
+MAC) after checking Requirement 13.3. A per-NIC token bucket (the group
+policy's integer bucket, frames only; default 1024 packets/s, burst 256)
+bounds intercepted packets (`metadata_drop_rate`). The first endpoint
+(later task) is expected to be a TAP device into the oar-net board's own
+kernel, one source address per NIC ID, relaying HTTP to helm's metadata
+service keyed by NIC ID.
+
 ## Data models
 
 - `NicBinding { vni, mac, owner_vtep }` (written).
+- `VpcConfig` per VNI (above); guest address tables per VNI, from
+  MapUpdate v2 through `set_neighbors()`.
 - `LocalNic { nic_id, function, vni, mac }`.
 - Mapping snapshot: `std::shared_ptr<const Snapshot>` swapped atomically.
 
@@ -146,6 +271,13 @@ errors (bad `map_update`) are rejected whole, leaving the old snapshot.
   limits against a fake clock, flood-list cap and meters, with the switch
   fuzzer checking that a `drop` VNI never replicates and that remote
   replicas never exceed frames × the flood-list cap.
+- The packet parser, DHCPv4 and DHCPv6 codecs each get unit tests and a
+  fuzz target; `fuzz_vswitch` also checks that no frame leaves a NIC
+  (delivered or sent to the underlay) with an IP source that NIC does not
+  own, that link-local traffic is never forwarded, and that DHCP and
+  metadata traffic never reaches the underlay. DHCP replies are checked
+  against captured `dhclient`/`systemd-networkd` exchanges, and harbor
+  boots a stock cloud image that must come up with its mapped address.
 - Interop: encode → kernel Geneve device decode, and the reverse, in a
   network namespace (CI-capable, no KVM needed).
 - harbor: two and three servers, as listed in Requirement 9.3.

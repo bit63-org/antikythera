@@ -185,3 +185,30 @@
   the VSwitch meters. _Requirements: 10.2, 10.6, 10.7_
 - [ ] 14. IGMP/MLD snooping, per-NIC group cap, join reports through helm
   and per-group VTEP lists. Needs the L3 parser. _Requirements: 10.5_
+- [ ] 15. L3/L4 packet parser (`src/oar/net/packet.*`): untagged
+  Ethernet, IPv4 with options, IPv6 with a bounded extension-header walk,
+  TCP/UDP/ICMP/ICMPv6 headers, fragments; tests and `fuzz_packet`.
+  _Requirements: 11.2_
+- [ ] 16. Source/destination check in the VSwitch on transmit and
+  receive: EtherType allowlist, source classes (own, local-only,
+  spoofed), destination owned by the destination NIC, multicast
+  destination for replicated frames, ARP sender and NA target checks,
+  router and DHCP-server messages dropped, per-cause counters;
+  `fuzz_vswitch` invariants. _Requirements: 11.1, 11.3–11.9_
+- [ ] 17. `VpcConfig` per VNI (`set_vpc_config`, MTU taken at attach),
+  gateway ARP/ND answers, `tx_drop_no_route`, and the stateless DHCPv4
+  server (`src/oar/net/dhcp4.*`), tests and fuzz. _Requirements: 12.1–12.3,
+  12.6_
+- [ ] 18. Router advertisements (solicited, and periodic through
+  `VSwitch::poll`) and the DHCPv6 server (`src/oar/net/dhcp6.*`), tests
+  and fuzz. _Requirements: 12.4–12.6_
+- [ ] 19. Metadata intercept: `MetadataEndpoint`, per-NIC packet rate
+  limit, `inject_metadata` checks. _Requirements: 13.1–13.3_
+- [ ] 20. Signed `VpcConfig` frame (controller-interface, to be specced
+  there) forwarded by helm over OarLink and applied by `NetRole`.
+  _Requirements: 12.1_
+- [ ] 21. Metadata service: the endpoint on the oar-net board, helm's
+  service keyed by NIC ID, IMDSv2 tokens (helm and controller specs).
+  _Requirements: 13.4_
+- [ ] 22. Per-NIC source/destination check opt-out, with route-table
+  targets that name a NIC (VPC step 3). _Requirements: 11.10_

@@ -158,17 +158,12 @@ auto TunnelKeyring::provision(OarLink& link, const oar::Vtep& vtep)
 }
 
 auto TunnelKeyring::fill(proto::Inventory& inv) const -> void {
-    inv.tunnel_keys.clear();
-    bool any = false;
-    std::vector<PublicKey> keys;
-    keys.reserve(inv.vteps.size());
+    // Every VTEP's role runs oar-net's WireGuard; none offloads PSP yet.
+    constexpr proto::TunnelModes modes = proto::tunnel_mode_bit(proto::TunnelMode::wireguard);
+    inv.tunnels.clear();
+    inv.tunnels.reserve(inv.vteps.size());
     for (const auto& v : inv.vteps) {
-        const auto key = public_key(v);
-        any = any || key.has_value();
-        keys.push_back(key.value_or(PublicKey{}));
-    }
-    if (any) {
-        inv.tunnel_keys = std::move(keys);
+        inv.tunnels.push_back({.modes = modes, .public_key = public_key(v).value_or(PublicKey{})});
     }
 }
 

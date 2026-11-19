@@ -30,7 +30,8 @@
 //     0x18 pages_1g_total u32 | pages_1g_free u32
 //     0x20 function_count u16 | vm_count u16 | volume_count u16 | network_count u16
 //     0x28 vteps      vtep_count x 48:
-//                       address [16] (IPv6 underlay) | tunnel_key [32]
+//                       address [16] (IPv6 underlay) | tunnel_modes u8 | rsvd [7]
+//                       tunnel_key [32]
 //          functions  function_count x 16:
 //                       slot u8 | type u8 | function u16 | state u8 | rsvd [3] | owner_vm u64
 //          vms        vm_count x 16: vm_id u64 | vcpus u16 | rsvd u16 | memory_mib u32
@@ -100,10 +101,13 @@
 // assigned or releasing. map_version 0 in `networks` means the network
 // exists but no mapping has been applied yet.
 //
-// A VTEP's tunnel_key is the X25519 public key of its WireGuard key pair
-// (tunnel_peers.hpp), all zero until helm has one for it. The controller
-// sends it to the VTEP's peers. Format 2 added it; format 1 had 16-byte
-// VTEP entries.
+// A VTEP's tunnel_modes is the set of tunnel modes it supports
+// (tunnel_peers.hpp, TunnelMode bits: wireguard, psp), from which the
+// controller picks one per pair of VTEPs; tunnel_key is the X25519 public
+// key of its WireGuard key pair, all zero until helm has one for it, and
+// non-zero only with the wireguard bit set. The controller sends the key
+// to the VTEP's peers. Format 2 added both; format 1 had 16-byte VTEP
+// entries.
 //
 // Enum values are shared with helm (FunctionType, FunctionState) and the
 // mailbox (Status, ExitReason, FaultCode); tests/proto_report_test.cpp
@@ -143,7 +147,7 @@ inline constexpr std::size_t max_volumes = 1024;
 inline constexpr std::size_t max_networks = 4096;
 
 inline constexpr std::size_t inventory_fixed_size = 0x28;
-inline constexpr std::size_t inventory_vtep_size = vtep_address_size + tunnel_key_size;  // 48
+inline constexpr std::size_t inventory_vtep_size = vtep_address_size + 8 + tunnel_key_size;  // 56
 inline constexpr std::size_t inventory_function_size = 16;
 inline constexpr std::size_t inventory_vm_size = 16;
 inline constexpr std::size_t inventory_volume_size = 24;
@@ -328,6 +332,14 @@ struct InventoryNetwork {
     friend auto operator==(const InventoryNetwork&, const InventoryNetwork&) -> bool = default;
 };
 
+// A VTEP's tunnel capabilities: the modes it supports and its WireGuard
+// public key (all zero until it has one).
+struct VtepTunnel {
+    TunnelModes modes{0};
+    TunnelPublicKey public_key{};
+    friend auto operator==(const VtepTunnel&, const VtepTunnel&) -> bool = default;
+};
+
 struct Inventory {
     std::uint64_t boot_id{0};
     std::uint64_t last_command_seq{0};
@@ -337,11 +349,10 @@ struct Inventory {
     std::uint32_t pages_1g_total{0};
     std::uint32_t pages_1g_free{0};
     std::vector<VtepAddress> vteps;
-    // The VTEPs' tunnel public keys (encoded with `vteps`): empty when no
-    // VTEP has a key yet, or one per entry of `vteps`, in the same order,
-    // all zero for a VTEP with none yet. Decoding gives empty when every
-    // key is zero, so the encoding stays canonical.
-    std::vector<TunnelPublicKey> tunnel_keys;
+    // The VTEPs' tunnel modes and keys (encoded with `vteps`): empty, or
+    // one per entry of `vteps` in the same order. Decoding gives empty when
+    // every entry is all zero, so the encoding stays canonical.
+    std::vector<VtepTunnel> tunnels;
     std::vector<InventoryFunction> functions;
     std::vector<InventoryVm> vms;
     std::vector<InventoryVolume> volumes;
@@ -579,8 +590,16 @@ namespace detail {
     if (std::ranges::adjacent_find(inv.vteps, std::ranges::greater_equal{}) != inv.vteps.end()) {
         return std::unexpected(DecodeError::not_ascending);
     }
-    if (!inv.tunnel_keys.empty() && inv.tunnel_keys.size() != inv.vteps.size()) {
+    if (!inv.tunnels.empty() && inv.tunnels.size() != inv.vteps.size()) {
         return std::unexpected(DecodeError::bad_public_key);
+    }
+    for (const auto& t : inv.tunnels) {
+        if ((t.modes & ~known_tunnel_modes) != 0) {
+            return std::unexpected(DecodeError::unknown_value);
+        }
+        if (!all_zero(t.public_key) && (t.modes & tunnel_mode_bit(TunnelMode::wireguard)) == 0) {
+            return std::unexpected(DecodeError::bad_public_key);
+        }
     }
     for (const auto& f : inv.functions) {
         if (!known(f.type) || !known(f.state)) {
@@ -885,14 +904,15 @@ private:
         return std::unexpected(DecodeError::trailing_bytes);
     }
     inv.vteps.resize(vtep_count);
-    inv.tunnel_keys.resize(vtep_count);
+    inv.tunnels.resize(vtep_count);
     for (std::size_t i = 0; i < vtep_count; ++i) {
         in.bytes(inv.vteps[i]);
-        in.bytes(inv.tunnel_keys[i]);
+        inv.tunnels[i].modes = in.u8();
+        zero = in.zeros(7) && zero;
+        in.bytes(inv.tunnels[i].public_key);
     }
-    if (std::ranges::all_of(inv.tunnel_keys,
-                            [](const TunnelPublicKey& k) { return all_zero(k); })) {
-        inv.tunnel_keys.clear();
+    if (std::ranges::all_of(inv.tunnels, [](const VtepTunnel& t) { return t == VtepTunnel{}; })) {
+        inv.tunnels.clear();
     }
     inv.functions.resize(function_count);
     for (auto& f : inv.functions) {
@@ -947,9 +967,12 @@ inline auto write_inventory(wire::Writer& w, const Inventory& inv) -> void {
     w.le16(static_cast<std::uint16_t>(inv.volumes.size()));
     w.le16(static_cast<std::uint16_t>(inv.networks.size()));
     for (std::size_t i = 0; i < inv.vteps.size(); ++i) {
-        constexpr TunnelPublicKey none{};
+        constexpr std::array<std::byte, 7> rsvd{};
+        const VtepTunnel t = inv.tunnels.empty() ? VtepTunnel{} : inv.tunnels[i];
         w.bytes(inv.vteps[i]);
-        w.bytes(inv.tunnel_keys.empty() ? none : inv.tunnel_keys[i]);
+        w.u8(t.modes);
+        w.bytes(rsvd);
+        w.bytes(t.public_key);
     }
     for (const auto& f : inv.functions) {
         w.u8(f.slot);

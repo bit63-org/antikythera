@@ -163,3 +163,9 @@ peers' public keys from the controller, so the authenticated underlay
    and naming the target server and VTEP.
 4. helm SHALL forward peer sets unmodified; the network role SHALL verify
    the signature, target and version before installing the peers.
+5. Each VTEP SHALL advertise the tunnel modes it supports (WireGuard, and
+   later PSP offload) in the inventory, and each peer in a peer set SHALL
+   name its mode, so the controller can move a fleet from WireGuard to PSP
+   one pair at a time, choosing PSP only where both ends support it. Only
+   WireGuard is implemented; a role SHALL refuse a peer set naming a mode
+   it does not run.

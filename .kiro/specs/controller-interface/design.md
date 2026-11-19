@@ -120,6 +120,11 @@ names an owner VM exactly when it is `assigned` or `releasing`. Enum values
 are helm's (`FunctionType`, `FunctionState`) and the mailbox's (`Status`,
 `ExitReason`, `FaultCode`), pinned by `tests/proto_report_test.cpp`.
 
+Report format 2 made each inventory VTEP entry 56 bytes: the address, the
+VTEP's supported tunnel modes (a bit set: WireGuard, PSP), seven reserved
+bytes, and its WireGuard public key (all zero until helm has a key pair
+for it; see "TunnelPeers"). Format 1 frames are refused.
+
 ## Multicast policy and usage
 
 Requirement 7 and oar-net Requirement 10; the decision and its reasoning
@@ -170,10 +175,6 @@ VNI was never opted in, though drops are still reported for visibility.
 Enablement hours come from the controller's own record of when each
 subnet's policy was in force.
 
-Report format 2 made each inventory VTEP entry 48 bytes: the address, then
-the VTEP's WireGuard public key (all zero until helm has a key pair for
-it; see "TunnelPeers"). Format 1 frames are refused.
-
 ## TunnelPeers
 
 oar-net carries VTEP-to-VTEP traffic inside WireGuard (oar-net
@@ -194,7 +195,8 @@ distributed through the controller (Requirement 8):
    0x00 magic 'AKTP' u32 | 0x04 version u16 (1) | 0x06 key_id u16
    0x08 server_id u64 | 0x10 vtep [16] | 0x20 peers_version u64
    0x28 peer_count u16 | 0x2A reserved [6]
-   0x30 peers: peer_count x { vtep [16] | public_key [32] }, VTEPs ascending
+   0x30 peers: peer_count x { vtep [16] | mode u8 | reserved [3] | spi u32 | key [32] },
+        VTEPs ascending
    then Ed25519 signature [64] over every byte before it
    ```
 
@@ -202,9 +204,23 @@ distributed through the controller (Requirement 8):
    like a MapUpdate: idempotent, and a role that missed versions catches up
    from the newest alone. `key_id`, `server_id` and the target VTEP are
    signed, so a set cannot be replayed elsewhere. No peer is the target
-   VTEP, no key is zero, no two peers share a key, and at most 2048 peers
-   fit (96 KiB). Pre-shared keys are not distributed: peers installed this
-   way have none.
+   VTEP, no key is zero, no two WireGuard peers share a key, and at most
+   2048 peers fit (112 KiB). Pre-shared keys are not distributed: peers
+   installed this way have none.
+
+   Each peer names its tunnel mode (Requirement 8.5). For `wireguard`,
+   `key` is the peer's X25519 public key and `spi` is 0. `psp` is room for
+   a later move to PSP NIC offload: `spi` would be the peer's receive SPI
+   and `key` the AES-256-GCM key derived for this sender. The controller
+   picks a mode per pair from what both VTEPs advertise, so a fleet moves
+   to PSP one pair at a time and falls back to WireGuard where either end
+   lacks it; a pair would switch with PSP keys pushed while WireGuard stays
+   up, then a new peer set flipping its mode. The guest MTU is already
+   budgeted for the larger PSP overhead (oar-net Requirement 6.3), so that
+   switch never changes a guest's MTU. Nothing implements PSP today: VTEPs
+   advertise only WireGuard, and a role refuses a peer set with a PSP peer.
+   PSP keys are secrets, so the frames carrying them will need wiping
+   wherever they are held.
 3. helm checks the frame's shape and server (ControllerSession), keeps the
    newest frame per VTEP, and forwards it unmodified over the sideband
    (`tunnel_peers`, chunked like `map_update`). It re-sends the key and the

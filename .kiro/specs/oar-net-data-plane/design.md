@@ -95,7 +95,9 @@ then makes its peers the Tunnel's controller-managed peers: peers that left
 or were re-keyed are removed first (so a key moving between VTEPs is never
 held twice), then every listed peer is set, and unchanged peers keep their
 sessions. Peers added by hand with `set_tunnel_peer` are left alone unless
-the frame names their VTEP.
+the frame names their VTEP. Every peer must be in WireGuard mode: the role
+advertises only WireGuard, so a peer in PSP mode (reserved for a later
+move to NIC offload) refuses the whole frame.
 
 ### Group policy and metering
 

@@ -43,13 +43,15 @@ auto key(std::uint8_t fill) -> proto::TunnelPublicKey {
 }
 
 auto sample() -> proto::TunnelPeers {
-    proto::TunnelPeers t{.server_id = sample_server,
-                         .key_id = 3,
-                         .vtep = vtep(1),
-                         .peers_version = 9,
-                         .peers = {{.vtep = vtep(2), .public_key = key(0x22)},
-                                   {.vtep = vtep(5), .public_key = key(0x55)}},
-                         .signature = {}};
+    proto::TunnelPeers t{
+        .server_id = sample_server,
+        .key_id = 3,
+        .vtep = vtep(1),
+        .peers_version = 9,
+        .peers =
+            {{.vtep = vtep(2), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = key(0x22)},
+             {.vtep = vtep(5), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = key(0x55)}},
+        .signature = {}};
     t.signature.fill(std::byte{0x5A});
     return t;
 }
@@ -108,11 +110,13 @@ BOOST_AUTO_TEST_CASE(layout_is_little_endian_with_peers_after_the_header) {
     BOOST_TEST(le_at(b, 0x28, 2) == 2U);
     BOOST_TEST(std::ranges::all_of(std::span{b}.subspan(0x2A, 6),
                                    [](std::byte x) { return x == std::byte{0}; }));
-    // Peer 1 (vtep(5)) at 0x30 + 48: address, then key.
+    // Peer 1 (vtep(5)) at 0x30 + 56: address, mode, reserved, SPI, key.
     const std::size_t p1 = proto::tunnel_peers_header_size + proto::tunnel_peer_size;
     BOOST_TEST((b[p1 + last] == std::byte{5}));
-    BOOST_TEST((b[p1 + 16] == std::byte{0x55}));
-    BOOST_TEST((b[p1 + 47] == std::byte{0x55}));
+    BOOST_TEST((b[p1 + 16] == std::byte{1}));  // wireguard
+    BOOST_TEST(le_at(b, p1 + 20, 4) == 0U);
+    BOOST_TEST((b[p1 + 24] == std::byte{0x55}));
+    BOOST_TEST((b[p1 + 55] == std::byte{0x55}));
     BOOST_TEST((b[b.size() - 1] == std::byte{0x5A}));
 }
 
@@ -150,8 +154,16 @@ BOOST_AUTO_TEST_CASE(rules_are_enforced_both_ways) {
          DecodeError::not_ascending},
         {[](proto::TunnelPeers& t) { t.peers[1].vtep = t.peers[0].vtep; },
          DecodeError::not_ascending},
-        {[](proto::TunnelPeers& t) { t.peers[1].public_key = {}; }, DecodeError::bad_public_key},
-        {[](proto::TunnelPeers& t) { t.peers[1].public_key = t.peers[0].public_key; },
+        {[](proto::TunnelPeers& t) { t.peers[1].key = {}; }, DecodeError::bad_public_key},
+        {[](proto::TunnelPeers& t) { t.peers[1].mode = static_cast<proto::TunnelMode>(3); },
+         DecodeError::unknown_value},
+        {[](proto::TunnelPeers& t) { t.peers[1].mode = static_cast<proto::TunnelMode>(0); },
+         DecodeError::unknown_value},
+        // WireGuard peers have no SPI; PSP peers need one.
+        {[](proto::TunnelPeers& t) { t.peers[1].spi = 1; }, DecodeError::bad_id},
+        {[](proto::TunnelPeers& t) { t.peers[1].mode = proto::TunnelMode::psp; },
+         DecodeError::bad_id},
+        {[](proto::TunnelPeers& t) { t.peers[1].key = t.peers[0].key; },
          DecodeError::duplicate_public_key},
     };
     for (const auto& c : cases) {
@@ -168,9 +180,36 @@ BOOST_AUTO_TEST_CASE(rules_are_enforced_both_ways) {
     std::ranges::fill(std::span{b}.subspan(0x10, 16), std::byte{0});
     BOOST_TEST((decode_error(b) == DecodeError::bad_vtep));
     b = good;
-    const std::size_t p1_key = proto::tunnel_peers_header_size + proto::tunnel_peer_size + 16;
+    const std::size_t p1_key = proto::tunnel_peers_header_size + proto::tunnel_peer_size + 24;
     std::ranges::fill(std::span{b}.subspan(p1_key, 32), std::byte{0x22});  // = peer 0's key
     BOOST_TEST((decode_error(b) == DecodeError::duplicate_public_key));
+}
+
+// Room for a later move to PSP, picked per pair: a PSP peer carries the
+// receiver's SPI and derived key, and its key is not a WireGuard identity,
+// so it may equal a WireGuard peer's.
+BOOST_AUTO_TEST_CASE(psp_peers_round_trip) {
+    auto t = sample();
+    t.peers[1].mode = proto::TunnelMode::psp;
+    t.peers[1].spi = 0x1234'5678;
+    t.peers[1].key = t.peers[0].key;
+    const auto b = encoded(t);
+    const std::size_t p1 = proto::tunnel_peers_header_size + proto::tunnel_peer_size;
+    BOOST_TEST(proto::tunnel_peer_size == 56U);
+    BOOST_TEST((b[p1 + 16] == std::byte{2}));
+    BOOST_TEST(le_at(b, p1 + 20, 4) == 0x1234'5678U);
+    BOOST_TEST((b[p1 + 24] == std::byte{0x22}));
+    BOOST_TEST((proto::decode_tunnel_peers(b).value() == t));
+    BOOST_TEST((encoded(sample())[proto::tunnel_peers_header_size + 16] == std::byte{1}));
+    BOOST_TEST(proto::tunnel_mode_bit(proto::TunnelMode::wireguard) == 0x01U);
+    BOOST_TEST(proto::tunnel_mode_bit(proto::TunnelMode::psp) == 0x02U);
+
+    // The three reserved bytes after the mode must be zero.
+    for (std::size_t off = 17; off < 20; ++off) {
+        auto bad = b;
+        bad[p1 + off] = std::byte{1};
+        BOOST_TEST((decode_error(bad) == DecodeError::reserved_not_zero), "offset " << off);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(header_rules) {
@@ -216,17 +255,19 @@ BOOST_AUTO_TEST_CASE(largest_set_round_trips) {
     t.vtep = vtep(0xFE);
     t.peers.clear();
     for (std::size_t i = 0; i < proto::max_tunnel_peers; ++i) {
-        proto::TunnelPeer p{.vtep = vtep(1), .public_key = key(1)};
+        proto::TunnelPeer p{
+            .vtep = vtep(1), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = key(1)};
         p.vtep[13] = std::byte{static_cast<std::uint8_t>(i >> 8U)};
         p.vtep[14] = std::byte{static_cast<std::uint8_t>(i & 0xFFU)};
-        p.public_key[0] = p.vtep[13];
-        p.public_key[1] = p.vtep[14];
+        p.key[0] = p.vtep[13];
+        p.key[1] = p.vtep[14];
         t.peers.push_back(p);
     }
     const auto b = encoded(t);
     BOOST_TEST(b.size() == proto::max_tunnel_peers_size);
     BOOST_TEST((proto::decode_tunnel_peers(b).value() == t));
-    t.peers.push_back({.vtep = vtep(0xFF), .public_key = key(0xEE)});
+    t.peers.push_back(
+        {.vtep = vtep(0xFF), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = key(0xEE)});
     BOOST_TEST((proto::encode_tunnel_peers(t).error() == DecodeError::too_many_entries));
 }
 

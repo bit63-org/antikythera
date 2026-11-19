@@ -129,9 +129,14 @@ struct Fixture {
 BOOST_AUTO_TEST_SUITE(tunnel_peer_set, *boost::unit_test::timeout(unit_timeout_seconds))
 
 BOOST_FIXTURE_TEST_CASE(installs_and_replaces_the_peer_set, Fixture) {
-    Frame f{.version = 1,
-            .peers = {{.vtep = vtep(2), .public_key = public_of(2)},
-                      {.vtep = vtep(3), .public_key = public_of(3)}}};
+    Frame f{
+        .version = 1,
+        .peers = {
+            {.vtep = vtep(2), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = public_of(2)},
+            {.vtep = vtep(3),
+             .mode = proto::TunnelMode::wireguard,
+             .spi = 0,
+             .key = public_of(3)}}};
     const auto b1 = f.bytes();
     BOOST_TEST((set.apply(b1) == PeersResult::applied));
     BOOST_TEST(signed_size == b1.size() - proto::ed25519_signature_size);
@@ -146,8 +151,9 @@ BOOST_FIXTURE_TEST_CASE(installs_and_replaces_the_peer_set, Fixture) {
 
     // Version 2: vtep(2) leaves, vtep(3) is re-keyed, vtep(4) joins.
     f.version = 2;
-    f.peers = {{.vtep = vtep(3), .public_key = public_of(33)},
-               {.vtep = vtep(4), .public_key = public_of(4)}};
+    f.peers = {
+        {.vtep = vtep(3), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = public_of(33)},
+        {.vtep = vtep(4), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = public_of(4)}};
     BOOST_TEST((set.apply(f.bytes()) == PeersResult::applied));
     BOOST_TEST((peer_vteps() == std::vector{vtep(3), vtep(4)}));
     BOOST_TEST((key_of(vtep(3)) == public_of(33)));
@@ -172,21 +178,31 @@ BOOST_FIXTURE_TEST_CASE(installs_and_replaces_the_peer_set, Fixture) {
 }
 
 BOOST_FIXTURE_TEST_CASE(a_key_can_move_between_vteps, Fixture) {
-    Frame f{.version = 1,
-            .peers = {{.vtep = vtep(2), .public_key = public_of(2)},
-                      {.vtep = vtep(3), .public_key = public_of(3)}}};
+    Frame f{
+        .version = 1,
+        .peers = {
+            {.vtep = vtep(2), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = public_of(2)},
+            {.vtep = vtep(3),
+             .mode = proto::TunnelMode::wireguard,
+             .spi = 0,
+             .key = public_of(3)}}};
     BOOST_TEST((set.apply(f.bytes()) == PeersResult::applied));
     // The two VTEPs swap keys: the Tunnel never sees one key on two peers.
     f.version = 2;
-    f.peers = {{.vtep = vtep(2), .public_key = public_of(3)},
-               {.vtep = vtep(3), .public_key = public_of(2)}};
+    f.peers = {
+        {.vtep = vtep(2), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = public_of(3)},
+        {.vtep = vtep(3), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = public_of(2)}};
     BOOST_TEST((set.apply(f.bytes()) == PeersResult::applied));
     BOOST_TEST((key_of(vtep(2)) == public_of(3)));
     BOOST_TEST((key_of(vtep(3)) == public_of(2)));
 }
 
 BOOST_FIXTURE_TEST_CASE(refusals_change_nothing, Fixture) {
-    const Frame good{.version = 5, .peers = {{.vtep = vtep(2), .public_key = public_of(2)}}};
+    const Frame good{.version = 5,
+                     .peers = {{.vtep = vtep(2),
+                                .mode = proto::TunnelMode::wireguard,
+                                .spi = 0,
+                                .key = public_of(2)}}};
     auto f = good;
     f.to_server = server + 1;
     BOOST_TEST((set.apply(f.bytes()) == PeersResult::wrong_target));
@@ -221,19 +237,40 @@ BOOST_FIXTURE_TEST_CASE(a_key_the_tunnel_refuses_is_rejected, Fixture) {
     // The role's own public key as a peer: the frame is well formed and
     // signed, but the Tunnel cannot use it.
     const auto own = tunnel->public_key().value();
-    const Frame f{.version = 1,
-                  .peers = {{.vtep = vtep(2), .public_key = public_of(2)},
-                            {.vtep = vtep(3), .public_key = own}}};
+    const Frame f{
+        .version = 1,
+        .peers = {
+            {.vtep = vtep(2), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = public_of(2)},
+            {.vtep = vtep(3), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = own}}};
     BOOST_TEST((set.apply(f.bytes()) == PeersResult::rejected));
     BOOST_TEST(set.version() == 0U);  // can be sent again once fixed
     BOOST_TEST(set.counters().rejected == 1U);
+}
+
+BOOST_FIXTURE_TEST_CASE(psp_peers_are_unsupported, Fixture) {
+    // The role advertises only WireGuard, so a PSP pair is a controller
+    // error: the whole frame is refused before anything changes.
+    const Frame f{
+        .version = 1,
+        .peers = {
+            {.vtep = vtep(2), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = public_of(2)},
+            {.vtep = vtep(3), .mode = proto::TunnelMode::psp, .spi = 9, .key = public_of(3)}}};
+    BOOST_TEST((set.apply(f.bytes()) == PeersResult::unsupported));
+    BOOST_TEST(!net::accepted(PeersResult::unsupported));
+    BOOST_TEST(tunnel->peers().empty());
+    BOOST_TEST(set.version() == 0U);
+    BOOST_TEST(set.counters().unsupported == 1U);
 }
 
 BOOST_FIXTURE_TEST_CASE(peers_added_by_hand_are_left_alone, Fixture) {
     wg::Key psk{};
     psk.fill(std::byte{0x33});
     BOOST_REQUIRE(tunnel->set_peer(vtep(8), public_of(8), psk).has_value());
-    const Frame f{.version = 1, .peers = {{.vtep = vtep(2), .public_key = public_of(2)}}};
+    const Frame f{.version = 1,
+                  .peers = {{.vtep = vtep(2),
+                             .mode = proto::TunnelMode::wireguard,
+                             .spi = 0,
+                             .key = public_of(2)}}};
     BOOST_TEST((set.apply(f.bytes()) == PeersResult::applied));
     auto empty = f;
     empty.version = 2;
@@ -253,7 +290,7 @@ BOOST_AUTO_TEST_CASE(no_verifier_trusts_nothing) {
 BOOST_AUTO_TEST_CASE(results_have_names) {
     for (auto r : {PeersResult::applied, PeersResult::redelivered, PeersResult::undecodable,
                    PeersResult::wrong_target, PeersResult::bad_signature, PeersResult::stale,
-                   PeersResult::rejected}) {
+                   PeersResult::rejected, PeersResult::unsupported}) {
         BOOST_TEST(std::string_view{net::to_string(r)} != "unknown");
     }
 }

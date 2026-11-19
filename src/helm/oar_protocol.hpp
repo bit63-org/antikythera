@@ -175,8 +175,8 @@ inline constexpr std::size_t max_map_chunk = max_body_size - map_chunk_head_size
 inline constexpr std::size_t max_map_frame =
     0x28 + (4096 * 0x20) + (8192 * 0x10) + (8192 * 0x18) + 64;
 // Largest TunnelPeers frame (proto::max_tunnel_peers_size: 48-byte header,
-// 2048 peers of 48 bytes, 64-byte signature), pinned the same way.
-inline constexpr std::size_t max_tunnel_peers_frame = 0x30 + (2048 * 0x30) + 64;
+// 2048 peers of 56 bytes, 64-byte signature), pinned the same way.
+inline constexpr std::size_t max_tunnel_peers_frame = 0x30 + (2048 * 0x38) + 64;
 static_assert(max_tunnel_peers_frame <= max_map_frame);
 
 inline constexpr std::size_t response_head_size = 2;

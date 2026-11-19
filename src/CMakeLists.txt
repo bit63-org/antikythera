@@ -18,6 +18,7 @@ target_link_libraries(ak_proto INTERFACE ak::common)
 # table, the VSwitch and the virtio-net function (network data plane).
 add_library(ak_oar_net
   oar/net/dhcp4.cpp
+  oar/net/dhcp6.cpp
   oar/net/geneve.cpp
   oar/net/mapping_table.cpp
   oar/net/mtu.cpp

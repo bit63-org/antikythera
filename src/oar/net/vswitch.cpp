@@ -10,6 +10,7 @@
 #include <string_view>
 
 #include "oar/net/dhcp4.hpp"
+#include "oar/net/dhcp6.hpp"
 
 namespace ak::oar::net {
 
@@ -237,6 +238,26 @@ auto dhcp4_client_message(const packet::ParsedPacket& p, const VpcConfig* cfg) n
     }
     return packet::is_unspecified(p.src4) || p.dst4 == ipv4_broadcast ||
            (cfg != nullptr && p.dst4 == cfg->ipv4_gateway);
+}
+
+constexpr Ipv6Address all_nodes{std::byte{0xff}, std::byte{0x02}, std::byte{0}, std::byte{0},
+                                std::byte{0},    std::byte{0},    std::byte{0}, std::byte{0},
+                                std::byte{0},    std::byte{0},    std::byte{0}, std::byte{0},
+                                std::byte{0},    std::byte{0},    std::byte{0}, std::byte{1}};
+
+// A DHCPv6 client message for this VNI's server (Requirement 12.5): UDP
+// 546 -> 547, unfragmented, to All_DHCP_Relay_Agents_and_Servers or the
+// gateway's link-local address.
+auto dhcp6_client_message(const packet::ParsedPacket& p, const VpcConfig* cfg) -> bool {
+    if (!is_ipv6(p) || p.fragment || !udp_ports(p, dhcp6::client_port, dhcp6::server_port)) {
+        return false;
+    }
+    return p.dst6 == dhcp6::all_servers ||
+           (cfg != nullptr && p.dst6 == gateway_link_local(cfg->gateway_mac));
+}
+
+auto metadata_destination(const packet::ParsedPacket& p) noexcept -> bool {
+    return is_ipv6(p) ? p.dst6 == metadata_ipv6 : p.dst4 == metadata_ipv4;
 }
 
 auto valid_nic(geneve::NicId id) noexcept -> bool {
@@ -500,6 +521,208 @@ auto VSwitch::handle_dhcp4(geneve::NicId src, const NicBinding& binding,
     return true;
 }
 
+auto VSwitch::send_ra(geneve::NicId nic, const NicBinding& binding, const VpcConfig& cfg,
+                      const Ipv6Address& dst) -> void {
+    const auto mtu_it = _mtus.find(nic);
+    const auto body = dhcp6::build_router_advertisement_body({
+        .gateway_mac = cfg.gateway_mac,
+        .prefix = cfg.ipv6_prefix.value_or(Ipv6Address{}),
+        .mtu = mtu_it == _mtus.end() ? std::uint16_t{0} : mtu_it->second,
+        .dns = cfg.dns6,
+        .router_lifetime = ra_router_lifetime_seconds,
+        .dns_lifetime = static_cast<std::uint32_t>(3 * ra_interval.count()),
+    });
+    const auto frame =
+        packet::build_icmpv6(binding.mac, cfg.gateway_mac, gateway_link_local(cfg.gateway_mac), dst,
+                             dhcp6::icmpv6_router_advertisement, 0, body, neighbor::nd_hop_limit);
+    if (deliver(nic, frame)) {
+        ++_counters.ra_sent;
+    }
+}
+
+auto VSwitch::handle_rs(geneve::NicId src, const NicBinding& binding, const packet::ParsedPacket& p)
+    -> void {
+    const VpcConfig* const cfg = vpc_config(binding.vni);
+    if (cfg == nullptr || !cfg->ipv6_prefix || p.hop_limit != neighbor::nd_hop_limit) {
+        ++_counters.rs_dropped;
+        return;
+    }
+    // RFC 4861 6.2.6: to the solicitor's address, or all-nodes from ::.
+    send_ra(src, binding, *cfg, packet::is_unspecified(p.src6) ? all_nodes : p.src6);
+}
+
+auto VSwitch::poll() -> void {
+    const Clock::time_point now = _now();
+    const auto snap = _mappings->snapshot();
+    for (const auto& [nic, port] : _ports) {
+        const auto binding = snap->lookup(nic);
+        if (!binding || !snap->is_local(nic)) {
+            continue;
+        }
+        const VpcConfig* const cfg = vpc_config(binding->vni);
+        if (cfg == nullptr || !cfg->ipv6_prefix) {
+            continue;
+        }
+        const auto last = _last_ra.find(nic);
+        if (last != _last_ra.end() && now - last->second < ra_interval) {
+            continue;
+        }
+        send_ra(nic, *binding, *cfg, all_nodes);
+        _last_ra.insert_or_assign(nic, now);
+    }
+}
+
+auto VSwitch::handle_dhcp6(geneve::NicId src, const NicBinding& binding,
+                           const packet::ParsedPacket& p) -> void {
+    using dhcp6::MessageType;
+    const VpcConfig* const cfg = vpc_config(binding.vni);
+    if (cfg == nullptr || !cfg->ipv6_prefix) {
+        ++_counters.dhcp6_no_config;
+        return;
+    }
+    const auto msg = dhcp6::parse(p.payload);
+    if (!msg || packet::is_unspecified(p.src6) ||
+        (msg->client_id.empty() && msg->type != MessageType::information_request)) {
+        ++_counters.dhcp6_bad;
+        return;
+    }
+    const auto ours = dhcp6::server_duid(cfg->gateway_mac);
+    // RFC 8415 16: which messages must, may or must not name a server.
+    bool wrong_server = false;
+    switch (msg->type) {
+        case MessageType::solicit:
+        case MessageType::confirm:
+        case MessageType::rebind:
+            wrong_server = msg->server_id.has_value();
+            break;
+        case MessageType::request:
+        case MessageType::renew:
+        case MessageType::release:
+        case MessageType::decline:
+            wrong_server = msg->server_id != ours;
+            break;
+        default:  // information-request
+            wrong_server = msg->server_id && *msg->server_id != ours;
+            break;
+    }
+    if (wrong_server) {
+        ++_counters.dhcp6_ignored;
+        return;
+    }
+
+    const Ipv6Address& prefix = *cfg->ipv6_prefix;
+    const auto in_prefix6 = [&prefix](const Ipv6Address& a) {
+        return std::equal(prefix.begin(), prefix.begin() + ipv6_interface_id_offset, a.begin());
+    };
+    dhcp6::Reply reply{.type = MessageType::reply,
+                       .server_id = ours,
+                       .iaid = std::nullopt,
+                       .addresses = {},
+                       .lifetime = cfg->lease_seconds,
+                       .status = std::nullopt,
+                       .rapid_commit = false,
+                       .dns = cfg->dns6,
+                       .domain = cfg->domain};
+    switch (msg->type) {
+        case MessageType::solicit:
+        case MessageType::request:
+        case MessageType::renew:
+        case MessageType::rebind:
+            if (msg->type == MessageType::solicit) {
+                reply.rapid_commit = msg->rapid_commit;
+                reply.type = msg->rapid_commit ? MessageType::reply : MessageType::advertise;
+            }
+            if (msg->ia_na) {
+                reply.iaid = msg->ia_na->iaid;
+                if (const VpcNeighbors* const table = neighbors(binding.vni); table != nullptr) {
+                    for (const auto& [ip, owner] : table->ipv6) {
+                        if (owner == src && in_prefix6(ip)) {
+                            reply.addresses.push_back(ip);
+                        }
+                    }
+                }
+            }
+            break;
+        case MessageType::confirm:
+            if (!msg->ia_na || msg->ia_na->addresses.empty()) {
+                ++_counters.dhcp6_ignored;  // RFC 8415 18.3.3: nothing to confirm
+                return;
+            }
+            reply.status = std::ranges::all_of(msg->ia_na->addresses, in_prefix6)
+                               ? dhcp6::StatusCode::success
+                               : dhcp6::StatusCode::not_on_link;
+            break;
+        case MessageType::release:
+        case MessageType::decline:
+            reply.status = dhcp6::StatusCode::success;
+            break;
+        default:  // information-request: configuration only
+            break;
+    }
+    const auto payload = dhcp6::build_reply(*msg, reply);
+    const auto frame =
+        packet::build_ipv6_udp(binding.mac, cfg->gateway_mac, gateway_link_local(cfg->gateway_mac),
+                               p.src6, dhcp6::server_port, dhcp6::client_port, payload);
+    if (deliver(src, frame)) {
+        ++_counters.dhcp6_replies;
+    }
+}
+
+auto VSwitch::take_metadata_token(Bucket& bucket) -> bool {
+    const Clock::time_point now = _now();
+    const std::uint64_t cap = std::uint64_t{metadata_burst} * nano;
+    if (!bucket.primed) {
+        bucket = {.frames = cap, .bytes = 0, .last = now, .primed = true};
+    } else {
+        const auto elapsed = now > bucket.last ? now - bucket.last : Clock::duration::zero();
+        const auto ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+        bucket.frames = refill(bucket.frames, metadata_rate_pps, metadata_burst, ns);
+        bucket.last = std::max(bucket.last, now);
+    }
+    if (bucket.frames < nano) {
+        return false;
+    }
+    bucket.frames -= nano;
+    return true;
+}
+
+auto VSwitch::handle_metadata(geneve::NicId src, const packet::ParsedPacket& p) -> void {
+    if (_metadata == nullptr) {
+        ++_counters.metadata_no_endpoint;
+        return;
+    }
+    if (!take_metadata_token(_metadata_buckets[src])) {
+        ++_counters.metadata_drop_rate;
+        return;
+    }
+    _metadata->deliver(src, p.ip);
+    ++_counters.metadata_tx;
+}
+
+auto VSwitch::inject_metadata(geneve::NicId nic, std::span<const std::byte> ip_packet) -> bool {
+    const auto snap = _mappings->snapshot();
+    const auto binding = snap->lookup(nic);
+    const VpcConfig* const cfg = binding ? vpc_config(binding->vni) : nullptr;
+    if (!binding || !snap->is_local(nic) || !attached(nic) || cfg == nullptr) {
+        ++_counters.metadata_inject_refused;
+        return false;
+    }
+    const auto frame = packet::build_ethernet(binding->mac, cfg->gateway_mac, ip_packet);
+    const auto p = packet::parse(frame);
+    const bool from_metadata =
+        p && (is_ipv6(*p) ? p->src6 == metadata_ipv6 : p->src4 == metadata_ipv4);
+    if (!from_metadata || owner(binding->vni, *p, false) != nic) {
+        ++_counters.metadata_inject_refused;
+        return false;
+    }
+    if (!deliver(nic, frame)) {
+        return false;
+    }
+    ++_counters.metadata_rx;
+    return true;
+}
+
 auto VSwitch::NicIdHash::operator()(geneve::NicId id) const noexcept -> std::size_t {
     return std::hash<std::uint64_t>{}(id.value);
 }
@@ -525,6 +748,8 @@ auto VSwitch::detach(geneve::NicId nic) -> bool {
         return false;
     }
     _mtus.erase(nic);
+    _last_ra.erase(nic);
+    _metadata_buckets.erase(nic);
     const auto it = _group.find(nic);
     if (it != _group.end()) {
         _retired.push_back({.nic = nic,
@@ -729,6 +954,10 @@ auto VSwitch::transmit(const TxFrame& tx) -> void {
             ++_counters.tx_drop_neighbor_spoofed;
             return;
         }
+        if (*icmp == dhcp6::icmpv6_router_solicitation) {
+            handle_rs(tx.source, *binding, *pkt);
+            return;
+        }
         if (*icmp == neighbor::icmpv6_neighbor_solicitation &&
             (handle_gateway_nd(tx.source, *binding, tx.frame, dst_mac) ||
              (group && handle_nd(*snap, tx.source, *binding, tx.frame)))) {
@@ -739,13 +968,21 @@ auto VSwitch::transmit(const TxFrame& tx) -> void {
         handle_dhcp4(tx.source, *binding, *pkt)) {
         return;
     }
+    if (dhcp6_client_message(*pkt, vpc_config(binding->vni))) {
+        handle_dhcp6(tx.source, *binding, *pkt);
+        return;
+    }
     if (local_only) {
         ++_counters.tx_drop_local_only;
         return;
     }
     if (const VpcConfig* const cfg = vpc_config(binding->vni);
         cfg != nullptr && dst_mac == cfg->gateway_mac) {
-        ++_counters.tx_drop_no_route;
+        if (metadata_destination(*pkt)) {
+            handle_metadata(tx.source, *pkt);
+        } else {
+            ++_counters.tx_drop_no_route;
+        }
         return;
     }
     forward(*snap, tx.source, *binding, tx.frame, &*pkt);

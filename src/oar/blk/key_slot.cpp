@@ -9,11 +9,28 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <openssl/crypto.h>
 
 namespace ak::oar::blk {
+
+namespace {
+
+// mlock and munlock through the raw system call, not libc. The sanitizer
+// runtimes intercept mlock and turn it into a silent no-op that reports
+// success, so an ASan build would hold the key in pageable memory. The
+// syscall cannot be interposed, by a sanitizer or by LD_PRELOAD.
+auto lock_page(void* addr, std::size_t len) noexcept -> bool {
+    return ::syscall(SYS_mlock, addr, len) == 0;
+}
+
+auto unlock_page(void* addr, std::size_t len) noexcept -> void {
+    static_cast<void>(::syscall(SYS_munlock, addr, len));
+}
+
+}  // namespace
 
 auto to_string(KeySlotError e) noexcept -> const char* {
     switch (e) {
@@ -57,7 +74,7 @@ auto KeySlot::create() -> std::expected<KeySlot, KeySlotError> {
         ::madvise(addr, page_size, MADV_WIPEONFORK) != 0) {
         return std::unexpected{KeySlotError::advise_failed};
     }
-    if (::mlock(addr, page_size) != 0) {
+    if (!lock_page(addr, page_size)) {
         return std::unexpected{KeySlotError::lock_failed};
     }
     return slot;
@@ -91,7 +108,7 @@ auto KeySlot::release() noexcept -> void {
     OPENSSL_cleanse(_page, _page_size);
     _holds_key = false;
     // munlock fails harmlessly if create() bailed out before mlock.
-    static_cast<void>(::munlock(_page, _page_size));
+    unlock_page(_page, _page_size);
     static_cast<void>(::munmap(_page, _page_size));
     _page = nullptr;
     _page_size = 0;

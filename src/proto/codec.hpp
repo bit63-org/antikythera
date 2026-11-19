@@ -11,7 +11,7 @@
 // antikythera library. It encodes and decodes frames and says which bytes
 // are signed; it never signs or verifies. Signing is the controller's job
 // (kythira's HSM/KMS) and verification is the receiver's (hull for slots,
-// helm/oar-net for mapping updates), each with its own Ed25519
+// oar-net for mapping updates and tunnel peer sets), each with its own Ed25519
 // implementation.
 //
 // All multi-byte fields are little-endian, matching the mailbox slot.
@@ -71,6 +71,9 @@ enum class DecodeError : std::uint8_t {
     bad_attachment_mode,      // more than one read-write attachment without multi_attach
     bad_qos,                  // a QoS limit of 0, or a burst below its baseline
     bad_source,               // a volume source whose fields do not fit its kind
+    bad_peers_version,        // tunnel peer set version 0 (versions start at 1)
+    bad_public_key,           // a tunnel public key is all zero
+    duplicate_public_key,     // two tunnel peers share a public key
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -155,6 +158,12 @@ enum class DecodeError : std::uint8_t {
             return "QoS limit 0 or burst below baseline";
         case DecodeError::bad_source:
             return "volume source fields do not fit its kind";
+        case DecodeError::bad_peers_version:
+            return "tunnel peer set version 0";
+        case DecodeError::bad_public_key:
+            return "tunnel public key all zero";
+        case DecodeError::duplicate_public_key:
+            return "two tunnel peers share a public key";
     }
     return "unknown";
 }

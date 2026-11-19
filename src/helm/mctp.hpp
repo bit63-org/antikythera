@@ -251,6 +251,7 @@ enum class VendorType : std::uint8_t {
     remove_tunnel_peer = 0x0D,
     group_policy = 0x0E,
     group_usage = 0x0F,
+    tunnel_peers = 0x10,
 };
 
 struct VendorHeader {

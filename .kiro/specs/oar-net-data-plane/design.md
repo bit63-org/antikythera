@@ -81,9 +81,21 @@ Vtep and the VSwitch's ingress policy check. A transport message carries
 the Geneve UDP payload itself, unpadded; the handshake is WireGuard's and
 interoperates with Linux (`tests/wireguard_interop.sh`). Overhead on top
 of Geneve: 32 bytes (`wg::transport_overhead`). Keys arrive over the
-sideband: `set_tunnel_key` (the role's static private key) and
-`set_tunnel_peer` / `remove_tunnel_peer` (per peer VTEP: public key and
-pre-shared key).
+sideband: `set_tunnel_key` (the role's static private key, which helm
+generates per VTEP) and `set_tunnel_peer` / `remove_tunnel_peer` (per peer
+VTEP: public key and pre-shared key).
+
+Peers normally come from the controller instead: `tunnel_peers` carries a
+signed TunnelPeers frame (controller-interface design "TunnelPeers"), the
+full list of this VTEP's peers and their public keys, which helm forwards
+unmodified. `TunnelPeerSet` (`src/oar/net/tunnel_peers.*`) checks that it
+names this server and VTEP, verifies its Ed25519 signature with the
+controller keys, ignores a re-delivered version and refuses an older one,
+then makes its peers the Tunnel's controller-managed peers: peers that left
+or were re-keyed are removed first (so a key moving between VTEPs is never
+held twice), then every listed peer is set, and unchanged peers keep their
+sessions. Peers added by hand with `set_tunnel_peer` are left alone unless
+the frame names their VTEP.
 
 ### Group policy and metering
 

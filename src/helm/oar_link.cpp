@@ -215,6 +215,18 @@ auto OarLink::map_update(std::span<const std::byte> frame) -> std::expected<void
     if (frame.empty() || frame.size() > oar::max_map_frame) {
         return std::unexpected(bad_request());
     }
+    return send_chunked(mctp::VendorType::map_update, frame);
+}
+
+auto OarLink::tunnel_peers(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
+    if (frame.empty() || frame.size() > oar::max_tunnel_peers_frame) {
+        return std::unexpected(bad_request());
+    }
+    return send_chunked(mctp::VendorType::tunnel_peers, frame);
+}
+
+auto OarLink::send_chunked(mctp::VendorType type, std::span<const std::byte> frame)
+    -> std::expected<void, LinkError> {
     const auto total = static_cast<std::uint32_t>(frame.size());
     for (std::size_t offset = 0; offset < frame.size();) {
         const auto len = std::min(oar::max_map_chunk, frame.size() - offset);
@@ -224,7 +236,7 @@ auto OarLink::map_update(std::span<const std::byte> frame) -> std::expected<void
         if (!body) {
             return std::unexpected(bad_request());
         }
-        auto response = transact(mctp::VendorType::map_update, *body);
+        auto response = transact(type, *body);
         if (!response) {
             return std::unexpected(response.error());
         }
@@ -509,7 +521,8 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
             return status_only(req ? handler.remove_tunnel_peer(*req) : oar::Status::bad_request);
         }
         case mctp::VendorType::map_update:
-            return status_only(map_chunk(handler, body));
+        case mctp::VendorType::tunnel_peers:
+            return status_only(frame_chunk(handler, type, body));
         case mctp::VendorType::group_policy: {
             auto frame = oar::decode_group_policy_frame(body);
             return status_only(frame ? handler.group_policy(*frame) : oar::Status::bad_request);
@@ -540,34 +553,42 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
     return status_only(oar::Status::unsupported);
 }
 
-auto OarEndpoint::map_chunk(OarHandler& handler, std::span<const std::byte> body) -> oar::Status {
+auto OarEndpoint::frame_chunk(OarHandler& handler, mctp::VendorType type,
+                              std::span<const std::byte> body) -> oar::Status {
     auto chunk = oar::decode_map_chunk(body);
     if (!chunk) {
-        reset_map();
+        reset_frame();
         return oar::Status::bad_request;
     }
+    const std::size_t limit =
+        type == mctp::VendorType::map_update ? oar::max_map_frame : oar::max_tunnel_peers_frame;
     if (chunk->offset == 0) {
         // A new transfer; whatever was in progress is abandoned.
-        reset_map();
-        _map_total = chunk->total;
-        _map_frame.reserve(chunk->total);
-    } else if (_map_total == 0 || chunk->total != _map_total ||
-               chunk->offset != _map_frame.size()) {
-        reset_map();
+        reset_frame();
+        if (chunk->total > limit) {
+            return oar::Status::bad_request;
+        }
+        _frame_type = type;
+        _frame_total = chunk->total;
+        _frame.reserve(chunk->total);
+    } else if (_frame_total == 0 || type != _frame_type || chunk->total != _frame_total ||
+               chunk->offset != _frame.size()) {
+        reset_frame();
         return oar::Status::bad_request;
     }
-    _map_frame.insert(_map_frame.end(), chunk->chunk.begin(), chunk->chunk.end());
-    if (_map_frame.size() < _map_total) {
+    _frame.insert(_frame.end(), chunk->chunk.begin(), chunk->chunk.end());
+    if (_frame.size() < _frame_total) {
         return oar::Status::ok;
     }
-    const auto status = handler.map_update(_map_frame);
-    reset_map();
+    const auto status = type == mctp::VendorType::map_update ? handler.map_update(_frame)
+                                                             : handler.tunnel_peers(_frame);
+    reset_frame();
     return status;
 }
 
-auto OarEndpoint::reset_map() noexcept -> void {
-    _map_total = 0;
-    _map_frame.clear();
+auto OarEndpoint::reset_frame() noexcept -> void {
+    _frame_total = 0;
+    _frame.clear();
 }
 
 }  // namespace ak::helm

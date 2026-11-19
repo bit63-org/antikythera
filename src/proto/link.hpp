@@ -21,6 +21,7 @@
 //   report        helm -> controller   a Report (report.hpp)
 //   report_ack    controller -> helm   server_id u64 | report_seq u64: every
 //                                      report up to report_seq is processed
+//   tunnel_peers  controller -> helm   a TunnelPeers frame (tunnel_peers.hpp)
 //
 // Report sequence numbers restart when helm reboots, so they are only
 // meaningful together with the boot ID: hello names it before any report,
@@ -48,6 +49,7 @@
 #include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
 #include "proto/report.hpp"
+#include "proto/tunnel_peers.hpp"
 
 namespace ak::proto {
 
@@ -56,7 +58,7 @@ inline constexpr std::size_t report_ack_size = 16;
 inline constexpr std::size_t hello_size = 16;
 inline constexpr std::size_t max_record_payload =
     std::max({envelope_size, max_map_update_size, max_report_size, report_ack_size, hello_size,
-              group_policy_size});
+              group_policy_size, max_tunnel_peers_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class RecordType : std::uint16_t {
@@ -66,6 +68,7 @@ enum class RecordType : std::uint16_t {
     report_ack = 4,
     hello = 5,
     group_policy = 6,
+    tunnel_peers = 7,
 };
 
 struct Record {
@@ -89,7 +92,7 @@ struct ReportAck {
 namespace detail {
 
 [[nodiscard]] constexpr auto known(RecordType t) noexcept -> bool {
-    return t >= RecordType::envelope && t <= RecordType::group_policy;
+    return t >= RecordType::envelope && t <= RecordType::tunnel_peers;
 }
 
 }  // namespace detail

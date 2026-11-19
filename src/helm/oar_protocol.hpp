@@ -38,6 +38,7 @@
 //   set_tunnel_key      0  private_key [32]
 //   set_tunnel_peer     0  vtep [16] | 16 public_key [32] | 48 psk [32]
 //   remove_tunnel_peer  0  vtep [16]
+//   tunnel_peers        0  total u32 | 4  offset u32 | 8  chunk (as map_update)
 //
 // The tunnel requests deliver the network role's WireGuard keys (oar-net
 // Requirement 5.2): its own static X25519 private key, and for each peer
@@ -77,6 +78,13 @@
 // later cursors page through it. A snapshot's final readings of detached
 // NICs are carried into the next snapshot until a read reaches its last
 // page, so an interrupted read loses nothing (UsagePager).
+//
+// tunnel_peers forwards one controller TunnelPeers frame
+// (src/proto/tunnel_peers.hpp: the signed public keys of one VTEP's
+// WireGuard peers) the same way, in the same chunk format, up to
+// max_tunnel_peers_frame. The role verifies it and replaces its
+// controller-managed peers with the frame's (oar-net Requirement 5.2). A
+// transfer of one type is abandoned by a chunk of the other.
 //
 // Responses (oar -> helm) start with a 2-byte head:
 //
@@ -166,6 +174,10 @@ inline constexpr std::size_t max_map_chunk = max_body_size - map_chunk_head_size
 // depend on ak::proto; tests/oar_protocol_test.cpp pins the two.
 inline constexpr std::size_t max_map_frame =
     0x28 + (4096 * 0x20) + (8192 * 0x10) + (8192 * 0x18) + 64;
+// Largest TunnelPeers frame (proto::max_tunnel_peers_size: 48-byte header,
+// 2048 peers of 48 bytes, 64-byte signature), pinned the same way.
+inline constexpr std::size_t max_tunnel_peers_frame = 0x30 + (2048 * 0x30) + 64;
+static_assert(max_tunnel_peers_frame <= max_map_frame);
 
 inline constexpr std::size_t response_head_size = 2;
 inline constexpr std::size_t inventory_head_size = 20;

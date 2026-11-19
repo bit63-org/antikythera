@@ -38,6 +38,37 @@ It exits non-zero on any failure. On failure the logs stay in
 `harbor/.run/phase1/`: the board processes' `slot*.log`, L1's
 `console.log`, and the exact `qemu.cmdline`.
 
+## Test controller
+
+`ak-test-controller` (built from `src/harbor/`) stands in for kythira's EC2
+module until it exists: it listens for one server's helm over mutually
+authenticated TLS, waits for it to register, then runs a script of signed
+commands, mapping updates and expectations, printing every report helm
+sends. Phases 3 to 5 drive the system with it.
+
+```bash
+openssl genpkey -algorithm ed25519 -out controller-ed25519.pem   # its public key goes in hull's key table
+ak-test-controller --listen 0.0.0.0:7443 \
+    --ca server-ca.pem --cert controller.pem --key controller-key.pem \
+    --signing-key controller-ed25519.pem --key-id 1 --server-id 7 \
+    --script phase3.txt
+```
+
+```text
+# phase3.txt
+create-network 0x55
+expect ok
+create-vm 0x1001 2 1024
+expect accepted
+map-update 0x55 1 0x10,02:00:00:00:00:10,fd00::1
+wait map_applied
+```
+
+Command sequence numbers start after the `last_command_seq` in helm's
+inventory, as the real controller's do. The full script language is in
+`src/harbor/test_controller.hpp`. Exit status 0 means every line passed,
+1 that one failed (its line number is printed), 2 a usage or setup error.
+
 ## Layout
 
 | Path | Purpose |

@@ -77,6 +77,19 @@ target_link_libraries(ak_hull
   PUBLIC ak::common ak::helm OpenSSL::Crypto
   PRIVATE ak::warnings ak::hardening)
 
+# harbor's test controller: signs commands and mapping updates and drives
+# one helm over the ControllerLink, standing in for kythira's EC2 module
+# until it exists (.kiro/specs/controller-interface/ task 5).
+add_library(ak_harbor_controller harbor/test_controller.cpp)
+add_library(ak::harbor_controller ALIAS ak_harbor_controller)
+target_link_libraries(ak_harbor_controller
+  PUBLIC ak::helm ak::proto ak::tls
+  PRIVATE OpenSSL::Crypto ak::warnings ak::hardening)
+add_executable(ak-test-controller harbor/ak_test_controller.cpp)
+target_link_libraries(ak-test-controller
+  PRIVATE ak::harbor_controller ak::warnings ak::hardening)
+install(TARGETS ak-test-controller RUNTIME DESTINATION bin)
+
 # oar-blk: AES-256-XTS volume encryption and the locked key slot (storage
 # data plane).
 add_library(ak_oar_blk

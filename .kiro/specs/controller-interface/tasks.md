@@ -1,6 +1,6 @@
 # Implementation Plan — Controller interface and the kythira EC2 integration
 
-## Status: 4/7 tasks complete
+## Status: 5/7 tasks complete
 
 ## Tasks
 
@@ -22,9 +22,12 @@
   pool-state, VM-exit, map-applied and host-fault events; link record
   framing and report acks in `src/proto/link.hpp`; tests and fuzz targets.
   See design "Inventory and status reports" and "Link framing".)
-- [ ] 5. A minimal test controller in harbor (C++ CLI that signs and sends
+- [x] 5. A minimal test controller in harbor (C++ CLI that signs and sends
   envelopes) to drive phases 3–5 before kythira's module exists.
-  _Requirements: 1, 5_
+  _Requirements: 1, 5_ (`ak-test-controller` from `src/harbor/`: an
+  Ed25519 signer that reproduces `src/proto/test_vectors.hpp`, a script
+  language for commands, mapping updates and expected outcomes, and the
+  mTLS server side of the ControllerLink. See `harbor/README.md`.)
 - [ ] 6. Draft the kythira `ec2-compatible-api` spec in the kythira
   repository, from Requirement 6. _Requirements: 6_
 - [ ] 7. End-to-end: AWS CLI `run-instances` against kythira, landing in a

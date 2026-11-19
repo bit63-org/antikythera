@@ -1,6 +1,6 @@
 # Implementation Plan — oar-blk: the storage data plane
 
-## Status: 6/16 tasks complete
+## Status: 7/16 tasks complete
 
 ## Tasks
 
@@ -59,8 +59,14 @@
   sideband socket (`VirtioBinding::retarget`, `set_reset_handler`).
 - [ ] 7. Boot from volume in harbor. _Requirements: 4_
 - [ ] 8. harbor encryption scenarios. _Requirements: 7.2_
-- [ ] 9. Image manifest codec, name and chunk digests, fuzz target.
+- [x] 9. Image manifest codec, name and chunk digests, fuzz target.
   _Requirements: 8.3, 8.11_
+  — `src/oar/blk/image_manifest.*` (library `ak_oar_blk_image`): encode
+  and decode with every field checked (count before allocation, exact
+  length, key ID set exactly when encrypted), `decode_named_manifest`
+  against the image name, `chunk_matches` for fetched chunks, hex image
+  names. `fuzz/fuzz_image_manifest.cpp` checks accepted manifests
+  re-encode byte for byte.
 - [ ] 10. ObjectStore seam, ChunkCache, Fetcher with readahead,
   Overlay and LazyImageBackend over an in-memory store.
   _Requirements: 8.1-8.7, 8.10, 7.3_

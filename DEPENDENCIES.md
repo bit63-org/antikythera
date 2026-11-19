@@ -30,11 +30,13 @@ build also works against system packages. See
 
 ### OpenSSL
 - **Status**: Required. `ak_hull` links `OpenSSL::Crypto` for command
-  signature verification; the helm key store and oar-blk follow. CI uses
+  signature verification and `ak_helm` for the key store (AES-256-GCM
+  key wrapping, `RAND_bytes`, `OPENSSL_cleanse`); oar-blk follows. CI uses
   Ubuntu 24.04's OpenSSL 3.0 (`libssl-dev`), so 3.0 is the configure
   floor.
-- **Purpose**: Ed25519 command signatures, AES-256-XTS for oar-blk,
-  `OPENSSL_cleanse` for key zeroization.
+- **Purpose**: Ed25519 command signatures, AES-256-GCM key wrapping in
+  the helm key store, AES-256-XTS for oar-blk, `OPENSSL_cleanse` for key
+  zeroization.
 - **Minimum version**: 3.6.5, taken from the `microsoft/vcpkg` git
   registry in `vcpkg-configuration.json` (the same pin kythira uses for
   its crash fixes), leaving every other port on the baseline.

@@ -1,6 +1,6 @@
 # Implementation Plan — helm: the control-plane role
 
-## Status: 5/12 tasks complete
+## Status: 6/12 tasks complete
 
 ## Tasks
 
@@ -20,8 +20,10 @@
   reassembly, tests, fuzz target (`src/helm/mctp.*`). _Requirements: 5.2, 10.1_
 - [ ] 6. OarLink with `SocketBinding` and `InProcessBinding`.
   _Requirements: 5, 7_
-- [ ] 7. KeyStore with software secure element; `ScopedKey` zeroization;
-  wrap/unwrap/rewrap/destroy. _Requirements: 4_
+- [x] 7. KeyStore with software secure element; `ScopedKey` zeroization;
+  wrap/unwrap/rewrap/destroy (`src/helm/key_store.*`,
+  `src/helm/secure_element.*`, `src/helm/scoped_key.*`), unit tests,
+  wrapped-key fuzz target. _Requirements: 4_
 - [ ] 8. MailboxDevice as a vfio-user server (harbor). _Requirements: 1_
 - [ ] 9. CommandRouter with compensation and timeouts. _Requirements: 3, 9_
 - [ ] 10. PowerSequencer (harbor: process orchestration and L1 launch).

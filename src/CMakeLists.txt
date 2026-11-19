@@ -22,19 +22,27 @@ target_link_libraries(ak_oar_net
   PUBLIC ak::common
   PRIVATE ak::warnings ak::hardening)
 
-# helm: control-plane mailbox protocol, device pool and MCTP sideband framing.
+# OpenSSL is required: AES-256-GCM key wrapping and OPENSSL_cleanse in the
+# helm key store, and Ed25519 in hull (the only implementation here). CI
+# builds against Ubuntu 24.04's OpenSSL 3.0, so 3.0 is the configure floor.
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+
+# helm: control-plane mailbox protocol, device pool, MCTP sideband framing
+# and key store.
 add_library(ak_helm
   helm/device_pool.cpp
+  helm/key_store.cpp
   helm/mailbox.cpp
-  helm/mctp.cpp)
+  helm/mctp.cpp
+  helm/scoped_key.cpp
+  helm/secure_element.cpp)
 add_library(ak::helm ALIAS ak_helm)
 target_link_libraries(ak_helm
   PUBLIC ak::common
-  PRIVATE ak::warnings ak::hardening)
+  PRIVATE OpenSSL::Crypto ak::warnings ak::hardening)
 
 # hull: host-agent command authentication (Ed25519 signatures and sequence
-# numbers) and the core / huge-page allocator. OpenSSL is required: it is the only Ed25519 implementation here.
-find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+# numbers) and the core / huge-page allocator.
 add_library(ak_hull
   hull/command_auth.cpp
   hull/cpu_topology.cpp

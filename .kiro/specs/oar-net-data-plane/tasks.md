@@ -20,6 +20,12 @@
   configured VNI and NIC pair and re-encode byte for byte; codec-built
   packets match flower and reach a socket behind the kernel device. Needs
   root, so plain ctest skips it; CI's `build (gcc-14)` runs it under sudo.
+  Finding: the kernel sets the Geneve C bit only when IP_TUNNEL_CRIT_OPT
+  is set (Open vSwitch does, tc `tunnel_key` does not), so a critical
+  option added through tc goes out with C clear. The codec drops such a
+  packet (Requirement 4.1); the test checks that drop, then decodes the
+  packet with C set. Our VTEP encodes in user space, so this only matters
+  for kernel or tc-based peers.
 - [x] 5. Shared virtio core: PCI capabilities, split virtqueue with bounds
   checks, fuzz target. _Requirements: 1.4_ — `src/oar/virtio/`:
   `GuestMemory` (registered DMA regions, no straddling), `SplitQueue`

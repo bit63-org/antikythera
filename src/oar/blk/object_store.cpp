@@ -1,0 +1,56 @@
+// Copyright (c) 2026 Clark Rawlins
+// SPDX-License-Identifier: Apache-2.0
+
+#include "oar/blk/object_store.hpp"
+
+namespace ak::oar::blk {
+
+auto to_string(FetchError e) noexcept -> const char* {
+    switch (e) {
+        case FetchError::not_found:
+            return "not_found";
+        case FetchError::denied:
+            return "denied";
+        case FetchError::timed_out:
+            return "timed_out";
+        case FetchError::bad_response:
+            return "bad_response";
+        case FetchError::too_large:
+            return "too_large";
+        case FetchError::io:
+            return "io";
+        case FetchError::corrupt:
+            return "corrupt";
+        case FetchError::shut_down:
+            return "shut_down";
+    }
+    return "unknown";
+}
+
+namespace {
+auto image_key(std::string_view prefix, std::string_view name_hex, std::string_view leaf)
+    -> std::string {
+    std::string key;
+    key.reserve(prefix.size() + name_hex.size() + leaf.size() + 2);
+    if (!prefix.empty()) {
+        key.append(prefix);
+        if (prefix.back() != '/') {
+            key.push_back('/');
+        }
+    }
+    key.append(name_hex);
+    key.push_back('/');
+    key.append(leaf);
+    return key;
+}
+}  // namespace
+
+auto image_manifest_key(std::string_view prefix, std::string_view name_hex) -> std::string {
+    return image_key(prefix, name_hex, "manifest");
+}
+
+auto image_data_key(std::string_view prefix, std::string_view name_hex) -> std::string {
+    return image_key(prefix, name_hex, "data");
+}
+
+}  // namespace ak::oar::blk

@@ -51,6 +51,7 @@ ak_add_test(file_backend_test        SOURCES file_backend_test.cpp        LIBS a
 ak_add_test(net_role_test            SOURCES net_role_test.cpp            LIBS ak::oar_net_role ak::hull)
 ak_add_test(blk_role_test            SOURCES blk_role_test.cpp            LIBS ak::oar_blk_role)
 ak_add_test(image_manifest_test      SOURCES image_manifest_test.cpp      LIBS ak::oar_blk_image)
+ak_add_test(image_volume_test        SOURCES image_volume_test.cpp        LIBS ak::oar_blk_image)
 ak_add_test(mailbox_test      SOURCES mailbox_test.cpp      LIBS ak::helm)
 ak_add_test(mailbox_device_test SOURCES mailbox_device_test.cpp LIBS ak::helm)
 ak_add_test(device_pool_test  SOURCES device_pool_test.cpp  LIBS ak::helm)

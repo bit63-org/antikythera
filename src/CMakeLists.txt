@@ -171,10 +171,16 @@ target_link_libraries(ak_oar_net_role
 # oar-blk image volumes: a read-only base image in object storage under an
 # ephemeral overlay (.kiro/specs/oar-blk-data-plane/ Requirement 8).
 add_library(ak_oar_blk_image
-  oar/blk/image_manifest.cpp)
+  oar/blk/chunk_cache.cpp
+  oar/blk/fetcher.cpp
+  oar/blk/image_manifest.cpp
+  oar/blk/lazy_image_backend.cpp
+  oar/blk/object_store.cpp
+  oar/blk/overlay.cpp)
 add_library(ak::oar_blk_image ALIAS ak_oar_blk_image)
+find_package(Threads REQUIRED)
 target_link_libraries(ak_oar_blk_image
-  PUBLIC ak::oar_blk
+  PUBLIC ak::oar_blk Threads::Threads
   PRIVATE ak::warnings ak::hardening)
 
 # The storage role as helm drives it over the sideband: volume files and

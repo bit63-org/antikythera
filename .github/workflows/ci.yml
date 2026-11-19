@@ -105,7 +105,9 @@ jobs:
   lint:
     name: lint
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # clang-tidy over the whole tree took 18.6 min on main at 5b76a07 and
+    # timed out at 20 on PR #33; give it room to grow.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 

@@ -101,6 +101,34 @@ One per data-plane role. MCTP message types (vendor-defined) for:
 `SmbusBinding` (hardware), `I3cBinding` (later), `SocketBinding` (harbor,
 one Unix socket per slot), `InProcessBinding` (combined placement).
 
+Every binding carries the same encoded SMBus packets (with PEC) that the
+wire does, one packet per send: `SocketBinding` is an `AF_UNIX`
+`SOCK_SEQPACKET` socket, whose datagram boundaries are packet boundaries,
+and `InProcessBinding` a pair of bounded queues. So the MCTP codec and
+reassembly run unchanged in every placement and only the binding differs
+(Requirement 7.1). Message bodies are in `src/helm/oar_protocol.hpp`:
+little-endian, strict both ways, with a 2-byte status head on every
+response. helm owns the MCTP tags and has one request outstanding per
+link; a response that arrives after its request timed out carries an old
+tag and is discarded, never taken for the next answer. Malformed or
+misaddressed packets are dropped and counted rather than failing the
+request, so noise costs time, not correctness.
+
+`map_update` forwards the controller's MapUpdate frame unmodified,
+signature included, so the role can check it itself. A frame (up to
+131 KiB) exceeds the 4 KiB MCTP message bound, so it travels as
+consecutive chunks (`total`, `offset`, bytes); offset 0 restarts a
+transfer, any gap or changed total aborts it, and the last chunk's answer
+is the result of applying the frame.
+
+`deliver_key` is the one place a plaintext volume key leaves helm.
+`OarLink` takes the `ScopedKey` by value, encodes it into exactly-sized
+buffers, and wipes the body, message and every packet after sending,
+success or failure. `OarEndpoint` wipes the reassembled request once the
+role's handler returns, so the handler must copy the key into its key slot
+during the call. Bytes in flight inside a binding (the kernel socket
+buffer, a queue entry) are outside this layer.
+
 ### PowerSequencer
 
 Per-slot PERST#, power enable, link-ready input; host PERST#/power. Boot

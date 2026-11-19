@@ -1,6 +1,6 @@
 # Implementation Plan — helm: the control-plane role
 
-## Status: 6/12 tasks complete
+## Status: 7/12 tasks complete
 
 ## Tasks
 
@@ -18,8 +18,11 @@
   (`src/helm/device_pool.*`). _Requirements: 3, 10.2_
 - [x] 5. MCTP framing codec (SMBus binding header + vendor message types),
   reassembly, tests, fuzz target (`src/helm/mctp.*`). _Requirements: 5.2, 10.1_
-- [ ] 6. OarLink with `SocketBinding` and `InProcessBinding`.
-  _Requirements: 5, 7_
+- [x] 6. OarLink with `SocketBinding` and `InProcessBinding`.
+  _Requirements: 5, 7_ (`src/helm/oar_protocol.*` bodies,
+  `src/helm/sideband_binding.*` bindings, `src/helm/oar_link.*` helm's
+  `OarLink` and the role's `OarEndpoint`; unit tests over both bindings,
+  `fuzz_oar_link`. See design "OarLink".)
 - [x] 7. KeyStore with software secure element; `ScopedKey` zeroization;
   wrap/unwrap/rewrap/destroy (`src/helm/key_store.*`,
   `src/helm/secure_element.*`, `src/helm/scoped_key.*`), unit tests,

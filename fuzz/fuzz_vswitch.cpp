@@ -13,6 +13,11 @@
 //         Geneve payload. After each record: nothing reached a NIC outside
 //         the sender's VNI, a dead NIC never sent or received, and every
 //         underlay send carries the true source NIC and VNI.
+//         Requirement 11: every IP frame that reaches another NIC or the
+//         underlay carries a source address owned by the NIC it came from
+//         (the sender on transmit, the Geneve source NIC on receive), never
+//         a link-local or unspecified one, and nothing but IPv4, IPv6 and
+//         ARP is ever forwarded.
 
 #include <array>
 #include <chrono>
@@ -25,6 +30,7 @@
 #include "oar/net/geneve.hpp"
 #include "oar/net/mapping_table.hpp"
 #include "oar/net/neighbor.hpp"
+#include "oar/net/packet.hpp"
 #include "oar/net/vswitch.hpp"
 
 namespace {
@@ -32,6 +38,7 @@ namespace {
 namespace net = ak::oar::net;
 namespace geneve = ak::oar::net::geneve;
 namespace nb = ak::oar::net::neighbor;
+namespace pk = ak::oar::net::packet;
 
 constexpr std::uint32_t vpc_one = 1;
 constexpr std::uint32_t vpc_two = 2;
@@ -64,22 +71,72 @@ auto mac(std::size_t index) -> net::MacAddress {
 
 class Port final : public net::RxPort {
 public:
-    auto deliver(std::span<const std::byte> /*frame*/) -> net::RxResult override {
+    auto deliver(std::span<const std::byte> frame) -> net::RxResult override {
         ++frames;
+        last.assign(frame.begin(), frame.end());
         return net::RxResult::delivered;
     }
     std::size_t frames{0};
+    std::vector<std::byte> last;
 };
 
 class Recorder final : public net::Underlay {
 public:
-    auto send(const net::RemoteFrame& f) -> void override { sent.push_back({f.vni, f.nics}); }
+    auto send(const net::RemoteFrame& f) -> void override {
+        sent.push_back({f.vni, f.nics, {f.frame.begin(), f.frame.end()}});
+    }
     struct Sent {
         std::uint32_t vni;
         geneve::NicPair nics;
+        std::vector<std::byte> frame;
     };
     std::vector<Sent> sent;
 };
+
+// Guest addresses: b (local) and c (remote) in vpc_one own one of each family.
+auto ip4_of(std::size_t index) -> nb::Ipv4Address {
+    return {std::byte{10}, std::byte{0}, std::byte{0}, static_cast<std::byte>(index + 1)};
+}
+
+auto ip6_of(std::size_t index) -> net::Ipv6Address {
+    net::Ipv6Address a{};
+    a[0] = ula_prefix;
+    a[1] = std::byte{1};
+    a[ipv6_last] = static_cast<std::byte>(index + 1);
+    return a;
+}
+
+constexpr std::size_t b_index = 1;
+
+auto owns_addresses(std::size_t index) -> bool {
+    return index == b_index || index == remote_index;
+}
+
+// Requirement 11: a forwarded frame is ARP, or IP from the true sender's
+// own address.
+auto forwarded_ok(std::span<const std::byte> frame, std::size_t sender) -> bool {
+    const std::uint16_t type = pk::ethertype(frame);
+    if (type == nb::ethertype_arp) {
+        return true;
+    }
+    const auto p = pk::parse(frame);
+    if (!p) {
+        return false;
+    }
+    if (!owns_addresses(sender)) {
+        return false;
+    }
+    return p->family == pk::IpFamily::ipv4 ? p->src4 == ip4_of(sender) : p->src6 == ip6_of(sender);
+}
+
+auto index_of(geneve::NicId id) -> std::size_t {
+    for (std::size_t i = 0; i < nic_count; ++i) {
+        if (nic_ids.at(i) == id.value) {
+            return i;
+        }
+    }
+    return nic_count;
+}
 
 auto fuzz_parsers(std::span<const std::byte> in) -> void {
     if (const auto arp = nb::parse_arp(in); arp) {
@@ -129,12 +186,11 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
             std::abort();
         }
     }
-    const nb::Ipv4Address ip_b{std::byte{10}, std::byte{0}, std::byte{0}, std::byte{2}};
-    net::Ipv6Address ip6_b = vtep(peer_tail);
-    ip6_b[1] = std::byte{1};
+    const geneve::NicId nic_b{nic_ids[b_index]};
+    const geneve::NicId nic_c{nic_ids[remote_index]};
     if (!sw.set_neighbors({.vni = vpc_one,
-                           .ipv4 = {{ip_b, geneve::NicId{nic_ids[1]}}},
-                           .ipv6 = {{ip6_b, geneve::NicId{nic_ids[1]}}}})) {
+                           .ipv4 = {{ip4_of(b_index), nic_b}, {ip4_of(remote_index), nic_c}},
+                           .ipv6 = {{ip6_of(b_index), nic_b}, {ip6_of(remote_index), nic_c}}})) {
         std::abort();
     }
 
@@ -157,7 +213,14 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
             vni = nic_vnis.at(src);
             sw.transmit({.source = geneve::NicId{nic_ids.at(src)}, .frame = bytes});
             for (const auto& s : underlay.sent) {
-                if (src == dead_index || s.vni != vni || s.nics.src.value != nic_ids.at(src)) {
+                if (src == dead_index || s.vni != vni || s.nics.src.value != nic_ids.at(src) ||
+                    !forwarded_ok(s.frame, src)) {
+                    std::abort();
+                }
+            }
+            for (std::size_t i = 0; i < nic_count; ++i) {
+                if (i != src && ports.at(i).frames != before.at(i) &&
+                    !forwarded_ok(ports.at(i).last, src)) {
                     std::abort();
                 }
             }
@@ -179,6 +242,13 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
             if (pkt) {
                 vni = pkt->vni;
                 static_cast<void>(sw.receive(*pkt, vtep(src % 2 == 0 ? peer_tail : self_tail)));
+                const std::size_t sender = pkt->nics ? index_of(pkt->nics->src) : nic_count;
+                for (std::size_t i = 0; i < nic_count; ++i) {
+                    if (ports.at(i).frames != before.at(i) &&
+                        !forwarded_ok(ports.at(i).last, sender)) {
+                        std::abort();
+                    }
+                }
             }
             if (!underlay.sent.empty()) {
                 std::abort();  // received traffic is never re-sent

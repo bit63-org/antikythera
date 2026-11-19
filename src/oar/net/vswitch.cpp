@@ -62,6 +62,64 @@ template<typename A> auto all_zero(const A& a) noexcept -> bool {
     return std::ranges::all_of(a, [](std::byte b) { return b == std::byte{0}; });
 }
 
+constexpr std::uint8_t icmp_redirect = 5;
+constexpr std::uint8_t icmpv6_router_advertisement = 134;
+constexpr std::uint8_t icmpv6_redirect = 137;
+constexpr std::uint16_t dhcp4_server_port = 67;
+constexpr std::uint16_t dhcp4_client_port = 68;
+constexpr std::uint16_t dhcp6_server_port = 547;
+constexpr std::size_t nd_target_offset = 8;  // in an NS or NA: type, code, checksum, flags
+
+auto is_ipv6(const packet::ParsedPacket& p) noexcept -> bool {
+    return p.family == packet::IpFamily::ipv6;
+}
+
+auto icmpv6_type(const packet::ParsedPacket& p) noexcept -> std::optional<std::uint8_t> {
+    if (!is_ipv6(p) || p.protocol != packet::ipproto_icmpv6 || !p.l4) {
+        return std::nullopt;
+    }
+    return p.l4->icmp_type;
+}
+
+auto udp_ports(const packet::ParsedPacket& p, std::uint16_t src, std::uint16_t dst) noexcept
+    -> bool {
+    return p.protocol == packet::ipproto_udp && p.l4 && p.l4->src_port == src &&
+           p.l4->dst_port == dst;
+}
+
+// Requirement 11.7: messages only a router or an address server sends.
+auto router_message(const packet::ParsedPacket& p) noexcept -> bool {
+    if (!p.l4) {
+        return false;
+    }
+    if (is_ipv6(p)) {
+        const auto type = icmpv6_type(p);
+        if (type == icmpv6_router_advertisement || type == icmpv6_redirect) {
+            return true;
+        }
+        return p.protocol == packet::ipproto_udp && p.l4->src_port == dhcp6_server_port;
+    }
+    if (p.protocol == packet::ipproto_icmp && p.l4->icmp_type == icmp_redirect) {
+        return true;
+    }
+    return p.protocol == packet::ipproto_udp && p.l4->src_port == dhcp4_server_port;
+}
+
+// Requirement 11.4: sources allowed only for traffic oar-net consumes. The
+// responders that consume them come with the VPC gateway (tasks 17-18);
+// until then these packets end at tx_drop_local_only unless the ND proxy
+// answers them.
+auto local_only_source(const packet::ParsedPacket& p) noexcept -> bool {
+    if (is_ipv6(p)) {
+        return packet::is_unspecified(p.src6) || packet::is_ipv6_link_local(p.src6);
+    }
+    return packet::is_unspecified(p.src4) && udp_ports(p, dhcp4_client_port, dhcp4_server_port);
+}
+
+auto ip_multicast_destination(const packet::ParsedPacket& p) noexcept -> bool {
+    return is_ipv6(p) ? packet::is_ipv6_multicast(p.dst6) : packet::is_ipv4_multicast(p.dst4);
+}
+
 auto valid_nic(geneve::NicId id) noexcept -> bool {
     return id != geneve::nic_invalid && id != geneve::nic_broadcast;
 }
@@ -335,42 +393,115 @@ auto VSwitch::transmit(const TxFrame& tx) -> void {
     const MacAddress dst_mac = mac_at(tx.frame, dst_mac_offset);
     const bool group = (dst_mac[0] & group_bit) == group_bit;
 
-    if (handle_arp(*snap, tx.source, *binding, tx.frame, group)) {
+    const std::uint16_t type = packet::ethertype(tx.frame);
+    if (type == neighbor::ethertype_arp) {
+        if (!handle_arp(*snap, tx.source, *binding, tx.frame, group)) {
+            forward(*snap, tx.source, *binding, tx.frame, nullptr);
+        }
         return;
     }
-    if (group) {
-        if (handle_nd(*snap, tx.source, *binding, tx.frame)) {
+    if (type != neighbor::ethertype_ipv4 && type != neighbor::ethertype_ipv6) {
+        ++_counters.tx_drop_ethertype;
+        return;
+    }
+    const auto pkt = packet::parse(tx.frame);
+    if (!pkt) {
+        ++_counters.tx_drop_malformed;
+        return;
+    }
+    const bool local_only = local_only_source(*pkt);
+    if (!local_only && owner(binding->vni, *pkt, true) != tx.source) {
+        ++_counters.tx_drop_ip_spoofed;
+        return;
+    }
+    if (router_message(*pkt)) {
+        ++_counters.tx_drop_router_msg;
+        return;
+    }
+    if (const auto icmp = icmpv6_type(*pkt); icmp) {
+        if (*icmp == neighbor::icmpv6_neighbor_advertisement &&
+            !own_na_target(*pkt, tx.source, binding->vni)) {
+            ++_counters.tx_drop_neighbor_spoofed;
             return;
         }
-        replicate(*snap, tx.source, binding->vni, tx.frame);
+        if (*icmp == neighbor::icmpv6_neighbor_solicitation && group &&
+            handle_nd(*snap, tx.source, *binding, tx.frame)) {
+            return;
+        }
+    }
+    if (local_only) {
+        ++_counters.tx_drop_local_only;
         return;
     }
+    forward(*snap, tx.source, *binding, tx.frame, &*pkt);
+}
 
-    const auto dst = snap->find_by_mac(binding->vni, dst_mac);
+auto VSwitch::owner(std::uint32_t vni, const packet::ParsedPacket& p, bool source) const
+    -> std::optional<geneve::NicId> {
+    const VpcNeighbors* const table = neighbors(vni);
+    if (table == nullptr) {
+        return std::nullopt;
+    }
+    if (is_ipv6(p)) {
+        const auto it = table->ipv6.find(source ? p.src6 : p.dst6);
+        return it == table->ipv6.end() ? std::nullopt : std::optional{it->second};
+    }
+    const auto it = table->ipv4.find(source ? p.src4 : p.dst4);
+    return it == table->ipv4.end() ? std::nullopt : std::optional{it->second};
+}
+
+auto VSwitch::own_na_target(const packet::ParsedPacket& p, geneve::NicId src,
+                            std::uint32_t vni) const -> bool {
+    if (p.l4_data.size() < nd_target_offset + Ipv6Address{}.size()) {
+        return false;
+    }
+    Ipv6Address target{};
+    std::copy_n(p.l4_data.begin() + static_cast<std::ptrdiff_t>(nd_target_offset), target.size(),
+                target.begin());
+    const VpcNeighbors* const table = neighbors(vni);
+    if (table == nullptr) {
+        return false;
+    }
+    const auto it = table->ipv6.find(target);
+    return it != table->ipv6.end() && it->second == src;
+}
+
+auto VSwitch::forward(const MappingSnapshot& snap, geneve::NicId src, const NicBinding& binding,
+                      std::span<const std::byte> frame, const packet::ParsedPacket* ip) -> void {
+    const MacAddress dst_mac = mac_at(frame, dst_mac_offset);
+    if ((dst_mac[0] & group_bit) == group_bit) {
+        replicate(snap, src, binding.vni, frame, ip == nullptr || ip_multicast_destination(*ip));
+        return;
+    }
+    const auto dst = snap.find_by_mac(binding.vni, dst_mac);
     if (!dst) {
         ++_counters.tx_drop_unknown_unicast;
         return;
     }
-    if (*dst == tx.source) {
+    if (*dst == src) {
         ++_counters.tx_drop_hairpin;
         return;
     }
-    if (snap->is_local(*dst)) {
+    if (ip != nullptr && owner(binding.vni, *ip, false) != *dst) {
+        ++_counters.tx_drop_ip_dst;
+        return;
+    }
+    if (snap.is_local(*dst)) {
         RxPort* const p = port(*dst);
         if (p == nullptr) {
             ++_counters.tx_drop_unattached;
             return;
         }
-        if (deliver_to(*p, tx.frame)) {
+        if (deliver_to(*p, frame)) {
             ++_counters.tx_local;
         }
         return;
     }
-    const auto remote = snap->lookup(*dst);  // find_by_mac only returns mapped NICs
+    const auto remote = snap.lookup(*dst);  // find_by_mac only returns mapped NICs
     _underlay->send({.vtep = remote->owner_vtep,
-                     .vni = binding->vni,
-                     .nics = {.src = tx.source, .dst = *dst},
-                     .frame = tx.frame});
+                     .vni = binding.vni,
+                     .nics = {.src = src, .dst = *dst},
+                     .frame = frame});
     ++_counters.tx_remote;
 }
 
@@ -384,10 +515,14 @@ auto VSwitch::handle_arp(const MappingSnapshot& snap, geneve::NicId src, const N
         }
         return false;  // not ARP, or malformed: forwarded as a plain frame
     }
+    // Requirement 11.6: the sender IP is the NIC's own, or 0.0.0.0 (a probe).
     const VpcNeighbors* const table = neighbors(binding.vni);
-    if (table != nullptr && !all_zero(arp->sender_ip)) {
-        const auto owner = table->ipv4.find(arp->sender_ip);
-        if (owner != table->ipv4.end() && owner->second != src) {
+    if (!all_zero(arp->sender_ip)) {
+        const bool own = table != nullptr && [&] {
+            const auto it = table->ipv4.find(arp->sender_ip);
+            return it != table->ipv4.end() && it->second == src;
+        }();
+        if (!own) {
             ++_counters.tx_drop_neighbor_spoofed;
             return true;
         }
@@ -435,7 +570,7 @@ auto VSwitch::handle_nd(const MappingSnapshot& snap, geneve::NicId src, const Ni
 }
 
 auto VSwitch::replicate(const MappingSnapshot& snap, geneve::NicId src, std::uint32_t vni,
-                        std::span<const std::byte> frame) -> void {
+                        std::span<const std::byte> frame, bool ip_ok) -> void {
     NicGroupState& state = _group[src];  // attached senders always have one
     GroupMeter& meter = state.meter;
     const auto policy_it = _group_policies.find(vni);
@@ -443,6 +578,11 @@ auto VSwitch::replicate(const MappingSnapshot& snap, geneve::NicId src, std::uin
         !admits(policy_it->second, mac_at(frame, dst_mac_offset))) {
         ++meter.drop_policy;
         ++_counters.tx_drop_group;
+        return;
+    }
+    if (!ip_ok) {  // Requirement 11.5: a multicast MAC with a unicast IP destination
+        ++meter.drop_policy;
+        ++_counters.tx_drop_ip_dst;
         return;
     }
     const GroupPolicy& policy = policy_it->second;
@@ -507,11 +647,17 @@ auto VSwitch::receive(const geneve::Packet& packet, const Ipv6Address& outer_src
             ++_counters.rx_drop_group;
             return dst;
         }
+        if (!inner_allowed(packet, *dst)) {
+            return dst;
+        }
         for (const MapEntry& e : snap->entries(packet.vni)) {
             if (snap->is_local(e.nic_id) && deliver(e.nic_id, packet.inner)) {
                 ++_counters.rx_delivered;
             }
         }
+        return dst;
+    }
+    if (!inner_allowed(packet, *dst)) {
         return dst;
     }
     RxPort* const p = port(*dst);
@@ -521,6 +667,35 @@ auto VSwitch::receive(const geneve::Packet& packet, const Ipv6Address& outer_src
         ++_counters.rx_delivered;
     }
     return dst;
+}
+
+auto VSwitch::inner_allowed(const geneve::Packet& packet, geneve::NicId dst) -> bool {
+    const std::uint16_t type = packet::ethertype(packet.inner);
+    if (type == neighbor::ethertype_arp) {
+        return true;
+    }
+    if (type != neighbor::ethertype_ipv4 && type != neighbor::ethertype_ipv6) {
+        ++_counters.rx_drop_ethertype;
+        return false;
+    }
+    const auto pkt = packet::parse(packet.inner);
+    if (!pkt) {
+        ++_counters.rx_drop_malformed;
+        return false;
+    }
+    // No local-only sources here: link-local and unspecified sources are
+    // never forwarded (Requirement 11.4), so a peer sending one is wrong.
+    if (owner(packet.vni, *pkt, true) != packet.nics->src) {
+        ++_counters.rx_drop_ip_spoofed;
+        return false;
+    }
+    const bool dst_ok = dst == geneve::nic_broadcast ? ip_multicast_destination(*pkt)
+                                                     : owner(packet.vni, *pkt, false) == dst;
+    if (!dst_ok) {
+        ++_counters.rx_drop_ip_dst;
+        return false;
+    }
+    return true;
 }
 
 }  // namespace ak::oar::net

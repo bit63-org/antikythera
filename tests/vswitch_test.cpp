@@ -1,10 +1,11 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-// .kiro/specs/oar-net-data-plane/ Requirements 2, 7 and 10 (tasks 8, 12):
-// VSwitch forwarding, the ARP/ND proxy, the dead VPC, and the group policy:
-// group frames dropped by default, opt-in multicast with head-end
-// replication, rate limits, the flood-list cap and per-NIC meters.
+// .kiro/specs/oar-net-data-plane/ Requirements 2, 7, 10 and 11 (tasks 8,
+// 12, 16): VSwitch forwarding, the ARP/ND proxy, the dead VPC, the group
+// policy (group frames dropped by default, opt-in multicast with head-end
+// replication, rate limits, the flood-list cap and per-NIC meters) and the
+// IP source/destination check.
 
 #define BOOST_TEST_MODULE vswitch_test
 #include <boost/test/unit_test.hpp>
@@ -18,15 +19,19 @@
 #include <vector>
 
 #include "common/wire.hpp"
+#include "net_frames.hpp"
 #include "oar/net/geneve.hpp"
 #include "oar/net/mapping_table.hpp"
 #include "oar/net/neighbor.hpp"
+#include "oar/net/packet.hpp"
 #include "oar/net/vswitch.hpp"
 #include "test_support.hpp"
 
 namespace net = ak::oar::net;
 namespace geneve = ak::oar::net::geneve;
 namespace nb = ak::oar::net::neighbor;
+namespace pk = ak::oar::net::packet;
+namespace fr = ak::test::frames;
 using ak::test::unit_timeout_seconds;
 using geneve::NicId;
 using net::MapEntry;
@@ -55,8 +60,9 @@ constexpr std::size_t ipv6_last = 15;
 constexpr std::size_t mac_last = 5;
 constexpr std::byte ula_prefix{0xfd};
 constexpr std::byte locally_administered{0x02};
-constexpr std::size_t payload_size = 32;
+constexpr std::size_t payload_size = 4;           // a 46-byte frame: 14 + 20 + 8 + 4
 constexpr std::uint16_t ethertype_test = 0x88B5;  // IEEE local experimental
+constexpr std::uint16_t test_port = 9999;
 constexpr std::uint16_t arp_htype_ethernet = 1;
 constexpr std::uint8_t mac_size = 6;
 constexpr std::uint8_t ipv4_size = 4;
@@ -121,14 +127,47 @@ auto ip6(std::uint8_t last) -> net::Ipv6Address {
     return a;
 }
 
+// The IPv4 address frame() uses for a MAC: a NIC's guest address, or a
+// group address for a group MAC (the low 23 bits of 01:00:5e, 255.255.255.255
+// for broadcast, 239.0.0.1 for any other group).
+auto ip_for(const net::MacAddress& mac) -> nb::Ipv4Address {
+    if ((mac[0] & std::byte{1}) == std::byte{0}) {
+        return ip4(std::to_integer<std::uint8_t>(mac[mac_last]));
+    }
+    if (mac == broadcast_mac()) {
+        return {std::byte{255}, std::byte{255}, std::byte{255}, std::byte{255}};
+    }
+    if (mac[0] == std::byte{0x01} && mac[1] == std::byte{0x00} && mac[2] == std::byte{0x5e}) {
+        return {std::byte{224}, mac[3] & std::byte{0x7f}, mac[4], mac[5]};
+    }
+    return {std::byte{239}, std::byte{0}, std::byte{0}, std::byte{1}};
+}
+
+// A UDP datagram between the guest addresses behind two MACs.
 auto frame(const net::MacAddress& dst, const net::MacAddress& src) -> std::vector<std::byte> {
-    std::vector<std::byte> f;
-    ak::wire::Writer w{f};
-    w.bytes(dst);
-    w.bytes(src);
-    w.be16(ethertype_test);
-    f.resize(f.size() + payload_size, std::byte{0x5a});
-    return f;
+    return fr::ipv4(
+        dst, src, ip_for(src), ip_for(dst), pk::ipproto_udp,
+        fr::udp(test_port, test_port, std::vector<std::byte>(payload_size, std::byte{0x5a})));
+}
+
+auto udp4(const net::MacAddress& dst, const net::MacAddress& src, const nb::Ipv4Address& src_ip,
+          const nb::Ipv4Address& dst_ip, std::uint16_t sport = test_port,
+          std::uint16_t dport = test_port) -> std::vector<std::byte> {
+    return fr::ipv4(dst, src, src_ip, dst_ip, pk::ipproto_udp, fr::udp(sport, dport, {}));
+}
+
+auto udp6(const net::MacAddress& dst, const net::MacAddress& src, const net::Ipv6Address& src_ip,
+          const net::Ipv6Address& dst_ip, std::uint16_t sport = test_port,
+          std::uint16_t dport = test_port) -> std::vector<std::byte> {
+    return fr::ipv6(dst, src, src_ip, dst_ip, pk::ipproto_udp, fr::udp(sport, dport, {}));
+}
+
+auto link_local(NicId id) -> net::Ipv6Address {
+    net::Ipv6Address a{};
+    a[0] = std::byte{0xfe};
+    a[1] = std::byte{0x80};
+    a[ipv6_last] = static_cast<std::byte>(id.value);
+    return a;
 }
 
 auto arp_request(NicId from, const nb::Ipv4Address& sender_ip, const nb::Ipv4Address& target_ip,
@@ -238,6 +277,21 @@ struct Fixture {
         BOOST_REQUIRE(sw.attach(nic_a, port_a));
         BOOST_REQUIRE(sw.attach(nic_b, port_b));
         BOOST_REQUIRE(sw.attach(nic_x, port_x));
+        // Every NIC owns 10.0.0.<id> and fd10::<id> (MapUpdate v2's guest
+        // addresses, as NetRole hands them over).
+        BOOST_REQUIRE(sw.set_neighbors(addresses(vpc, {nic_a, nic_b, nic_c, nic_d, nic_e})));
+        BOOST_REQUIRE(sw.set_neighbors(addresses(other_vpc, {nic_x, nic_y})));
+    }
+
+    static auto addresses(std::uint32_t vni, std::initializer_list<NicId> nics)
+        -> net::NeighborUpdate {
+        net::NeighborUpdate u{.vni = vni};
+        for (const NicId n : nics) {
+            const auto last = static_cast<std::uint8_t>(n.value);
+            u.ipv4.push_back({ip4(last), n});
+            u.ipv6.push_back({ip6(last), n});
+        }
+        return u;
     }
 
     auto opt_in(const net::GroupPolicy& policy = multicast_policy()) -> void {
@@ -646,12 +700,13 @@ BOOST_AUTO_TEST_CASE(drops_arp_spoofing, *boost::unit_test::timeout(unit_timeout
     send(nic_a, arp_request(nic_a, ip4(1), ip4(2), mac_of(nic_b)));  // sender MAC is b's
     BOOST_TEST(nothing_delivered());
     BOOST_TEST(sw.counters().tx_drop_neighbor_spoofed == 2);
-    // Unregistered sender addresses and probes from 0.0.0.0 pass the spoofing
-    // check and then meet the group policy.
+    // Requirement 11.6: an unregistered sender address is not a's either;
+    // a probe from 0.0.0.0 passes and then meets the group policy.
     send(nic_a, arp_request(nic_a, ip4(5), ip4(7)));
+    BOOST_TEST(sw.counters().tx_drop_neighbor_spoofed == 3);
     send(nic_a, arp_request(nic_a, nb::Ipv4Address{}, ip4(7)));
-    BOOST_TEST(sw.counters().tx_drop_neighbor_spoofed == 2);
-    BOOST_TEST(sw.counters().tx_drop_group == 2);
+    BOOST_TEST(sw.counters().tx_drop_neighbor_spoofed == 3);
+    BOOST_TEST(sw.counters().tx_drop_group == 1);
 }
 
 BOOST_AUTO_TEST_CASE(answers_neighbor_solicitation,
@@ -674,9 +729,9 @@ BOOST_AUTO_TEST_CASE(never_answers_dad, *boost::unit_test::timeout(unit_timeout_
     BOOST_REQUIRE(sw.set_neighbors({.vni = vpc, .ipv6 = {{ip6(1), nic_a}, {ip6(2), nic_b}}}));
     send(nic_a, neighbor_solicitation(nic_a, net::Ipv6Address{}, ip6(1)));
     send(nic_a, neighbor_solicitation(nic_a, net::Ipv6Address{}, ip6(2)));
-    BOOST_TEST(nothing_delivered());  // unanswered, and solicited-node never floods
+    BOOST_TEST(nothing_delivered());  // unanswered, and :: is never forwarded
     BOOST_TEST(sw.counters().nd_replies == 0);
-    BOOST_TEST(sw.counters().tx_drop_group == 2);
+    BOOST_TEST(sw.counters().tx_drop_local_only == 2);
 }
 
 BOOST_AUTO_TEST_CASE(neighbor_update_validation, *boost::unit_test::timeout(unit_timeout_seconds)) {
@@ -699,15 +754,16 @@ BOOST_AUTO_TEST_CASE(neighbor_update_validation, *boost::unit_test::timeout(unit
         (sw.set_neighbors({.vni = vpc, .ipv4 = {{ip4(1), nic_a}, {ip4(1), nic_b}}}).error() ==
          NeighborError::duplicate_address));
 
-    // A rejected update leaves the previous one; an empty one removes it.
-    BOOST_REQUIRE(sw.set_neighbors({.vni = vpc, .ipv4 = {{ip4(2), nic_b}}}));
+    // A rejected update leaves the previous one; an empty one removes it,
+    // after which a no longer owns 10.0.0.1 either.
+    BOOST_REQUIRE(sw.set_neighbors({.vni = vpc, .ipv4 = {{ip4(1), nic_a}, {ip4(2), nic_b}}}));
     BOOST_TEST(!sw.set_neighbors({.vni = vpc, .ipv4 = {{ip4(2), nic_b}, {ip4(2), nic_a}}}));
     send(nic_a, arp_request(nic_a, ip4(1), ip4(2)));
     BOOST_TEST(sw.counters().arp_replies == 1);
     BOOST_REQUIRE(sw.set_neighbors({.vni = vpc}));
     send(nic_a, arp_request(nic_a, ip4(1), ip4(2)));
     BOOST_TEST(sw.counters().arp_replies == 1);
-    BOOST_TEST(sw.counters().tx_drop_group == 1);
+    BOOST_TEST(sw.counters().tx_drop_neighbor_spoofed == 1);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
@@ -881,6 +937,9 @@ BOOST_AUTO_TEST_CASE(boards_talk_through_geneve, *boost::unit_test::timeout(unit
     FakePort port_b;
     BOOST_REQUIRE(board1.attach(nic_a, port_a));
     BOOST_REQUIRE(board2.attach(nic_b, port_b));
+    const net::NeighborUpdate addrs{.vni = vpc, .ipv4 = {{ip4(11), nic_a}, {ip4(22), nic_b}}};
+    BOOST_REQUIRE(board1.set_neighbors(addrs));
+    BOOST_REQUIRE(board2.set_neighbors(addrs));
 
     const auto to_b = frame(mac_of(nic_b), mac_of(nic_a));
     board1.transmit({.source = nic_a, .frame = to_b});
@@ -895,6 +954,230 @@ BOOST_AUTO_TEST_CASE(boards_talk_through_geneve, *boost::unit_test::timeout(unit
     BOOST_TEST(port_a.frames[0] == mcast);
     BOOST_TEST(board1.counters().tx_remote == 1);
     BOOST_TEST(board2.counters().tx_replicas_remote == 1);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// Requirement 11 (task 16): the IP source/destination check.
+BOOST_FIXTURE_TEST_SUITE(ip_check, Fixture)
+
+namespace {
+
+constexpr std::uint16_t dhcp4_server = 67;
+constexpr std::uint16_t dhcp4_client = 68;
+constexpr std::uint16_t dhcp6_client = 546;
+constexpr std::uint16_t dhcp6_server = 547;
+constexpr std::uint8_t icmp_redirect = 5;
+constexpr std::uint8_t icmpv6_router_solicitation = 133;
+constexpr std::uint8_t icmpv6_router_advertisement = 134;
+constexpr std::uint8_t icmpv6_redirect = 137;
+constexpr std::uint32_t na_solicited_override = 0x6000'0000;
+
+auto all_nodes() -> net::Ipv6Address {
+    net::Ipv6Address a{};
+    a[0] = std::byte{0xff};
+    a[1] = std::byte{0x02};
+    a[ipv6_last] = std::byte{1};
+    return a;
+}
+
+auto all_nodes_mac() -> net::MacAddress {
+    return {std::byte{0x33}, std::byte{0x33}, std::byte{0},
+            std::byte{0},    std::byte{0},    std::byte{1}};
+}
+
+// A solicited NA from `from` for `target`, to `to`.
+auto neighbor_advertisement(NicId from, NicId to, const net::Ipv6Address& source,
+                            const net::Ipv6Address& target) -> std::vector<std::byte> {
+    std::vector<std::byte> body;
+    ak::wire::Writer w{body};
+    w.be32(na_solicited_override);
+    w.bytes(target);
+    const auto msg = fr::icmpv6(source, ip6(static_cast<std::uint8_t>(to.value)),
+                                nb::icmpv6_neighbor_advertisement, 0, body);
+    return fr::ipv6(mac_of(to), mac_of(from), source, ip6(static_cast<std::uint8_t>(to.value)),
+                    pk::ipproto_icmpv6, msg, nb::nd_hop_limit);
+}
+
+auto icmpv6_frame(NicId from, const net::MacAddress& dst_mac, const net::Ipv6Address& src,
+                  const net::Ipv6Address& dst, std::uint8_t type) -> std::vector<std::byte> {
+    const std::vector<std::byte> body(12, std::byte{0});
+    return fr::ipv6(dst_mac, mac_of(from), src, dst, pk::ipproto_icmpv6,
+                    fr::icmpv6(src, dst, type, 0, body), nb::nd_hop_limit);
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(only_ip_and_arp, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    std::vector<std::byte> f;
+    ak::wire::Writer w{f};
+    fr::ethernet(w, mac_of(nic_b), mac_of(nic_a), ethertype_test);
+    f.resize(64, std::byte{0});
+    send(nic_a, f);
+    // A VLAN tag wrapping a valid IPv4 frame is not IP (Requirement 11.1).
+    auto tagged = frame(mac_of(nic_b), mac_of(nic_a));
+    const std::vector<std::byte> tag{std::byte{0x81}, std::byte{0x00}, std::byte{0x00},
+                                     std::byte{0x05}};
+    tagged.insert(tagged.begin() + 12, tag.begin(), tag.end());
+    send(nic_a, tagged);
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().tx_drop_ethertype == 2);
+}
+
+BOOST_AUTO_TEST_CASE(malformed_ip_dropped, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto f = frame(mac_of(nic_b), mac_of(nic_a));
+    f[ethernet_header_size] = std::byte{0x41};  // IHL 1
+    send(nic_a, f);
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().tx_drop_malformed == 1);
+}
+
+BOOST_AUTO_TEST_CASE(forged_source_dropped, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    send(nic_a, udp4(mac_of(nic_b), mac_of(nic_a), ip4(22), ip4(22)));  // b's address
+    send(nic_a, udp4(mac_of(nic_c), mac_of(nic_a), ip4(99), ip4(33)));  // nobody's
+    send(nic_a, udp6(mac_of(nic_b), mac_of(nic_a), ip6(33), ip6(22)));  // c's
+    send(nic_x, udp4(mac_of(nic_y), mac_of(nic_x), ip4(11), ip4(77)));  // a's, other VPC
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().tx_drop_ip_spoofed == 4);
+    // The genuine sources go through, local and remote, both families.
+    send(nic_a, udp4(mac_of(nic_b), mac_of(nic_a), ip4(11), ip4(22)));
+    send(nic_a, udp6(mac_of(nic_c), mac_of(nic_a), ip6(11), ip6(33)));
+    BOOST_TEST(port_b.frames.size() == 1);
+    BOOST_TEST(underlay.sent.size() == 1);
+}
+
+BOOST_AUTO_TEST_CASE(no_address_no_ip, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // a keeps its IPv4 address but loses its IPv6 one.
+    net::NeighborUpdate u = Fixture::addresses(vpc, {nic_b, nic_c, nic_d, nic_e});
+    u.ipv4.push_back({ip4(11), nic_a});
+    BOOST_REQUIRE(sw.set_neighbors(u));
+    send(nic_a, udp6(mac_of(nic_b), mac_of(nic_a), ip6(11), ip6(22)));
+    BOOST_TEST(sw.counters().tx_drop_ip_spoofed == 1);
+    send(nic_a, udp4(mac_of(nic_b), mac_of(nic_a), ip4(11), ip4(22)));
+    BOOST_TEST(port_b.frames.size() == 1);
+    // The change applies to the very next frame, and an empty table means no IP.
+    BOOST_REQUIRE(sw.set_neighbors({.vni = vpc}));
+    send(nic_a, udp4(mac_of(nic_b), mac_of(nic_a), ip4(11), ip4(22)));
+    BOOST_TEST(sw.counters().tx_drop_ip_spoofed == 2);
+    BOOST_TEST(port_b.frames.size() == 1);
+}
+
+BOOST_AUTO_TEST_CASE(destination_must_own_address,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    send(nic_a, udp4(mac_of(nic_b), mac_of(nic_a), ip4(11), ip4(33)));  // c's address, b's MAC
+    send(nic_a, udp6(mac_of(nic_c), mac_of(nic_a), ip6(11), ip6(99)));  // nobody's
+    send(nic_a, udp4(mac_of(nic_b), mac_of(nic_a), ip4(11), ip4(66)));  // x's, other VPC
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().tx_drop_ip_dst == 3);
+}
+
+BOOST_AUTO_TEST_CASE(local_only_sources, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const nb::Ipv4Address any{};
+    const nb::Ipv4Address bcast{std::byte{255}, std::byte{255}, std::byte{255}, std::byte{255}};
+    // A DHCP client message from 0.0.0.0 is for a local responder; until
+    // one exists it is dropped, never flooded (Requirement 12.6).
+    send(nic_a, udp4(broadcast_mac(), mac_of(nic_a), any, bcast, dhcp4_client, dhcp4_server));
+    // Link-local and unspecified IPv6 sources, unicast or multicast.
+    send(nic_a, udp6(mac_of(nic_b), mac_of(nic_a), link_local(nic_a), link_local(nic_b)));
+    send(nic_a, udp6(mac_of(nic_b), mac_of(nic_a), link_local(nic_a), ip6(22)));
+    send(nic_a, icmpv6_frame(nic_a, all_nodes_mac(), net::Ipv6Address{}, all_nodes(),
+                             icmpv6_router_solicitation));
+    send(nic_a, udp6(all_nodes_mac(), mac_of(nic_a), link_local(nic_a), all_nodes(), dhcp6_client,
+                     dhcp6_server));
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().tx_drop_local_only == 5);
+    // 0.0.0.0 for anything but a DHCP client message is a forgery.
+    send(nic_a, udp4(mac_of(nic_b), mac_of(nic_a), any, ip4(22)));
+    BOOST_TEST(sw.counters().tx_drop_ip_spoofed == 1);
+    // Link-local destinations from a real source are not anyone's address.
+    send(nic_a, udp6(mac_of(nic_b), mac_of(nic_a), ip6(11), link_local(nic_b)));
+    BOOST_TEST(sw.counters().tx_drop_ip_dst == 1);
+    BOOST_TEST(nothing_delivered());
+}
+
+BOOST_AUTO_TEST_CASE(guests_are_not_routers, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in();  // even where multicast is allowed
+    send(nic_a, icmpv6_frame(nic_a, all_nodes_mac(), link_local(nic_a), all_nodes(),
+                             icmpv6_router_advertisement));
+    send(nic_a, icmpv6_frame(nic_a, mac_of(nic_b), ip6(11), ip6(22), icmpv6_redirect));
+    const std::vector<std::byte> redirect{std::byte{icmp_redirect},
+                                          std::byte{1},
+                                          std::byte{0},
+                                          std::byte{0},
+                                          std::byte{0},
+                                          std::byte{0},
+                                          std::byte{0},
+                                          std::byte{0}};
+    send(nic_a,
+         fr::ipv4(mac_of(nic_b), mac_of(nic_a), ip4(11), ip4(22), pk::ipproto_icmp, redirect));
+    send(nic_a, udp4(mac_of(nic_b), mac_of(nic_a), ip4(11), ip4(22), dhcp4_server, dhcp4_client));
+    send(nic_a, udp6(mac_of(nic_b), mac_of(nic_a), ip6(11), ip6(22), dhcp6_server, dhcp6_client));
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().tx_drop_router_msg == 5);
+}
+
+BOOST_AUTO_TEST_CASE(neighbor_advertisement_target,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    send(nic_a, neighbor_advertisement(nic_a, nic_b, ip6(11), ip6(33)));  // claims c's address
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().tx_drop_neighbor_spoofed == 1);
+    send(nic_a, neighbor_advertisement(nic_a, nic_b, ip6(11), ip6(11)));
+    BOOST_TEST(port_b.frames.size() == 1);
+}
+
+BOOST_AUTO_TEST_CASE(replicated_needs_multicast_destination,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in();
+    send(nic_a, udp4(mdns_mac(), mac_of(nic_a), ip4(11), ip4(22)));
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().tx_drop_ip_dst == 1);
+    BOOST_TEST(sw.group_meter(nic_a)->drop_policy == 1);
+    send(nic_a, udp6(all_nodes_mac(), mac_of(nic_a), ip6(11), all_nodes()));
+    BOOST_TEST(port_b.frames.size() == 1);
+}
+
+BOOST_AUTO_TEST_CASE(unicast_arp_still_forwarded,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto reply = arp_request(nic_a, ip4(11), ip4(22));
+    std::ranges::copy(mac_of(nic_b), reply.begin());
+    reply[ethernet_header_size + 7] = std::byte{nb::arp_op_reply};
+    send(nic_a, reply);
+    BOOST_TEST(port_b.frames.size() == 1);
+}
+
+BOOST_AUTO_TEST_CASE(receiver_checks_inner_frame,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // c (on peer) forges a's address; claims a destination a does not own;
+    // sends a non-IP EtherType; sends a broken IPv4 header.
+    const Inbound spoofed{nic_c, nic_a, vpc, udp4(mac_of(nic_a), mac_of(nic_c), ip4(22), ip4(11))};
+    const Inbound wrong_dst{nic_c, nic_a, vpc,
+                            udp4(mac_of(nic_a), mac_of(nic_c), ip4(33), ip4(22))};
+    std::vector<std::byte> other;
+    ak::wire::Writer w{other};
+    fr::ethernet(w, mac_of(nic_a), mac_of(nic_c), ethertype_test);
+    other.resize(64, std::byte{0});
+    const Inbound not_ip{nic_c, nic_a, vpc, other};
+    auto broken_bytes = frame(mac_of(nic_a), mac_of(nic_c));
+    broken_bytes[ethernet_header_size + 3] = std::byte{0xff};  // total length past the frame
+    const Inbound broken{nic_c, nic_a, vpc, broken_bytes};
+    const Inbound link{nic_c, nic_a, vpc,
+                       udp6(mac_of(nic_a), mac_of(nic_c), link_local(nic_c), ip6(11))};
+    for (const Inbound* in : {&spoofed, &wrong_dst, &not_ip, &broken, &link}) {
+        BOOST_TEST(sw.receive(in->packet, vtep(peer_tail)).has_value());
+    }
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().rx_drop_ip_spoofed == 2);
+    BOOST_TEST(sw.counters().rx_drop_ip_dst == 1);
+    BOOST_TEST(sw.counters().rx_drop_ethertype == 1);
+    BOOST_TEST(sw.counters().rx_drop_malformed == 1);
+
+    // A replicated frame needs a multicast destination too.
+    opt_in();
+    const Inbound mcast_unicast_ip{nic_c, geneve::nic_broadcast, vpc,
+                                   udp4(mdns_mac(), mac_of(nic_c), ip4(33), ip4(11))};
+    BOOST_TEST(sw.receive(mcast_unicast_ip.packet, vtep(peer_tail)).has_value());
+    BOOST_TEST(sw.counters().rx_drop_ip_dst == 2);
+    BOOST_TEST(nothing_delivered());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

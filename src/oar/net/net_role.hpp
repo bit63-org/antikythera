@@ -44,7 +44,11 @@
 // Re-delivery of the version already applied for a VNI (helm resends after
 // a sideband reconnect) answers ok without touching the table; an older
 // version, a frame for another server, a bad signature or a mapping the
-// table refuses answers failed and leaves the table unchanged.
+// table refuses answers failed and leaves the table unchanged. The guest
+// addresses in the same frame replace the VSwitch's neighbor table for the
+// VNI once the mapping is applied: they feed the ARP/ND proxy and the IP
+// source and destination checks, so a VNI's addresses always match its
+// signed mapping.
 //
 // Not thread-safe: the sideband, the transports and the underlay share one
 // thread, as the VSwitch and Vtep require.

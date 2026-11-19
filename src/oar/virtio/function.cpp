@@ -198,6 +198,37 @@ auto PciFunction::memory_changing() -> void {
     }
 }
 
+auto PciFunction::memory_changing(Gpa gpa, std::uint64_t len) -> void {
+    if (!_live || len == 0) {
+        return;
+    }
+    // [a, a + n) and [gpa, gpa + len) overlap, computed without wrapping:
+    // each range starts before the other ends.
+    const std::uint64_t last = gpa + (len - 1) < gpa ? ~std::uint64_t{0} : gpa + (len - 1);
+    auto overlaps = [&](Gpa a, std::size_t n) {
+        if (n == 0) {
+            return false;
+        }
+        const std::uint64_t a_last = a + (n - 1) < a ? ~std::uint64_t{0} : a + (n - 1);
+        return a <= last && gpa <= a_last;
+    };
+    for (std::uint16_t i = 0; i < _params.num_queues; ++i) {
+        if (!_queues[i].has_value()) {
+            continue;
+        }
+        const auto config = _common.queue(i);
+        if (!config) {
+            continue;
+        }
+        if (overlaps(config->desc, desc_table_bytes(config->size)) ||
+            overlaps(config->driver, avail_ring_bytes(config->size)) ||
+            overlaps(config->device, used_ring_bytes(config->size))) {
+            fail();
+            return;
+        }
+    }
+}
+
 auto PciFunction::poll() -> bool {
     return _live && _device->poll();
 }

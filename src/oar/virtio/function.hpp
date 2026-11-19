@@ -167,10 +167,20 @@ public:
     // FLR or power-on: every register back to its reset value, queues and
     // in-flight buffers gone (Requirement 1.3).
     auto reset() -> void;
-    // The transport is about to remove a guest memory region. Queues hold
-    // spans into it, so they are dropped first; a live driver sees
-    // DEVICE_NEEDS_RESET.
+    // The transport is about to remove guest memory it cannot describe:
+    // live queues are dropped and a live driver sees DEVICE_NEEDS_RESET.
     auto memory_changing() -> void;
+    // The transport is about to remove [gpa, gpa + len). Only a live ring
+    // (descriptor table, available or used ring) inside that range forces
+    // DEVICE_NEEDS_RESET. Buffers are translated afresh on every pop and no
+    // device keeps their spans between calls, so nothing else can dangle.
+    // Hosts unmap ranges that never held rings all the time: the VMM drops
+    // and re-adds the window of every BAR whose decoding the guest
+    // toggles, and those windows are DMA regions too. Failing the device
+    // for each would wedge a live driver (Linux does not recover from
+    // DEVICE_NEEDS_RESET), which is how an L1 host hung while probing a
+    // second function.
+    auto memory_changing(Gpa gpa, std::uint64_t len) -> void;
     // Deferred device work (Device::poll); true while more remains.
     [[nodiscard]] auto poll() -> bool;
 

@@ -9,8 +9,8 @@
 //
 // --mtu sets the guest MTU directly. --underlay-mtu derives it from the
 // underlay the way the data plane must (task 11, mtu.hpp): the underlay MTU
-// less Geneve encapsulation and the tunnel's overhead (WireGuard over IPv6
-// is 80), and prints the plan.
+// less Geneve encapsulation and the tunnel's overhead (oar-net's WireGuard
+// adds 32), and prints the plan.
 //
 // L0 QEMU attaches with vfio-user-pci; the L1 host binds the function to
 // vfio-pci and Cloud Hypervisor hands it to an L2 guest, whose stock

@@ -113,8 +113,8 @@
   the Vtep's largest Geneve payload. The encapsulation overhead is 94, not
   the requirement's 90: guest VLAN tags are payload and VirtioNetFunction
   admits one beyond the MTU, so a tagged full-size frame needs the extra 4.
-  WireGuard over IPv6 adds 80 (`wireguard_ipv6_overhead`); 9000 with
-  WireGuard gives guests 8826, 1500 without a tunnel 1406. `ak-oar-net
+  oar-net's WireGuard adds 32 inside the same UDP datagram
+  (`wireguard_overhead`); 9000 with WireGuard gives guests 8874, 1500 without a tunnel 1406. `ak-oar-net
   --underlay-mtu N [--tunnel-overhead N]` advertises the planned MTU
   through `VIRTIO_NET_F_MTU`. `VtepConfig::max_payload` drops and counts
   (`tx_drop_too_big`) any datagram over the plan, and every

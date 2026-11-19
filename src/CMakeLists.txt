@@ -39,11 +39,20 @@ target_link_libraries(ak_oar_virtio
 # OpenSSL is required: AES-256-GCM key wrapping and OPENSSL_cleanse in the
 # helm key store, and Ed25519 in hull (the only implementation here). CI
 # builds against Ubuntu 24.04's OpenSSL 3.0, so 3.0 is the configure floor.
-find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto SSL)
 
-# helm: control-plane mailbox protocol, device pool, MCTP sideband framing
-# and key store.
+# ak_tls: mutually authenticated TLS 1.3 over TCP for the ControllerLink
+# (helm the client, the controller or harbor's test controller the server).
+add_library(ak_tls tls/tls.cpp)
+add_library(ak::tls ALIAS ak_tls)
+target_include_directories(ak_tls PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ak_tls
+  PRIVATE OpenSSL::SSL OpenSSL::Crypto ak::warnings ak::hardening)
+
+# helm: control-plane mailbox protocol, device pool, MCTP sideband framing,
+# key store and the ControllerLink.
 add_library(ak_helm
+  helm/controller_link.cpp
   helm/device_pool.cpp
   helm/key_store.cpp
   helm/mailbox.cpp
@@ -52,7 +61,7 @@ add_library(ak_helm
   helm/secure_element.cpp)
 add_library(ak::helm ALIAS ak_helm)
 target_link_libraries(ak_helm
-  PUBLIC ak::common
+  PUBLIC ak::common ak::proto ak::tls
   PRIVATE OpenSSL::Crypto ak::warnings ak::hardening)
 
 # hull: host-agent command authentication (Ed25519 signatures and sequence

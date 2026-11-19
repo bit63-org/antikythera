@@ -109,9 +109,10 @@ launches/kills board processes and then launches the L1 QEMU.
 
 ### ControllerLink
 
-See `controller-interface`. Verifies envelope shape and forwards the
-signed slot image; never verifies signatures itself (hull does — helm is
-not trusted to).
+See `controller-interface` (design "ControllerLink"). Verifies envelope
+shape and target server and forwards the signed slot image; never verifies
+signatures itself (hull does — helm is not trusted to). Built in
+`src/helm/controller_link.*`.
 
 ## Data models
 

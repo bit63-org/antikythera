@@ -94,7 +94,18 @@
 // and the NIC's MTU (given at attach). Nothing about DHCP is stored: the
 // mapping is the lease database. Other IP packets for the gateway MAC are
 // dropped until routing exists. Without a VpcConfig, DHCP is dropped and
-// counted, never flooded.
+// counted, never flooded. With an IPv6 prefix the gateway also answers
+// router solicitations and DHCPv6 (the NIC's in-prefix IPv6 addresses in
+// IA_NA), and poll() sends each attached NIC an unsolicited router
+// advertisement every ra_interval, so a guest's default route never
+// expires (task 18).
+//
+// Metadata (Requirement 13, task 19): IP packets from a NIC's own address
+// to 169.254.169.254 or fd00:ec2::254 at the gateway MAC go to the
+// MetadataEndpoint with the NIC ID the frame arrived on, never into the
+// fabric, within a per-NIC packet rate. inject_metadata() delivers the
+// endpoint's replies to that NIC only, and only from the metadata address
+// to one of the NIC's own addresses.
 //
 // Threading: a VSwitch belongs to one data-plane thread. transmit(),
 // receive(), attach(), detach(), set_neighbors() and set_vpc_config() must
@@ -144,6 +155,21 @@ public:
     virtual ~Underlay() = default;
 
     virtual auto send(const RemoteFrame& frame) -> void = 0;
+};
+
+// The instance metadata service's side of the intercept (Requirement 13).
+// `ip_packet` (the IP header onward) is valid only during deliver(); `nic`
+// is the function the frame arrived on, the caller's only identity.
+class MetadataEndpoint {
+public:
+    MetadataEndpoint() = default;
+    MetadataEndpoint(const MetadataEndpoint&) = delete;
+    auto operator=(const MetadataEndpoint&) -> MetadataEndpoint& = delete;
+    MetadataEndpoint(MetadataEndpoint&&) = delete;
+    auto operator=(MetadataEndpoint&&) -> MetadataEndpoint& = delete;
+    virtual ~MetadataEndpoint() = default;
+
+    virtual auto deliver(geneve::NicId nic, std::span<const std::byte> ip_packet) -> void = 0;
 };
 
 struct Ipv4Neighbor {
@@ -226,6 +252,11 @@ inline constexpr Ipv6Address metadata_ipv6{
     std::byte{0xfd}, std::byte{0x00}, std::byte{0x0e}, std::byte{0xc2}, std::byte{0}, std::byte{0},
     std::byte{0},    std::byte{0},    std::byte{0},    std::byte{0},    std::byte{0}, std::byte{0},
     std::byte{0},    std::byte{0},    std::byte{0x02}, std::byte{0x54}};  // fd00:ec2::254
+
+inline constexpr std::chrono::seconds ra_interval{200};
+inline constexpr std::uint16_t ra_router_lifetime_seconds = 1800;
+inline constexpr std::uint32_t metadata_rate_pps = 1024;  // per NIC
+inline constexpr std::uint32_t metadata_burst = 256;
 
 enum class AttachError : std::uint8_t {
     invalid_nic_id,    // 0 or the broadcast ID
@@ -325,8 +356,19 @@ struct SwitchCounters {
     std::uint64_t dhcp4_no_config{0};   // the VNI has no VpcConfig
     std::uint64_t dhcp4_no_address{0};  // the NIC has no IPv4 address inside the VPC prefix
     std::uint64_t dhcp4_bad{0};         // unparsable, or chaddr is not the NIC's MAC
-    std::uint64_t rx_frames{0};         // packets handed to receive()
-    std::uint64_t rx_delivered{0};      // copies delivered to local NICs
+    std::uint64_t ra_sent{0};           // solicited and periodic router advertisements
+    std::uint64_t rs_dropped{0};        // no IPv6 gateway, or a hop limit other than 255
+    std::uint64_t dhcp6_replies{0};
+    std::uint64_t dhcp6_ignored{0};    // names another server, or misses one it needs
+    std::uint64_t dhcp6_no_config{0};  // the VNI has no IPv6 gateway
+    std::uint64_t dhcp6_bad{0};        // unparsable, no client ID, or an unspecified source
+    std::uint64_t metadata_tx{0};      // packets handed to the metadata endpoint
+    std::uint64_t metadata_rx{0};      // endpoint replies delivered
+    std::uint64_t metadata_drop_rate{0};
+    std::uint64_t metadata_no_endpoint{0};
+    std::uint64_t metadata_inject_refused{0};  // reply not from the metadata address to the NIC
+    std::uint64_t rx_frames{0};                // packets handed to receive()
+    std::uint64_t rx_delivered{0};             // copies delivered to local NICs
     std::uint64_t rx_drop_unattached{0};
     std::uint64_t rx_drop_group{0};       // replicated frames this VTEP's policy does not admit
     std::uint64_t rx_drop_ethertype{0};   // inner frame not IPv4, IPv6 or ARP
@@ -377,6 +419,17 @@ public:
     // Every attached NIC's meter, in NIC ID order, then the final meters of
     // NICs detached since the last call (which this call forgets).
     auto group_usage() -> std::vector<GroupUsage>;
+
+    // Sends the periodic router advertisements that are due (Requirement
+    // 12.4). Called from the data-plane loop, as often as it likes.
+    auto poll() -> void;
+
+    // The metadata endpoint, or null to drop intercepted packets.
+    auto set_metadata_endpoint(MetadataEndpoint* endpoint) -> void { _metadata = endpoint; }
+    // Delivers a reply from the metadata endpoint to `nic`; false if the
+    // NIC is gone or the packet is not from the metadata address to one of
+    // its addresses (Requirement 13.3).
+    auto inject_metadata(geneve::NicId nic, std::span<const std::byte> ip_packet) -> bool;
 
     // A frame from a local NIC (FrameSink).
     auto transmit(const TxFrame& tx) -> void override;
@@ -441,6 +494,14 @@ private:
                            std::span<const std::byte> frame, const MacAddress& dst_mac) -> bool;
     auto handle_dhcp4(geneve::NicId src, const NicBinding& binding, const packet::ParsedPacket& p)
         -> bool;
+    auto handle_rs(geneve::NicId src, const NicBinding& binding, const packet::ParsedPacket& p)
+        -> void;
+    auto send_ra(geneve::NicId nic, const NicBinding& binding, const VpcConfig& cfg,
+                 const Ipv6Address& dst) -> void;
+    auto handle_dhcp6(geneve::NicId src, const NicBinding& binding, const packet::ParsedPacket& p)
+        -> void;
+    auto handle_metadata(geneve::NicId src, const packet::ParsedPacket& p) -> void;
+    auto take_metadata_token(Bucket& bucket) -> bool;
     // The NIC's DHCP address: its lowest guest IPv4 address inside `prefix`.
     [[nodiscard]] auto dhcp4_address(std::uint32_t vni, geneve::NicId nic,
                                      const Ipv4Prefix& prefix) const
@@ -455,6 +516,9 @@ private:
     std::unordered_map<geneve::NicId, RxPort*, NicIdHash> _ports;
     std::unordered_map<geneve::NicId, std::uint16_t, NicIdHash> _mtus;
     std::unordered_map<std::uint32_t, VpcConfig> _vpc_configs;
+    std::unordered_map<geneve::NicId, Clock::time_point, NicIdHash> _last_ra;
+    std::unordered_map<geneve::NicId, Bucket, NicIdHash> _metadata_buckets;
+    MetadataEndpoint* _metadata{nullptr};
     std::unordered_map<std::uint32_t, VpcNeighbors> _neighbors;
     std::unordered_map<std::uint32_t, GroupPolicy> _group_policies;  // only non-drop VNIs
     std::unordered_map<geneve::NicId, NicGroupState, NicIdHash> _group;

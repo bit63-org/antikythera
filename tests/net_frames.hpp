@@ -153,6 +153,11 @@ struct DhcpOption {
     std::vector<std::byte> value;
 };
 
+struct DhcpOption6 {
+    std::uint16_t code{0};
+    std::vector<std::byte> value;
+};
+
 inline auto dhcp4_request(std::uint8_t type, const net::MacAddress& chaddr, std::uint32_t xid,
                           std::vector<DhcpOption> options = {}, std::uint16_t flags = 0,
                           const pk::Ipv4Address& ciaddr = {}) -> std::vector<std::byte> {
@@ -217,6 +222,60 @@ inline auto dhcp4_options(std::span<const std::byte> message)
                                    message.begin() + static_cast<std::ptrdiff_t>(i + 2),
                                    message.begin() + static_cast<std::ptrdiff_t>(i + 2 + len)));
         i += 2 + len;
+    }
+    return out;
+}
+
+// A DHCPv6 client message: type, transaction ID, then each option as given
+// (code, value).
+inline auto dhcp6_message(std::uint8_t type, std::uint32_t xid,
+                          const std::vector<DhcpOption6>& options) -> std::vector<std::byte> {
+    std::vector<std::byte> m;
+    ak::wire::Writer w{m};
+    w.be32((std::uint32_t{type} << 24U) | (xid & 0x00FF'FFFFU));
+    for (const auto& o : options) {
+        w.be16(o.code);
+        w.be16(static_cast<std::uint16_t>(o.value.size()));
+        w.bytes(o.value);
+    }
+    return m;
+}
+
+// An IA_NA option body: IAID, T1 and T2 zero, then IAADDR options.
+inline auto ia_na(std::uint32_t iaid, const std::vector<net::Ipv6Address>& addresses = {})
+    -> std::vector<std::byte> {
+    std::vector<std::byte> v;
+    ak::wire::Writer w{v};
+    w.be32(iaid);
+    w.be32(0);
+    w.be32(0);
+    for (const auto& a : addresses) {
+        w.be16(5);
+        w.be16(24);
+        w.bytes(a);
+        w.be32(0);
+        w.be32(0);
+    }
+    return v;
+}
+
+// Top-level DHCPv6 options of a server message, in order.
+inline auto dhcp6_options(std::span<const std::byte> message)
+    -> std::vector<std::pair<std::uint16_t, std::vector<std::byte>>> {
+    std::vector<std::pair<std::uint16_t, std::vector<std::byte>>> out;
+    std::size_t i = 4;
+    while (i + 4 <= message.size()) {
+        const auto code = static_cast<std::uint16_t>((std::to_integer<unsigned>(message[i]) << 8U) |
+                                                     std::to_integer<unsigned>(message[i + 1]));
+        const auto len = (std::to_integer<std::size_t>(message[i + 2]) << 8U) |
+                         std::to_integer<std::size_t>(message[i + 3]);
+        if (i + 4 + len > message.size()) {
+            break;
+        }
+        out.emplace_back(code, std::vector<std::byte>(
+                                   message.begin() + static_cast<std::ptrdiff_t>(i + 4),
+                                   message.begin() + static_cast<std::ptrdiff_t>(i + 4 + len)));
+        i += 4 + len;
     }
     return out;
 }

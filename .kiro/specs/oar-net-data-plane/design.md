@@ -42,8 +42,11 @@ ARP/ND for known IPs answered from the mapping (proxy).
 
 Uses `ak::oar::net::geneve::{encode,decode}` and `check_ingress` (both
 written and fuzzed). UDP source port = hash(inner 5-tuple) folded into
-49152–65535. OAM packets: keepalive every N seconds per peer; peers missing
-K keepalives are reported to helm.
+49152–65535; a pool of sockets on consecutive ports carries it, since an
+ordinary UDP socket has one source port. OAM packets (`oam.hpp`, O bit
+set, VNI 0, own Protocol Type): keepalive every N seconds per peer VTEP;
+peers missing K keepalives are reported to helm through `PeerObserver`.
+Peers are the other VTEPs of VNIs with a local NIC, from the mappings.
 
 ### MappingTable
 

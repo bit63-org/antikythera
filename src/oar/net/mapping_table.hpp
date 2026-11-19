@@ -85,6 +85,11 @@ public:
     [[nodiscard]] auto version(std::uint32_t vni) const -> std::uint64_t;
     // Entries of `vni` in update order; empty if it has none.
     [[nodiscard]] auto entries(std::uint32_t vni) const -> std::span<const MapEntry>;
+    // The other VTEPs this VTEP exchanges traffic with: every owner VTEP,
+    // other than this one, of a VNI that has at least one NIC of this VTEP.
+    // Sorted, without duplicates. The Vtep keeps OAM keepalives running to
+    // exactly these.
+    [[nodiscard]] auto peer_vteps() const -> std::vector<Ipv6Address>;
     // Number of VNIs with at least one NIC.
     [[nodiscard]] auto vni_count() const noexcept -> std::size_t;
     [[nodiscard]] auto nic_count() const noexcept -> std::size_t { return _nics.size(); }

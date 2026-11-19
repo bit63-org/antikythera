@@ -1,6 +1,6 @@
 # Implementation Plan — oar-net: the network data plane
 
-## Status: 8/11 tasks complete
+## Status: 9/11 tasks complete
 
 ## Tasks
 
@@ -75,8 +75,36 @@
   spoofing checks; the
   VSwitch is not wired into `ak-oar-net` (it serves one NIC; task 9 adds
   the Vtep runtime that drives both).
-- [ ] 9. Vtep runtime: UDP sockets, OAM keepalives, drop counters.
-  _Requirements: 3.5, 3.6, 4.4_
+- [x] 9. Vtep runtime: UDP sockets, OAM keepalives, drop counters.
+  _Requirements: 3.5, 3.6, 4.4_ — `Vtep` (`src/oar/net/vtep.*`) is the
+  VSwitch's `Underlay`: it Geneve-encodes each `RemoteFrame` and sends it
+  to the peer's port 6081 with a UDP source port hashed from the inner
+  flow (`flow_port()`: VNI, IP addresses, protocol, and ports for
+  unfragmented TCP/UDP/SCTP, guest VLAN tags skipped, folded into
+  49152-65535). `Vtep::receive()` decodes one UDP payload, counts decode
+  drops per `DecodeError`, consumes OAM and returns data packets for
+  `VSwitch::receive()`, which counts policy drops per `PolicyError`.
+  OAM (`src/oar/net/oam.*`): a keepalive is a Geneve packet with O set,
+  VNI 0, Protocol Type 0x88B6 (placeholder) and a 12-byte body (version,
+  type, sequence); the MTU probe will be another type (task 11). Every
+  `keepalive_interval` the Vtep sends one to each peer VTEP
+  (`MappingSnapshot::peer_vteps()`: the other owners in VNIs with a NIC
+  here); a peer is up when one arrives and down after `keepalive_misses`
+  silent intervals, reported through `PeerObserver` for helm. Keepalives
+  from addresses that are not peers are dropped and counted; until
+  WireGuard (task 10) liveness is advisory, since OAM is unauthenticated.
+  Time is passed in (`tick(now)` returns the next deadline).
+  `UdpEndpoint` (`src/oar/net/udp_endpoint.*`): an IPv6-only non-blocking
+  socket bound to the VTEP address and 6081 for receive, plus an optional
+  pool of sockets on consecutive source ports chosen by flow port (a plain
+  socket cannot pick its source port per datagram; a raw socket needs
+  CAP_NET_RAW); `pump()` feeds received datagrams through the Vtep into the
+  VSwitch. Fuzz: `fuzz_vtep`. Tests include two VTEPs joined end to end
+  and loopback UDP (skipped where the sandbox has no IPv6). Not yet:
+  `ak-oar-net` still serves one NIC without the VSwitch or Vtep, since
+  helm has no channel yet to hand oar-net its map_updates and NIC
+  attachments; that wiring comes with the harbor multi-server tests
+  (task 11). Peer state changes are not yet carried to helm.
 - [ ] 10. WireGuard tunnel integration and key delivery from helm.
   _Requirements: 5_
 - [ ] 11. MTU computation and advertisement; harbor multi-server tests.

@@ -329,3 +329,31 @@ BOOST_AUTO_TEST_CASE(readers_see_whole_snapshots,
     pool.clear();
     BOOST_TEST(!torn.load());
 }
+
+BOOST_AUTO_TEST_CASE(peer_vteps_are_other_owners_in_vnis_with_local_nics,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    constexpr std::uint8_t third_tail = 3;
+    constexpr std::uint8_t fourth_tail = 4;
+    constexpr NicId nic_d{44};
+    constexpr NicId nic_e{55};
+    constexpr std::uint8_t mac_d = 0x44;
+    constexpr std::uint8_t mac_e = 0x55;
+    net::MappingTable table{addr(self_tail)};
+    BOOST_TEST(table.snapshot()->peer_vteps().empty());
+
+    // vpc: a here, b on peer, c on third (listed twice through two NICs: once).
+    BOOST_REQUIRE(table.apply(
+        {.vni = vpc,
+         .version = 1,
+         .entries = {entry(nic_c, mac_c, third_tail), entry(nic_a, mac_a, self_tail),
+                     entry(nic_b, mac_b, peer_tail), entry(nic_d, mac_d, third_tail)}}));
+    // other_vpc has no NIC here: its VTEPs are not peers.
+    BOOST_REQUIRE(table.apply(
+        {.vni = other_vpc, .version = 1, .entries = {entry(nic_e, mac_e, fourth_tail)}}));
+    const auto peers = table.snapshot()->peer_vteps();
+    BOOST_TEST((peers == std::vector<net::Ipv6Address>{addr(peer_tail), addr(third_tail)}));
+
+    // Emptying vpc removes them.
+    BOOST_REQUIRE(table.apply({.vni = vpc, .version = 2, .entries = {}}));
+    BOOST_TEST(table.snapshot()->peer_vteps().empty());
+}

@@ -13,14 +13,18 @@ add_library(ak_proto INTERFACE)
 add_library(ak::proto ALIAS ak_proto)
 target_link_libraries(ak_proto INTERFACE ak::common)
 
-# oar-net: Geneve encapsulation, VTEP ingress policy, the controller
-# mapping table and the virtio-net function (network data plane).
+# oar-net: Geneve encapsulation, VTEP ingress policy and runtime, the
+# controller mapping table, the VSwitch and the virtio-net function
+# (network data plane).
 add_library(ak_oar_net
   oar/net/geneve.cpp
   oar/net/mapping_table.cpp
   oar/net/neighbor.cpp
+  oar/net/oam.cpp
+  oar/net/udp_endpoint.cpp
   oar/net/virtio_net.cpp
   oar/net/vswitch.cpp
+  oar/net/vtep.cpp
   oar/net/vtep_policy.cpp)
 add_library(ak::oar_net ALIAS ak_oar_net)
 target_link_libraries(ak_oar_net

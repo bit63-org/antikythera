@@ -49,13 +49,14 @@ auto vtep(std::uint8_t tail) -> oar::Vtep {
 
 auto peers_frame(const oar::Vtep& to, std::uint64_t version)
     -> std::pair<proto::TunnelPeers, std::vector<std::byte>> {
-    proto::TunnelPeers t{.server_id = 1,
-                         .key_id = 1,
-                         .vtep = to,
-                         .peers_version = version,
-                         .peers = {{.vtep = vtep(0x77), .public_key = {}}},
-                         .signature = {}};
-    t.peers[0].public_key.fill(std::byte{static_cast<std::uint8_t>(version)});
+    proto::TunnelPeers t{
+        .server_id = 1,
+        .key_id = 1,
+        .vtep = to,
+        .peers_version = version,
+        .peers = {{.vtep = vtep(0x77), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = {}}},
+        .signature = {}};
+    t.peers[0].key.fill(std::byte{static_cast<std::uint8_t>(version)});
     auto b = proto::encode_tunnel_peers(t);
     BOOST_REQUIRE(b.has_value());
     return {t, *b};
@@ -156,16 +157,22 @@ BOOST_AUTO_TEST_CASE(fill_reports_public_keys_in_vtep_order) {
     proto::Inventory inv;
     inv.boot_id = 1;
     inv.vteps = {vtep(1), vtep(2), vtep(3)};
+    constexpr auto wg = proto::tunnel_mode_bit(proto::TunnelMode::wireguard);
     ring.fill(inv);
-    BOOST_TEST(inv.tunnel_keys.empty());  // no VTEP has a key yet
+    // Every VTEP supports WireGuard (and only WireGuard), keyed or not.
+    BOOST_REQUIRE(inv.tunnels.size() == 3U);
+    BOOST_TEST(std::ranges::all_of(inv.tunnels, [](const proto::VtepTunnel& t) {
+        return t.modes == wg && t.public_key == proto::TunnelPublicKey{};
+    }));
 
     const auto k1 = ring.ensure(vtep(1)).value();
     const auto k3 = ring.ensure(vtep(3)).value();
     ring.fill(inv);
-    BOOST_REQUIRE(inv.tunnel_keys.size() == 3U);
-    BOOST_TEST((inv.tunnel_keys[0] == k1));
-    BOOST_TEST((inv.tunnel_keys[1] == proto::TunnelPublicKey{}));
-    BOOST_TEST((inv.tunnel_keys[2] == k3));
+    BOOST_REQUIRE(inv.tunnels.size() == 3U);
+    BOOST_TEST((inv.tunnels[0].public_key == k1));
+    BOOST_TEST((inv.tunnels[1].public_key == proto::TunnelPublicKey{}));
+    BOOST_TEST((inv.tunnels[2].public_key == k3));
+    BOOST_TEST(inv.tunnels[2].modes == wg);
 
     // The controller reads them back from the encoded report.
     auto bytes =
@@ -173,7 +180,7 @@ BOOST_AUTO_TEST_CASE(fill_reports_public_keys_in_vtep_order) {
     BOOST_REQUIRE(bytes.has_value());
     auto back = proto::decode_report(*bytes);
     BOOST_REQUIRE(back.has_value());
-    BOOST_TEST((std::get<proto::Inventory>(back->body).tunnel_keys == inv.tunnel_keys));
+    BOOST_TEST((std::get<proto::Inventory>(back->body).tunnels == inv.tunnels));
 }
 
 BOOST_AUTO_TEST_CASE(keeps_the_newest_peer_set_per_vtep) {

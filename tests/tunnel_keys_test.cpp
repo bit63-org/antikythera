@@ -352,8 +352,9 @@ struct Server {
         auto report = proto::decode_report(*bytes);
         BOOST_REQUIRE(report.has_value());
         const auto& got = std::get<proto::Inventory>(report->body);
-        BOOST_REQUIRE(got.tunnel_keys.size() == 1U);
-        return got.tunnel_keys[0];
+        BOOST_REQUIRE(got.tunnels.size() == 1U);
+        BOOST_TEST(got.tunnels[0].modes == proto::tunnel_mode_bit(proto::TunnelMode::wireguard));
+        return got.tunnels[0].public_key;
     }
 
     // A controller record arriving at helm: decoded and checked the way
@@ -434,8 +435,12 @@ BOOST_AUTO_TEST_CASE(controller_distributes_vtep_keys,
     {
         const auto sa = a.serve();
         const auto sb = b.serve();
-        BOOST_TEST(a.deliver(peers_record(a, 1, {{.vtep = b.addr, .public_key = key_b}})));
-        BOOST_TEST(b.deliver(peers_record(b, 1, {{.vtep = a.addr, .public_key = key_a}})));
+        BOOST_TEST(a.deliver(peers_record(
+            a, 1,
+            {{.vtep = b.addr, .mode = proto::TunnelMode::wireguard, .spi = 0, .key = key_b}})));
+        BOOST_TEST(b.deliver(peers_record(
+            b, 1,
+            {{.vtep = a.addr, .mode = proto::TunnelMode::wireguard, .spi = 0, .key = key_a}})));
     }
     BOOST_TEST((a.sink.forwarded == std::vector<bool>{true}));
     BOOST_TEST((b.sink.forwarded == std::vector<bool>{true}));

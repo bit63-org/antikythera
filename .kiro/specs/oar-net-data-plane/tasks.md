@@ -1,6 +1,6 @@
 # Implementation Plan — oar-net: the network data plane
 
-## Status: 7/11 tasks complete
+## Status: 8/11 tasks complete
 
 ## Tasks
 
@@ -51,8 +51,28 @@
   (`src/oar/net/mapping_table.*`), tests, fuzz target. Takes a decoded
   `MapUpdate`; the wire codec and signature check are controller task 2.
   _Requirements: 2.5, 8_
-- [ ] 8. VSwitch: local forwarding, broadcast replication, ARP/ND proxy,
-  dead VPC. _Requirements: 2, 7_
+- [x] 8. VSwitch: local forwarding, broadcast replication, ARP/ND proxy,
+  dead VPC. _Requirements: 2, 7_ — `VSwitch` (`src/oar/net/vswitch.*`) is
+  every function's `FrameSink` and delivers through `RxPort` (implemented
+  by `VirtioNetFunction`). One mapping snapshot per frame. Transmit checks
+  the source is attached and mapped to this VTEP (otherwise dead VPC) and
+  that its MAC is the mapped one, then delivers locally, hands remote
+  unicast to an `Underlay` with `{vtep, vni, src, dst}` for the Vtep
+  (task 9), drops unknown unicast and hairpins, and floods group frames to
+  local members plus once per remote VTEP with the broadcast NIC ID.
+  `receive()` runs `check_ingress` against the same snapshot it delivers
+  with; policy drops are counted per reason. The dead VPC is not a table:
+  a NIC is in it when it is not mapped to this VTEP, so helm detaches by
+  dropping it from the map_update. ARP/ND (`src/oar/net/neighbor.*`):
+  bounds-checked parsers, proxy answers for addresses helm registers per
+  VNI through `set_neighbors()` (reply MAC from the current snapshot), ARP
+  with another NIC's sender MAC or IP and NS with a foreign source
+  link-layer option dropped, DAD probes never answered. Fuzz:
+  `fuzz_vswitch` (parsers, and isolation invariants over frame streams).
+  Not yet: the controller's map_update carries no guest IP addresses, so
+  helm has no wire source for `set_neighbors()`; NA spoofing checks; the
+  VSwitch is not wired into `ak-oar-net` (it serves one NIC; task 9 adds
+  the Vtep runtime that drives both).
 - [ ] 9. Vtep runtime: UDP sockets, OAM keepalives, drop counters.
   _Requirements: 3.5, 3.6, 4.4_
 - [ ] 10. WireGuard tunnel integration and key delivery from helm.

@@ -114,6 +114,20 @@ enum class RxResult : std::uint8_t {
 
 [[nodiscard]] auto to_string(RxResult r) noexcept -> const char*;
 
+// Something that takes frames toward a guest: a VirtioNetFunction, or a
+// test double. The VSwitch delivers through this.
+class RxPort {
+public:
+    RxPort() = default;
+    RxPort(const RxPort&) = delete;
+    auto operator=(const RxPort&) -> RxPort& = delete;
+    RxPort(RxPort&&) = delete;
+    auto operator=(RxPort&&) -> RxPort& = delete;
+    virtual ~RxPort() = default;
+
+    virtual auto deliver(std::span<const std::byte> frame) -> RxResult = 0;
+};
+
 enum class NetConfigError : std::uint8_t {
     invalid_nic_id,  // 0 or the broadcast ID
     bad_mac,         // group (multicast) or all-zero MAC
@@ -145,7 +159,7 @@ struct NetParams {
     std::size_t tx_budget{256};  // TX chains per notification before deferring to poll()
 };
 
-class VirtioNetFunction final : public virtio::Device {
+class VirtioNetFunction final : public virtio::Device, public RxPort {
 public:
     [[nodiscard]] static auto create(const NetParams& params, const virtio::GuestMemory& memory,
                                      virtio::InterruptSink& interrupts, FrameSink& sink)
@@ -161,7 +175,7 @@ public:
     [[nodiscard]] auto pci() noexcept -> virtio::PciFunction& { return *_pci; }
 
     // Hands one frame to the guest (data plane -> guest).
-    auto deliver(std::span<const std::byte> frame) -> RxResult;
+    auto deliver(std::span<const std::byte> frame) -> RxResult override;
 
     // helm reassigns the NIC (detach to the dead VPC, or a new attachment).
     // Resets the function like an FLR first, so nothing from the previous

@@ -18,7 +18,9 @@ target_link_libraries(ak_proto INTERFACE ak::common)
 add_library(ak_oar_net
   oar/net/geneve.cpp
   oar/net/mapping_table.cpp
+  oar/net/neighbor.cpp
   oar/net/virtio_net.cpp
+  oar/net/vswitch.cpp
   oar/net/vtep_policy.cpp)
 add_library(ak::oar_net ALIAS ak_oar_net)
 target_link_libraries(ak_oar_net

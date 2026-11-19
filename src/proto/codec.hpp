@@ -31,30 +31,34 @@ inline constexpr KeyId no_key_id = 0;
 inline constexpr std::size_t ed25519_signature_size = 64;
 
 enum class DecodeError : std::uint8_t {
-    truncated,              // the frame ended before a field did
-    trailing_bytes,         // bytes after the end of the frame
-    bad_magic,              //
-    bad_version,            // a frame format version this code does not speak
-    bad_key_id,             // key_id is no_key_id
-    key_id_mismatch,        // envelope key_id differs from the slot header's key_id
-    bad_server_id,          // server_id 0 (never allocated)
-    reserved_not_zero,      // a reserved byte is non-zero
-    bad_vni,                // VNI 0 or wider than 24 bits
-    bad_map_version,        // mapping version 0 (versions start at 1)
-    too_many_entries,       // more than max_map_entries
-    bad_nic_id,             // NIC ID 0
-    nic_ids_not_ascending,  // entries not in strictly increasing NIC ID order
-    bad_mac,                // MAC not a locally administered unicast address
-    bad_vtep,               // owner VTEP address unspecified (all zero) or multicast
-    bad_report_seq,         // report sequence number 0
-    bad_boot_id,            // inventory boot ID 0
-    bad_id,                 // a VM, volume or command identifier that must be non-zero is 0
-    unknown_value,          // an enum field holds a value the protocol does not define
-    bad_capacity,           // a free count larger than its total
-    not_ascending,          // a list that must be in strictly increasing key order is not
-    bad_owner,              // a function's owner VM disagrees with its state
-    bad_record_type,        // a link record type this code does not speak
-    record_too_large,       // a link record longer than max_record_payload
+    truncated,                // the frame ended before a field did
+    trailing_bytes,           // bytes after the end of the frame
+    bad_magic,                //
+    bad_version,              // a frame format version this code does not speak
+    bad_key_id,               // key_id is no_key_id
+    key_id_mismatch,          // envelope key_id differs from the slot header's key_id
+    bad_server_id,            // server_id 0 (never allocated)
+    reserved_not_zero,        // a reserved byte is non-zero
+    bad_vni,                  // VNI 0 or wider than 24 bits
+    bad_map_version,          // mapping version 0 (versions start at 1)
+    too_many_entries,         // more than max_map_entries
+    bad_nic_id,               // NIC ID 0
+    nic_ids_not_ascending,    // entries not in strictly increasing NIC ID order
+    bad_mac,                  // MAC not a locally administered unicast address
+    bad_vtep,                 // owner VTEP address unspecified (all zero) or multicast
+    bad_report_seq,           // report sequence number 0
+    bad_boot_id,              // inventory boot ID 0
+    bad_id,                   // a VM, volume or command identifier that must be non-zero is 0
+    unknown_value,            // an enum field holds a value the protocol does not define
+    bad_capacity,             // a free count larger than its total
+    not_ascending,            // a list that must be in strictly increasing key order is not
+    bad_owner,                // a function's owner VM disagrees with its state
+    bad_record_type,          // a link record type this code does not speak
+    record_too_large,         // a link record longer than max_record_payload
+    too_many_addresses,       // more than max_guest_addresses of one family
+    bad_guest_address,        // a guest address that is not unicast
+    addresses_not_ascending,  // guest addresses not in strictly increasing order
+    unknown_address_nic,      // a guest address owned by a NIC not in the mapping
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -107,6 +111,14 @@ enum class DecodeError : std::uint8_t {
             return "unknown link record type";
         case DecodeError::record_too_large:
             return "link record too large";
+        case DecodeError::too_many_addresses:
+            return "too many guest addresses";
+        case DecodeError::bad_guest_address:
+            return "guest address not unicast";
+        case DecodeError::addresses_not_ascending:
+            return "guest addresses not strictly ascending";
+        case DecodeError::unknown_address_nic:
+            return "guest address owned by a NIC not in the mapping";
     }
     return "unknown";
 }

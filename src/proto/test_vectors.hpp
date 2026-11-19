@@ -50,35 +50,39 @@ inline constexpr std::string_view envelope1_signature =
     "99970893c1198627e171f8498ecee53bc4b8e4da19c82e35746e5eea0397b914e0d5402d8ceb15b80e88c8ec"
     "e883a965d613c5e691e2244d8d13a074384ca601";
 
-// Vector 2: a MapUpdate for server 7, VNI 0xABCD, map_version 3, signed
-// with key 1 (key_id 1), two entries:
+// Vector 2: a MapUpdate (format v2) for server 7, VNI 0xABCD, map_version
+// 3, signed with key 1 (key_id 1), two entries:
 //   NIC 0x10, MAC 02:00:00:00:00:10, owner VTEP fd00::1
 //   NIC 0x11, MAC 02:00:00:00:00:11, owner VTEP fd00::2
+// and guest addresses 10.0.0.16 (NIC 0x10), 10.0.0.17 (NIC 0x11) and
+// fd12::10 (NIC 0x10).
 inline constexpr std::uint64_t map2_server_id = 7;
 inline constexpr std::uint16_t map2_key_id = 1;
 inline constexpr std::uint32_t map2_vni = 0xABCD;
 inline constexpr std::uint64_t map2_map_version = 3;
 inline constexpr std::string_view map2 =
-    "414b4d55010001000700000000000000cdab0000020000000300000000000000100000000000000002000000"
-    "00100000fd00000000000000000000000000000111000000000000000200000000110000fd00000000000000"
-    "0000000000000002a3114d12fe9f37aa231df1d68186d79dc8a090cc08bf9350642c19f646791005dc598ec3"
-    "3d4b8112762cf9ed905c727b7be8f2d5fd08e9fd49c59ef4925bf007";
+    "414b4d55020001000700000000000000cdab0000020002000300000000000000010000000000000010000000"
+    "000000000200000000100000fd00000000000000000000000000000111000000000000000200000000110000"
+    "fd00000000000000000000000000000210000000000000000a0000100000000011000000000000000a000011"
+    "000000001000000000000000fd1200000000000000000000000000107399462eea4d7abde776a6360424604b"
+    "883a05d6e4b61f697190165634c84edc306e156572e31ed5a318b3d1c4bfc1535a556e61bf9370a51882c45d"
+    "23ae880b";
 inline constexpr std::string_view map2_signature =
-    "a3114d12fe9f37aa231df1d68186d79dc8a090cc08bf9350642c19f646791005dc598ec33d4b8112762cf9ed"
-    "905c727b7be8f2d5fd08e9fd49c59ef4925bf007";
+    "7399462eea4d7abde776a6360424604b883a05d6e4b61f697190165634c84edc306e156572e31ed5a318b3d1"
+    "c4bfc1535a556e61bf9370a51882c45d23ae880b";
 
-// Vector 3: an empty MapUpdate for server 7, VNI 1, map_version 1, signed
+// Vector 3: an empty MapUpdate (format v2) for server 7, VNI 1, map_version 1, signed
 // with key 2 (key_id 2): a rotated key, and a VPC with no NICs left.
 inline constexpr std::uint64_t map0_server_id = 7;
 inline constexpr std::uint16_t map0_key_id = 2;
 inline constexpr std::uint32_t map0_vni = 1;
 inline constexpr std::uint64_t map0_map_version = 1;
 inline constexpr std::string_view map0 =
-    "414b4d5501000200070000000000000001000000000000000100000000000000e2caebe54593367947ff51cb"
-    "4e043dbb8f1d28d69b1fd076d8132367c444f859687afc2a8b20e1b02e1152299125e3f7e1189cb7c06f983b"
-    "b2dd6b09ca8b9102";
+    "414b4d55020002000700000000000000010000000000000001000000000000000000000000000000da5b98d1"
+    "fd9b4e0923f8a7452c722df82d2bb10dc19de1bd4de6f5203be17976c070c3fb029da4b75be5a130ec6ede28"
+    "d0b8b1293c7611e94f49088651987d04";
 inline constexpr std::string_view map0_signature =
-    "e2caebe54593367947ff51cb4e043dbb8f1d28d69b1fd076d8132367c444f859687afc2a8b20e1b02e115229"
-    "9125e3f7e1189cb7c06f983bb2dd6b09ca8b9102";
+    "da5b98d1fd9b4e0923f8a7452c722df82d2bb10dc19de1bd4de6f5203be17976c070c3fb029da4b75be5a130"
+    "ec6ede28d0b8b1293c7611e94f49088651987d04";
 
 }  // namespace ak::proto::vectors

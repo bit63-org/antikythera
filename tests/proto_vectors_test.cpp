@@ -38,6 +38,8 @@ constexpr std::uint8_t ula_prefix = 0xFD;
 constexpr std::uint64_t map2_nic_a = 0x10;
 constexpr std::uint64_t map2_nic_b = 0x11;
 constexpr std::size_t last = 15;
+constexpr std::uint8_t guest_net = 10;
+constexpr std::uint8_t guest_ula_second = 0x12;
 
 auto verifier() -> ak::hull::SignatureVerifier {
     const std::array keys{ak::test::controller_key(vec::envelope1_key_id, vec::key1_public),
@@ -54,6 +56,20 @@ auto map2_entry(std::uint64_t nic, std::uint8_t vtep_last) -> proto::MapEntry {
     e.owner_vtep[0] = std::byte{ula_prefix};
     e.owner_vtep[last] = std::byte{vtep_last};
     return e;
+}
+
+// 10.0.0.<nic> and fd12::<nic>: the guest addresses in vector 2.
+auto guest_ipv4(std::uint64_t nic) -> proto::GuestIpv4 {
+    return {.nic_id = nic,
+            .address = {std::byte{guest_net}, {}, {}, std::byte{static_cast<std::uint8_t>(nic)}}};
+}
+
+auto guest_ipv6(std::uint64_t nic) -> proto::GuestIpv6 {
+    proto::GuestIpv6 g{.nic_id = nic, .address = {}};
+    g.address[0] = std::byte{ula_prefix};
+    g.address[1] = std::byte{guest_ula_second};
+    g.address[last] = std::byte{static_cast<std::uint8_t>(nic)};
+    return g;
 }
 
 auto signed_map_update(const proto::MapUpdate& m, const TestSigner& signer)
@@ -138,6 +154,8 @@ BOOST_AUTO_TEST_CASE(map2_reproduces_and_verifies) {
                       .vni = vec::map2_vni,
                       .map_version = vec::map2_map_version,
                       .entries = {map2_entry(map2_nic_a, 1), map2_entry(map2_nic_b, 2)},
+                      .ipv4 = {guest_ipv4(map2_nic_a), guest_ipv4(map2_nic_b)},
+                      .ipv6 = {guest_ipv6(map2_nic_a)},
                       .signature = {}},
                      TestSigner{vec::key1_secret});
 }
@@ -149,6 +167,8 @@ BOOST_AUTO_TEST_CASE(map0_reproduces_and_verifies) {
                       .vni = vec::map0_vni,
                       .map_version = vec::map0_map_version,
                       .entries = {},
+                      .ipv4 = {},
+                      .ipv6 = {},
                       .signature = {}},
                      TestSigner{vec::key2_secret});
 }

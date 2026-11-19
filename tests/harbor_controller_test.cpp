@@ -192,6 +192,21 @@ BOOST_AUTO_TEST_CASE(map_updates_parse_and_sort) {
     BOOST_TEST(std::to_integer<int>(m.entries[1].owner_vtep[10]) == 0xFF);  // IPv4-mapped
     BOOST_TEST(std::to_integer<int>(m.entries[1].owner_vtep[15]) == 2);
     BOOST_TEST(std::to_integer<int>(m.entries[1].mac[5]) == 0x11);
+    BOOST_TEST(m.ipv4.empty());
+    BOOST_TEST(m.ipv6.empty());
+
+    // Guest addresses follow the VTEP, sorted into the frame's order.
+    auto g = action(
+        "map-update 5 3 0x11,02:00:00:00:00:11,fd00::2,10.0.0.9,fd12::11 "
+        "0x10,02:00:00:00:00:10,fd00::1,10.0.0.8,10.0.0.7");
+    const auto& gm = std::get<harbor::SendMapUpdate>(g);
+    BOOST_REQUIRE(gm.ipv4.size() == 3U);
+    BOOST_TEST(std::to_integer<int>(gm.ipv4[0].address[3]) == 7);
+    BOOST_TEST(gm.ipv4[0].nic_id == 0x10U);
+    BOOST_TEST(gm.ipv4[2].nic_id == 0x11U);
+    BOOST_REQUIRE(gm.ipv6.size() == 1U);
+    BOOST_TEST(gm.ipv6[0].nic_id == 0x11U);
+    BOOST_TEST(std::to_integer<int>(gm.ipv6[0].address[1]) == 0x12);
 }
 
 BOOST_AUTO_TEST_CASE(expectations_parse) {
@@ -216,6 +231,8 @@ BOOST_AUTO_TEST_CASE(mistakes_are_named) {
     BOOST_TEST(parse_error("map-update 5 1 0x10,02:00:00:00:00:10,nowhere").find("VTEP") !=
                std::string::npos);
     BOOST_TEST(parse_error("map-update 5 1 0x10").find("NIC,MAC,VTEP") != std::string::npos);
+    BOOST_TEST(parse_error("map-update 5 1 0x10,02:00:00:00:00:10,fd00::1,10.0.0.300")
+                   .find("guest address") != std::string::npos);
     // Values hull's strict decoder refuses fail here, not as `malformed`.
     BOOST_TEST(parse_error("create-network 0").find("invalid command") != std::string::npos);
     BOOST_TEST(parse_error("create-network 0x1000000").find("invalid command") !=

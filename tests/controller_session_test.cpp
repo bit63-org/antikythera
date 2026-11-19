@@ -98,8 +98,14 @@ auto envelope_record(std::uint64_t to, std::uint64_t seq) -> std::vector<std::by
 }
 
 auto map_update_record(std::uint64_t to) -> std::vector<std::byte> {
-    proto::MapUpdate m{
-        .server_id = to, .key_id = key, .vni = 5, .map_version = 1, .entries = {}, .signature = {}};
+    proto::MapUpdate m{.server_id = to,
+                       .key_id = key,
+                       .vni = 5,
+                       .map_version = 1,
+                       .entries = {},
+                       .ipv4 = {},
+                       .ipv6 = {},
+                       .signature = {}};
     auto b = proto::encode_map_update(m);
     BOOST_REQUIRE(b.has_value());
     return framed(RecordType::map_update, *b);

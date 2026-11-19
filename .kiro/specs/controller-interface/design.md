@@ -24,6 +24,8 @@ Envelope {
 MapUpdate {
   server_id u64, key_id u16, vni u32, map_version u64,
   entries [] { nic_id u64, mac [6], owner_vtep [16] },
+  ipv4 [] { nic_id u64, address [4] },     // guest addresses (format v2)
+  ipv6 [] { nic_id u64, address [16] },
   signature [64]            // Ed25519 over everything above
 }
 ```
@@ -45,6 +47,16 @@ encoding with no duplicates), MACs must be locally administered unicast
 (Requirement 4.2), owner VTEPs must be unicast IPv6 (IPv4-mapped allowed),
 and a frame holds at most 4096 entries; a larger VPC needs a new format
 version.
+
+Format version 2 added the guest addresses oar-net's ARP/ND proxy answers
+for: per address family, a list of `{nic_id, address}` in strictly
+increasing address order (so each address belongs to one NIC and the
+encoding stays canonical), each naming a NIC in the same frame's
+entries, at most 8192 per family. Addresses must be unicast (IPv4 not
+0.0.0.0 and below 224.0.0.0, IPv6 neither unspecified nor multicast). The
+addresses ride in the mapping frame rather than a separate message so the
+proxy can never answer for a NIC under a stale mapping, and one version
+number covers both.
 
 Open question: the envelope's `server_id` is not signed, and the slot
 header has no server field, so a command signed for one server would

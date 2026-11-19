@@ -191,16 +191,31 @@
   the VSwitch meters. _Requirements: 10.2, 10.6, 10.7_
 - [ ] 14. IGMP/MLD snooping, per-NIC group cap, join reports through helm
   and per-group VTEP lists. Needs the L3 parser. _Requirements: 10.5_
-- [ ] 15. L3/L4 packet parser (`src/oar/net/packet.*`): untagged
+- [x] 15. L3/L4 packet parser (`src/oar/net/packet.*`): untagged
   Ethernet, IPv4 with options, IPv6 with a bounded extension-header walk,
   TCP/UDP/ICMP/ICMPv6 headers, fragments; tests and `fuzz_packet`.
-  _Requirements: 11.2_
-- [ ] 16. Source/destination check in the VSwitch on transmit and
+  _Requirements: 11.2_ — `packet::parse` returns a `ParsedPacket` (both
+  address families, protocol, hop limit, fragment flags, L4 ports or
+  ICMP type/code, and nested views of the IP packet, L4 data and
+  payload) or a `PacketError`. `fuzz_packet` checks that every view lies
+  inside the one before it and that L4 only appears in first fragments.
+  Test frames come from `tests/net_frames.hpp`.
+- [x] 16. Source/destination check in the VSwitch on transmit and
   receive: EtherType allowlist, source classes (own, local-only,
   spoofed), destination owned by the destination NIC, multicast
   destination for replicated frames, ARP sender and NA target checks,
   router and DHCP-server messages dropped, per-cause counters;
-  `fuzz_vswitch` invariants. _Requirements: 11.1, 11.3–11.9_
+  `fuzz_vswitch` invariants. _Requirements: 11.1, 11.3–11.9_ — the
+  address tables are the `set_neighbors()` ones, which `NetRole` fills
+  from each applied map_update's guest addresses, so a VNI whose map
+  carries no addresses carries no IP (the tests now give every NIC
+  10.0.0.<id> and fd10::<id>). Local-only packets (DHCP client from
+  0.0.0.0, link-local or unspecified IPv6) end at `tx_drop_local_only`
+  unless the ND proxy answers them, until the gateway responders (tasks
+  17–18) consume them. On receive the replicated-frame policy check runs
+  before the inner IP check, so group meters and `rx_drop_group` keep
+  their meaning. `fuzz_vswitch` checks that every forwarded frame is ARP
+  or IP from the true sender's own address.
 - [ ] 17. `VpcConfig` per VNI (`set_vpc_config`, MTU taken at attach),
   gateway ARP/ND answers, `tx_drop_no_route`, and the stateless DHCPv4
   server (`src/oar/net/dhcp4.*`), tests and fuzz. _Requirements: 12.1–12.3,

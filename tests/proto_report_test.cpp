@@ -124,6 +124,30 @@ auto set_le16(std::vector<std::byte>& b, std::size_t off, std::uint16_t v) -> vo
     BOOST_REQUIRE(w.write(v, ak::wire::Order::little).has_value());
 }
 
+auto usage_entry(std::uint8_t slot, std::uint64_t nic, std::uint64_t attachment)
+    -> proto::GroupUsageEntry {
+    return {.slot = slot,
+            .nic_id = nic,
+            .vni = 5,
+            .detached = false,
+            .attachment = attachment,
+            .frames = 10,
+            .bytes = 1000,
+            .replicas_remote = 30,
+            .replica_bytes_remote = 3000,
+            .replicas_local = 10,
+            .replica_bytes_local = 1000,
+            .drop_policy = 1,
+            .drop_rate = 2,
+            .drop_fanout = 3};
+}
+
+auto sample_usage() -> proto::GroupUsage {
+    auto detached = usage_entry(1, 0x22, 4);
+    detached.detached = true;
+    return {.entries = {usage_entry(1, 0x11, 3), detached, usage_entry(2, 0x11, 1)}};
+}
+
 auto all_bodies() -> std::vector<proto::ReportBody> {
     return {
         sample_inventory(),
@@ -147,6 +171,8 @@ auto all_bodies() -> std::vector<proto::ReportBody> {
         proto::MapApplied{.vni = 5, .map_version = 4},
         proto::HostFaultReport{
             .code = proto::FaultCode::iommu_fault, .slot = 3, .detail = 0xDEAD'BEEF},
+        sample_usage(),
+        proto::GroupUsage{},
     };
 }
 
@@ -259,7 +285,7 @@ BOOST_AUTO_TEST_CASE(header_rules) {
     b = good;
     set_le16(b, off_kind, 0);
     BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
-    set_le16(b, off_kind, 7);
+    set_le16(b, off_kind, 8);
     BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
     b = good;
     b[off_reserved + 3] = std::byte{1};
@@ -403,6 +429,70 @@ BOOST_AUTO_TEST_CASE(event_rules) {
     b = encoded(make_report(proto::HostFaultReport{}));
     b[body + 3] = std::byte{1};
     BOOST_TEST((decode_error(b) == DecodeError::reserved_not_zero));
+}
+
+BOOST_AUTO_TEST_CASE(group_usage_layout) {
+    const auto b = encoded(make_report(sample_usage()));
+    constexpr std::size_t body = proto::report_header_size;
+    BOOST_TEST(b.size() ==
+               body + proto::group_usage_fixed_size + (3 * proto::group_usage_entry_size));
+    BOOST_TEST(std::to_integer<int>(b[body]) == 3);  // count
+    const std::size_t second = body + proto::group_usage_fixed_size + proto::group_usage_entry_size;
+    BOOST_TEST(le64_at(b, second) == 0x22U);                 // nic_id
+    BOOST_TEST(std::to_integer<int>(b[second + 12]) == 1);   // flags: detached
+    BOOST_TEST(std::to_integer<int>(b[second + 13]) == 1);   // slot
+    BOOST_TEST(le64_at(b, second + 16) == 4U);               // attachment
+    BOOST_TEST(le64_at(b, second + 24 + (3 * 8)) == 3000U);  // replica_bytes_remote
+    static_assert(proto::max_group_usage_size < proto::max_report_size);
+}
+
+BOOST_AUTO_TEST_CASE(group_usage_rules_are_enforced_both_ways) {
+    const auto refused = [](proto::GroupUsage u, DecodeError want) {
+        BOOST_TEST((encode_error(make_report(u)) == want));
+    };
+    auto u = sample_usage();
+    u.entries[0].nic_id = 0;
+    refused(u, DecodeError::bad_id);
+    u = sample_usage();
+    u.entries[0].attachment = 0;
+    refused(u, DecodeError::bad_id);
+    u = sample_usage();
+    u.entries[0].vni = proto::max_vni + 1;
+    refused(u, DecodeError::bad_vni);
+    u = sample_usage();
+    std::swap(u.entries[0], u.entries[1]);
+    refused(u, DecodeError::not_ascending);
+    u = sample_usage();
+    u.entries.push_back(u.entries.back());  // duplicate key
+    refused(u, DecodeError::not_ascending);
+    u = {};
+    for (std::uint64_t i = 1; i <= proto::max_group_usage_entries + 1; ++i) {
+        u.entries.push_back(usage_entry(0, i, 1));
+    }
+    refused(u, DecodeError::too_many_entries);
+
+    // Decode: unknown flag bits and reserved bytes, counts and lengths.
+    constexpr std::size_t body = proto::report_header_size;
+    constexpr std::size_t first = body + proto::group_usage_fixed_size;
+    const auto good = encoded(make_report(sample_usage()));
+    auto b = good;
+    b[first + 12] = std::byte{0x02};
+    BOOST_TEST((decode_error(b) == DecodeError::reserved_not_zero));
+    b = good;
+    b[first + 14] = std::byte{1};
+    BOOST_TEST((decode_error(b) == DecodeError::reserved_not_zero));
+    b = good;
+    b[body + 2] = std::byte{1};
+    BOOST_TEST((decode_error(b) == DecodeError::reserved_not_zero));
+    b = good;
+    set_le16(b, body, 0xFFFF);  // hostile count, checked before allocating
+    BOOST_TEST((decode_error(b) == DecodeError::too_many_entries));
+    b = good;
+    set_le16(b, body, 4);
+    BOOST_TEST((decode_error(b) == DecodeError::truncated));
+    b = good;
+    set_le16(b, body, 2);
+    BOOST_TEST((decode_error(b) == DecodeError::trailing_bytes));
 }
 
 BOOST_AUTO_TEST_CASE(errors_have_names) {

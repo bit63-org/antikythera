@@ -236,6 +236,44 @@ auto OarLink::map_update(std::span<const std::byte> frame) -> std::expected<void
     return {};
 }
 
+auto OarLink::group_policy(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
+    auto body = oar::encode_group_policy_frame(frame);
+    if (!body) {
+        return std::unexpected(bad_request());
+    }
+    return expect_empty(transact(mctp::VendorType::group_policy, *body));
+}
+
+auto OarLink::group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError> {
+    std::vector<oar::UsageEntry> out;
+    std::uint16_t total = 0;
+    std::uint16_t cursor = 0;
+    do {
+        auto body = oar::encode_usage_request(cursor);
+        if (!body) {
+            return std::unexpected(bad_request());
+        }
+        auto response = transact(mctp::VendorType::group_usage, *body);
+        if (!response) {
+            return std::unexpected(response.error());
+        }
+        auto page = oar::decode_usage_page(*response, cursor);
+        if (!page || (cursor != 0 && page->total != total)) {
+            return std::unexpected(bad_response());
+        }
+        total = page->total;
+        // Each page continues the order of the last.
+        if (!out.empty() && !page->entries.empty() &&
+            std::pair{page->entries.front().nic_id, page->entries.front().attachment} <=
+                std::pair{out.back().nic_id, out.back().attachment}) {
+            return std::unexpected(bad_response());
+        }
+        out.insert(out.end(), page->entries.begin(), page->entries.end());
+        cursor = static_cast<std::uint16_t>(out.size());
+    } while (cursor < total);
+    return out;
+}
+
 auto OarLink::health() -> std::expected<oar::Health, LinkError> {
     std::vector<std::byte> body;
     auto response = transact(mctp::VendorType::health, body);
@@ -472,6 +510,22 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
         }
         case mctp::VendorType::map_update:
             return status_only(map_chunk(handler, body));
+        case mctp::VendorType::group_policy: {
+            auto frame = oar::decode_group_policy_frame(body);
+            return status_only(frame ? handler.group_policy(*frame) : oar::Status::bad_request);
+        }
+        case mctp::VendorType::group_usage: {
+            auto cursor = oar::decode_usage_request(body);
+            if (!cursor) {
+                return status_only(oar::Status::bad_request);
+            }
+            auto page = handler.group_usage(*cursor);
+            if (!page) {
+                return status_only(page.error() == oar::Status::ok ? oar::Status::failed
+                                                                   : page.error());
+            }
+            return with_body(oar::encode_usage_page(*page, *cursor));
+        }
         case mctp::VendorType::health: {
             if (!oar::decode_empty(body)) {
                 return status_only(oar::Status::bad_request);

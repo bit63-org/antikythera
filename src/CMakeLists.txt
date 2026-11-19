@@ -70,6 +70,7 @@ target_link_libraries(ak_tls
 add_library(ak_helm
   helm/audit_log.cpp
   helm/command_router.cpp
+  helm/group_usage.cpp
   helm/controller_link.cpp
   helm/device_pool.cpp
   helm/helm_config.cpp

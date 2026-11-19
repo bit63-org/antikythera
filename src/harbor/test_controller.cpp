@@ -125,6 +125,20 @@ auto Signer::map_update(const proto::MapUpdate& update) const
     return *frame;
 }
 
+auto Signer::group_policy(const proto::GroupPolicy& policy) const
+    -> std::optional<std::vector<std::byte>> {
+    auto frame = proto::encode_group_policy(policy);
+    if (!frame) {
+        return std::nullopt;
+    }
+    const auto sig = sign(proto::group_policy_signed_bytes(*frame));
+    if (!sig) {
+        return std::nullopt;
+    }
+    proto::set_group_policy_signature(*frame, *sig);
+    return *frame;
+}
+
 // ---- Script ---------------------------------------------------------------
 
 namespace {
@@ -291,6 +305,7 @@ constexpr std::array kind_names{
     std::pair{"vm_exited", proto::ReportKind::vm_exited},
     std::pair{"map_applied", proto::ReportKind::map_applied},
     std::pair{"host_fault", proto::ReportKind::host_fault},
+    std::pair{"group_usage", proto::ReportKind::group_usage},
 };
 
 template<typename T, std::size_t N>
@@ -551,6 +566,59 @@ auto parse_line(std::string_view line) -> std::expected<std::optional<Action>, s
         std::ranges::sort(m.ipv6, std::ranges::lexicographical_compare, &proto::GuestIpv6::address);
         return std::optional<Action>{std::move(m)};
     }
+    if (verb == "group-policy") {
+        constexpr std::size_t multicast_args = 8;
+        if (args.size() < 3) {
+            return std::unexpected("group-policy: want VNI VERSION drop|multicast ...");
+        }
+        auto vni = number<std::uint32_t>(args[0], "VNI");
+        auto version = number<std::uint64_t>(args[1], "policy version");
+        if (!vni) {
+            return std::unexpected(vni.error());
+        }
+        if (!version) {
+            return std::unexpected(version.error());
+        }
+        SendGroupPolicy g{.vni = *vni, .policy_version = *version};
+        if (args[2] == "drop" && args.size() == 3) {
+            return std::optional<Action>{g};
+        }
+        if (args[2] != "multicast" ||
+            (args.size() != multicast_args && args.size() != multicast_args + 1)) {
+            return std::unexpected(
+                "group-policy: want VNI VERSION drop, or VNI VERSION multicast RATE_FRAMES "
+                "BURST_FRAMES RATE_BYTES BURST_BYTES MAX_REMOTE_VTEPS [MAX_GROUPS_PER_NIC]");
+        }
+        g.mode = proto::GroupMode::multicast;
+        auto rate_frames = number<std::uint32_t>(args[3], "frame rate");
+        auto burst_frames = number<std::uint32_t>(args[4], "frame burst");
+        auto rate_bytes = number<std::uint64_t>(args[5], "byte rate");
+        auto burst_bytes = number<std::uint64_t>(args[6], "byte burst");
+        auto vteps = number<std::uint32_t>(args[7], "flood-list cap");
+        for (const auto* r : {&rate_frames, &burst_frames, &vteps}) {
+            if (!*r) {
+                return std::unexpected(r->error());
+            }
+        }
+        for (const auto* r : {&rate_bytes, &burst_bytes}) {
+            if (!*r) {
+                return std::unexpected(r->error());
+            }
+        }
+        g.rate_frames = *rate_frames;
+        g.burst_frames = *burst_frames;
+        g.rate_bytes = *rate_bytes;
+        g.burst_bytes = *burst_bytes;
+        g.max_remote_vteps = *vteps;
+        if (args.size() == multicast_args + 1) {
+            auto groups = number<std::uint16_t>(args[multicast_args], "group cap");
+            if (!groups) {
+                return std::unexpected(groups.error());
+            }
+            g.max_groups_per_nic = *groups;
+        }
+        return std::optional<Action>{g};
+    }
     auto body = command(verb, args);
     if (!body) {
         return std::unexpected(body.error());
@@ -589,6 +657,14 @@ auto to_string(const proto::Report& report) -> std::string {
                    << " reason=" << static_cast<int>(b.reason);
             } else if constexpr (std::is_same_v<T, proto::MapApplied>) {
                 os << " vni=" << b.vni << " version=" << b.map_version;
+            } else if constexpr (std::is_same_v<T, proto::GroupUsage>) {
+                os << " entries=" << b.entries.size();
+                for (const auto& e : b.entries) {
+                    os << " [slot=" << int{e.slot} << " nic=0x" << std::hex << e.nic_id << std::dec
+                       << " attachment=" << e.attachment << (e.detached ? " detached" : "")
+                       << " frames=" << e.frames << " replicas_remote=" << e.replicas_remote
+                       << " replica_bytes_remote=" << e.replica_bytes_remote << "]";
+                }
             } else {
                 os << " code=" << static_cast<int>(b.code) << " slot=" << int{b.slot}
                    << " detail=0x" << std::hex << b.detail << std::dec;
@@ -684,6 +760,7 @@ auto TestController::handle(const proto::Record& rec)
         }
         case proto::RecordType::envelope:
         case proto::RecordType::map_update:
+        case proto::RecordType::group_policy:
         case proto::RecordType::report_ack:
             break;
     }
@@ -787,6 +864,24 @@ auto TestController::run(const Action& action) -> std::expected<void, std::strin
                     return std::unexpected("could not encode or sign the mapping update");
                 }
                 return send(proto::RecordType::map_update, *frame);
+            } else if constexpr (std::is_same_v<T, SendGroupPolicy>) {
+                const proto::GroupPolicy g{.server_id = _options.server_id,
+                                           .key_id = _options.key_id,
+                                           .vni = a.vni,
+                                           .mode = a.mode,
+                                           .policy_version = a.policy_version,
+                                           .rate_frames = a.rate_frames,
+                                           .burst_frames = a.burst_frames,
+                                           .rate_bytes = a.rate_bytes,
+                                           .burst_bytes = a.burst_bytes,
+                                           .max_remote_vteps = a.max_remote_vteps,
+                                           .max_groups_per_nic = a.max_groups_per_nic,
+                                           .signature = {}};
+                auto frame = _signer.group_policy(g);
+                if (!frame) {
+                    return std::unexpected("could not encode or sign the group policy");
+                }
+                return send(proto::RecordType::group_policy, *frame);
             } else if constexpr (std::is_same_v<T, ExpectOutcome>) {
                 if (_last_command_seq == 0) {
                     return std::unexpected("expect: no command sent yet");

@@ -97,7 +97,7 @@ BOOST_AUTO_TEST_CASE(oversized_record_fails_before_its_payload_arrives) {
 BOOST_AUTO_TEST_CASE(bad_type_and_reserved_break_the_stream) {
     for (const auto& [bytes, want] :
          {std::pair{bytes_of(0, 0, 0, 0, 0, 0, 0, 0), DecodeError::bad_record_type},
-          std::pair{bytes_of(0, 0, 0, 0, 6, 0, 0, 0), DecodeError::bad_record_type},
+          std::pair{bytes_of(0, 0, 0, 0, 7, 0, 0, 0), DecodeError::bad_record_type},
           std::pair{bytes_of(0, 0, 0, 0, 1, 0, 0, 1), DecodeError::reserved_not_zero}}) {
         proto::RecordDecoder d;
         d.feed(bytes);

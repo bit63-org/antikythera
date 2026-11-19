@@ -626,6 +626,116 @@ BOOST_AUTO_TEST_CASE(socket_listener_connects_a_slot) {
     std::filesystem::remove(dir);
 }
 
+// A network role's group policy and meters (oar-net Requirement 10).
+class MeterRole final : public OarHandler {
+public:
+    std::vector<std::vector<std::byte>> policies;
+    std::vector<oar::UsageEntry> attached;
+    std::vector<oar::UsageEntry> retired;  // returned by the next snapshot only
+    int snapshots{0};
+
+    auto function_inventory() -> std::expected<oar::Inventory, oar::Status> override {
+        return std::unexpected(oar::Status::failed);
+    }
+    auto prepare_function(const oar::PrepareFunction&) -> oar::Status override {
+        return oar::Status::ok;
+    }
+    auto clean_function(const oar::CleanFunction&) -> oar::Status override {
+        return oar::Status::ok;
+    }
+    auto deliver_key(const oar::DeliverKey&) -> oar::Status override { return oar::Status::ok; }
+    auto drop_key(const oar::DropKey&) -> oar::Status override { return oar::Status::ok; }
+    auto map_update(std::span<const std::byte>) -> oar::Status override { return oar::Status::ok; }
+    auto health() -> std::expected<oar::Health, oar::Status> override { return oar::Health{}; }
+    auto group_policy(std::span<const std::byte> frame) -> oar::Status override {
+        policies.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
+    }
+    auto group_usage(std::uint16_t cursor) -> std::expected<oar::UsagePage, oar::Status> override {
+        return _pager.page(cursor, [this] {
+            ++snapshots;
+            auto all = attached;
+            all.insert(all.end(), retired.begin(), retired.end());
+            retired.clear();
+            return all;
+        });
+    }
+
+private:
+    oar::UsagePager _pager;
+};
+
+auto meter(std::uint64_t nic, std::uint64_t attachment, bool detached = false) -> oar::UsageEntry {
+    return {.nic_id = nic,
+            .vni = 5,
+            .detached = detached,
+            .attachment = attachment,
+            .frames = nic,
+            .bytes = nic * 100,
+            .replicas_remote = nic * 2,
+            .replica_bytes_remote = nic * 200};
+}
+
+BOOST_AUTO_TEST_CASE(group_usage_reads_every_page) {
+    constexpr std::uint64_t nics = 100;  // three pages
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    MeterRole role;
+    for (std::uint64_t n = nics; n >= 1; --n) {  // any order; the pager sorts
+        role.attached.push_back(meter(n, n));
+    }
+    role.retired.push_back(meter(nics + 1, 1, true));
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    std::vector<oar::UsageEntry> first;
+    std::vector<oar::UsageEntry> second;
+    {
+        const Server server{endpoint, role};
+        auto got = link.group_usage();
+        BOOST_REQUIRE(got.has_value());
+        first = *got;
+        got = link.group_usage();
+        BOOST_REQUIRE(got.has_value());
+        second = *got;
+    }
+    BOOST_REQUIRE(first.size() == nics + 1);
+    BOOST_TEST(first.front().nic_id == 1U);
+    BOOST_TEST(first.back().detached);
+    BOOST_TEST((first[41] == meter(42, 42)));
+    BOOST_TEST(second.size() == nics);  // the final reading was delivered once
+    BOOST_TEST(role.snapshots == 2);
+}
+
+BOOST_AUTO_TEST_CASE(group_policy_is_forwarded_whole) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    MeterRole role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const auto frame = pattern(oar::group_policy_frame_size);
+    {
+        const Server server{endpoint, role};
+        BOOST_TEST(link.group_policy(frame).has_value());
+        // Any other length never reaches the wire.
+        BOOST_TEST(
+            (link.group_policy(std::span{frame}.first(10)).error().code == LinkErrc::bad_request));
+    }
+    BOOST_REQUIRE(role.policies.size() == 1U);
+    BOOST_TEST(role.policies[0] == frame);
+}
+
+BOOST_AUTO_TEST_CASE(roles_without_group_meters_answer_unsupported) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    FakeOar fake;  // keeps the defaults
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const Server server{endpoint, fake};
+    const auto policy = link.group_policy(pattern(oar::group_policy_frame_size));
+    BOOST_REQUIRE(!policy.has_value());
+    BOOST_TEST((policy.error().status == oar::Status::unsupported));
+    const auto usage = link.group_usage();
+    BOOST_REQUIRE(!usage.has_value());
+    BOOST_TEST((usage.error().status == oar::Status::unsupported));
+}
+
 BOOST_AUTO_TEST_CASE(names) {
     BOOST_TEST(std::string_view{ak::helm::to_string(LinkErrc::refused)} == "refused");
     BOOST_TEST(std::string_view{ak::helm::to_string(BindingError::queue_full)} == "queue_full");

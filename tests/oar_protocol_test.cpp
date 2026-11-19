@@ -13,11 +13,14 @@
 #include <cstdint>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
 #include "helm/oar_protocol.hpp"
+#include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
+#include "proto/report.hpp"
 #include "test_support.hpp"
 
 namespace oar = ak::helm::oar;
@@ -502,6 +505,138 @@ BOOST_AUTO_TEST_CASE(health_round_trip_and_rejects) {
         (oar::decode_health(bytes_of(3, 0, 0, 0, 0, 0, 0, 0)).error() == BodyError::unknown_enum));
     BOOST_TEST((oar::decode_health(bytes_of(0, 1, 0, 0, 0, 0, 0, 0)).error() ==
                 BodyError::reserved_not_zero));
+}
+
+namespace {
+
+auto usage(std::uint64_t nic, std::uint64_t attachment, bool detached = false) -> oar::UsageEntry {
+    return {.nic_id = nic,
+            .vni = 9,
+            .detached = detached,
+            .attachment = attachment,
+            .frames = 1,
+            .bytes = 2,
+            .replicas_remote = 3,
+            .replica_bytes_remote = 4,
+            .replicas_local = 5,
+            .replica_bytes_local = 6,
+            .drop_policy = 7,
+            .drop_rate = 8,
+            .drop_fanout = 9};
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(group_mirrors_match_proto) {
+    BOOST_TEST(oar::group_policy_frame_size == ak::proto::group_policy_size);
+    BOOST_TEST(oar::usage_entry_size == ak::proto::group_usage_entry_size);
+    BOOST_TEST(oar::max_usage_entries == ak::proto::max_group_usage_entries);
+    BOOST_TEST(oar::usage_detached == ak::proto::group_usage_detached);
+    // A full page fits one message.
+    BOOST_TEST(oar::response_head_size + oar::usage_head_size +
+                   (oar::max_usage_page * oar::usage_entry_size) <=
+               oar::max_body_size);
+}
+
+BOOST_AUTO_TEST_CASE(group_policy_frame_and_usage_request) {
+    const std::vector<std::byte> frame(oar::group_policy_frame_size, std::byte{3});
+    BOOST_TEST(oar::decode_group_policy_frame(oar::encode_group_policy_frame(frame).value())
+                   .value()
+                   .size() == frame.size());
+    BOOST_TEST((oar::encode_group_policy_frame(std::span{frame}.first(5)).error() ==
+                BodyError::truncated));
+    BOOST_TEST((oar::decode_group_policy_frame(std::vector<std::byte>(129)).error() ==
+                BodyError::trailing_bytes));
+    BOOST_TEST(oar::decode_usage_request(oar::encode_usage_request(41).value()).value() == 41);
+    BOOST_TEST(
+        (oar::decode_usage_request(bytes_of(0, 0, 1, 0)).error() == BodyError::reserved_not_zero));
+    BOOST_TEST((oar::decode_usage_request(bytes_of(0, 0)).error() == BodyError::truncated));
+}
+
+BOOST_AUTO_TEST_CASE(usage_page_round_trip_and_rules) {
+    const oar::UsagePage page{.total = 5, .entries = {usage(1, 1), usage(2, 7, true)}};
+    auto body = oar::encode_usage_page(page, 3);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::usage_head_size + (2 * oar::usage_entry_size));
+    BOOST_TEST((oar::decode_usage_page(*body, 3).value() == page));
+    // The page must fit the cursor it answers.
+    BOOST_TEST((oar::decode_usage_page(*body, 4).error() == BodyError::bad_chunk));
+    BOOST_TEST((oar::encode_usage_page(page, 4).error() == BodyError::bad_chunk));
+    BOOST_TEST(
+        (oar::encode_usage_page({.total = 3, .entries = {}}, 0).error() == BodyError::bad_chunk));
+    BOOST_TEST(oar::encode_usage_page({.total = 0, .entries = {}}, 0).has_value());
+
+    auto bad = page;
+    bad.entries[1].nic_id = 0;
+    BOOST_TEST((oar::encode_usage_page(bad, 0).error() == BodyError::zero_id));
+    bad = page;
+    bad.entries[1].vni = 0;
+    BOOST_TEST((oar::encode_usage_page(bad, 0).error() == BodyError::bad_vni));
+    bad = page;
+    std::swap(bad.entries[0], bad.entries[1]);
+    BOOST_TEST((oar::encode_usage_page(bad, 0).error() == BodyError::not_increasing));
+    bad = {.total = 100, .entries = std::vector<oar::UsageEntry>(41, usage(1, 1))};
+    BOOST_TEST((oar::encode_usage_page(bad, 0).error() == BodyError::too_many_entries));
+
+    auto b = *body;
+    b[oar::usage_head_size + oar::usage_entry_size + 12] = std::byte{0x03};  // unknown flag
+    BOOST_TEST((oar::decode_usage_page(b, 3).error() == BodyError::reserved_not_zero));
+    b = *body;
+    b[4] = std::byte{0};  // reserved head
+    b[6] = std::byte{1};
+    BOOST_TEST((oar::decode_usage_page(b, 3).error() == BodyError::reserved_not_zero));
+    b = *body;
+    b.pop_back();
+    BOOST_TEST((oar::decode_usage_page(b, 3).error() == BodyError::truncated));
+}
+
+BOOST_AUTO_TEST_CASE(pager_pages_one_snapshot) {
+    oar::UsagePager pager;
+    int calls = 0;
+    std::vector<oar::UsageEntry> meters;
+    for (std::uint64_t n = 90; n >= 1; --n) {
+        meters.push_back(usage(n, 1));
+    }
+    const auto snap = [&] {
+        ++calls;
+        return meters;
+    };
+    BOOST_TEST((pager.page(5, snap).error() == Status::bad_request));  // no snapshot yet
+    auto p0 = pager.page(0, snap).value();
+    BOOST_TEST(p0.total == 90);
+    BOOST_TEST(p0.entries.size() == oar::max_usage_page);
+    BOOST_TEST(p0.entries.front().nic_id == 1U);  // sorted
+    auto p1 = pager.page(40, snap).value();
+    auto p2 = pager.page(80, snap).value();
+    BOOST_TEST(p1.entries.front().nic_id == 41U);
+    BOOST_TEST(p2.entries.size() == 10U);
+    BOOST_TEST(calls == 1);
+    // After the last page the snapshot is closed.
+    BOOST_TEST((pager.page(80, snap).error() == Status::bad_request));
+    // An empty role answers one empty page.
+    meters.clear();
+    BOOST_TEST(pager.page(0, snap).value().total == 0);
+}
+
+BOOST_AUTO_TEST_CASE(pager_carries_unread_final_readings) {
+    oar::UsagePager pager;
+    std::vector<oar::UsageEntry> meters;
+    for (std::uint64_t n = 1; n <= 50; ++n) {
+        meters.push_back(usage(n, 1));
+    }
+    meters.push_back(usage(60, 2, true));
+    auto source = meters;
+    const auto snap = [&] { return std::exchange(source, {}); };
+    BOOST_REQUIRE(pager.page(0, snap).has_value());  // first page only; the read stops
+    // The switch forgot the final reading; the pager did not.
+    source = {usage(1, 1)};
+    auto again = pager.page(0, snap).value();
+    BOOST_TEST(again.total == 2);
+    BOOST_TEST(again.entries.back().detached);
+    BOOST_TEST(again.entries.back().nic_id == 60U);
+    // Read to the end: delivered, so the next snapshot drops it.
+    source = {usage(1, 1)};
+    BOOST_TEST(pager.page(0, snap).value().total == 1);
 }
 
 BOOST_AUTO_TEST_CASE(names) {

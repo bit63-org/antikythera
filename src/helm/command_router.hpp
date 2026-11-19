@@ -107,6 +107,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <vector>
 
 #include "helm/audit_log.hpp"
 #include "helm/device_pool.hpp"
@@ -159,6 +160,16 @@ public:
         -> std::expected<void, LinkError> = 0;
     virtual auto rewrap_volume(const oar::RewrapVolume& request)
         -> std::expected<void, LinkError> = 0;
+    // The network role's group policy and meters (GroupUsageReporter).
+    virtual auto group_policy(std::span<const std::byte> /*frame*/)
+        -> std::expected<void, LinkError> {
+        return std::unexpected(
+            LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported});
+    }
+    virtual auto group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError> {
+        return std::unexpected(
+            LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported});
+    }
 };
 
 class OarLinkPort final : public OarPort {
@@ -175,6 +186,8 @@ public:
     auto create_volume(const oar::CreateVolume& request) -> std::expected<void, LinkError> override;
     auto delete_volume(const oar::DeleteVolume& request) -> std::expected<void, LinkError> override;
     auto rewrap_volume(const oar::RewrapVolume& request) -> std::expected<void, LinkError> override;
+    auto group_policy(std::span<const std::byte> frame) -> std::expected<void, LinkError> override;
+    auto group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError> override;
 
 private:
     OarLink* _link;

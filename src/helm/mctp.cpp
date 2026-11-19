@@ -73,6 +73,8 @@ constexpr auto known_vendor_type(std::uint8_t raw) noexcept -> bool {
         case VendorType::set_tunnel_key:
         case VendorType::set_tunnel_peer:
         case VendorType::remove_tunnel_peer:
+        case VendorType::group_policy:
+        case VendorType::group_usage:
             return true;
     }
     return false;

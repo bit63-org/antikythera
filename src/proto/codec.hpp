@@ -60,6 +60,8 @@ enum class DecodeError : std::uint8_t {
     addresses_not_ascending,  // guest addresses not in strictly increasing order
     unknown_address_nic,      // a guest address owned by a NIC not in the mapping
     server_id_mismatch,       // envelope server_id differs from the slot header's server_id
+    bad_policy_version,       // group policy version 0 (versions start at 1)
+    bad_group_limits,         // group policy limits that do not fit its mode or bounds
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -122,6 +124,10 @@ enum class DecodeError : std::uint8_t {
             return "guest addresses not strictly ascending";
         case DecodeError::unknown_address_nic:
             return "guest address owned by a NIC not in the mapping";
+        case DecodeError::bad_policy_version:
+            return "group policy version 0";
+        case DecodeError::bad_group_limits:
+            return "group policy limits do not fit its mode";
     }
     return "unknown";
 }

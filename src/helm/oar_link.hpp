@@ -125,6 +125,13 @@ public:
     // transfer, which always starts again at offset 0.
     auto map_update(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
     auto health() -> std::expected<oar::Health, LinkError>;
+    // Forwards one controller GroupPolicy frame (exactly
+    // oar::group_policy_frame_size bytes) to a network role.
+    auto group_policy(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
+    // Reads every page of the role's group meters: one snapshot, in
+    // (nic_id, attachment) order. A page that disagrees with the first
+    // page's total, or a role that never finishes, is a bad_response.
+    auto group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError>;
 
     [[nodiscard]] auto stats() const noexcept -> const LinkStats& { return _stats; }
 
@@ -188,6 +195,17 @@ public:
     }
     virtual auto remove_tunnel_peer(const oar::RemoveTunnelPeer& /*request*/) -> oar::Status {
         return oar::Status::unsupported;
+    }
+    // Broadcast/multicast policy and meters, which only the network role
+    // keeps (oar-net Requirement 10). `frame` is valid only during the call.
+    virtual auto group_policy(std::span<const std::byte> /*frame*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    // One page of the meter snapshot; network roles answer through an
+    // oar::UsagePager.
+    virtual auto group_usage(std::uint16_t /*cursor*/)
+        -> std::expected<oar::UsagePage, oar::Status> {
+        return std::unexpected(oar::Status::unsupported);
     }
 };
 

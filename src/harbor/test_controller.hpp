@@ -40,10 +40,15 @@
 //   map-update VNI VERSION [NIC,MAC,VTEP[,GUEST_IP ...] ...]
 //                        e.g. 0x10,02:00:00:00:00:10,fd00::1,10.0.0.5,fd12::5
 //                        (guest IPs are what the ARP/ND proxy answers for)
+//   group-policy VNI VERSION drop
+//   group-policy VNI VERSION multicast RATE_FRAMES BURST_FRAMES RATE_BYTES BURST_BYTES
+//                MAX_REMOTE_VTEPS [MAX_GROUPS_PER_NIC]
+//                        the VPC's broadcast/multicast policy (oar-net Requirement 10)
 //   expect STATUS        the last command's outcome must be STATUS
 //                        (ok, accepted, bad_signature, stale_sequence, wrong_server, ...)
 //   wait KIND            wait for a report of KIND (inventory, command_outcome,
-//                        pool_state, vm_exited, map_applied, host_fault)
+//                        pool_state, vm_exited, map_applied, host_fault,
+//                        group_usage)
 //
 // The RFC 8032 test keys are for harbor only; a real host image never
 // compiles them in.
@@ -64,6 +69,7 @@
 #include "helm/mailbox.hpp"
 #include "proto/envelope.hpp"
 #include "proto/link.hpp"
+#include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
 #include "proto/report.hpp"
 #include "tls/tls.hpp"
@@ -95,6 +101,8 @@ public:
         -> std::optional<proto::EnvelopeBytes>;
 
     // `update` encoded and signed (its signature field is ignored).
+    [[nodiscard]] auto group_policy(const proto::GroupPolicy& policy) const
+        -> std::optional<std::vector<std::byte>>;
     [[nodiscard]] auto map_update(const proto::MapUpdate& update) const
         -> std::optional<std::vector<std::byte>>;
 
@@ -116,6 +124,17 @@ struct SendMapUpdate {
     std::vector<proto::GuestIpv4> ipv4;
     std::vector<proto::GuestIpv6> ipv6;
 };
+struct SendGroupPolicy {
+    std::uint32_t vni{0};
+    std::uint64_t policy_version{0};
+    proto::GroupMode mode{proto::GroupMode::drop};
+    std::uint32_t rate_frames{0};
+    std::uint32_t burst_frames{0};
+    std::uint64_t rate_bytes{0};
+    std::uint64_t burst_bytes{0};
+    std::uint32_t max_remote_vteps{0};
+    std::uint16_t max_groups_per_nic{0};
+};
 struct ExpectOutcome {
     proto::CommandStatus status{proto::CommandStatus::ok};
 };
@@ -123,7 +142,7 @@ struct WaitReport {
     proto::ReportKind kind{proto::ReportKind::inventory};
 };
 
-using Action = std::variant<SendCommand, SendMapUpdate, ExpectOutcome, WaitReport>;
+using Action = std::variant<SendCommand, SendMapUpdate, SendGroupPolicy, ExpectOutcome, WaitReport>;
 
 // One script line: an action, nothing (blank or comment), or a message
 // saying what is wrong with it.

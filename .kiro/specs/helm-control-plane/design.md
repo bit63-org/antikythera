@@ -78,6 +78,21 @@ type whose destructor zeroizes (`OPENSSL_cleanse`) and which can only be
 consumed by `OarLink::deliver_key`. In harbor the secure element is a
 file-backed software implementation behind the same interface.
 
+The secure element interface takes and returns only wrapped keys, so a
+plaintext VM key never leaves it; the only plaintext out is a volume key
+as a `ScopedKey`. Wrapping is AES-256-GCM with a random 96-bit nonce,
+and the AAD binds the blob's header and identity (`vm_id` for a VM key,
+`volume_id` and owner `vm_id` for a volume key): a wrapped volume key
+copied to another volume, or presented as another VM's, fails
+authentication, which is what makes `REWRAP_VOLUME` the only way to move
+a volume (Requirement 4.7). Wrapped keys have a versioned wire format
+(`version | kind | key_len | nonce | ciphertext | tag`), decoded as
+untrusted input since volume keys come back from the media.
+`destroy_vm_key` also drops every volume key the VM key wraps and
+returns those volumes, crypto-erased. The software secure element keeps
+its 32-byte master key in a file created `0600` and refuses a symlink, a
+non-regular file, group/other permission bits, or the wrong size.
+
 ### OarLink
 
 One per data-plane role. MCTP message types (vendor-defined) for:

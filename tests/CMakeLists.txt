@@ -44,3 +44,4 @@ ak_add_test(resource_allocator_test SOURCES resource_allocator_test.cpp LIBS ak:
 ak_add_test(proto_envelope_test   SOURCES proto_envelope_test.cpp   LIBS ak::proto ak::helm)
 ak_add_test(proto_map_update_test SOURCES proto_map_update_test.cpp LIBS ak::proto)
 ak_add_test(proto_vectors_test    SOURCES proto_vectors_test.cpp    LIBS ak::proto ak::hull)
+ak_add_test(key_store_test     SOURCES key_store_test.cpp     LIBS ak::helm)

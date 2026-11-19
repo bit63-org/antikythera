@@ -81,6 +81,9 @@ constexpr std::size_t multi_chunk_frame = 10'000;  // three chunks
 constexpr std::size_t big_mtu = mctp::max_packet_payload;
 constexpr std::size_t tiny_capacity = 2;
 constexpr std::size_t oversized_datagram = mctp::max_packet_size + 10;
+constexpr std::uint64_t sample_sectors = 0x20'0000;
+constexpr std::size_t wrapped_size = 95;
+constexpr std::uint8_t rewrapped_fill = 0x7E;
 
 auto config(std::chrono::milliseconds timeout = long_timeout, std::size_t mtu = mctp::baseline_mtu)
     -> LinkConfig {
@@ -118,6 +121,28 @@ public:
     std::vector<std::byte> key;
     ak::helm::VolumeId key_volume{0};
     std::vector<std::vector<std::byte>> frames;
+    std::optional<ak::helm::VolumeId> created;
+    std::uint64_t created_sectors{0};
+    std::vector<std::byte> created_key;
+    std::optional<oar::DeleteVolume> deleted;
+    ak::helm::VmId rewrapped_owner{0};
+    std::vector<std::byte> rewrapped_key;
+
+    auto create_volume(const oar::CreateVolume& r) -> oar::Status override {
+        created = r.volume_id;
+        created_sectors = r.capacity_sectors;
+        created_key.assign(r.wrapped_key.begin(), r.wrapped_key.end());
+        return status;
+    }
+    auto delete_volume(const oar::DeleteVolume& r) -> oar::Status override {
+        deleted = r;
+        return status;
+    }
+    auto rewrap_volume(const oar::RewrapVolume& r) -> oar::Status override {
+        rewrapped_owner = r.owner_vm;
+        rewrapped_key.assign(r.wrapped_key.begin(), r.wrapped_key.end());
+        return status;
+    }
 
     auto function_inventory() -> std::expected<oar::Inventory, oar::Status> override {
         if (status != oar::Status::ok) {
@@ -184,6 +209,8 @@ auto exercise(Binding& helm_binding, Binding& oar_binding, std::size_t mtu) -> v
     OarLink link{helm_binding, config(long_timeout, mtu)};
     const auto key = sample_key();
     const auto frame = pattern(multi_chunk_frame);
+    const auto wrapped = pattern(wrapped_size);
+    const std::vector<std::byte> rewrapped(wrapped_size, std::byte{rewrapped_fill});
     const oar::PrepareFunction prep{.fn = sample_fn,
                                     .type = FunctionType::blk_fn,
                                     .vm_id = sample_vm,
@@ -203,6 +230,17 @@ auto exercise(Binding& helm_binding, Binding& oar_binding, std::size_t mtu) -> v
         BOOST_TEST(link.clean_function({.fn = sample_fn, .action = CleaningAction::drop_volume_key})
                        .has_value());
         BOOST_TEST(link.map_update(frame).has_value());
+        BOOST_TEST(link.create_volume({.volume_id = sample_volume,
+                                       .owner_vm = sample_vm,
+                                       .capacity_sectors = sample_sectors,
+                                       .block_size = oar::sector_size,
+                                       .wrapped_key = wrapped})
+                       .has_value());
+        BOOST_TEST(link.rewrap_volume({.volume_id = sample_volume,
+                                       .owner_vm = sample_vm + 1,
+                                       .wrapped_key = rewrapped})
+                       .has_value());
+        BOOST_TEST(link.delete_volume({.volume_id = sample_volume}).has_value());
 
         auto h = link.health();
         BOOST_REQUIRE(h.has_value());
@@ -216,6 +254,12 @@ auto exercise(Binding& helm_binding, Binding& oar_binding, std::size_t mtu) -> v
     BOOST_TEST((fake.cleaned->action == CleaningAction::drop_volume_key));
     BOOST_REQUIRE(fake.frames.size() == 1U);
     BOOST_TEST((fake.frames[0] == frame));
+    BOOST_TEST((fake.created == sample_volume));
+    BOOST_TEST(fake.created_sectors == sample_sectors);
+    BOOST_TEST((fake.created_key == wrapped));
+    BOOST_TEST(fake.rewrapped_owner == sample_vm + 1);
+    BOOST_TEST((fake.rewrapped_key == rewrapped));
+    BOOST_TEST(fake.deleted->volume_id == sample_volume);
     BOOST_TEST(link.stats().dropped_packets == 0U);
     BOOST_TEST(link.stats().dropped_messages == 0U);
 }
@@ -401,6 +445,42 @@ BOOST_AUTO_TEST_CASE(endpoint_refuses_malformed_requests) {
     BOOST_TEST(!endpoint.serve_one(fake, long_timeout).value());
     BOOST_TEST(endpoint.stats().dropped_messages == 1U);
     BOOST_TEST((helm_b->receive(0ms).error() == BindingError::timed_out));
+}
+
+BOOST_AUTO_TEST_CASE(roles_without_a_volume_store_answer_unsupported) {
+    // A handler that keeps the defaults (any role but storage).
+    class NoStore final : public OarHandler {
+    public:
+        auto function_inventory() -> std::expected<oar::Inventory, oar::Status> override {
+            return std::unexpected(oar::Status::failed);
+        }
+        auto prepare_function(const oar::PrepareFunction&) -> oar::Status override {
+            return oar::Status::ok;
+        }
+        auto clean_function(const oar::CleanFunction&) -> oar::Status override {
+            return oar::Status::ok;
+        }
+        auto deliver_key(const oar::DeliverKey&) -> oar::Status override { return oar::Status::ok; }
+        auto drop_key(const oar::DropKey&) -> oar::Status override { return oar::Status::ok; }
+        auto map_update(std::span<const std::byte>) -> oar::Status override {
+            return oar::Status::ok;
+        }
+        auto health() -> std::expected<oar::Health, oar::Status> override { return oar::Health{}; }
+    };
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    NoStore role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    const auto body = oar::encode_delete_volume({.volume_id = sample_volume}).value();
+    send_raw_request(*helm_b, mctp::VendorType::delete_volume, body, 0);
+    serve_request(endpoint, role);
+    BOOST_TEST((read_raw_status(*helm_b) == oar::Status::unsupported));
+
+    // A malformed volume body never reaches the handler.
+    FakeOar fake;
+    send_raw_request(*helm_b, mctp::VendorType::create_volume, bytes_of(1, 2, 3), 1);
+    serve_request(endpoint, fake);
+    BOOST_TEST((read_raw_status(*helm_b) == oar::Status::bad_request));
+    BOOST_TEST(!fake.created.has_value());
 }
 
 BOOST_AUTO_TEST_CASE(map_transfer_must_be_contiguous) {

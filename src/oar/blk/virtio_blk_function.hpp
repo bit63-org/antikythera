@@ -49,6 +49,14 @@
 // queues but keeps the key. Only the transport's FLR (function_reset), helm's
 // drop_key and destruction remove the key.
 //
+// Attach order. helm delivers the key only after the VMM has opened the
+// function (opening a VFIO device resets it, which would wipe the key), so
+// a guest can start probing the disk before the key is there. await_key()
+// covers that window: until deliver_key() or drop_key(), requests are left
+// in the rings untouched, not failed, so the guest's first reads wait
+// rather than see I/O errors. An FLR in the window keeps the wait; the
+// requests left waiting are served once the key arrives.
+//
 // A ring error, or a request with no writable status byte (which cannot be
 // completed), puts the function in DEVICE_NEEDS_RESET (PciFunction::fail).
 //
@@ -199,8 +207,13 @@ public:
     // helm (over this role's sideband, Requirement 2.5): loads the volume
     // key and builds one cipher per queue. The caller wipes its own copy.
     [[nodiscard]] auto deliver_key(XtsKey key) -> std::expected<void, KeyError>;
-    // Wipes the key and frees the ciphers. Safe without a key.
+    // Wipes the key and frees the ciphers, and ends an await_key() wait.
+    // Safe without a key.
     auto drop_key() noexcept -> void;
+    // Holds every request until deliver_key() or drop_key() (the attach
+    // window above). No effect while a key is held.
+    auto await_key() noexcept -> void;
+    [[nodiscard]] auto awaiting_key() const noexcept -> bool { return _awaiting_key; }
     [[nodiscard]] auto holds_key() const noexcept -> bool { return _key.holds_key(); }
 
     [[nodiscard]] auto geometry() const noexcept -> const VolumeGeometry& {
@@ -245,6 +258,7 @@ private:
     std::vector<Queue> _queues;
     std::array<std::byte, blk_cfg::size> _device_config{};
     std::array<std::byte, id_bytes> _serial{};
+    bool _awaiting_key{false};
     BlkCounters _counters;
 };
 

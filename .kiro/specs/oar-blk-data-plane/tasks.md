@@ -1,6 +1,6 @@
 # Implementation Plan — oar-blk: the storage data plane
 
-## Status: 5/8 tasks complete
+## Status: 6/8 tasks complete
 
 ## Tasks
 
@@ -41,8 +41,22 @@
   Files are created `O_EXCL` 0600, opened `O_NOFOLLOW`, size-checked;
   `rewrap` rewrites owner and key only; `erase` wipes the header, syncs
   and unlinks (the release half of DELETE_VOLUME).
-- [ ] 6. helm integration: create/attach/detach/delete/rewrap volume flows.
+- [x] 6. helm integration: create/attach/detach/delete/rewrap volume flows.
   _Requirements: 3_
+  — Sideband `create_volume`, `delete_volume`, `rewrap_volume`
+  (`src/helm/oar_protocol.*`, vendor types 0x08-0x0A, fuzzed in
+  `fuzz_oar_link`). helm's CommandRouter stores a new volume with its
+  wrapped key on the lowest blk slot (compensated by delete), delivers
+  the key on ATTACH_VOLUME's ok rather than before relay (the VMM's open
+  resets the function), reports a lost delivery as a `device_lost` host
+  fault, and after commit erases (DELETE_VOLUME, DESTROY_VM without
+  persist) or rewrites (REWRAP_VOLUME) the volume on the media.
+  `VirtioBlkFunction::await_key` holds guest I/O in the rings until the
+  key arrives, across the FLR. `src/oar/blk/blk_role.*` is the role's
+  OarHandler over FileBackend, with one function per transport swapped
+  between an empty placeholder and the attached volume;
+  `ak-oar-blk` (`oar_blk_main.cpp`) serves it over vfio-user and helm's
+  sideband socket (`VirtioBinding::retarget`, `set_reset_handler`).
 - [ ] 7. Boot from volume in harbor. _Requirements: 4_
 - [ ] 8. harbor encryption scenarios. _Requirements: 7.2_
 

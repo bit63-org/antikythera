@@ -67,6 +67,9 @@ constexpr auto known_vendor_type(std::uint8_t raw) noexcept -> bool {
         case VendorType::drop_key:
         case VendorType::map_update:
         case VendorType::health:
+        case VendorType::create_volume:
+        case VendorType::delete_volume:
+        case VendorType::rewrap_volume:
             return true;
     }
     return false;

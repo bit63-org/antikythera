@@ -191,9 +191,7 @@ auto VirtioBinding::run() -> std::expected<bool, std::string> {
     }
     if (errno == ENOTCONN) {
         // The client went away; its mappings and our queues go with it.
-        if (_function != nullptr) {
-            _function->reset();
-        }
+        device_reset();
         return false;
     }
     return failed("vfu_run_ctx");
@@ -259,9 +257,37 @@ auto VirtioBinding::dma_unregister(std::uint64_t iova) -> void {
 }
 
 auto VirtioBinding::device_reset() -> void {
-    if (_function != nullptr) {
+    if (_on_reset) {
+        _on_reset();
+    } else if (_function != nullptr) {
         _function->reset();
     }
+}
+
+auto VirtioBinding::set_reset_handler(std::function<void()> handler) -> void {
+    _on_reset = std::move(handler);
+}
+
+auto VirtioBinding::retarget(virtio::PciFunction& function) -> std::expected<void, std::string> {
+    if (_function == nullptr) {
+        return std::unexpected(std::string{"retarget before bind"});
+    }
+    const auto& a = _function->identity();
+    const auto& b = function.identity();
+    const auto caps = [](const virtio::PciFunction& f) {
+        std::vector<std::vector<std::byte>> out;
+        for (const auto& cap : f.capabilities()) {
+            out.push_back(virtio::encode_capability(cap, 0));
+        }
+        return out;
+    };
+    if (a.device_id != b.device_id || a.class_code != b.class_code || a.subclass != b.subclass ||
+        a.prog_if != b.prog_if || _function->msix_vectors() != function.msix_vectors() ||
+        caps(*_function) != caps(function)) {
+        return std::unexpected(std::string{"retarget: the function's PCI shape differs"});
+    }
+    _function = &function;
+    return {};
 }
 
 auto VirtioBinding::log(const char* message) const -> void {

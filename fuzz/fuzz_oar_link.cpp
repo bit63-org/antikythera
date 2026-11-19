@@ -49,6 +49,15 @@ auto decoders(std::span<const std::byte> body) -> void {
     if (auto d = oar::decode_drop_key(body)) {
         same(body, oar::encode_drop_key(*d));
     }
+    if (auto c = oar::decode_create_volume(body)) {
+        same(body, oar::encode_create_volume(*c));
+    }
+    if (auto d = oar::decode_delete_volume(body)) {
+        same(body, oar::encode_delete_volume(*d));
+    }
+    if (auto r = oar::decode_rewrap_volume(body)) {
+        same(body, oar::encode_rewrap_volume(*r));
+    }
     if (auto m = oar::decode_map_chunk(body)) {
         same(body, oar::encode_map_chunk(*m));
     }
@@ -85,6 +94,18 @@ public:
     }
     auto health() -> std::expected<oar::Health, oar::Status> override {
         return std::unexpected(oar::Status::busy);
+    }
+    auto create_volume(const oar::CreateVolume& c) -> oar::Status override {
+        if (c.wrapped_key.empty() || c.wrapped_key.size() > oar::max_wrapped_volume_key) {
+            std::abort();
+        }
+        return oar::Status::ok;
+    }
+    auto rewrap_volume(const oar::RewrapVolume& r) -> oar::Status override {
+        if (r.wrapped_key.empty() || r.wrapped_key.size() > oar::max_wrapped_volume_key) {
+            std::abort();
+        }
+        return oar::Status::ok;
     }
 };
 

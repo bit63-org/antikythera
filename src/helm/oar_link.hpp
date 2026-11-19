@@ -108,6 +108,10 @@ public:
     auto deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key)
         -> std::expected<void, LinkError>;
     auto drop_key(const oar::DropKey& request) -> std::expected<void, LinkError>;
+    // The storage role's volume store (oar-blk Requirement 3).
+    auto create_volume(const oar::CreateVolume& request) -> std::expected<void, LinkError>;
+    auto delete_volume(const oar::DeleteVolume& request) -> std::expected<void, LinkError>;
+    auto rewrap_volume(const oar::RewrapVolume& request) -> std::expected<void, LinkError>;
     // Sends one controller MapUpdate frame, in chunks. Fails without sending
     // if the frame is empty or larger than oar::max_map_frame. A failure part
     // way leaves the role's partial frame to be discarded by the next
@@ -154,6 +158,18 @@ public:
     // A whole, reassembled MapUpdate frame, not yet decoded or verified.
     virtual auto map_update(std::span<const std::byte> frame) -> oar::Status = 0;
     virtual auto health() -> std::expected<oar::Health, oar::Status> = 0;
+    // The volume store, which only the storage role keeps; every other
+    // role answers unsupported. request.wrapped_key is valid only during
+    // the call.
+    virtual auto create_volume(const oar::CreateVolume& /*request*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    virtual auto delete_volume(const oar::DeleteVolume& /*request*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    virtual auto rewrap_volume(const oar::RewrapVolume& /*request*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
 };
 
 class OarEndpoint {

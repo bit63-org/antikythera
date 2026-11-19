@@ -161,6 +161,10 @@ public:
     [[nodiscard]] auto accept(std::chrono::milliseconds timeout)
         -> std::expected<std::unique_ptr<SocketBinding>, BindingError>;
 
+    // The listening socket, for a caller that polls it with other
+    // descriptors (readable: a peer is waiting for accept).
+    [[nodiscard]] auto fd() const noexcept -> int { return _fd; }
+
 private:
     SocketListener(int fd, std::filesystem::path path) noexcept : _fd{fd}, _path{std::move(path)} {}
 

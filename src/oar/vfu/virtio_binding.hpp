@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -57,6 +58,19 @@ public:
     // once; `function` must outlive the binding.
     [[nodiscard]] auto bind(virtio::PciFunction& function) -> std::expected<void, std::string>;
 
+    // Serves `function` instead of the one bound before, for a device whose
+    // backing changes while the client stays attached (oar-blk swaps a
+    // volume's function in and out). The client cached the PCI shape at
+    // bind(), so `function` must match it: same IDs, MSI-X vectors and
+    // virtio capabilities; otherwise nothing changes. The old function is
+    // free to go once this returns.
+    [[nodiscard]] auto retarget(virtio::PciFunction& function) -> std::expected<void, std::string>;
+
+    // What a reset (FLR, or the client going away) does. Unset, it is
+    // PciFunction::reset(); a device that holds secrets (oar-blk's key)
+    // sets its own, which must reset the function too.
+    auto set_reset_handler(std::function<void()> handler) -> void;
+
     // The descriptor to poll for readability (it changes after attach()).
     [[nodiscard]] auto poll_fd() const -> int;
     // Accepts a client if one is waiting: true attached, false not yet.
@@ -82,6 +96,7 @@ private:
     std::string _log_name;
     virtio::GuestMemory _memory;
     virtio::PciFunction* _function{nullptr};
+    std::function<void()> _on_reset;
 };
 
 }  // namespace ak::oar::vfu

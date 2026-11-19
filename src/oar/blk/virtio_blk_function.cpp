@@ -259,7 +259,11 @@ auto VirtioBlkFunction::queue_error() -> void {
 
 auto VirtioBlkFunction::function_reset() -> void {
     _pci->reset();
+    // The VMM's open resets the function before helm sends the key, so an
+    // FLR does not end the wait for it.
+    const bool awaiting = _awaiting_key;
     drop_key();
+    _awaiting_key = awaiting;
     wipe_bounce();
     ++_counters.function_resets;
 }
@@ -285,7 +289,21 @@ auto VirtioBlkFunction::deliver_key(XtsKey key) -> std::expected<void, KeyError>
         }
         q.cipher.emplace(std::move(*cipher));
     }
+    if (_awaiting_key) {
+        // Serve what queued up while waiting: the transport's next poll()
+        // picks these up.
+        _awaiting_key = false;
+        for (auto& q : _queues) {
+            q.pending = true;
+        }
+    }
     return {};
+}
+
+auto VirtioBlkFunction::await_key() noexcept -> void {
+    if (!_key.holds_key()) {
+        _awaiting_key = true;
+    }
 }
 
 auto VirtioBlkFunction::drop_key() noexcept -> void {
@@ -293,11 +311,16 @@ auto VirtioBlkFunction::drop_key() noexcept -> void {
         q.cipher.reset();  // EVP_CIPHER_CTX_free cleanses the key schedule
     }
     _key.drop();
+    _awaiting_key = false;
 }
 
 auto VirtioBlkFunction::process(std::uint16_t index) -> bool {
     virtio::SplitQueue* ring = _pci->queue(index);
     if (ring == nullptr) {
+        return false;
+    }
+    if (_awaiting_key) {
+        // Left in the ring; deliver_key() marks the queue pending.
         return false;
     }
     Queue& q = _queues[index];

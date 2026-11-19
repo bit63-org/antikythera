@@ -1,0 +1,293 @@
+// Copyright (c) 2026 Clark Rawlins
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+// Message bodies of the helm <-> oar sideband protocol (OarLink,
+// .kiro/specs/helm-control-plane/ Requirements 5 and 7, design "OarLink").
+//
+// Each operation is one ak vendor-defined MCTP message (helm/mctp.hpp,
+// VendorType) sent by helm as a request and answered by the data-plane role
+// with a response of the same VendorType and the response flag set. This
+// header defines only the bodies, which follow the 7-byte vendor header.
+// Integers are little-endian, like the mailbox and src/proto/.
+//
+// Requests (helm -> oar):
+//
+//   function_inventory  (empty)
+//   prepare_function    0  fn u16 | 2  type u8 | 3  reserved u8 | 4  reserved u32
+//                       8  vm_id u64 | 16 per-type config:
+//                         nic_vf: nic_id u64 | vni u32 | mac [6] | reserved u16  (20 bytes)
+//                         blk_fn: volume_id u64                                  (8 bytes)
+//                         gpu_whole, gpu_vf: nothing
+//   clean_function      0  fn u16 | 2  action u8 (CleaningAction) | 3  reserved u8
+//   deliver_key         0  fn u16 | 2  reserved u16 | 4  reserved u32 | 8  volume_id u64
+//                       16 key [64] (AES-256-XTS volume key, oar-blk Requirement 2)
+//   drop_key            0  fn u16 | 2  reserved u16 | 4  reserved u32 | 8  volume_id u64
+//   map_update          0  total u32 | 4  offset u32 | 8  chunk (1..max_map_chunk bytes)
+//   health              (empty)
+//
+// map_update forwards one controller MapUpdate frame (src/proto/map_update.hpp)
+// unmodified, signature included, so the role can check it itself. A full
+// frame (up to 131 KiB) is larger than an MCTP message may be here
+// (mctp::max_message_size), so it travels as consecutive chunks: offset 0
+// starts a transfer, each later chunk continues exactly where the last one
+// ended, and the chunk that reaches `total` completes it. Every chunk is
+// acknowledged; the last acknowledgement carries the result of applying it.
+//
+// Responses (oar -> helm) start with a 2-byte head:
+//
+//   0  status u8 (Status) | 1  reserved u8
+//
+// A response with any status other than ok ends there. An ok response to
+// function_inventory or health carries a body after the head:
+//
+//   function_inventory  2  role u8 (Role) | 3  reserved u8 | 4  count u16
+//                       6  vtep [16] (IPv6; the role's VTEP for net, zero otherwise)
+//                       22 count x { fn u16 | type u8 (FunctionType) | reserved u8 }
+//   health              2  state u8 (HealthState) | 3  reserved u8 | 4  fault_code u16
+//                       6  uptime_seconds u32
+//
+// Every decoder here is strict (exact length, zero reserved bytes, known
+// enum values, non-zero identifiers) and every encoder enforces the same
+// rules, so neither side can emit a body the other would refuse. The
+// sideband is unauthenticated in the first release (Requirement 5.3), so
+// helm parses responses with the same suspicion as the oar parses requests.
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <span>
+#include <variant>
+#include <vector>
+
+#include "helm/device_pool.hpp"
+#include "helm/mctp.hpp"
+#include "helm/scoped_key.hpp"
+#include "helm/secure_element.hpp"
+
+namespace ak::helm::oar {
+
+// A function's number within its slot (helm-control-plane design, data
+// models: FunctionId { slot, fn }).
+using FunctionNumber = std::uint16_t;
+using NicId = std::uint64_t;
+
+inline constexpr std::size_t mac_size = 6;
+inline constexpr std::size_t vtep_size = 16;
+using Mac = std::array<std::byte, mac_size>;
+using Vtep = std::array<std::byte, vtep_size>;
+
+inline constexpr std::uint32_t max_vni = 0x00FF'FFFF;  // 24-bit Geneve VNI
+
+// Largest body a message can carry (mctp::max_message_size less the vendor header).
+inline constexpr std::size_t max_body_size = mctp::max_message_size - mctp::vendor_header_size;
+
+inline constexpr std::size_t prepare_head_size = 16;
+inline constexpr std::size_t nic_config_size = 20;
+inline constexpr std::size_t blk_config_size = 8;
+inline constexpr std::size_t clean_function_size = 4;
+inline constexpr std::size_t deliver_key_size = 16 + volume_key_size;
+inline constexpr std::size_t drop_key_size = 16;
+inline constexpr std::size_t map_chunk_head_size = 8;
+inline constexpr std::size_t max_map_chunk = max_body_size - map_chunk_head_size;
+// Largest MapUpdate frame (proto::max_map_update_size: 32-byte header,
+// 4096 entries of 32 bytes, 64-byte signature). Mirrored so this header
+// does not depend on ak::proto; tests/oar_protocol_test.cpp pins the two.
+inline constexpr std::size_t max_map_frame = 0x20 + (4096 * 0x20) + 64;
+
+inline constexpr std::size_t response_head_size = 2;
+inline constexpr std::size_t inventory_head_size = 20;
+inline constexpr std::size_t inventory_entry_size = 4;
+// Bounded so an inventory response fits one message with room to spare.
+inline constexpr std::size_t max_inventory_entries = 1000;
+inline constexpr std::size_t health_body_size = 8;
+
+// Result of a request. Values are part of the wire protocol: never renumber.
+enum class Status : std::uint8_t {
+    ok = 0,
+    unknown_function = 1,  // no such function on this role
+    wrong_type = 2,        // the function is not of the type the request names
+    bad_request = 3,       // the request body did not decode
+    busy = 4,              // the function is in a state that cannot take the request
+    failed = 5,            // the role tried and failed (cleaning error, bad map frame)
+    unsupported = 6,       // this role does not implement the operation
+};
+
+// Which data-plane role answers on a slot. Values are wire protocol.
+enum class Role : std::uint8_t {
+    net = 1,
+    blk = 2,
+    gpu = 3,
+};
+
+// Values are wire protocol.
+enum class HealthState : std::uint8_t {
+    ok = 0,
+    degraded = 1,
+    faulted = 2,
+};
+
+[[nodiscard]] auto to_string(Status s) noexcept -> const char*;
+[[nodiscard]] auto to_string(Role r) noexcept -> const char*;
+[[nodiscard]] auto to_string(HealthState h) noexcept -> const char*;
+
+// Whether a role may report functions of `type`.
+[[nodiscard]] auto role_serves(Role role, FunctionType type) noexcept -> bool;
+
+enum class BodyError : std::uint8_t {
+    truncated,          // shorter than the body's fixed size
+    trailing_bytes,     // longer than the body's size
+    reserved_not_zero,  // a reserved byte is set
+    unknown_enum,       // function type, cleaning action, status, role or state out of range
+    zero_id,            // vm_id, nic_id or volume_id is zero (ids are never zero)
+    bad_vni,            // zero, or wider than 24 bits
+    bad_mac,            // not a locally administered unicast MAC
+    bad_vtep,           // zero for the net role, non-zero for any other
+    type_mismatch,      // config does not match the function type, or role cannot serve it
+    not_increasing,     // inventory entries not in strictly increasing fn order
+    too_many_entries,   // inventory larger than max_inventory_entries
+    bad_chunk,          // map_update total, offset or chunk length out of range
+    status_with_body,   // a non-ok response carries bytes after its head
+};
+
+[[nodiscard]] auto to_string(BodyError e) noexcept -> const char*;
+
+// ---- Requests -------------------------------------------------------------
+
+struct NicConfig {
+    NicId nic_id{0};
+    std::uint32_t vni{0};
+    Mac mac{};
+
+    friend auto operator==(const NicConfig&, const NicConfig&) -> bool = default;
+};
+
+struct BlkConfig {
+    VolumeId volume_id{0};
+
+    friend auto operator==(const BlkConfig&, const BlkConfig&) -> bool = default;
+};
+
+// monostate for GPU functions, which take no configuration.
+using FunctionConfig = std::variant<std::monostate, NicConfig, BlkConfig>;
+
+struct PrepareFunction {
+    FunctionNumber fn{0};
+    FunctionType type{FunctionType::nic_vf};
+    VmId vm_id{0};
+    FunctionConfig config;
+
+    friend auto operator==(const PrepareFunction&, const PrepareFunction&) -> bool = default;
+};
+
+struct CleanFunction {
+    FunctionNumber fn{0};
+    CleaningAction action{CleaningAction::reset_nic_vf};
+
+    friend auto operator==(const CleanFunction&, const CleanFunction&) -> bool = default;
+};
+
+// The key is a view: into the caller's ScopedKey when encoding, into the
+// received message when decoding. The receiver copies it into its key slot
+// and wipes the message (OarEndpoint does).
+struct DeliverKey {
+    FunctionNumber fn{0};
+    VolumeId volume_id{0};
+    std::span<const std::byte, volume_key_size> key;
+};
+
+struct DropKey {
+    FunctionNumber fn{0};
+    VolumeId volume_id{0};
+
+    friend auto operator==(const DropKey&, const DropKey&) -> bool = default;
+};
+
+// One chunk of a MapUpdate frame. `chunk` views into the message.
+struct MapChunk {
+    std::uint32_t total{0};
+    std::uint32_t offset{0};
+    std::span<const std::byte> chunk;
+};
+
+[[nodiscard]] auto encode_prepare_function(const PrepareFunction& p)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_prepare_function(std::span<const std::byte> body) noexcept
+    -> std::expected<PrepareFunction, BodyError>;
+
+[[nodiscard]] auto encode_clean_function(const CleanFunction& c)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_clean_function(std::span<const std::byte> body) noexcept
+    -> std::expected<CleanFunction, BodyError>;
+
+// The returned buffer holds the key: the caller wipes it with secure_zero.
+[[nodiscard]] auto encode_deliver_key(const DeliverKey& d)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_deliver_key(std::span<const std::byte> body) noexcept
+    -> std::expected<DeliverKey, BodyError>;
+
+[[nodiscard]] auto encode_drop_key(const DropKey& d)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_drop_key(std::span<const std::byte> body) noexcept
+    -> std::expected<DropKey, BodyError>;
+
+[[nodiscard]] auto encode_map_chunk(const MapChunk& m)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_map_chunk(std::span<const std::byte> body) noexcept
+    -> std::expected<MapChunk, BodyError>;
+
+// function_inventory and health requests have empty bodies.
+[[nodiscard]] auto decode_empty(std::span<const std::byte> body) noexcept
+    -> std::expected<void, BodyError>;
+
+// ---- Responses ------------------------------------------------------------
+
+struct InventoryEntry {
+    FunctionNumber fn{0};
+    FunctionType type{FunctionType::nic_vf};
+
+    friend auto operator==(const InventoryEntry&, const InventoryEntry&) -> bool = default;
+};
+
+struct Inventory {
+    Role role{Role::net};
+    Vtep vtep{};
+    std::vector<InventoryEntry> functions;  // strictly increasing fn
+
+    friend auto operator==(const Inventory&, const Inventory&) -> bool = default;
+};
+
+struct Health {
+    HealthState state{HealthState::ok};
+    std::uint16_t fault_code{0};
+    std::uint32_t uptime_seconds{0};
+
+    friend auto operator==(const Health&, const Health&) -> bool = default;
+};
+
+// A decoded response head. `body` is what follows it, empty unless status is ok.
+struct ResponseView {
+    Status status{Status::ok};
+    std::span<const std::byte> body;
+};
+
+// A response with the given status and (only for ok) body.
+[[nodiscard]] auto encode_response(Status status, std::span<const std::byte> body = {})
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_response(std::span<const std::byte> response) noexcept
+    -> std::expected<ResponseView, BodyError>;
+
+// Inventory and health bodies, as carried after an ok head.
+[[nodiscard]] auto encode_inventory(const Inventory& inv)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_inventory(std::span<const std::byte> body)
+    -> std::expected<Inventory, BodyError>;
+
+[[nodiscard]] auto encode_health(const Health& h)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_health(std::span<const std::byte> body) noexcept
+    -> std::expected<Health, BodyError>;
+
+}  // namespace ak::helm::oar

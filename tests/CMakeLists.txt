@@ -58,6 +58,8 @@ ak_add_test(harbor_controller_test SOURCES harbor_controller_test.cpp LIBS ak::h
 ak_add_test(key_store_test     SOURCES key_store_test.cpp     LIBS ak::helm)
 ak_add_test(virtqueue_test    SOURCES virtqueue_test.cpp    LIBS ak::oar_virtio)
 ak_add_test(virtio_pci_test   SOURCES virtio_pci_test.cpp   LIBS ak::oar_virtio)
+ak_add_test(oar_protocol_test SOURCES oar_protocol_test.cpp LIBS ak::helm ak::proto)
+ak_add_test(oar_link_test     SOURCES oar_link_test.cpp     LIBS ak::helm)
 
 # Python tests for the tooling around the C++ tree (the hull kernel config
 # checker). Skipped, not failed, when no interpreter is found.

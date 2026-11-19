@@ -1,0 +1,355 @@
+// Copyright (c) 2026 Clark Rawlins
+// SPDX-License-Identifier: Apache-2.0
+
+// .kiro/specs/helm-control-plane/ Requirements 5 and 7: OarLink message
+// bodies (helm/oar_protocol.hpp), strict both ways.
+
+#define BOOST_TEST_MODULE oar_protocol_test
+#include <boost/test/unit_test.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <string_view>
+#include <variant>
+#include <vector>
+
+#include "helm/oar_protocol.hpp"
+#include "proto/map_update.hpp"
+#include "test_support.hpp"
+
+namespace oar = ak::helm::oar;
+using ak::helm::CleaningAction;
+using ak::helm::FunctionType;
+using ak::test::bytes_of;
+using ak::test::unit_timeout_seconds;
+using oar::BodyError;
+using oar::Status;
+
+namespace {
+
+constexpr oar::FunctionNumber sample_fn = 0x0102;
+constexpr ak::helm::VmId sample_vm = 0x1122'3344'5566'7788;
+constexpr oar::NicId sample_nic = 0x0A0B'0C0D'0E0F'1011;
+constexpr std::uint32_t sample_vni = 0x00AB'CDEF;
+constexpr ak::helm::VolumeId sample_volume = 0x99;
+constexpr oar::Mac local_mac{std::byte{0x02}, std::byte{0x00}, std::byte{0x5E},
+                             std::byte{0x10}, std::byte{0x20}, std::byte{0x30}};
+constexpr oar::Mac global_mac{std::byte{0x00}, std::byte{0x11}, std::byte{0x22},
+                              std::byte{0x33}, std::byte{0x44}, std::byte{0x55}};
+constexpr oar::Mac multicast_mac{std::byte{0x03}, std::byte{0x00}, std::byte{0x00},
+                                 std::byte{0x00}, std::byte{0x00}, std::byte{0x01}};
+constexpr std::uint32_t wide_vni = 0x0100'0000;
+constexpr std::size_t nic_body_size = oar::prepare_head_size + oar::nic_config_size;
+constexpr std::size_t blk_body_size = oar::prepare_head_size + oar::blk_config_size;
+constexpr std::size_t type_offset = 2;
+constexpr std::size_t reserved8_offset = 3;
+constexpr std::size_t reserved32_offset = 4;
+constexpr std::size_t nic_reserved_offset = nic_body_size - 1;
+constexpr std::uint8_t bad_type = 9;
+constexpr std::uint8_t bad_action = 4;
+constexpr std::uint8_t bad_status = 7;
+constexpr std::uint8_t key_fill = 0xA5;
+constexpr std::uint32_t small_total = 100;
+constexpr std::uint32_t mid_offset = 40;
+constexpr std::size_t fn_count = 3;
+
+auto nic_request() -> oar::PrepareFunction {
+    return {.fn = sample_fn,
+            .type = FunctionType::nic_vf,
+            .vm_id = sample_vm,
+            .config = oar::NicConfig{.nic_id = sample_nic, .vni = sample_vni, .mac = local_mac}};
+}
+
+auto net_inventory() -> oar::Inventory {
+    oar::Inventory inv{.role = oar::Role::net, .vtep = {}, .functions = {}};
+    inv.vtep.back() = std::byte{1};
+    for (std::size_t i = 0; i < fn_count; ++i) {
+        inv.functions.push_back(
+            {.fn = static_cast<oar::FunctionNumber>(i * 2), .type = FunctionType::nic_vf});
+    }
+    return inv;
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_SUITE(oar_protocol, *boost::unit_test::timeout(unit_timeout_seconds))
+
+BOOST_AUTO_TEST_CASE(map_frame_limit_matches_proto) {
+    BOOST_TEST(oar::max_map_frame == ak::proto::max_map_update_size);
+    BOOST_TEST(oar::max_map_chunk + oar::map_chunk_head_size + ak::helm::mctp::vendor_header_size ==
+               ak::helm::mctp::max_message_size);
+}
+
+BOOST_AUTO_TEST_CASE(prepare_nic_layout_and_round_trip) {
+    auto body = oar::encode_prepare_function(nic_request());
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == nic_body_size);
+    // fn LE, type, then vm_id LE at 8.
+    BOOST_TEST(std::to_integer<int>((*body)[0]) == 0x02);
+    BOOST_TEST(std::to_integer<int>((*body)[1]) == 0x01);
+    BOOST_TEST(std::to_integer<int>((*body)[type_offset]) == 1);
+    BOOST_TEST(std::to_integer<int>((*body)[8]) == 0x88);
+    auto back = oar::decode_prepare_function(*body);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST((*back == nic_request()));
+}
+
+BOOST_AUTO_TEST_CASE(prepare_blk_and_gpu_round_trip) {
+    const oar::PrepareFunction blk{.fn = 1,
+                                   .type = FunctionType::blk_fn,
+                                   .vm_id = sample_vm,
+                                   .config = oar::BlkConfig{.volume_id = sample_volume}};
+    auto body = oar::encode_prepare_function(blk);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == blk_body_size);
+    BOOST_TEST((oar::decode_prepare_function(*body).value() == blk));
+
+    const oar::PrepareFunction gpu{
+        .fn = 1, .type = FunctionType::gpu_vf, .vm_id = sample_vm, .config = std::monostate{}};
+    body = oar::encode_prepare_function(gpu);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::prepare_head_size);
+    BOOST_TEST((oar::decode_prepare_function(*body).value() == gpu));
+}
+
+BOOST_AUTO_TEST_CASE(prepare_encode_rejects_invalid) {
+    auto p = nic_request();
+    p.vm_id = 0;
+    BOOST_TEST((oar::encode_prepare_function(p).error() == BodyError::zero_id));
+    p = nic_request();
+    p.config = oar::BlkConfig{.volume_id = sample_volume};
+    BOOST_TEST((oar::encode_prepare_function(p).error() == BodyError::type_mismatch));
+    p = nic_request();
+    std::get<oar::NicConfig>(p.config).nic_id = 0;
+    BOOST_TEST((oar::encode_prepare_function(p).error() == BodyError::zero_id));
+    for (const std::uint32_t vni : {std::uint32_t{0}, wide_vni}) {
+        p = nic_request();
+        std::get<oar::NicConfig>(p.config).vni = vni;
+        BOOST_TEST((oar::encode_prepare_function(p).error() == BodyError::bad_vni));
+    }
+    for (const auto& mac : {global_mac, multicast_mac}) {
+        p = nic_request();
+        std::get<oar::NicConfig>(p.config).mac = mac;
+        BOOST_TEST((oar::encode_prepare_function(p).error() == BodyError::bad_mac));
+    }
+    const oar::PrepareFunction blk{.fn = 1,
+                                   .type = FunctionType::blk_fn,
+                                   .vm_id = sample_vm,
+                                   .config = oar::BlkConfig{.volume_id = 0}};
+    BOOST_TEST((oar::encode_prepare_function(blk).error() == BodyError::zero_id));
+}
+
+BOOST_AUTO_TEST_CASE(prepare_decode_rejects_malformed) {
+    const auto good = oar::encode_prepare_function(nic_request()).value();
+
+    auto b = good;
+    b.pop_back();
+    BOOST_TEST((oar::decode_prepare_function(b).error() == BodyError::truncated));
+    b = good;
+    b.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_prepare_function(b).error() == BodyError::trailing_bytes));
+    BOOST_TEST(
+        (oar::decode_prepare_function(std::span{good}.first(oar::prepare_head_size - 1)).error() ==
+         BodyError::truncated));
+
+    for (const std::size_t off : {reserved8_offset, reserved32_offset, nic_reserved_offset}) {
+        b = good;
+        b[off] = std::byte{1};
+        BOOST_TEST((oar::decode_prepare_function(b).error() == BodyError::reserved_not_zero));
+    }
+    b = good;
+    b[type_offset] = std::byte{bad_type};
+    BOOST_TEST((oar::decode_prepare_function(b).error() == BodyError::unknown_enum));
+    // A blk type over a NIC-sized body has the wrong length for its type.
+    b = good;
+    b[type_offset] = std::byte{static_cast<std::uint8_t>(FunctionType::blk_fn)};
+    BOOST_TEST((oar::decode_prepare_function(b).error() == BodyError::trailing_bytes));
+}
+
+BOOST_AUTO_TEST_CASE(clean_function_round_trip_and_rejects) {
+    const oar::CleanFunction c{.fn = sample_fn, .action = CleaningAction::drop_volume_key};
+    auto body = oar::encode_clean_function(c);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::clean_function_size);
+    BOOST_TEST((oar::decode_clean_function(*body).value() == c));
+
+    BOOST_TEST((oar::decode_clean_function(bytes_of(0, 0, bad_action, 0)).error() ==
+                BodyError::unknown_enum));
+    BOOST_TEST(
+        (oar::decode_clean_function(bytes_of(0, 0, 0, 1)).error() == BodyError::reserved_not_zero));
+    BOOST_TEST((oar::decode_clean_function(bytes_of(0, 0, 0)).error() == BodyError::truncated));
+    BOOST_TEST(
+        (oar::encode_clean_function({.fn = 0, .action = static_cast<CleaningAction>(bad_action)})
+             .error() == BodyError::unknown_enum));
+}
+
+BOOST_AUTO_TEST_CASE(deliver_key_round_trip_views_key) {
+    std::array<std::byte, ak::helm::volume_key_size> key{};
+    key.fill(std::byte{key_fill});
+    auto body = oar::encode_deliver_key({.fn = sample_fn, .volume_id = sample_volume, .key = key});
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::deliver_key_size);
+    BOOST_TEST(body->capacity() == oar::deliver_key_size);  // no reallocation copies
+    auto back = oar::decode_deliver_key(*body);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST(back->fn == sample_fn);
+    BOOST_TEST(back->volume_id == sample_volume);
+    BOOST_TEST(std::ranges::equal(back->key, key));
+    BOOST_TEST(back->key.data() == body->data() + (oar::deliver_key_size - key.size()));
+
+    BOOST_TEST((oar::encode_deliver_key({.fn = 0, .volume_id = 0, .key = key}).error() ==
+                BodyError::zero_id));
+    auto b = *body;
+    b[2] = std::byte{1};
+    BOOST_TEST((oar::decode_deliver_key(b).error() == BodyError::reserved_not_zero));
+    b.pop_back();
+    BOOST_TEST((oar::decode_deliver_key(b).error() == BodyError::truncated));
+}
+
+BOOST_AUTO_TEST_CASE(drop_key_round_trip_and_rejects) {
+    const oar::DropKey d{.fn = sample_fn, .volume_id = sample_volume};
+    auto body = oar::encode_drop_key(d);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST((oar::decode_drop_key(*body).value() == d));
+    auto b = *body;
+    std::ranges::fill(std::span{b}.subspan(8), std::byte{0});
+    BOOST_TEST((oar::decode_drop_key(b).error() == BodyError::zero_id));
+    b = *body;
+    b[7] = std::byte{1};
+    BOOST_TEST((oar::decode_drop_key(b).error() == BodyError::reserved_not_zero));
+    b = *body;
+    b.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_drop_key(b).error() == BodyError::trailing_bytes));
+}
+
+BOOST_AUTO_TEST_CASE(map_chunk_bounds) {
+    const std::vector<std::byte> data(mid_offset, std::byte{1});
+    auto body = oar::encode_map_chunk({.total = small_total, .offset = 0, .chunk = data});
+    BOOST_REQUIRE(body.has_value());
+    auto back = oar::decode_map_chunk(*body);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST(back->total == small_total);
+    BOOST_TEST(back->offset == 0U);
+    BOOST_TEST(std::ranges::equal(back->chunk, data));
+
+    const auto bad = [](std::uint32_t total, std::uint32_t offset, std::size_t len) {
+        const std::vector<std::byte> chunk(len, std::byte{0});
+        return oar::encode_map_chunk({.total = total, .offset = offset, .chunk = chunk}).error() ==
+               BodyError::bad_chunk;
+    };
+    BOOST_TEST(bad(0, 0, 1));                                                // empty frame
+    BOOST_TEST(bad(small_total, 0, 0));                                      // empty chunk
+    BOOST_TEST(bad(small_total, small_total, 1));                            // offset past the end
+    BOOST_TEST(bad(small_total, small_total - mid_offset + 1, mid_offset));  // overruns total
+    BOOST_TEST(bad(oar::max_map_frame + 1, 0, 1));                           // frame too large
+    BOOST_TEST(bad(oar::max_map_frame, 0, oar::max_map_chunk + 1));          // chunk too large
+    BOOST_TEST(!bad(oar::max_map_frame, 0, oar::max_map_chunk));
+
+    BOOST_TEST(
+        (oar::decode_map_chunk(bytes_of(1, 0, 0, 0, 0, 0, 0, 0)).error() == BodyError::truncated));
+}
+
+BOOST_AUTO_TEST_CASE(empty_bodies) {
+    BOOST_TEST(oar::decode_empty({}).has_value());
+    BOOST_TEST((oar::decode_empty(bytes_of(0)).error() == BodyError::trailing_bytes));
+}
+
+BOOST_AUTO_TEST_CASE(response_heads) {
+    auto ok = oar::encode_response(Status::ok, bytes_of(1, 2));
+    BOOST_REQUIRE(ok.has_value());
+    BOOST_TEST((*ok == bytes_of(0, 0, 1, 2)));
+    auto view = oar::decode_response(*ok);
+    BOOST_REQUIRE(view.has_value());
+    BOOST_TEST((view->status == Status::ok));
+    BOOST_TEST(view->body.size() == 2U);
+
+    auto busy = oar::encode_response(Status::busy);
+    BOOST_REQUIRE(busy.has_value());
+    BOOST_TEST((oar::decode_response(*busy)->status == Status::busy));
+
+    BOOST_TEST(
+        (oar::encode_response(Status::busy, bytes_of(1)).error() == BodyError::status_with_body));
+    BOOST_TEST((oar::decode_response(bytes_of(4, 0, 1)).error() == BodyError::status_with_body));
+    BOOST_TEST((oar::decode_response(bytes_of(bad_status, 0)).error() == BodyError::unknown_enum));
+    BOOST_TEST((oar::decode_response(bytes_of(0, 1)).error() == BodyError::reserved_not_zero));
+    BOOST_TEST((oar::decode_response(bytes_of(0)).error() == BodyError::truncated));
+}
+
+BOOST_AUTO_TEST_CASE(inventory_round_trip) {
+    const auto inv = net_inventory();
+    auto body = oar::encode_inventory(inv);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::inventory_head_size + (fn_count * oar::inventory_entry_size));
+    auto back = oar::decode_inventory(*body);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST((*back == inv));
+
+    const oar::Inventory empty_blk{.role = oar::Role::blk, .vtep = {}, .functions = {}};
+    BOOST_TEST(
+        (oar::decode_inventory(oar::encode_inventory(empty_blk).value()).value() == empty_blk));
+}
+
+BOOST_AUTO_TEST_CASE(inventory_rules) {
+    auto inv = net_inventory();
+    inv.vtep = {};
+    BOOST_TEST((oar::encode_inventory(inv).error() == BodyError::bad_vtep));
+    inv = net_inventory();
+    inv.role = oar::Role::blk;
+    BOOST_TEST((oar::encode_inventory(inv).error() == BodyError::bad_vtep));
+    inv.vtep = {};
+    BOOST_TEST((oar::encode_inventory(inv).error() == BodyError::type_mismatch));
+    inv = net_inventory();
+    inv.functions[1].fn = inv.functions[0].fn;
+    BOOST_TEST((oar::encode_inventory(inv).error() == BodyError::not_increasing));
+    inv = net_inventory();
+    inv.functions.resize(oar::max_inventory_entries + 1);
+    BOOST_TEST((oar::encode_inventory(inv).error() == BodyError::too_many_entries));
+
+    const oar::Inventory gpu{.role = oar::Role::gpu,
+                             .vtep = {},
+                             .functions = {{.fn = 0, .type = FunctionType::gpu_whole},
+                                           {.fn = 1, .type = FunctionType::gpu_vf}}};
+    BOOST_TEST(oar::encode_inventory(gpu).has_value());
+
+    const auto good = oar::encode_inventory(net_inventory()).value();
+    auto b = good;
+    b.pop_back();
+    BOOST_TEST((oar::decode_inventory(b).error() == BodyError::truncated));
+    b = good;
+    b.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_inventory(b).error() == BodyError::trailing_bytes));
+    b = good;
+    b[1] = std::byte{1};
+    BOOST_TEST((oar::decode_inventory(b).error() == BodyError::reserved_not_zero));
+    b = good;
+    b[0] = std::byte{0};
+    BOOST_TEST((oar::decode_inventory(b).error() == BodyError::unknown_enum));
+    b = good;
+    b.back() = std::byte{1};  // last entry's reserved byte
+    BOOST_TEST((oar::decode_inventory(b).error() == BodyError::reserved_not_zero));
+}
+
+BOOST_AUTO_TEST_CASE(health_round_trip_and_rejects) {
+    const oar::Health h{.state = oar::HealthState::degraded, .fault_code = 7, .uptime_seconds = 9};
+    auto body = oar::encode_health(h);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST((oar::decode_health(*body).value() == h));
+    BOOST_TEST(
+        (oar::decode_health(bytes_of(3, 0, 0, 0, 0, 0, 0, 0)).error() == BodyError::unknown_enum));
+    BOOST_TEST((oar::decode_health(bytes_of(0, 1, 0, 0, 0, 0, 0, 0)).error() ==
+                BodyError::reserved_not_zero));
+}
+
+BOOST_AUTO_TEST_CASE(names) {
+    BOOST_TEST(std::string_view{oar::to_string(Status::busy)} == "busy");
+    BOOST_TEST(std::string_view{oar::to_string(oar::Role::gpu)} == "gpu");
+    BOOST_TEST(std::string_view{oar::to_string(oar::HealthState::faulted)} == "faulted");
+    BOOST_TEST(std::string_view{oar::to_string(BodyError::bad_chunk)} == "bad_chunk");
+    BOOST_TEST(oar::role_serves(oar::Role::gpu, FunctionType::gpu_vf));
+    BOOST_TEST(!oar::role_serves(oar::Role::net, FunctionType::blk_fn));
+}
+
+BOOST_AUTO_TEST_SUITE_END()

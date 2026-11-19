@@ -100,11 +100,17 @@
   socket cannot pick its source port per datagram; a raw socket needs
   CAP_NET_RAW); `pump()` feeds received datagrams through the Vtep into the
   VSwitch. Fuzz: `fuzz_vtep`. Tests include two VTEPs joined end to end
-  and loopback UDP (skipped where the sandbox has no IPv6). Not yet:
-  `ak-oar-net` still serves one NIC without the VSwitch or Vtep, since
-  helm has no channel yet to hand oar-net its map_updates and NIC
-  attachments; that wiring comes with the harbor multi-server tests
-  (task 11). Peer state changes are not yet carried to helm.
+  and loopback UDP (skipped where the sandbox has no IPv6). `NetRole`
+  (`src/oar/net/net_role.*`, task 11) wires the whole VTEP behind helm's
+  sideband: MappingTable, VSwitch, Vtep and one virtio-net function per
+  transport; `prepare_function` gives a function helm's NIC ID and MAC and
+  connects it, `clean_function` resets it to a placeholder in the dead
+  VPC, and `map_update` checks the target server and the controller's
+  Ed25519 signature before applying (an already-applied version answers
+  ok unchanged). `ak-oar-net` runs it with a `UdpEndpoint` underlay and
+  helm's sideband socket; `--socket` keeps the single-NIC TAP mode for
+  `harbor/oar_net_smoke.py`. Peer state reaches helm only as `health`
+  (degraded while a peer is down).
 - [x] 10. WireGuard tunnel integration and key delivery from helm.
   _Requirements: 5_ — `Tunnel` (`src/oar/net/tunnel.*`) runs WireGuard
   (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s) between the Vtep and the
@@ -133,8 +139,8 @@
   (`tests/wireguard_interop.sh`, CI under sudo: kernel-initiated and
   Tunnel-initiated handshakes, data both ways). Not yet: nothing in helm
   produces the keys (the controller has no message carrying VTEP public
-  keys, and helm does not generate the role's key pair); `ak-oar-net` is
-  not wired to the Tunnel (with the VSwitch and Vtep, task 11); cookie
+  keys, and helm does not generate the role's key pair); `NetRole`/`ak-oar-net`
+  are not wired to the Tunnel yet (task 11); cookie
   replies under load; IPsec ESP (Requirement 5.1's alternative).
 - [ ] 11. MTU computation and advertisement; harbor multi-server tests.
   _Requirements: 6, 9.3_ — Done: `plan_mtu()` (`src/oar/net/mtu.*`)
@@ -154,4 +160,6 @@
   or not at all, and `PeerStatus::mtu_ok` records that full-size
   datagrams from that peer get through. Not yet: the harbor multi-server
   tests (cross-server reachability, VPC isolation, forged VNI and NIC IDs,
-  MTU behaviour; tikhov), and reporting `mtu_ok` to helm.
+  MTU behaviour; tikhov), reporting `mtu_ok` to helm, and the ARP/ND proxy
+  addresses from MapUpdate v2 (`VSwitch::set_neighbors`), which `NetRole`
+  applies once the v2 frame format lands.

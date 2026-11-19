@@ -108,6 +108,28 @@ inventory, as the real controller's do. The full script language is in
 `src/harbor/test_controller.hpp`. Exit status 0 means every line passed,
 1 that one failed (its line number is printed), 2 a usage or setup error.
 
+## helm daemon
+
+`ak-helm` is helm as a running daemon: it powers each slot's board process
+(the PowerSequencer over harbor's `ProcessBackplane`), opens each board's
+sideband socket once it is ready, reads the role's functions and cleans
+them into the pool, then releases the host and connects to the controller
+over mTLS, so the first inventory the controller sees already lists every
+function. Controller commands go through the CommandRouter and mapping
+updates to every net role; `SIGTERM` holds the host and powers the slots
+off.
+
+```bash
+ak-helm --check harbor/helm.conf.example   # parse a configuration only
+ak-helm --config /etc/antikythera/helm.conf
+```
+
+The configuration format is in `src/helm/helm_config.hpp`; see
+[`helm.conf.example`](helm.conf.example). The mailbox to hull
+(MailboxDevice, helm task 8) is not built yet, so until it is every
+command the router relays is answered `internal_error`; registration,
+inventory, slot power, cleaning, mapping updates and status reports run.
+
 ## oar-net virtio-net function
 
 `ak-oar-net` (built with `-DAK_VFIO_USER=ON`) serves one virtio-net NIC
@@ -155,5 +177,6 @@ no key. Booting an L2 guest from a volume is oar-blk task 7.
 | `l1/phase2-check.sh` | runs inside L1: vfio-pci binding, L2 boot, guest checks, hot-plug and unplug |
 | `l1/l2-image.sh`, `l1/l2-init.sh` | build the L2 guest inside L1 (kernel + busybox initramfs) and its `/init` |
 | `phase2.sh` | phase 2 end to end |
+| `helm.conf.example` | sample `ak-helm` configuration (ctest parses it) |
 | `oar_net_smoke.py` | drives a running `ak-oar-net` over vfio-user without QEMU (see below) |
 | `kernel/` | hull kernel fragments (strict `hull.config`, per-arch, `l1-debug.config`), resolver and checker; see [`kernel/README.md`](kernel/README.md) |

@@ -55,6 +55,8 @@ ak_add_test(device_pool_test  SOURCES device_pool_test.cpp  LIBS ak::helm)
 ak_add_test(audit_log_test    SOURCES audit_log_test.cpp    LIBS ak::helm)
 ak_add_test(command_router_test SOURCES command_router_test.cpp LIBS ak::helm)
 ak_add_test(power_sequencer_test SOURCES power_sequencer_test.cpp LIBS ak::helm)
+ak_add_test(helm_daemon_test SOURCES helm_daemon_test.cpp LIBS ak::helm ak::harbor_controller ak::hull OpenSSL::Crypto)
+ak_add_test(helm_config_test SOURCES helm_config_test.cpp LIBS ak::helm)
 ak_add_test(mailbox_bodies_test SOURCES mailbox_bodies_test.cpp LIBS ak::helm)
 ak_add_test(mctp_test         SOURCES mctp_test.cpp         LIBS ak::helm)
 ak_add_test(signature_verifier_test SOURCES signature_verifier_test.cpp LIBS ak::hull)
@@ -119,3 +121,8 @@ target_link_libraries(wireguard_interop_peer PRIVATE ak::oar_net ak::warnings)
 add_test(NAME wireguard_interop
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/wireguard_interop.sh $<TARGET_FILE:wireguard_interop_peer>)
 set_tests_properties(wireguard_interop PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+# harbor's sample ak-helm configuration must keep parsing.
+add_test(NAME ak_helm_check
+         COMMAND $<TARGET_FILE:ak-helm> --check ${PROJECT_SOURCE_DIR}/harbor/helm.conf.example)
+set_tests_properties(ak_helm_check PROPERTIES TIMEOUT 30)

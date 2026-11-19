@@ -90,7 +90,7 @@ public:
         -> void = 0;
 };
 
-enum class LinkError : std::uint8_t {
+enum class SessionError : std::uint8_t {
     bad_record,       // the stream or a payload failed strict decoding
     wrong_direction,  // a record type only helm sends
     wrong_server,     // an envelope or mapping update for another server
@@ -98,7 +98,7 @@ enum class LinkError : std::uint8_t {
     not_connected,    // bytes arrived with no connection open
 };
 
-[[nodiscard]] auto to_string(LinkError e) noexcept -> const char*;
+[[nodiscard]] auto to_string(SessionError e) noexcept -> const char*;
 
 inline constexpr std::size_t max_pending_reports = 4096;
 
@@ -118,7 +118,8 @@ public:
     [[nodiscard]] auto connected() const noexcept -> bool { return _connected; }
 
     // Bytes from the controller. An error means: close the connection.
-    [[nodiscard]] auto on_bytes(std::span<const std::byte> bytes) -> std::expected<void, LinkError>;
+    [[nodiscard]] auto on_bytes(std::span<const std::byte> bytes)
+        -> std::expected<void, SessionError>;
 
     // Queues a report (assigning its sequence number); it is sent now if
     // connected, else at the next connection. Returns the sequence number.
@@ -139,7 +140,7 @@ private:
     };
 
     auto queue(proto::ReportBody body) -> std::uint64_t;
-    auto handle(const proto::Record& rec) -> std::expected<void, LinkError>;
+    auto handle(const proto::Record& rec) -> std::expected<void, SessionError>;
 
     std::uint64_t _server_id;
     std::uint64_t _boot_id;
@@ -163,7 +164,7 @@ struct LinkOptions {
     std::chrono::milliseconds io_timeout{std::chrono::seconds{30}};
 };
 
-struct LinkStats {
+struct ControllerLinkStats {
     std::uint64_t connects{0};  // completed handshakes
     std::uint64_t failures{0};  // failed connects and broken connections
     std::uint64_t protocol_errors{0};
@@ -188,7 +189,7 @@ public:
     // Thread-safe: queue a report from any helm thread.
     auto report(proto::ReportBody body) -> std::uint64_t;
 
-    [[nodiscard]] auto stats() const -> LinkStats;
+    [[nodiscard]] auto stats() const -> ControllerLinkStats;
 
 private:
     ControllerLink(LinkOptions options, ControllerSession& session, tls::Context ctx, int wake_fd);
@@ -206,7 +207,7 @@ private:
     // Guards _session and _stats. Recursive so a sink callback, which runs
     // with it held, may queue a report through report().
     mutable std::recursive_mutex _mutex;
-    LinkStats _stats;
+    ControllerLinkStats _stats;
 };
 
 }  // namespace ak::helm

@@ -1,0 +1,25 @@
+# Copyright (c) 2026 Clark Rawlins
+# SPDX-License-Identifier: Apache-2.0
+
+# ak-helm configuration for one harbor server (src/helm/helm_config.hpp has
+# every directive). ctest checks that this file parses (ak_helm_check).
+
+server-id 7
+controller 127.0.0.1:7443
+controller-name 127.0.0.1
+ca /etc/antikythera/controller-ca.pem
+cert /etc/antikythera/server-7.pem
+key /etc/antikythera/server-7-key.pem
+audit-log /var/lib/antikythera/helm-audit.log
+master-key ephemeral
+
+# slot N SOCKET HELM_ADDR BOARD_ADDR HELM_EID BOARD_EID ARGV...
+# The board process listens on SOCKET (SOCK_SEQPACKET) once it is ready.
+slot 1 /run/antikythera/slot1-sideband.sock 0x08 0x11 8 17 /usr/local/bin/ak-board --slot 1
+slot 2 /run/antikythera/slot2-sideband.sock 0x08 0x12 8 18 /usr/local/bin/ak-board --slot 2
+
+# Released once the slots are up: harbor's L1 QEMU (harbor/l1/run.sh).
+host /usr/local/bin/harbor-l1 --server 7
+
+command-timeout-ms 30000
+link-timeout-ms 30000

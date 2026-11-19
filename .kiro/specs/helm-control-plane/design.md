@@ -231,6 +231,40 @@ shape and target server and forwards the signed slot image; never verifies
 signatures itself (hull does — helm is not trusted to). Built in
 `src/helm/controller_link.*`.
 
+### HelmDaemon (helm main)
+
+The event loop of the overview, built in `src/helm/helm_daemon.*`, with
+`ak-helm` (`src/helm/helm_main.cpp`, configuration in
+`src/helm/helm_config.*`) running it in harbor. Decisions made in the
+implementation:
+
+- One loop thread owns the router, pool, key store, sequencer and every
+  OarLink. ControllerLink callbacks (its own thread, with its lock held)
+  and the MailboxDevice's host slots only queue onto it; the inventory the
+  ControllerSession sends is a snapshot the loop republishes after every
+  pass, so the link thread never touches the router.
+- Start order: slots boot and attach, the host is released, then the
+  ControllerLink starts, so the first registration lists every function.
+- On link-ready the daemon opens the slot's sideband (a `SocketBinding` to
+  the board process in harbor), reads its inventory and calls `add_slot`.
+  A sideband that cannot be opened or read is reported as a `device_lost`
+  host fault once and retried on every check. A recovered slot gets a new
+  sideband and inventory before `slot_power_cycled`. A faulted slot's
+  sideband is closed, so requests for it fail as disconnected.
+- MapUpdate frames go unmodified to every attached net role, which
+  verifies the signature itself (helm verifies none); `on_map_applied` is
+  called once every net role accepted it.
+- The daemon never powers anything off on its own: stopping the loop leaves
+  slots and host running (Requirement 2.3); `shutdown()` is explicit and
+  `ak-helm` calls it on SIGTERM.
+- Until the MailboxDevice (task 8) exists `ak-helm` uses a host port that
+  refuses every post, so relayed commands are answered `internal_error`.
+- Open: helm restarts with the router's `last_seq` at 0, so the controller,
+  which resumes from the inventory's `last_command_seq`, would reuse
+  sequence numbers hull already accepted. The floor needs to come from hull
+  (its report) or from helm's audit log before commands can survive a helm
+  restart.
+
 ## Data models
 
 - `FunctionId { slot: u8, fn: u16 }`, globally `{server, slot, fn}`.

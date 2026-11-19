@@ -15,17 +15,17 @@
 
 namespace ak::helm {
 
-auto to_string(LinkError e) noexcept -> const char* {
+auto to_string(SessionError e) noexcept -> const char* {
     switch (e) {
-        case LinkError::bad_record:
+        case SessionError::bad_record:
             return "bad_record";
-        case LinkError::wrong_direction:
+        case SessionError::wrong_direction:
             return "wrong_direction";
-        case LinkError::wrong_server:
+        case SessionError::wrong_server:
             return "wrong_server";
-        case LinkError::bad_ack:
+        case SessionError::bad_ack:
             return "bad_ack";
-        case LinkError::not_connected:
+        case SessionError::not_connected:
             return "not_connected";
     }
     return "unknown";
@@ -103,18 +103,18 @@ auto ControllerSession::take_outbound() -> std::vector<std::byte> {
     return std::exchange(_outbound, {});
 }
 
-auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, LinkError> {
+auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, SessionError> {
     switch (rec.type) {
         case proto::RecordType::envelope: {
             auto env = proto::decode_envelope(rec.payload);
             if (!env) {
-                return std::unexpected(LinkError::bad_record);
+                return std::unexpected(SessionError::bad_record);
             }
             // Until the slot itself names its server (the open question in
             // the controller-interface design), this check and mTLS are
             // what keep one server's commands off another.
             if (env->server_id != _server_id) {
-                return std::unexpected(LinkError::wrong_server);
+                return std::unexpected(SessionError::wrong_server);
             }
             _sink->on_envelope(*env);
             return {};
@@ -122,10 +122,10 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
         case proto::RecordType::map_update: {
             auto update = proto::decode_map_update(rec.payload);
             if (!update) {
-                return std::unexpected(LinkError::bad_record);
+                return std::unexpected(SessionError::bad_record);
             }
             if (update->server_id != _server_id) {
-                return std::unexpected(LinkError::wrong_server);
+                return std::unexpected(SessionError::wrong_server);
             }
             _sink->on_map_update(*update, rec.payload);
             return {};
@@ -133,10 +133,10 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
         case proto::RecordType::report_ack: {
             auto ack = proto::decode_report_ack(rec.payload);
             if (!ack) {
-                return std::unexpected(LinkError::bad_record);
+                return std::unexpected(SessionError::bad_record);
             }
             if (ack->server_id != _server_id || ack->report_seq >= _next_seq) {
-                return std::unexpected(LinkError::bad_ack);
+                return std::unexpected(SessionError::bad_ack);
             }
             // Acks may repeat or arrive late after a reconnect: only move
             // forward.
@@ -148,21 +148,21 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
         }
         case proto::RecordType::report:
         case proto::RecordType::hello:
-            return std::unexpected(LinkError::wrong_direction);
+            return std::unexpected(SessionError::wrong_direction);
     }
-    return std::unexpected(LinkError::bad_record);
+    return std::unexpected(SessionError::bad_record);
 }
 
 auto ControllerSession::on_bytes(std::span<const std::byte> bytes)
-    -> std::expected<void, LinkError> {
+    -> std::expected<void, SessionError> {
     if (!_connected) {
-        return std::unexpected(LinkError::not_connected);
+        return std::unexpected(SessionError::not_connected);
     }
     _decoder.feed(bytes);
     for (;;) {
         auto rec = _decoder.next();
         if (!rec) {
-            return std::unexpected(LinkError::bad_record);
+            return std::unexpected(SessionError::bad_record);
         }
         if (!rec->has_value()) {
             return {};
@@ -235,7 +235,7 @@ auto ControllerLink::report(proto::ReportBody body) -> std::uint64_t {
     return seq;
 }
 
-auto ControllerLink::stats() const -> LinkStats {
+auto ControllerLink::stats() const -> ControllerLinkStats {
     const std::scoped_lock lock{_mutex};
     return _stats;
 }

@@ -46,6 +46,12 @@
   snapshot. See design "Audit log".)
 - [ ] 12. harbor CI: both placements. _Requirements: 7, 10.3_
 
+Wiring (not a numbered task): `HelmDaemon` and `ak-helm` join the
+ControllerLink, CommandRouter, PowerSequencer and per-slot OarLinks into
+the running daemon (`src/helm/helm_daemon.*`, `src/helm/helm_config.*`,
+`src/helm/helm_main.cpp`; design "HelmDaemon"). The mailbox side plugs in
+with task 8.
+
 ## Deferred
 
 - SPDM attestation and secure sessions on the sideband (Requirement 5.3).

@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "common/wire.hpp"
@@ -143,6 +144,81 @@ inline auto icmpv6(const net::Ipv6Address& src, const net::Ipv6Address& dst, std
     m[2] = static_cast<std::byte>(sum >> CHAR_BIT);
     m[3] = static_cast<std::byte>(sum & UINT8_MAX);
     return m;
+}
+
+// A DHCPv4 client message (BOOTREQUEST) with `options` (code, value pairs,
+// End appended) for `chaddr`.
+struct DhcpOption {
+    std::uint8_t code{0};
+    std::vector<std::byte> value;
+};
+
+inline auto dhcp4_request(std::uint8_t type, const net::MacAddress& chaddr, std::uint32_t xid,
+                          std::vector<DhcpOption> options = {}, std::uint16_t flags = 0,
+                          const pk::Ipv4Address& ciaddr = {}) -> std::vector<std::byte> {
+    constexpr std::uint8_t op_request = 1;
+    constexpr std::uint8_t htype_ethernet = 1;
+    constexpr std::uint8_t hlen_ethernet = 6;
+    constexpr std::size_t chaddr_pad = 10;
+    constexpr std::size_t sname_file = 64 + 128;
+    constexpr std::uint32_t magic_cookie = 0x6382'5363;
+    constexpr std::uint8_t opt_message_type = 53;
+    constexpr std::uint8_t opt_end = 255;
+    std::vector<std::byte> m;
+    ak::wire::Writer w{m};
+    w.u8(op_request);
+    w.u8(htype_ethernet);
+    w.u8(hlen_ethernet);
+    w.u8(0);
+    w.be32(xid);
+    w.be16(0);
+    w.be16(flags);
+    w.bytes(ciaddr);
+    m.resize(m.size() + 12, std::byte{0});  // yiaddr, siaddr, giaddr
+    w.bytes(chaddr);
+    m.resize(m.size() + chaddr_pad + sname_file, std::byte{0});
+    w.be32(magic_cookie);
+    w.u8(opt_message_type);
+    w.u8(1);
+    w.u8(type);
+    for (const auto& o : options) {
+        w.u8(o.code);
+        w.u8(static_cast<std::uint8_t>(o.value.size()));
+        w.bytes(o.value);
+    }
+    w.u8(opt_end);
+    return m;
+}
+
+// The options of a DHCPv4 server message, by code (first instance), after
+// the 240-byte fixed part and cookie.
+inline auto dhcp4_options(std::span<const std::byte> message)
+    -> std::vector<std::pair<std::uint8_t, std::vector<std::byte>>> {
+    constexpr std::size_t options_offset = 240;
+    std::vector<std::pair<std::uint8_t, std::vector<std::byte>>> out;
+    std::size_t i = options_offset;
+    while (i < message.size()) {
+        const auto code = std::to_integer<std::uint8_t>(message[i]);
+        if (code == 255) {
+            break;
+        }
+        if (code == 0) {
+            ++i;
+            continue;
+        }
+        if (i + 1 >= message.size()) {
+            break;
+        }
+        const auto len = std::to_integer<std::size_t>(message[i + 1]);
+        if (i + 2 + len > message.size()) {
+            break;
+        }
+        out.emplace_back(code, std::vector<std::byte>(
+                                   message.begin() + static_cast<std::ptrdiff_t>(i + 2),
+                                   message.begin() + static_cast<std::ptrdiff_t>(i + 2 + len)));
+        i += 2 + len;
+    }
+    return out;
 }
 
 }  // namespace ak::test::frames

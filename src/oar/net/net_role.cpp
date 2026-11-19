@@ -38,6 +38,22 @@ auto to_map_update(const proto::MapUpdate& u) -> MapUpdate {
     return out;
 }
 
+// The proxy addresses carried by the same frame (format v2). decode
+// guarantees what set_neighbors() checks: unicast, unique, and every NIC
+// listed in the frame.
+auto to_neighbors(const proto::MapUpdate& u) -> NeighborUpdate {
+    NeighborUpdate out{.vni = u.vni, .ipv4 = {}, .ipv6 = {}};
+    out.ipv4.reserve(u.ipv4.size());
+    for (const auto& g : u.ipv4) {
+        out.ipv4.push_back({.ip = g.address, .nic = geneve::NicId{g.nic_id}});
+    }
+    out.ipv6.reserve(u.ipv6.size());
+    for (const auto& g : u.ipv6) {
+        out.ipv6.push_back({.ip = g.address, .nic = geneve::NicId{g.nic_id}});
+    }
+    return out;
+}
+
 }  // namespace
 
 auto placeholder_identity(oar::FunctionNumber fn, std::uint16_t mtu) -> NicIdentity {
@@ -214,6 +230,16 @@ auto NetRole::map_update(std::span<const std::byte> frame) -> oar::Status {
     }
     if (!_mappings.apply(to_map_update(*update))) {
         ++_counters.map_rejected;
+        return oar::Status::failed;
+    }
+    // The proxy follows the mapping. Its answers resolve each address
+    // through the current snapshot, so the moment between the two calls
+    // cannot answer for a NIC the new mapping dropped. If the addresses are
+    // refused (decode makes that unreachable), fail closed: no proxy answers
+    // for the VNI rather than stale ones.
+    if (!_vswitch->set_neighbors(to_neighbors(*update))) {
+        static_cast<void>(_vswitch->set_neighbors({.vni = update->vni, .ipv4 = {}, .ipv6 = {}}));
+        ++_counters.map_neighbors_rejected;
         return oar::Status::failed;
     }
     ++_counters.map_applied;

@@ -160,6 +160,7 @@
   or not at all, and `PeerStatus::mtu_ok` records that full-size
   datagrams from that peer get through. Not yet: the harbor multi-server
   tests (cross-server reachability, VPC isolation, forged VNI and NIC IDs,
-  MTU behaviour; tikhov), reporting `mtu_ok` to helm, and the ARP/ND proxy
-  addresses from MapUpdate v2 (`VSwitch::set_neighbors`), which `NetRole`
-  applies once the v2 frame format lands.
+  MTU behaviour; tikhov), reporting `mtu_ok` to helm. `NetRole::map_update` hands the
+  frame's guest addresses (MapUpdate v2) to `VSwitch::set_neighbors` after
+  applying the mapping, failing closed (no proxy answers for the VNI) if
+  they were ever refused.

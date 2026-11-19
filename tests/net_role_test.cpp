@@ -105,10 +105,15 @@ auto signer() -> const ak::test::TestSigner& {
     return s;
 }
 
+auto guest_ip(std::uint64_t nic) -> proto::Ipv4Address {
+    return {std::byte{10}, std::byte{0}, std::byte{0}, static_cast<std::byte>(nic)};
+}
+
 // Signs like the controller: encode with a blank signature, sign, set.
+// `addressed` NICs also get guest_ip(nic) in the frame (format v2).
 auto signed_map(std::uint64_t server, std::uint64_t version,
-                const std::vector<std::pair<std::uint64_t, std::uint8_t>>& nics)
-    -> std::vector<std::byte> {
+                const std::vector<std::pair<std::uint64_t, std::uint8_t>>& nics,
+                const std::vector<std::uint64_t>& addressed = {}) -> std::vector<std::byte> {
     // Member by member, so the frame format can grow fields (v2's guest
     // addresses) without this needing every one spelled out.
     proto::MapUpdate m{};
@@ -118,6 +123,9 @@ auto signed_map(std::uint64_t server, std::uint64_t version,
     m.map_version = version;
     for (const auto& [nic, tail] : nics) {
         m.entries.push_back({.nic_id = nic, .mac = mac_of(nic), .owner_vtep = vtep(tail)});
+    }
+    for (const std::uint64_t nic : addressed) {  // ascending NIC IDs give ascending addresses
+        m.ipv4.push_back({.nic_id = nic, .address = guest_ip(nic)});
     }
     auto bytes = proto::encode_map_update(m);
     BOOST_REQUIRE(bytes.has_value());
@@ -394,6 +402,57 @@ BOOST_FIXTURE_TEST_CASE(map_updates_are_checked, One,
     // An empty list withdraws the VNI.
     BOOST_TEST((role->map_update(signed_map(server_one, 3, {})) == Status::ok));
     BOOST_TEST(role->mappings().snapshot()->nic_count() == 0U);
+}
+
+// An ARP request from `nic` for `target`, as a guest sends it.
+auto arp_request(std::uint64_t nic, const proto::Ipv4Address& target) -> std::vector<std::byte> {
+    constexpr std::uint16_t ethertype_arp = 0x0806;
+    constexpr std::uint16_t ethertype_ipv4 = 0x0800;
+    std::vector<std::byte> f;
+    const auto be16 = [&f](std::uint16_t v) {
+        f.push_back(static_cast<std::byte>(v >> 8U));
+        f.push_back(static_cast<std::byte>(v & 0xFFU));
+    };
+    const auto put = [&f](const auto& bytes) { f.insert(f.end(), bytes.begin(), bytes.end()); };
+    f.insert(f.end(), 6, std::byte{0xFF});
+    put(mac_of(nic));
+    be16(ethertype_arp);
+    be16(1);  // Ethernet
+    be16(ethertype_ipv4);
+    f.push_back(std::byte{6});
+    f.push_back(std::byte{4});
+    be16(1);  // request
+    put(mac_of(nic));
+    put(guest_ip(nic));
+    f.insert(f.end(), 6, std::byte{0});
+    put(target);
+    return f;
+}
+
+BOOST_FIXTURE_TEST_CASE(map_update_feeds_the_proxy, One,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(role->map_update(signed_map(
+                      server_one, 1, {{nic_a, self_tail}, {nic_c, peer_tail}}, {nic_a, nic_c})) ==
+                  Status::ok);
+    BOOST_REQUIRE(prepare(fn0, nic_a) == Status::ok);
+    driver(fn0);
+    const auto buf = post_rx(fn0);
+    send(fn0, arp_request(nic_a, guest_ip(nic_c)));
+    BOOST_TEST(role->vswitch().counters().arp_replies == 1U);
+    BOOST_TEST(wire.sent.empty());  // answered on the board, nothing flooded
+    const auto got = received(fn0, buf);
+    BOOST_REQUIRE(got.has_value());
+    // The reply comes from c's MAC.
+    BOOST_TEST(std::ranges::equal(std::span{*got}.subspan(6, 6), mac_of(nic_c)));
+
+    // The next version drops c's address: no longer answered.
+    BOOST_REQUIRE(role->map_update(signed_map(server_one, 2,
+                                              {{nic_a, self_tail}, {nic_c, peer_tail}}, {nic_a})) ==
+                  Status::ok);
+    static_cast<void>(post_rx(fn0));
+    send(fn0, arp_request(nic_a, guest_ip(nic_c)));
+    BOOST_TEST(role->vswitch().counters().arp_replies == 1U);
+    BOOST_TEST(role->counters().map_neighbors_rejected == 0U);
 }
 
 BOOST_FIXTURE_TEST_CASE(local_guests_talk_through_the_vswitch, One,

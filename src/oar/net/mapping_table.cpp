@@ -131,6 +131,26 @@ auto MappingSnapshot::entries(std::uint32_t vni) const -> std::span<const MapEnt
     return it->second.entries;
 }
 
+auto MappingSnapshot::peer_vteps() const -> std::vector<Ipv6Address> {
+    std::vector<Ipv6Address> peers;
+    for (const auto& [vni, vpc] : _vpcs) {
+        const bool here = std::ranges::any_of(
+            vpc.entries, [this](const MapEntry& e) { return e.owner_vtep == _local_vtep; });
+        if (!here) {
+            continue;
+        }
+        for (const MapEntry& e : vpc.entries) {
+            if (e.owner_vtep != _local_vtep) {
+                peers.push_back(e.owner_vtep);
+            }
+        }
+    }
+    std::ranges::sort(peers);
+    const auto dup = std::ranges::unique(peers);
+    peers.erase(dup.begin(), dup.end());
+    return peers;
+}
+
 auto MappingSnapshot::vni_count() const noexcept -> std::size_t {
     return static_cast<std::size_t>(
         std::ranges::count_if(_vpcs, [](const auto& kv) { return !kv.second.entries.empty(); }));

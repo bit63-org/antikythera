@@ -31,6 +31,8 @@ auto to_string(AuthFailure f) noexcept -> const char* {
             return "malformed";
         case AuthFailure::not_a_command:
             return "not_a_command";
+        case AuthFailure::wrong_server:
+            return "wrong_server";
         case AuthFailure::unknown_key:
             return "unknown_key";
         case AuthFailure::bad_signature:
@@ -43,7 +45,7 @@ auto to_string(AuthFailure f) noexcept -> const char* {
     return "unknown";
 }
 
-auto authenticate(const mb::Slot& slot, const SignatureVerifier& verifier,
+auto authenticate(const mb::Slot& slot, mb::ServerId server_id, const SignatureVerifier& verifier,
                   SequenceTracker& sequence) -> std::expected<mb::Message, AuthError> {
     auto msg = mb::decode(slot);
     if (!msg) {
@@ -51,6 +53,11 @@ auto authenticate(const mb::Slot& slot, const SignatureVerifier& verifier,
     }
     if (!mb::is_command(msg->header.type)) {
         return std::unexpected(AuthError{.failure = AuthFailure::not_a_command});
+    }
+    // decode() already refused no_server_id on a command, so a hull that was
+    // never provisioned (server_id 0) refuses everything.
+    if (msg->header.server_id != server_id) {
+        return std::unexpected(AuthError{.failure = AuthFailure::wrong_server});
     }
     if (auto ok = verifier.verify_slot(slot, msg->header.key_id); !ok) {
         return std::unexpected(AuthError{.failure = to_failure(ok.error())});

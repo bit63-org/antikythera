@@ -116,7 +116,7 @@ auto send(tls::Stream& s, RecordType t, std::span<const std::byte> payload) -> v
 }
 
 auto envelope_bytes(std::uint64_t seq) -> std::vector<std::byte> {
-    const mb::Header h{.type = mb::Type::list_vms, .seq = seq, .key_id = key};
+    const mb::Header h{.type = mb::Type::list_vms, .seq = seq, .key_id = key, .server_id = server};
     std::array<std::byte, mb::signature_size> sig{};
     auto slot = mb::encode(h, {}, sig);
     BOOST_REQUIRE(slot.has_value());

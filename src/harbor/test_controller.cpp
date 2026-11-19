@@ -92,7 +92,8 @@ auto Signer::envelope(std::uint64_t server_id, proto::KeyId key_id, std::uint64_
     const mb::Header header{.type = mb::type_of(body),
                             .seq = seq,
                             .body_len = static_cast<std::uint16_t>(bytes.size()),
-                            .key_id = key_id};
+                            .key_id = key_id,
+                            .server_id = server_id};
     const std::array<std::byte, mb::signature_size> blank{};
     auto slot = mb::encode(header, bytes, blank);
     if (!slot) {
@@ -280,6 +281,7 @@ constexpr std::array status_names{
     std::pair{"timed_out", proto::CommandStatus::timed_out},
     std::pair{"internal_error", proto::CommandStatus::internal_error},
     std::pair{"unsupported", proto::CommandStatus::unsupported},
+    std::pair{"wrong_server", proto::CommandStatus::wrong_server},
 };
 
 constexpr std::array kind_names{
@@ -323,6 +325,8 @@ public:
         return take(number<T>(next(), what));
     }
     auto device() -> mb::DeviceType { return take(device_type(next())); }
+    auto mac_address() -> mb::Mac { return take(mac(next())); }
+    [[nodiscard]] auto more() const noexcept -> bool { return _pos < _args.size(); }
     auto detach_policy() -> mb::DetachPolicy { return take(policy(next())); }
 
     [[nodiscard]] auto error() const -> const std::string& { return _error; }
@@ -349,6 +353,7 @@ struct Verb {
     std::string_view name;
     std::size_t args;
     auto (*parse)(Args&) -> mb::Body;
+    std::size_t optional_args{0};  // trailing arguments that may be left out
 };
 
 auto device_ref(Args& p, mb::DeviceType type) -> mb::DeviceRef {
@@ -370,16 +375,29 @@ constexpr std::array verbs{
                  .vm_id = vm, .vcpus = vcpus, .memory_mib = mem, .boot_mode = mb::BootMode::volume};
          }},
     Verb{"destroy-vm", 1,
-         [](Args& p) -> mb::Body { return mb::DestroyVm{.vm_id = p.num<std::uint64_t>("VM id")}; }},
+         [](Args& p) -> mb::Body {
+             const auto vm = p.num<std::uint64_t>("VM id");
+             // The optional "persist" is checked in command().
+             return mb::DestroyVm{.vm_id = vm, .persist_volumes = p.more()};
+         },
+         1},
+    // A NIC names its VPC, NIC ID and MAC (mailbox v3); a GPU names none.
     Verb{"attach-device", 4,
          [](Args& p) -> mb::Body {
              const auto vm = p.num<std::uint64_t>("VM id");
              const auto slot = p.num<std::uint8_t>("slot");
              const auto type = p.device();
              const auto fn = p.num<std::uint16_t>("function");
-             return mb::AttachDevice{.vm_id = vm,
-                                     .device = {.slot = slot, .type = type, .function = fn}};
-         }},
+             mb::AttachDevice out{.vm_id = vm,
+                                  .device = {.slot = slot, .type = type, .function = fn}};
+             if (p.more()) {
+                 out.vni = p.num<std::uint32_t>("VNI");
+                 out.nic_id = p.num<std::uint64_t>("NIC id");
+                 out.mac = p.mac_address();
+             }
+             return out;
+         },
+         3},
     Verb{"detach-device", 6,
          [](Args& p) -> mb::Body {
              const auto vm = p.num<std::uint64_t>("VM id");
@@ -442,21 +460,16 @@ auto command(std::string_view verb, std::span<const std::string_view> args)
     if (v == verbs.end()) {
         return std::optional<mb::Body>{};
     }
-    // destroy-vm takes an optional trailing "persist".
-    const bool persist = verb == "destroy-vm" && args.size() == 2;
-    if (persist && args[1] != "persist") {
-        return std::unexpected("destroy-vm: second argument must be 'persist'");
-    }
-    if (args.size() != v->args + (persist ? 1 : 0)) {
+    if (args.size() != v->args && args.size() != v->args + v->optional_args) {
         return std::unexpected(std::string{verb} + ": wrong number of arguments");
+    }
+    if (verb == "destroy-vm" && args.size() == 2 && args[1] != "persist") {
+        return std::unexpected("destroy-vm: second argument must be 'persist'");
     }
     Args p{args};
     auto body = v->parse(p);
     if (!p.error().empty()) {
         return std::unexpected(p.error());
-    }
-    if (persist) {
-        std::get<mb::DestroyVm>(body).persist_volumes = true;
     }
     return std::optional<mb::Body>{std::move(body)};
 }
@@ -470,6 +483,7 @@ auto validate(const mb::Body& body) -> std::expected<void, std::string> {
     msg.header.type = mb::type_of(body);
     msg.header.body_len = static_cast<std::uint16_t>(bytes.size());
     msg.header.key_id = 1;
+    msg.header.server_id = 1;
     if (bytes.size() > msg.body.size()) {
         return std::unexpected("command body too long");
     }

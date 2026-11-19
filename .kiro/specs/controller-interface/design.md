@@ -58,21 +58,34 @@ addresses ride in the mapping frame rather than a separate message so the
 proxy can never answer for a NIC under a stale mapping, and one version
 number covers both.
 
-Open question: the envelope's `server_id` is not signed, and the slot
-header has no server field, so a command signed for one server would
-verify on another whose sequence floor is lower. Today only mTLS to the
-right helm prevents that. Closing it means either a server ID in the slot
-header (mailbox v3) or per-server signing keys.
+`key_id` and `server_id` are carried in the slot header as well, inside
+the signed range `[0x00, 0xC0)`, so hull picks the verification key and
+knows the command is meant for it without trusting the envelope wrapper.
+Mailbox protocol version 2 put `key_id` in two of version 1's six
+reserved header bytes (a little-endian u16 at slot offset 0x12). Version 3
+grew the header from 24 to 32 bytes for a little-endian u64 `server_id`
+at 0x18, after four reserved zero bytes, shrinking the body limit from
+168 to 160 bytes. Commands must carry a non-zero `key_id` and
+`server_id` (0 means "unsigned" and "never allocated"); responses and
+events, which are not signed, must carry 0 in both. A slot that breaks
+either rule fails `mailbox::decode`. The envelope's `key_id` and
+`server_id` must equal the slot's, which `decode_envelope` checks, but
+hull trusts only the slot.
 
-`key_id` is carried in the slot header as well, so hull can pick the
-verification key without trusting the envelope wrapper. Mailbox protocol
-version 2 assigns it two of version 1's six reserved header bytes: a
-little-endian u16 at slot offset 0x12, inside the signed range
-`[0x00, 0xC0)`, followed by four reserved zero bytes. Commands must carry
-a non-zero `key_id` (0 means "unsigned"); responses and events, which are
-not signed, must carry 0. A slot that breaks either rule is rejected
-before signature verification. The envelope's `key_id` must equal the
-slot's; helm may check this, but hull trusts only the slot.
+hull checks the slot's `server_id` against its own provisioned identity
+right after decoding, before the signature: a command signed for another
+server is refused as `wrong_server` (a distinct outcome status) without
+any crypto and without consuming a sequence number. Before version 3 the
+envelope's `server_id` was not signed, so a command signed for one server
+verified on any other whose sequence floor was lower, and only mTLS to
+the right helm prevented replaying it there. A server ID in the slot was
+chosen over per-server signing keys because it keeps one key table per
+region and costs eight bytes of body.
+
+Version 3 also gave `ATTACH_DEVICE` for a NIC VF the VPC (VNI), the
+region-unique NIC ID and the guest MAC (32-byte body), which helm passes
+to oar-net to prepare the VF; before, helm had to be configured with them
+out of band. A GPU attach carries zeros there.
 
 ## Inventory and status reports
 

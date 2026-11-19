@@ -42,8 +42,13 @@ agent.
 
 OpenSSL EVP Ed25519 verify over slot bytes `[0, 0xC0)`. Public keys are a
 compiled-in table (supports rotation: up to N keys, selected by the
-`key_id` field of the signed slot header, mailbox protocol v2 — see
-`controller-interface`).
+`key_id` field of the signed slot header — see `controller-interface`).
+Before verifying, `authenticate` compares the signed header's `server_id`
+(mailbox protocol v3) with the server ID the agent was provisioned with
+and refuses a mismatch as `wrong_server`. An agent with no server ID (0)
+refuses every command. Open question: the init binary has to hand the
+agent its server ID at boot; where it reads it from (the signed image's
+command line, or a measured provisioning file) is not decided yet.
 
 ### VmSupervisor
 

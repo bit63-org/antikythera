@@ -175,6 +175,8 @@ BOOST_AUTO_TEST_CASE(enums_match_helm_and_the_mailbox) {
                   static_cast<int>(mb::Status::stale_sequence));
     static_assert(static_cast<int>(proto::CommandStatus::unsupported) ==
                   static_cast<int>(mb::Status::unsupported));
+    static_assert(static_cast<int>(proto::CommandStatus::wrong_server) ==
+                  static_cast<int>(mb::Status::wrong_server));
     static_assert(static_cast<int>(proto::ExitReason::vmm_failure) ==
                   static_cast<int>(mb::ExitReason::vmm_failure));
     static_assert(static_cast<int>(proto::FaultCode::resources_exhausted) ==
@@ -370,7 +372,7 @@ BOOST_AUTO_TEST_CASE(event_rules) {
         {proto::CommandOutcome{.in_reply_to = 1, .command = 0, .payload = {}}, DecodeError::bad_id},
         {proto::CommandOutcome{.in_reply_to = 1,
                                .command = 1,
-                               .status = static_cast<proto::CommandStatus>(13),
+                               .status = static_cast<proto::CommandStatus>(14),
                                .payload = {}},
          DecodeError::unknown_value},
         {proto::CommandOutcome{.in_reply_to = 1,
@@ -404,10 +406,10 @@ BOOST_AUTO_TEST_CASE(event_rules) {
 }
 
 BOOST_AUTO_TEST_CASE(errors_have_names) {
-    for (auto e :
-         {DecodeError::bad_report_seq, DecodeError::bad_boot_id, DecodeError::bad_id,
-          DecodeError::unknown_value, DecodeError::bad_capacity, DecodeError::not_ascending,
-          DecodeError::bad_owner, DecodeError::bad_record_type, DecodeError::record_too_large}) {
+    for (auto e : {DecodeError::bad_report_seq, DecodeError::bad_boot_id, DecodeError::bad_id,
+                   DecodeError::unknown_value, DecodeError::bad_capacity,
+                   DecodeError::not_ascending, DecodeError::bad_owner, DecodeError::bad_record_type,
+                   DecodeError::record_too_large, DecodeError::server_id_mismatch}) {
         BOOST_TEST(std::string_view{proto::to_string(e)} != "unknown");
     }
 }

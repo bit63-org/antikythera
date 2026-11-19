@@ -94,7 +94,7 @@ inline constexpr std::size_t inventory_volume_size = 24;
 inline constexpr std::size_t inventory_network_size = 16;
 inline constexpr std::size_t command_outcome_fixed_size = 16;
 // The mailbox response payload limit (helm/mailbox.hpp max_response_payload).
-inline constexpr std::size_t max_outcome_payload = 156;
+inline constexpr std::size_t max_outcome_payload = 148;
 inline constexpr std::size_t fixed_event_size = 16;
 
 inline constexpr std::size_t max_inventory_size =
@@ -151,6 +151,7 @@ enum class CommandStatus : std::uint16_t {
     timed_out = 10,
     internal_error = 11,
     unsupported = 12,
+    wrong_server = 13,
 };
 
 // helm::mailbox::ExitReason.
@@ -294,7 +295,7 @@ namespace detail {
     return s <= FunctionState::faulted;
 }
 [[nodiscard]] constexpr auto known(CommandStatus s) noexcept -> bool {
-    return s <= CommandStatus::unsupported;
+    return s <= CommandStatus::wrong_server;
 }
 [[nodiscard]] constexpr auto known(ExitReason r) noexcept -> bool {
     return r >= ExitReason::guest_shutdown && r <= ExitReason::vmm_failure;

@@ -59,6 +59,7 @@ enum class DecodeError : std::uint8_t {
     bad_guest_address,        // a guest address that is not unicast
     addresses_not_ascending,  // guest addresses not in strictly increasing order
     unknown_address_nic,      // a guest address owned by a NIC not in the mapping
+    server_id_mismatch,       // envelope server_id differs from the slot header's server_id
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -77,6 +78,8 @@ enum class DecodeError : std::uint8_t {
             return "envelope key id differs from slot key id";
         case DecodeError::bad_server_id:
             return "server id 0";
+        case DecodeError::server_id_mismatch:
+            return "envelope server id differs from slot server id";
         case DecodeError::reserved_not_zero:
             return "reserved bytes not zero";
         case DecodeError::bad_vni:

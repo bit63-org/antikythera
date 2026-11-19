@@ -68,8 +68,9 @@ jailed, strict userspace parser.
 2. The agent SHALL map BAR0 through VFIO and receive MSI-X via eventfd.
 3. The agent SHALL create no DMA mappings in the mailbox's IOMMU domain.
 4. The agent SHALL copy each slot out once, then decode it with
-   `ak::helm::mailbox::decode`, then verify the signature and sequence
-   number, then validate the body — rejecting at the first failure.
+   `ak::helm::mailbox::decode`, then check that it names this server,
+   then verify the signature and sequence number, then validate the
+   body — rejecting at the first failure.
 
 ### Requirement 4: Signed commands only
 
@@ -80,6 +81,9 @@ jailed, strict userspace parser.
 2. WHEN a command's signature does not verify THEN the agent SHALL reject
    it, respond with an error, and take no action.
 3. Sequence numbers SHALL be strictly increasing; replays SHALL be rejected.
+4. The agent SHALL be provisioned with its server ID, and SHALL reject a
+   command whose signed slot header names another server (mailbox
+   protocol v3) without verifying it or consuming a sequence number.
 
 ### Requirement 5: Device inventory and passthrough
 

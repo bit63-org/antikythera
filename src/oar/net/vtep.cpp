@@ -161,6 +161,10 @@ auto to_string(VtepConfigError e) noexcept -> const char* {
             return "bad_misses";
         case VtepConfigError::bad_port:
             return "bad_port";
+        case VtepConfigError::bad_max_payload:
+            return "bad_max_payload";
+        case VtepConfigError::bad_probe_interval:
+            return "bad_probe_interval";
     }
     return "unknown";
 }
@@ -177,6 +181,12 @@ auto Vtep::create(const MappingTable& mappings, DatagramSender& sender, PeerObse
     if (config.peer_port == 0) {
         return std::unexpected(VtepConfigError::bad_port);
     }
+    if (config.max_payload != 0 && config.max_payload < oam::message_size) {
+        return std::unexpected(VtepConfigError::bad_max_payload);
+    }
+    if (config.max_payload != 0 && config.probe_interval <= std::chrono::milliseconds::zero()) {
+        return std::unexpected(VtepConfigError::bad_probe_interval);
+    }
     return std::unique_ptr<Vtep>(new Vtep(mappings, sender, observer, config));
 }
 
@@ -186,7 +196,8 @@ Vtep::Vtep(const MappingTable& mappings, DatagramSender& sender, PeerObserver* o
       _sender{&sender},
       _observer{observer},
       _config{config},
-      _keepalive_sequence{initial_keepalive_sequence} {}
+      _keepalive_sequence{initial_keepalive_sequence},
+      _probe_sequence{initial_keepalive_sequence} {}
 
 auto Vtep::grace() const -> VtepClock::duration {
     return _config.keepalive_interval * _config.keepalive_misses;
@@ -197,6 +208,10 @@ auto Vtep::send(const RemoteFrame& frame) -> void {
         geneve::encode({.vni = frame.vni, .nics = frame.nics, .oam = false}, frame.frame);
     if (!payload) {
         ++_counters.tx_encode_failed;
+        return;
+    }
+    if (_config.max_payload != 0 && payload->size() > _config.max_payload) {
+        ++_counters.tx_drop_too_big;
         return;
     }
     if (!_sender->send_to(frame.vtep, _config.peer_port, flow_port(frame.vni, frame.frame),
@@ -239,8 +254,18 @@ auto Vtep::handle_oam(const geneve::Packet& packet, const Ipv6Address& outer_src
         ++_counters.rx_drop_oam_unknown_peer;
         return;
     }
-    ++_counters.keepalives_rx;
     Peer& peer = it->second;
+    if (message->type == oam::Type::mtu_probe) {
+        // Liveness is the keepalives' job; a probe only speaks for the path.
+        ++_counters.probes_rx;
+        ++peer.status.probes_rx;
+        const std::size_t size = geneve::base_header_size + oam::body_size + message->padding;
+        peer.status.largest_probe = std::max(peer.status.largest_probe, size);
+        peer.status.mtu_ok =
+            _config.max_payload != 0 && peer.status.largest_probe >= _config.max_payload;
+        return;
+    }
+    ++_counters.keepalives_rx;
     ++peer.status.keepalives_rx;
     peer.status.last_sequence = message->sequence;
     peer.deadline = now + grace();
@@ -267,8 +292,10 @@ auto Vtep::sync_peers(VtepClock::time_point now) -> void {
         return !std::ranges::binary_search(wanted, kv.first);
     });
     for (const Ipv6Address& vtep : wanted) {
-        _peers.try_emplace(
-            vtep, Peer{.status = {.vtep = vtep}, .next_keepalive = now, .deadline = now + grace()});
+        _peers.try_emplace(vtep, Peer{.status = {.vtep = vtep},
+                                      .next_keepalive = now,
+                                      .next_probe = now,
+                                      .deadline = now + grace()});
     }
     _synced = std::move(snap);
 }
@@ -280,12 +307,24 @@ auto Vtep::tick(VtepClock::time_point now) -> VtepClock::time_point {
         if (now >= peer.next_keepalive) {
             const auto message =
                 oam::encode({.type = oam::Type::keepalive, .sequence = _keepalive_sequence++});
-            if (_sender->send_to(vtep, _config.peer_port, flow_port_base, message)) {
+            if (send_oam(vtep, message)) {
                 ++_counters.keepalives_tx;
             } else {
                 ++_counters.keepalive_send_failed;
             }
             peer.next_keepalive = now + _config.keepalive_interval;
+        }
+        if (_config.max_payload != 0) {
+            if (now >= peer.next_probe) {
+                const auto probe = oam::encode_probe(_probe_sequence++, _config.max_payload);
+                if (send_oam(vtep, probe)) {
+                    ++_counters.probes_tx;
+                } else {
+                    ++_counters.probe_send_failed;
+                }
+                peer.next_probe = now + _config.probe_interval;
+            }
+            next = std::min(next, peer.next_probe);
         }
         if (now >= peer.deadline) {
             set_state(peer, PeerState::down);
@@ -296,6 +335,10 @@ auto Vtep::tick(VtepClock::time_point now) -> VtepClock::time_point {
         }
     }
     return next;
+}
+
+auto Vtep::send_oam(const Ipv6Address& vtep, std::span<const std::byte> message) -> bool {
+    return _sender->send_to(vtep, _config.peer_port, flow_port_base, message);
 }
 
 auto Vtep::peers() const -> std::vector<PeerStatus> {

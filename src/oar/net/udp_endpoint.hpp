@@ -17,7 +17,8 @@
 // socket could set any port, but needs CAP_NET_RAW, which harbor's
 // unprivileged runs do not have.
 //
-// The sockets are IPv6-only and non-blocking. A full send buffer drops the
+// The sockets are IPv6-only, non-blocking and never fragment locally
+// (IPV6_DONTFRAG): a datagram larger than the path MTU fails to send. A full send buffer drops the
 // datagram (counted by the Vtep), as a congested link would.
 
 #include <cstddef>

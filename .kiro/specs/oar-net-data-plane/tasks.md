@@ -86,7 +86,7 @@
   `VSwitch::receive()`, which counts policy drops per `PolicyError`.
   OAM (`src/oar/net/oam.*`): a keepalive is a Geneve packet with O set,
   VNI 0, Protocol Type 0x88B6 (placeholder) and a 12-byte body (version,
-  type, sequence); the MTU probe will be another type (task 11). Every
+  type, sequence); the MTU probe is type 2 (task 11). Every
   `keepalive_interval` the Vtep sends one to each peer VTEP
   (`MappingSnapshot::peer_vteps()`: the other owners in VNIs with a NIC
   here); a peer is up when one arrives and down after `keepalive_misses`
@@ -108,4 +108,19 @@
 - [ ] 10. WireGuard tunnel integration and key delivery from helm.
   _Requirements: 5_
 - [ ] 11. MTU computation and advertisement; harbor multi-server tests.
-  _Requirements: 6, 9.3_
+  _Requirements: 6, 9.3_ — Done: `plan_mtu()` (`src/oar/net/mtu.*`)
+  turns the underlay MTU and the tunnel's overhead into the guest MTU and
+  the Vtep's largest Geneve payload. The encapsulation overhead is 94, not
+  the requirement's 90: guest VLAN tags are payload and VirtioNetFunction
+  admits one beyond the MTU, so a tagged full-size frame needs the extra 4.
+  WireGuard over IPv6 adds 80 (`wireguard_ipv6_overhead`); 9000 with
+  WireGuard gives guests 8826, 1500 without a tunnel 1406. `ak-oar-net
+  --underlay-mtu N [--tunnel-overhead N]` advertises the planned MTU
+  through `VIRTIO_NET_F_MTU`. `VtepConfig::max_payload` drops and counts
+  (`tx_drop_too_big`) any datagram over the plan, and every
+  `probe_interval` sends each peer an OAM `mtu_probe` padded to exactly
+  that size; `UdpEndpoint` sets `IPV6_DONTFRAG`, so a probe arrives whole
+  or not at all, and `PeerStatus::mtu_ok` records that full-size
+  datagrams from that peer get through. Not yet: the harbor multi-server
+  tests (cross-server reachability, VPC isolation, forged VNI and NIC IDs,
+  MTU behaviour; tikhov), and reporting `mtu_ok` to helm.

@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-// .kiro/specs/oar-net-data-plane/ Requirement 3.6 (task 9): the OAM
-// keepalive codec.
+// .kiro/specs/oar-net-data-plane/ Requirement 3.6 (tasks 9 and 11): the
+// OAM keepalive and MTU probe codec.
 
 #define BOOST_TEST_MODULE oam_test
 #include <boost/test/unit_test.hpp>
@@ -99,12 +99,48 @@ BOOST_AUTO_TEST_CASE(rejects_bad_bodies, *boost::unit_test::timeout(unit_timeout
     BOOST_TEST((parse_error(ver) == OamError::bad_version));
 
     auto type = good;
-    type[body_type_offset] = std::byte{2};  // the future MTU probe
+    type[body_type_offset] = std::byte{3};
     BOOST_TEST((parse_error(type) == OamError::unknown_type));
 
     auto longer = good;
     longer.push_back(std::byte{0});
     BOOST_TEST((parse_error(longer) == OamError::trailing_bytes));
+}
+
+BOOST_AUTO_TEST_CASE(mtu_probe_pads_to_size, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    constexpr std::size_t size = 1400;
+    const auto bytes = oam::encode_probe(sample_sequence, size);
+    BOOST_TEST(bytes.size() == size);
+    BOOST_TEST((bytes[body_type_offset] == std::byte{2}));
+    for (std::size_t i = oam::message_size; i < bytes.size(); ++i) {
+        BOOST_TEST((bytes[i] == std::byte{0}));
+    }
+    auto parsed = oam::parse(decode(bytes));
+    BOOST_REQUIRE(parsed.has_value());
+    BOOST_TEST((parsed->type == oam::Type::mtu_probe));
+    BOOST_TEST(parsed->sequence == sample_sequence);
+    BOOST_TEST(parsed->padding == size - oam::message_size);
+}
+
+BOOST_AUTO_TEST_CASE(mtu_probe_minimum_and_padding_contents,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // Too small a size still yields a whole message, with no padding.
+    const auto small = oam::encode_probe(1, 0);
+    BOOST_TEST(small.size() == oam::message_size);
+    auto parsed = oam::parse(decode(small));
+    BOOST_REQUIRE(parsed.has_value());
+    BOOST_TEST(parsed->padding == 0U);
+
+    // Padding is ignored on receipt, whatever it holds.
+    auto dirty = oam::encode_probe(1, oam::message_size + 3);
+    dirty.back() = std::byte{0xEE};
+    parsed = oam::parse(decode(dirty));
+    BOOST_REQUIRE(parsed.has_value());
+    BOOST_TEST(parsed->padding == 3U);
+
+    // A keepalive never carries padding, even if the message asks for it.
+    BOOST_TEST(oam::encode({.type = oam::Type::keepalive, .sequence = 1, .padding = 9}).size() ==
+               oam::message_size);
 }
 
 BOOST_AUTO_TEST_CASE(error_names, *boost::unit_test::timeout(unit_timeout_seconds)) {

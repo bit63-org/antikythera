@@ -6,7 +6,8 @@
 // from one of a few outer sources, and the same bytes as an inner frame
 // through flow_port(). Checks that every OAM message the parser accepts
 // survives a re-encode, that flow ports stay in range, and that
-// nothing but data packets comes back from receive().
+// nothing but data packets comes back from receive(), and that a peer is
+// only marked mtu_ok by a probe of at least max_payload.
 
 #include <array>
 #include <chrono>
@@ -56,6 +57,10 @@ public:
     }
 };
 
+// A 1500-byte underlay with no tunnel (mtu.hpp), so MTU probes are sent and
+// judged.
+constexpr std::uint32_t max_payload = 1452;
+
 // One VTEP for the whole run, so peer state carries across inputs.
 struct State {
     State() {
@@ -64,7 +69,8 @@ struct State {
              .version = 1,
              .entries = {{.nic_id = {1}, .mac = mac(1), .owner_vtep = vtep(source_tails[0])},
                          {.nic_id = {2}, .mac = mac(2), .owner_vtep = vtep(source_tails[1])}}}));
-        runtime = std::move(*net::Vtep::create(table, sender, nullptr, {}));
+        runtime =
+            std::move(*net::Vtep::create(table, sender, nullptr, {.max_payload = max_payload}));
     }
     net::MappingTable table{vtep(source_tails[0])};
     NullSender sender;
@@ -102,6 +108,11 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     static_cast<void>(state.runtime->tick(now));
     if (auto pkt = state.runtime->receive(in, source, now); pkt && pkt->oam) {
         std::abort();
+    }
+    for (const auto& peer : state.runtime->peers()) {
+        if (peer.mtu_ok && peer.largest_probe < max_payload) {
+            std::abort();
+        }
     }
     return 0;
 }

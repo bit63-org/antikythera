@@ -47,7 +47,16 @@ auto encode(const Message& message) -> std::vector<std::byte> {
     w.u8(static_cast<std::uint8_t>(message.type));
     w.be16(reserved);
     w.be64(message.sequence);
+    if (message.type == Type::mtu_probe) {
+        out.resize(out.size() + message.padding, std::byte{0});
+    }
     return out;
+}
+
+auto encode_probe(std::uint64_t sequence, std::size_t payload_size) -> std::vector<std::byte> {
+    return encode({.type = Type::mtu_probe,
+                   .sequence = sequence,
+                   .padding = payload_size > message_size ? payload_size - message_size : 0});
 }
 
 auto parse(const geneve::Packet& packet) noexcept -> std::expected<Message, OamError> {
@@ -70,6 +79,9 @@ auto parse(const geneve::Packet& packet) noexcept -> std::expected<Message, OamE
     }
     if (*ver != version) {
         return std::unexpected(OamError::bad_version);
+    }
+    if (*type == static_cast<std::uint8_t>(Type::mtu_probe)) {
+        return Message{.type = Type::mtu_probe, .sequence = *sequence, .padding = r.remaining()};
     }
     if (*type != static_cast<std::uint8_t>(Type::keepalive)) {
         return std::unexpected(OamError::unknown_type);

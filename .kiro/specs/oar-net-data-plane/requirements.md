@@ -117,8 +117,10 @@ network rejected, since Geneve itself has no authentication.
 #### Acceptance Criteria
 
 1. The data plane SHALL compute the guest MTU from the underlay MTU minus
-   encapsulation overhead (90 bytes for Geneve with the NIC-pair option,
-   plus the tunnel's overhead) and advertise it through `VIRTIO_NET_F_MTU`.
+   encapsulation overhead (94 bytes for Geneve with the NIC-pair option:
+   outer IPv6 and UDP, Geneve, the option, the inner Ethernet header and
+   one guest VLAN tag; plus the tunnel's overhead) and advertise it through
+   `VIRTIO_NET_F_MTU`.
 2. With a 9000-byte underlay, guests SHALL get at least 1500.
 
 ### Requirement 7: Placements

@@ -42,6 +42,14 @@ auto open_bound(const Ipv6Address& addr, std::uint16_t port, std::uint32_t scope
         ::close(fd);
         return std::unexpected(std::move(err));
     }
+    // Never fragment locally: an oversize datagram fails (EMSGSIZE, counted
+    // as a send failure by the Vtep) instead of leaving in pieces, which is
+    // what makes an MTU probe's arrival mean something.
+    if (::setsockopt(fd, IPPROTO_IPV6, IPV6_DONTFRAG, &sockopt_on, sizeof sockopt_on) < 0) {
+        auto err = errno_text("IPV6_DONTFRAG");
+        ::close(fd);
+        return std::unexpected(std::move(err));
+    }
     const sockaddr_in6 sa = to_sockaddr(addr, port, scope_id);
     if (::bind(fd, reinterpret_cast<const sockaddr*>(&sa), sizeof sa) < 0) {
         auto err = errno_text("bind") + " (port " + std::to_string(port) + ")";

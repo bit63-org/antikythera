@@ -13,6 +13,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -24,6 +25,7 @@
 #include "common/wire.hpp"
 #include "oar/net/geneve.hpp"
 #include "oar/net/mapping_table.hpp"
+#include "oar/net/mtu.hpp"
 #include "oar/net/oam.hpp"
 #include "oar/net/udp_endpoint.hpp"
 #include "oar/net/vswitch.hpp"
@@ -61,6 +63,9 @@ constexpr std::size_t ipv6_last = 15;
 constexpr std::size_t mac_last = 5;
 constexpr std::byte ula_prefix{0xfd};
 constexpr std::byte locally_administered{0x02};
+constexpr std::uint32_t underlay_mtu = 1500;
+constexpr std::uint32_t mtu_payload = underlay_mtu - net::outer_header_size;
+constexpr auto probe_interval = std::chrono::seconds{10};
 constexpr std::size_t payload_size = 32;
 constexpr std::uint16_t ethertype_test = 0x88B5;
 constexpr std::uint16_t ethertype_ipv4 = 0x0800;
@@ -304,6 +309,21 @@ BOOST_AUTO_TEST_CASE(config_validation, *boost::unit_test::timeout(unit_timeout_
     bad.peer_port = 0;
     BOOST_TEST(
         (net::Vtep::create(table, sender, nullptr, bad).error() == net::VtepConfigError::bad_port));
+    bad = config();
+    bad.max_payload = oam::message_size - 1;
+    BOOST_TEST((net::Vtep::create(table, sender, nullptr, bad).error() ==
+                net::VtepConfigError::bad_max_payload));
+    bad = config();
+    bad.max_payload = mtu_payload;
+    bad.probe_interval = milliseconds{0};
+    BOOST_TEST((net::Vtep::create(table, sender, nullptr, bad).error() ==
+                net::VtepConfigError::bad_probe_interval));
+    bad.max_payload = 0;  // no probes: the interval does not matter
+    BOOST_TEST(net::Vtep::create(table, sender, nullptr, bad).has_value());
+    for (auto e :
+         {net::VtepConfigError::bad_max_payload, net::VtepConfigError::bad_probe_interval}) {
+        BOOST_TEST(std::string{net::to_string(e)} != "unknown");
+    }
     BOOST_TEST(net::Vtep::create(table, sender, nullptr, config()).has_value());
 }
 
@@ -389,6 +409,148 @@ BOOST_AUTO_TEST_CASE(oam_never_returned, *boost::unit_test::timeout(unit_timeout
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// Task 11: the MTU limit and MTU probes.
+struct MtuFixture {
+    MtuFixture() {
+        standard_mappings(table);
+        auto c = config();
+        c.max_payload = mtu_payload;
+        c.probe_interval = probe_interval;
+        auto v = net::Vtep::create(table, sender, &recorder, c);
+        BOOST_REQUIRE(v.has_value());
+        vtep_ = std::move(*v);
+    }
+
+    [[nodiscard]] auto probes_to(const net::Ipv6Address& dst) const -> std::vector<Datagram> {
+        std::vector<Datagram> out;
+        for (const Datagram& d : sender.sent) {
+            auto p = geneve::decode(d.payload);
+            if (d.dst != dst || !p || !p->oam) {
+                continue;
+            }
+            auto m = oam::parse(*p);
+            if (m && m->type == oam::Type::mtu_probe) {
+                out.push_back(d);
+            }
+        }
+        return out;
+    }
+
+    [[nodiscard]] auto peer(const net::Ipv6Address& addr) const -> net::PeerStatus {
+        for (const auto& p : vtep_->peers()) {
+            if (p.vtep == addr) {
+                return p;
+            }
+        }
+        BOOST_FAIL("no such peer");
+        return {};
+    }
+
+    net::MappingTable table{vtep(self_tail)};
+    FakeSender sender;
+    Recorder recorder;
+    std::unique_ptr<net::Vtep> vtep_;
+    net::VtepClock::time_point t0{std::chrono::seconds{1000}};
+};
+
+BOOST_FIXTURE_TEST_SUITE(mtu, MtuFixture)
+
+BOOST_AUTO_TEST_CASE(oversize_datagrams_dropped, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // Exactly max_payload goes; one byte more is dropped and counted.
+    const std::size_t fits = mtu_payload - net::geneve_header_size;
+    const std::vector<std::byte> frame(fits, std::byte{0x02});
+    vtep_->send({.vtep = vtep(peer_tail), .vni = vpc, .nics = {nic_a, nic_c}, .frame = frame});
+    BOOST_REQUIRE(sender.sent.size() == 1);
+    BOOST_TEST(sender.sent[0].payload.size() == mtu_payload);
+
+    const std::vector<std::byte> big(fits + 1, std::byte{0x02});
+    vtep_->send({.vtep = vtep(peer_tail), .vni = vpc, .nics = {nic_a, nic_c}, .frame = big});
+    BOOST_TEST(sender.sent.size() == 1);
+    BOOST_TEST(vtep_->counters().tx_drop_too_big == 1);
+    BOOST_TEST(vtep_->counters().tx_packets == 1);
+}
+
+BOOST_AUTO_TEST_CASE(full_size_guest_frame_fits, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // The plan's own numbers: a tagged guest frame of the advertised MTU
+    // encapsulates to exactly max_geneve_payload.
+    auto plan = net::plan_mtu(underlay_mtu);
+    BOOST_REQUIRE(plan.has_value());
+    BOOST_REQUIRE(plan->max_geneve_payload == mtu_payload);
+    const std::vector<std::byte> frame(plan->guest_mtu + net::inner_frame_overhead,
+                                       std::byte{0x02});
+    vtep_->send({.vtep = vtep(peer_tail), .vni = vpc, .nics = {nic_a, nic_c}, .frame = frame});
+    BOOST_REQUIRE(sender.sent.size() == 1);
+    BOOST_TEST(sender.sent[0].payload.size() == mtu_payload);
+    BOOST_TEST(sender.sent[0].payload.size() + net::outer_header_size == underlay_mtu);
+}
+
+BOOST_AUTO_TEST_CASE(probes_fill_max_payload, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto next = vtep_->tick(t0);
+    const auto probes = probes_to(vtep(peer_tail));
+    BOOST_REQUIRE(probes.size() == 1);
+    BOOST_TEST(probes[0].payload.size() == mtu_payload);
+    BOOST_TEST(probes[0].dst_port == geneve::udp_port);
+    BOOST_TEST(probes_to(vtep(third_tail)).size() == 1);
+    BOOST_TEST(probes_to(vtep(fourth_tail)).empty());  // not a peer
+    BOOST_TEST(vtep_->counters().probes_tx == 2);
+    BOOST_TEST((next == t0 + interval));  // keepalives come sooner than probes
+
+    // Keepalives keep their own schedule; the next probe waits its interval.
+    static_cast<void>(vtep_->tick(t0 + interval));
+    BOOST_TEST(probes_to(vtep(peer_tail)).size() == 1);
+    static_cast<void>(vtep_->tick(t0 + probe_interval));
+    BOOST_TEST(probes_to(vtep(peer_tail)).size() == 2);
+
+    sender.refuse = true;  // e.g. EMSGSIZE from a smaller path
+    static_cast<void>(vtep_->tick(t0 + (2 * probe_interval)));
+    BOOST_TEST(vtep_->counters().probe_send_failed == 2);
+}
+
+BOOST_AUTO_TEST_CASE(probe_receipt_sets_mtu_ok, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    static_cast<void>(vtep_->tick(t0));
+    // A short probe (the peer's plan is smaller, or it was cut down) is
+    // recorded but does not prove the path.
+    BOOST_TEST(!vtep_->receive(oam::encode_probe(1, mtu_payload - 100), vtep(peer_tail), t0));
+    auto p = peer(vtep(peer_tail));
+    BOOST_TEST(p.probes_rx == 1);
+    BOOST_TEST(p.largest_probe == mtu_payload - 100);
+    BOOST_TEST(!p.mtu_ok);
+    // Probes say nothing about liveness.
+    BOOST_TEST((p.state == PeerState::pending));
+    BOOST_TEST(p.keepalives_rx == 0);
+
+    BOOST_TEST(!vtep_->receive(oam::encode_probe(2, mtu_payload), vtep(peer_tail), t0));
+    p = peer(vtep(peer_tail));
+    BOOST_TEST(p.mtu_ok);
+    BOOST_TEST(p.largest_probe == mtu_payload);
+    BOOST_TEST(vtep_->counters().probes_rx == 2);
+    BOOST_TEST(!peer(vtep(third_tail)).mtu_ok);
+
+    // Strangers' probes are dropped like their keepalives.
+    BOOST_TEST(!vtep_->receive(oam::encode_probe(3, mtu_payload), vtep(stranger_tail), t0));
+    BOOST_TEST(vtep_->counters().rx_drop_oam_unknown_peer == 1);
+    BOOST_TEST(vtep_->counters().probes_rx == 2);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_AUTO_TEST_CASE(no_limit_no_probes, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    net::MappingTable table{vtep(self_tail)};
+    standard_mappings(table);
+    FakeSender sender;
+    auto v = net::Vtep::create(table, sender, nullptr, config());
+    BOOST_REQUIRE(v.has_value());
+    const net::VtepClock::time_point t0{std::chrono::seconds{1000}};
+    static_cast<void>((*v)->tick(t0));
+    BOOST_TEST((*v)->counters().probes_tx == 0);
+    const std::vector<std::byte> big(net::max_guest_mtu, std::byte{0x02});
+    (*v)->send({.vtep = vtep(peer_tail), .vni = vpc, .nics = {nic_a, nic_c}, .frame = big});
+    BOOST_TEST((*v)->counters().tx_drop_too_big == 0);
+    // A probe still arrives fine at a VTEP without a plan, but proves nothing.
+    BOOST_TEST(!(*v)->receive(oam::encode_probe(1, mtu_payload), vtep(peer_tail), t0));
+    BOOST_TEST(!(*v)->peers()[0].mtu_ok);
+}
 
 BOOST_FIXTURE_TEST_SUITE(keepalives, Fixture)
 

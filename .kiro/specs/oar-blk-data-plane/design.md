@@ -52,7 +52,13 @@
   rejected. One cipher per I/O queue: it reuses its OpenSSL contexts.
 - **Backend** — harbor: a sparse file per volume plus a metadata header
   (volume ID, owner VM, wrapped key, size). Board: NVMe via the board's
-  root-complex controller.
+  root-complex controller. `BlockBackend` is the seam: volume byte
+  offsets, size, read, write, flush. The file header is one 4 KiB block
+  so data stays aligned for both block sizes; the wrapped key is opaque
+  to oar-blk (helm authenticates it on unwrap) and a SHA-256 over the
+  fields catches corruption first. Delete is crypto-erase in helm plus
+  `FileBackend::erase`, which overwrites the header, the file's only
+  copy of the wrapped key, before unlinking.
 
 ## Placement notes
 

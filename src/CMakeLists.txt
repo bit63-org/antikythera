@@ -104,6 +104,7 @@ install(TARGETS ak-test-controller RUNTIME DESTINATION bin)
 # virtio-blk request parser and the virtio-blk function on the shared
 # virtio core (storage data plane).
 add_library(ak_oar_blk
+  oar/blk/file_backend.cpp
   oar/blk/key_slot.cpp
   oar/blk/request_parser.cpp
   oar/blk/virtio_blk_function.cpp

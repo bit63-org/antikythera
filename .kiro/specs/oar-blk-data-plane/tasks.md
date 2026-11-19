@@ -1,6 +1,6 @@
 # Implementation Plan — oar-blk: the storage data plane
 
-## Status: 4/8 tasks complete
+## Status: 5/8 tasks complete
 
 ## Tasks
 
@@ -33,7 +33,14 @@
   keeps them. `fuzz/fuzz_virtio_blk.cpp` drives it as a hostile guest
   and checks every backend access stays inside the volume. The
   `ak-oar-blk` vfio-user server comes with the file backend (task 5).
-- [ ] 5. File backend with volume metadata header. _Requirements: 3.1_
+- [x] 5. File backend with volume metadata header. _Requirements: 3.1_
+  — `src/oar/blk/file_backend.*`: one sparse file per volume, a 4 KiB
+  header (magic, version, IDs, capacity, block size, opaque wrapped key,
+  SHA-256) then the ciphertext. Header decoded with `ak::wire` as
+  untrusted input (`fuzz/fuzz_volume_metadata.cpp`, re-encode check).
+  Files are created `O_EXCL` 0600, opened `O_NOFOLLOW`, size-checked;
+  `rewrap` rewrites owner and key only; `erase` wipes the header, syncs
+  and unlinks (the release half of DELETE_VOLUME).
 - [ ] 6. helm integration: create/attach/detach/delete/rewrap volume flows.
   _Requirements: 3_
 - [ ] 7. Boot from volume in harbor. _Requirements: 4_

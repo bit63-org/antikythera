@@ -54,7 +54,8 @@ build also works against system packages. See
   Real boards use Linux `pci-epf` instead.
 - **Version**: v0.8, commit `37491ed9af828fc161238dacd82e83ea35a09f87`,
   from the overlay port in `vcpkg-overlays/libvfio-user/` (it is not in
-  the vcpkg registry). Pulls in `json-c`, plus `cmocka`, which upstream's
+  the vcpkg registry), with one local patch: DMA range unmaps behave as in
+  VFIO type1, which QEMU's intel-iommu needs. Pulls in `json-c`, plus `cmocka`, which upstream's
   meson build requires unconditionally.
 - **Notes**: detected through `libvfio-user.pc`. Upstream v0.8 installs no
   `.pc` file, so the overlay port generates one (json-c under `Requires:`,

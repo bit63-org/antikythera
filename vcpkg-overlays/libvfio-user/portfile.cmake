@@ -7,6 +7,9 @@ vcpkg_from_git(
     OUT_SOURCE_PATH SOURCE_PATH
     URL https://github.com/nutanix/libvfio-user.git
     REF 37491ed9af828fc161238dacd82e83ea35a09f87
+    # Range unmaps as VFIO type1 does them; see the patch header.
+    PATCHES
+        0001-dma-unmap-ranges-like-vfio-type1.patch
 )
 
 # cmocka is declared unconditionally by upstream's meson.build even though

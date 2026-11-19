@@ -391,3 +391,68 @@ BOOST_AUTO_TEST_CASE(address_classes, *boost::unit_test::timeout(unit_timeout_se
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_AUTO_TEST_SUITE(builders)
+
+namespace {
+
+// The one's-complement sum over `data` plus `seed`, folded; 0xFFFF (i.e. a
+// sum of zero after inversion) means a correct checksum is inside.
+auto ones_sum(std::uint32_t seed, std::span<const std::byte> data) -> std::uint16_t {
+    std::uint32_t sum = seed;
+    for (std::size_t i = 0; i + 1 < data.size(); i += 2) {
+        sum += (std::to_integer<std::uint32_t>(data[i]) << 8U) |
+               std::to_integer<std::uint32_t>(data[i + 1]);
+    }
+    if (data.size() % 2 != 0) {
+        sum += std::to_integer<std::uint32_t>(data.back()) << 8U;
+    }
+    while ((sum >> 16U) != 0) {
+        sum = (sum & 0xFFFFU) + (sum >> 16U);
+    }
+    return static_cast<std::uint16_t>(sum);
+}
+
+auto pseudo(std::span<const std::byte> src, std::span<const std::byte> dst, std::uint8_t protocol,
+            std::size_t length) -> std::uint32_t {
+    std::uint32_t s = ones_sum(0, src);
+    s += ones_sum(0, dst);
+    s += protocol;
+    s += static_cast<std::uint32_t>(length & 0xFFFFU) + static_cast<std::uint32_t>(length >> 16U);
+    return s;
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(ipv4_udp, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto f = pk::build_ipv4_udp(mac_b, mac_a, ip4_a, ip4_b, 67, 68, bytes(301));
+    const auto p = pk::parse(f);
+    BOOST_REQUIRE(p.has_value());
+    BOOST_TEST((p->src4 == ip4_a));
+    BOOST_TEST(p->l4->dst_port == 68);
+    BOOST_TEST(p->payload.size() == 301);
+    BOOST_TEST(ones_sum(0, p->ip.first(pk::ipv4_min_header_size)) == 0xFFFF);
+    BOOST_TEST(ones_sum(pseudo(ip4_a, ip4_b, pk::ipproto_udp, p->l4_data.size()), p->l4_data) ==
+               0xFFFF);
+}
+
+BOOST_AUTO_TEST_CASE(ipv6_udp_and_icmpv6, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto u = pk::build_ipv6_udp(mac_b, mac_a, ip6(1), ip6(2), 547, 546, bytes(7));
+    const auto p = pk::parse(u);
+    BOOST_REQUIRE(p.has_value());
+    BOOST_TEST(p->hop_limit == pk::reply_hop_limit);
+    BOOST_TEST(ones_sum(pseudo(ip6(1), ip6(2), pk::ipproto_udp, p->l4_data.size()), p->l4_data) ==
+               0xFFFF);
+    const auto i = pk::build_icmpv6(mac_b, mac_a, ip6(1), ip6(2), 134, 0, bytes(12), 255);
+    const auto q = pk::parse(i);
+    BOOST_REQUIRE(q.has_value());
+    BOOST_TEST(q->hop_limit == 255);
+    BOOST_TEST(q->l4->icmp_type == 134);
+    BOOST_TEST(net::neighbor::icmpv6_checksum(ip6(1), ip6(2), q->l4_data) == 0);
+
+    const auto e = pk::build_ethernet(mac_b, mac_a, q->ip);
+    BOOST_TEST(pk::ethertype(e) == net::neighbor::ethertype_ipv6);
+    BOOST_TEST(pk::parse(e).has_value());
+}
+
+BOOST_AUTO_TEST_SUITE_END()

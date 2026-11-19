@@ -84,10 +84,23 @@
 // addresses, so the proxy and the check cannot disagree, and a VNI with no
 // addresses carries no IP.
 //
+// VPC gateway (Requirement 12, task 17): a VNI with a VpcConfig has a
+// virtual gateway at the config's MAC. oar-net answers, for the asking NIC
+// only, ARP for the gateway address and 169.254.169.254, neighbor
+// solicitations for the gateway's link-local address and fd00:ec2::254
+// (when the VNI has an IPv6 prefix), and DHCPv4 from the mapping: the
+// NIC's lowest guest IPv4 address inside the VPC prefix, the prefix's
+// mask, the gateway as router and server, the DNS servers, domain, lease
+// and the NIC's MTU (given at attach). Nothing about DHCP is stored: the
+// mapping is the lease database. Other IP packets for the gateway MAC are
+// dropped until routing exists. Without a VpcConfig, DHCP is dropped and
+// counted, never flooded.
+//
 // Threading: a VSwitch belongs to one data-plane thread. transmit(),
-// receive(), attach(), detach() and set_neighbors() must all be called from
-// it. The MappingTable is the only structure shared with other threads.
-// Data-path problems are counted, never thrown (design "Error handling").
+// receive(), attach(), detach(), set_neighbors() and set_vpc_config() must
+// all be called from it. The MappingTable is the only structure shared with
+// other threads. Data-path problems are counted, never thrown (design "Error
+// handling").
 
 #include <array>
 #include <chrono>
@@ -98,6 +111,7 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -157,6 +171,61 @@ enum class NeighborError : std::uint8_t {
 };
 
 [[nodiscard]] auto to_string(NeighborError e) noexcept -> const char*;
+
+struct Ipv4Prefix {
+    neighbor::Ipv4Address address{};
+    std::uint8_t length{0};
+
+    friend auto operator==(const Ipv4Prefix&, const Ipv4Prefix&) -> bool = default;
+};
+
+// A VNI's gateway and guest configuration (Requirement 12.1). Written by the
+// controller, signed, and forwarded by helm (the frame is task 20).
+struct VpcConfig {
+    MacAddress gateway_mac{};  // locally administered unicast, from the controller's pool
+    Ipv4Prefix ipv4{};         // the VPC's IPv4 prefix, length 8..30, no host bits
+    neighbor::Ipv4Address ipv4_gateway{};       // inside ipv4, not its network or broadcast address
+    std::optional<Ipv6Address> ipv6_prefix{};   // a /64: low 64 bits zero
+    std::vector<neighbor::Ipv4Address> dns4{};  // at most max_dns_servers
+    std::vector<Ipv6Address> dns6{};            // at most max_dns_servers
+    std::string domain{};                       // DNS name, at most max_domain_size bytes
+    std::uint32_t lease_seconds{0};             // min_lease_seconds .. max_lease_seconds
+
+    friend auto operator==(const VpcConfig&, const VpcConfig&) -> bool = default;
+};
+
+inline constexpr std::size_t max_dns_servers = 4;
+inline constexpr std::size_t max_domain_size = 253;
+inline constexpr std::uint32_t min_lease_seconds = 60;
+inline constexpr std::uint32_t max_lease_seconds = 0x7FFF'FFFF;
+inline constexpr std::uint8_t min_ipv4_prefix = 8;
+inline constexpr std::uint8_t max_ipv4_prefix = 30;
+
+enum class VpcConfigError : std::uint8_t {
+    vni_out_of_range,  // 0, or wider than 24 bits
+    bad_gateway_mac,   // zero, group, or not locally administered
+    bad_ipv4_prefix,   // length outside 8..30, or host bits set
+    bad_ipv4_gateway,  // outside the prefix, or its network or broadcast address
+    bad_ipv6_prefix,   // low 64 bits set, or multicast, link-local or unspecified
+    too_many_dns,      // more than max_dns_servers in a family
+    bad_dns,           // a zero, multicast or broadcast server address
+    bad_domain,        // too long, or not a DNS name
+    bad_lease,         // outside min_lease_seconds .. max_lease_seconds
+};
+
+[[nodiscard]] auto to_string(VpcConfigError e) noexcept -> const char*;
+
+// The gateway's IPv6 link-local address: fe80::/64 with the modified EUI-64
+// interface ID of its MAC (RFC 4291 appendix A).
+[[nodiscard]] auto gateway_link_local(const MacAddress& gateway_mac) noexcept -> Ipv6Address;
+
+// The instance metadata addresses (Requirement 13).
+inline constexpr neighbor::Ipv4Address metadata_ipv4{std::byte{169}, std::byte{254}, std::byte{169},
+                                                     std::byte{254}};
+inline constexpr Ipv6Address metadata_ipv6{
+    std::byte{0xfd}, std::byte{0x00}, std::byte{0x0e}, std::byte{0xc2}, std::byte{0}, std::byte{0},
+    std::byte{0},    std::byte{0},    std::byte{0},    std::byte{0},    std::byte{0}, std::byte{0},
+    std::byte{0},    std::byte{0},    std::byte{0x02}, std::byte{0x54}};  // fd00:ec2::254
 
 enum class AttachError : std::uint8_t {
     invalid_nic_id,    // 0 or the broadcast ID
@@ -248,10 +317,16 @@ struct SwitchCounters {
     std::uint64_t tx_drop_unknown_unicast{0};  // no NIC holds the destination MAC
     std::uint64_t tx_drop_hairpin{0};          // unicast to the sender's own MAC
     std::uint64_t tx_drop_unattached{0};       // local destination with no function attached
+    std::uint64_t tx_drop_no_route{0};         // IP for the gateway MAC that nothing consumed
     std::uint64_t arp_replies{0};
     std::uint64_t nd_replies{0};
-    std::uint64_t rx_frames{0};     // packets handed to receive()
-    std::uint64_t rx_delivered{0};  // copies delivered to local NICs
+    std::uint64_t dhcp4_replies{0};
+    std::uint64_t dhcp4_ignored{0};     // release, decline, or a request for another server
+    std::uint64_t dhcp4_no_config{0};   // the VNI has no VpcConfig
+    std::uint64_t dhcp4_no_address{0};  // the NIC has no IPv4 address inside the VPC prefix
+    std::uint64_t dhcp4_bad{0};         // unparsable, or chaddr is not the NIC's MAC
+    std::uint64_t rx_frames{0};         // packets handed to receive()
+    std::uint64_t rx_delivered{0};      // copies delivered to local NICs
     std::uint64_t rx_drop_unattached{0};
     std::uint64_t rx_drop_group{0};       // replicated frames this VTEP's policy does not admit
     std::uint64_t rx_drop_ethertype{0};   // inner frame not IPv4, IPv6 or ARP
@@ -270,8 +345,11 @@ public:
     // `now` drives the group rate limiters; tests pass a fake clock.
     VSwitch(const MappingTable& mappings, Underlay& underlay, Now now = Clock::now);
 
-    // Connects the function serving `nic` (its NicIdentity::nic_id).
-    auto attach(geneve::NicId nic, RxPort& port) -> std::expected<void, AttachError>;
+    // Connects the function serving `nic` (its NicIdentity::nic_id). `mtu`
+    // is what the function advertises (VIRTIO_NET_F_MTU), handed to DHCP;
+    // 0 leaves the MTU option out.
+    auto attach(geneve::NicId nic, RxPort& port, std::uint16_t mtu = 0)
+        -> std::expected<void, AttachError>;
     // Disconnects it; false if it was not attached.
     auto detach(geneve::NicId nic) -> bool;
     [[nodiscard]] auto attached(geneve::NicId nic) const -> bool;
@@ -279,6 +357,13 @@ public:
     // Replaces the proxied addresses of one VNI. Validated as a whole; a bad
     // update changes nothing.
     auto set_neighbors(const NeighborUpdate& update) -> std::expected<void, NeighborError>;
+
+    // Sets one VNI's gateway configuration, validated as a whole; a bad
+    // config changes nothing. clear_vpc_config() removes it.
+    auto set_vpc_config(std::uint32_t vni, const VpcConfig& config)
+        -> std::expected<void, VpcConfigError>;
+    auto clear_vpc_config(std::uint32_t vni) -> void;
+    [[nodiscard]] auto vpc_config(std::uint32_t vni) const -> const VpcConfig*;
 
     // Sets one VNI's group policy, validated as a whole; a bad policy changes
     // nothing. A drop policy restores the default. Existing rate buckets keep
@@ -348,6 +433,18 @@ private:
         -> std::optional<geneve::NicId>;
     [[nodiscard]] auto own_na_target(const packet::ParsedPacket& p, geneve::NicId src,
                                      std::uint32_t vni) const -> bool;
+    // The gateway's ARP/ND answers and the DHCPv4 server; true if the frame
+    // was consumed (answered or dropped).
+    auto handle_gateway_arp(geneve::NicId src, const NicBinding& binding,
+                            const neighbor::ArpPacket& arp, const MacAddress& dst_mac) -> bool;
+    auto handle_gateway_nd(geneve::NicId src, const NicBinding& binding,
+                           std::span<const std::byte> frame, const MacAddress& dst_mac) -> bool;
+    auto handle_dhcp4(geneve::NicId src, const NicBinding& binding, const packet::ParsedPacket& p)
+        -> bool;
+    // The NIC's DHCP address: its lowest guest IPv4 address inside `prefix`.
+    [[nodiscard]] auto dhcp4_address(std::uint32_t vni, geneve::NicId nic,
+                                     const Ipv4Prefix& prefix) const
+        -> std::optional<neighbor::Ipv4Address>;
     auto deliver(geneve::NicId nic, std::span<const std::byte> frame) -> bool;
     auto deliver_to(RxPort& port, std::span<const std::byte> frame) -> bool;
     [[nodiscard]] auto port(geneve::NicId nic) const -> RxPort*;
@@ -356,6 +453,8 @@ private:
     const MappingTable* _mappings;
     Underlay* _underlay;
     std::unordered_map<geneve::NicId, RxPort*, NicIdHash> _ports;
+    std::unordered_map<geneve::NicId, std::uint16_t, NicIdHash> _mtus;
+    std::unordered_map<std::uint32_t, VpcConfig> _vpc_configs;
     std::unordered_map<std::uint32_t, VpcNeighbors> _neighbors;
     std::unordered_map<std::uint32_t, GroupPolicy> _group_policies;  // only non-drop VNIs
     std::unordered_map<geneve::NicId, NicGroupState, NicIdHash> _group;

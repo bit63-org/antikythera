@@ -4,8 +4,12 @@
 #include "oar/net/vswitch.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <functional>
 #include <set>
+#include <string_view>
+
+#include "oar/net/dhcp4.hpp"
 
 namespace ak::oar::net {
 
@@ -120,6 +124,121 @@ auto ip_multicast_destination(const packet::ParsedPacket& p) noexcept -> bool {
     return is_ipv6(p) ? packet::is_ipv6_multicast(p.dst6) : packet::is_ipv4_multicast(p.dst4);
 }
 
+auto to_u32(const neighbor::Ipv4Address& a) noexcept -> std::uint32_t {
+    std::uint32_t v = 0;
+    for (const std::byte b : a) {
+        v = (v << 8U) | std::to_integer<std::uint32_t>(b);
+    }
+    return v;
+}
+
+auto from_u32(std::uint32_t v) noexcept -> neighbor::Ipv4Address {
+    neighbor::Ipv4Address a{};
+    for (std::size_t i = a.size(); i-- > 0;) {
+        a.at(i) = static_cast<std::byte>(v & 0xFFU);
+        v >>= 8U;
+    }
+    return a;
+}
+
+auto prefix_mask(std::uint8_t length) noexcept -> std::uint32_t {
+    return length == 0 ? 0 : ~std::uint32_t{0} << (32U - length);
+}
+
+auto in_prefix(const Ipv4Prefix& prefix, const neighbor::Ipv4Address& a) noexcept -> bool {
+    return (to_u32(a) & prefix_mask(prefix.length)) == to_u32(prefix.address);
+}
+
+constexpr neighbor::Ipv4Address ipv4_broadcast{std::byte{255}, std::byte{255}, std::byte{255},
+                                               std::byte{255}};
+constexpr std::size_t max_label_size = 63;
+constexpr std::size_t ipv6_interface_id_offset = 8;
+constexpr std::byte mac_local_bit{0x02};
+
+// RFC 1035 preferred name syntax (letters, digits, hyphens; labels of 1-63
+// bytes not starting or ending with a hyphen), as DHCP option 15 carries it.
+auto valid_domain(const std::string& name) -> bool {
+    if (name.empty()) {
+        return true;
+    }
+    if (name.size() > max_domain_size) {
+        return false;
+    }
+    std::size_t start = 0;
+    while (start <= name.size()) {
+        const std::size_t dot = std::min(name.find('.', start), name.size());
+        const std::string_view label{name.data() + start, dot - start};
+        if (label.empty() || label.size() > max_label_size || label.front() == '-' ||
+            label.back() == '-') {
+            return false;
+        }
+        for (const char c : label) {
+            if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '-') {
+                return false;
+            }
+        }
+        start = dot + 1;
+    }
+    return true;
+}
+
+auto valid_dns4(const neighbor::Ipv4Address& a) noexcept -> bool {
+    return !all_zero(a) && !packet::is_ipv4_multicast(a) && a != ipv4_broadcast;
+}
+
+auto valid_dns6(const Ipv6Address& a) noexcept -> bool {
+    return !packet::is_unspecified(a) && !packet::is_ipv6_multicast(a);
+}
+
+auto validate(const VpcConfig& c) -> std::expected<void, VpcConfigError> {
+    const MacAddress& m = c.gateway_mac;
+    if (all_zero(m) || (m[0] & group_bit) == group_bit || (m[0] & mac_local_bit) != mac_local_bit) {
+        return std::unexpected(VpcConfigError::bad_gateway_mac);
+    }
+    if (c.ipv4.length < min_ipv4_prefix || c.ipv4.length > max_ipv4_prefix ||
+        (to_u32(c.ipv4.address) & ~prefix_mask(c.ipv4.length)) != 0) {
+        return std::unexpected(VpcConfigError::bad_ipv4_prefix);
+    }
+    const std::uint32_t host_mask = ~prefix_mask(c.ipv4.length);
+    const std::uint32_t host = to_u32(c.ipv4_gateway) & host_mask;
+    if (!in_prefix(c.ipv4, c.ipv4_gateway) || host == 0 || host == host_mask) {
+        return std::unexpected(VpcConfigError::bad_ipv4_gateway);
+    }
+    if (c.ipv6_prefix) {
+        const Ipv6Address& p = *c.ipv6_prefix;
+        const bool low_clear = std::all_of(p.begin() + ipv6_interface_id_offset, p.end(),
+                                           [](std::byte b) { return b == std::byte{0}; });
+        if (!low_clear || packet::is_unspecified(p) || packet::is_ipv6_multicast(p) ||
+            packet::is_ipv6_link_local(p)) {
+            return std::unexpected(VpcConfigError::bad_ipv6_prefix);
+        }
+    }
+    if (c.dns4.size() > max_dns_servers || c.dns6.size() > max_dns_servers) {
+        return std::unexpected(VpcConfigError::too_many_dns);
+    }
+    if (!std::ranges::all_of(c.dns4, valid_dns4) || !std::ranges::all_of(c.dns6, valid_dns6)) {
+        return std::unexpected(VpcConfigError::bad_dns);
+    }
+    if (!valid_domain(c.domain)) {
+        return std::unexpected(VpcConfigError::bad_domain);
+    }
+    if (c.lease_seconds < min_lease_seconds || c.lease_seconds > max_lease_seconds) {
+        return std::unexpected(VpcConfigError::bad_lease);
+    }
+    return {};
+}
+
+// A DHCPv4 client message for this VNI's server (Requirement 12.3): UDP
+// 68 -> 67, unfragmented, from 0.0.0.0 or to the broadcast address or the
+// gateway. A client talking to some other host's port 67 is forwarded.
+auto dhcp4_client_message(const packet::ParsedPacket& p, const VpcConfig* cfg) noexcept -> bool {
+    if (is_ipv6(p) || p.fragment || !udp_ports(p, dhcp4_client_port, dhcp4_server_port)) {
+        return false;
+    }
+    return packet::is_unspecified(p.src4) || p.dst4 == ipv4_broadcast ||
+           (cfg != nullptr && p.dst4 == cfg->ipv4_gateway);
+}
+
 auto valid_nic(geneve::NicId id) noexcept -> bool {
     return id != geneve::nic_invalid && id != geneve::nic_broadcast;
 }
@@ -198,6 +317,187 @@ auto to_string(GroupPolicyError e) noexcept -> const char* {
     return "unknown";
 }
 
+auto to_string(VpcConfigError e) noexcept -> const char* {
+    switch (e) {
+        case VpcConfigError::vni_out_of_range:
+            return "vni_out_of_range";
+        case VpcConfigError::bad_gateway_mac:
+            return "bad_gateway_mac";
+        case VpcConfigError::bad_ipv4_prefix:
+            return "bad_ipv4_prefix";
+        case VpcConfigError::bad_ipv4_gateway:
+            return "bad_ipv4_gateway";
+        case VpcConfigError::bad_ipv6_prefix:
+            return "bad_ipv6_prefix";
+        case VpcConfigError::too_many_dns:
+            return "too_many_dns";
+        case VpcConfigError::bad_dns:
+            return "bad_dns";
+        case VpcConfigError::bad_domain:
+            return "bad_domain";
+        case VpcConfigError::bad_lease:
+            return "bad_lease";
+    }
+    return "unknown";
+}
+
+auto gateway_link_local(const MacAddress& gateway_mac) noexcept -> Ipv6Address {
+    Ipv6Address a{};
+    a[0] = std::byte{0xfe};
+    a[1] = std::byte{0x80};
+    a[8] = gateway_mac[0] ^ mac_local_bit;  // RFC 4291: the universal/local bit, inverted
+    a[9] = gateway_mac[1];
+    a[10] = gateway_mac[2];
+    a[11] = std::byte{0xff};
+    a[12] = std::byte{0xfe};
+    a[13] = gateway_mac[3];
+    a[14] = gateway_mac[4];
+    a[15] = gateway_mac[5];
+    return a;
+}
+
+auto VSwitch::set_vpc_config(std::uint32_t vni, const VpcConfig& config)
+    -> std::expected<void, VpcConfigError> {
+    if (vni == 0 || vni > geneve::vni_max) {
+        return std::unexpected(VpcConfigError::vni_out_of_range);
+    }
+    if (auto ok = validate(config); !ok) {
+        return ok;
+    }
+    _vpc_configs.insert_or_assign(vni, config);
+    return {};
+}
+
+auto VSwitch::clear_vpc_config(std::uint32_t vni) -> void {
+    _vpc_configs.erase(vni);
+}
+
+auto VSwitch::vpc_config(std::uint32_t vni) const -> const VpcConfig* {
+    const auto it = _vpc_configs.find(vni);
+    return it == _vpc_configs.end() ? nullptr : &it->second;
+}
+
+auto VSwitch::dhcp4_address(std::uint32_t vni, geneve::NicId nic, const Ipv4Prefix& prefix) const
+    -> std::optional<neighbor::Ipv4Address> {
+    const VpcNeighbors* const table = neighbors(vni);
+    if (table == nullptr) {
+        return std::nullopt;
+    }
+    // The map is ordered by address, so the first match is the lowest.
+    for (const auto& [ip, owner] : table->ipv4) {
+        if (owner == nic && in_prefix(prefix, ip)) {
+            return ip;
+        }
+    }
+    return std::nullopt;
+}
+
+auto VSwitch::handle_gateway_arp(geneve::NicId src, const NicBinding& binding,
+                                 const neighbor::ArpPacket& arp, const MacAddress& dst_mac)
+    -> bool {
+    const VpcConfig* const cfg = vpc_config(binding.vni);
+    if (cfg == nullptr || arp.op != neighbor::arp_op_request) {
+        return false;
+    }
+    const bool to_gateway = (dst_mac[0] & group_bit) == group_bit || dst_mac == cfg->gateway_mac;
+    if (!to_gateway || (arp.target_ip != cfg->ipv4_gateway && arp.target_ip != metadata_ipv4)) {
+        return false;
+    }
+    if (deliver(src, neighbor::build_arp_reply(arp, cfg->gateway_mac))) {
+        ++_counters.arp_replies;
+    }
+    return true;
+}
+
+auto VSwitch::handle_gateway_nd(geneve::NicId src, const NicBinding& binding,
+                                std::span<const std::byte> frame, const MacAddress& dst_mac)
+    -> bool {
+    const VpcConfig* const cfg = vpc_config(binding.vni);
+    if (cfg == nullptr || !cfg->ipv6_prefix) {
+        return false;
+    }
+    const bool to_gateway = (dst_mac[0] & group_bit) == group_bit || dst_mac == cfg->gateway_mac;
+    if (!to_gateway) {
+        return false;
+    }
+    const auto ns = neighbor::parse_neighbor_solicitation(frame);
+    if (!ns || all_zero(ns->source_ip)) {
+        return false;  // the proxy path counts spoofing; DAD is never answered
+    }
+    if (ns->target_ip != gateway_link_local(cfg->gateway_mac) && ns->target_ip != metadata_ipv6) {
+        return false;
+    }
+    if (deliver(src, neighbor::build_neighbor_advertisement(*ns, cfg->gateway_mac))) {
+        ++_counters.nd_replies;
+    }
+    return true;
+}
+
+auto VSwitch::handle_dhcp4(geneve::NicId src, const NicBinding& binding,
+                           const packet::ParsedPacket& p) -> bool {
+    const VpcConfig* const cfg = vpc_config(binding.vni);
+    if (cfg == nullptr) {
+        ++_counters.dhcp4_no_config;
+        return true;
+    }
+    const auto msg = dhcp4::parse(p.payload);
+    if (!msg || msg->chaddr != binding.mac) {
+        ++_counters.dhcp4_bad;
+        return true;
+    }
+    if (msg->type == dhcp4::MessageType::release || msg->type == dhcp4::MessageType::decline ||
+        (msg->server_id && *msg->server_id != cfg->ipv4_gateway)) {
+        ++_counters.dhcp4_ignored;
+        return true;
+    }
+    const auto mtu_it = _mtus.find(src);
+    dhcp4::Reply reply{
+        .type = dhcp4::MessageType::ack,
+        .yiaddr = {},
+        .server = cfg->ipv4_gateway,
+        .subnet_mask = from_u32(prefix_mask(cfg->ipv4.length)),
+        .router = cfg->ipv4_gateway,
+        .dns = cfg->dns4,
+        .domain = cfg->domain,
+        .mtu = mtu_it == _mtus.end() ? std::uint16_t{0} : mtu_it->second,
+        .lease_seconds = cfg->lease_seconds,
+    };
+    if (msg->type == dhcp4::MessageType::inform) {
+        reply.lease_seconds = 0;  // RFC 2131 3.4: no lease, no yiaddr
+    } else {
+        const auto address = dhcp4_address(binding.vni, src, cfg->ipv4);
+        if (!address) {
+            ++_counters.dhcp4_no_address;
+            return true;
+        }
+        if (msg->type == dhcp4::MessageType::discover) {
+            reply.type = dhcp4::MessageType::offer;
+            reply.yiaddr = *address;
+        } else if (msg->requested_ip.value_or(msg->ciaddr) == *address) {  // request
+            reply.yiaddr = *address;
+        } else {
+            reply.type = dhcp4::MessageType::nak;
+        }
+    }
+    // RFC 2131 4.1: a NAK is broadcast; otherwise unicast to ciaddr if the
+    // client has one, broadcast if it asked, else to the offered address.
+    // The Ethernet destination is always the NIC, and only it gets a copy.
+    const bool unicast_ciaddr = reply.type != dhcp4::MessageType::nak && !all_zero(msg->ciaddr);
+    const bool broadcast =
+        reply.type == dhcp4::MessageType::nak ||
+        (!unicast_ciaddr && ((msg->flags & dhcp4::flag_broadcast) != 0 || all_zero(reply.yiaddr)));
+    const neighbor::Ipv4Address dst = broadcast        ? ipv4_broadcast
+                                      : unicast_ciaddr ? msg->ciaddr
+                                                       : reply.yiaddr;
+    const auto payload = dhcp4::build_reply(*msg, reply);
+    const auto frame = packet::build_ipv4_udp(binding.mac, cfg->gateway_mac, cfg->ipv4_gateway, dst,
+                                              dhcp4::server_port, dhcp4::client_port, payload);
+    if (deliver(src, frame)) {
+        ++_counters.dhcp4_replies;
+    }
+    return true;
+}
+
 auto VSwitch::NicIdHash::operator()(geneve::NicId id) const noexcept -> std::size_t {
     return std::hash<std::uint64_t>{}(id.value);
 }
@@ -205,13 +505,15 @@ auto VSwitch::NicIdHash::operator()(geneve::NicId id) const noexcept -> std::siz
 VSwitch::VSwitch(const MappingTable& mappings, Underlay& underlay, Now now)
     : _mappings{&mappings}, _underlay{&underlay}, _now{std::move(now)} {}
 
-auto VSwitch::attach(geneve::NicId nic, RxPort& port) -> std::expected<void, AttachError> {
+auto VSwitch::attach(geneve::NicId nic, RxPort& port, std::uint16_t mtu)
+    -> std::expected<void, AttachError> {
     if (!valid_nic(nic)) {
         return std::unexpected(AttachError::invalid_nic_id);
     }
     if (!_ports.try_emplace(nic, &port).second) {
         return std::unexpected(AttachError::already_attached);
     }
+    _mtus.insert_or_assign(nic, mtu);
     _group.insert_or_assign(nic, NicGroupState{.attachment = ++_attachments});
     return {};
 }
@@ -220,6 +522,7 @@ auto VSwitch::detach(geneve::NicId nic) -> bool {
     if (_ports.erase(nic) == 0) {
         return false;
     }
+    _mtus.erase(nic);
     const auto it = _group.find(nic);
     if (it != _group.end()) {
         _retired.push_back({.nic = nic,
@@ -424,13 +727,23 @@ auto VSwitch::transmit(const TxFrame& tx) -> void {
             ++_counters.tx_drop_neighbor_spoofed;
             return;
         }
-        if (*icmp == neighbor::icmpv6_neighbor_solicitation && group &&
-            handle_nd(*snap, tx.source, *binding, tx.frame)) {
+        if (*icmp == neighbor::icmpv6_neighbor_solicitation &&
+            (handle_gateway_nd(tx.source, *binding, tx.frame, dst_mac) ||
+             (group && handle_nd(*snap, tx.source, *binding, tx.frame)))) {
             return;
         }
     }
+    if (dhcp4_client_message(*pkt, vpc_config(binding->vni)) &&
+        handle_dhcp4(tx.source, *binding, *pkt)) {
+        return;
+    }
     if (local_only) {
         ++_counters.tx_drop_local_only;
+        return;
+    }
+    if (const VpcConfig* const cfg = vpc_config(binding->vni);
+        cfg != nullptr && dst_mac == cfg->gateway_mac) {
+        ++_counters.tx_drop_no_route;
         return;
     }
     forward(*snap, tx.source, *binding, tx.frame, &*pkt);
@@ -526,6 +839,9 @@ auto VSwitch::handle_arp(const MappingSnapshot& snap, geneve::NicId src, const N
             ++_counters.tx_drop_neighbor_spoofed;
             return true;
         }
+    }
+    if (handle_gateway_arp(src, binding, *arp, mac_at(frame, dst_mac_offset))) {
+        return true;
     }
     if (!group || arp->op != neighbor::arp_op_request || table == nullptr) {
         return false;

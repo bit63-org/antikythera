@@ -251,7 +251,152 @@ auto parse_ipv6(std::span<const std::byte> l3) -> std::expected<ParsedPacket, Pa
     }
 }
 
+// One's-complement sum of 16-bit big-endian words, unfolded.
+auto add_words(std::uint32_t sum, std::span<const std::byte> data) noexcept -> std::uint32_t {
+    std::size_t i = 0;
+    for (; i + 1 < data.size(); i += 2) {
+        sum += be16_at(data, i);
+    }
+    if (i < data.size()) {
+        sum += std::uint32_t{u8_at(data, i)} << 8U;
+    }
+    return sum;
+}
+
+auto fold(std::uint32_t sum) noexcept -> std::uint16_t {
+    while ((sum >> 16U) != 0) {
+        sum = (sum & 0xFFFFU) + (sum >> 16U);
+    }
+    return static_cast<std::uint16_t>(~sum & 0xFFFFU);
+}
+
+auto put16(std::vector<std::byte>& out, std::size_t at, std::uint16_t v) noexcept -> void {
+    out[at] = static_cast<std::byte>(v >> 8U);
+    out[at + 1] = static_cast<std::byte>(v & 0xFFU);
+}
+
+constexpr std::size_t udp_checksum_offset = 6;
+constexpr std::size_t icmp_checksum_offset = 2;
+constexpr std::size_t ipv4_checksum_offset = 10;
+constexpr std::uint8_t ipv4_vihl = 0x45;
+constexpr std::uint16_t ipv4_dont_fragment = 0x4000;
+constexpr std::uint32_t ipv6_version_word = 0x6000'0000;
+
+auto write_ethernet(wire::Writer& w, const MacAddress& dst, const MacAddress& src,
+                    std::uint16_t type) -> void {
+    w.bytes(dst);
+    w.bytes(src);
+    w.be16(type);
+}
+
+// An L4 checksum over the IPv6 pseudo-header and `l4`.
+auto ipv6_l4_checksum(const Ipv6Address& src, const Ipv6Address& dst, std::uint8_t protocol,
+                      std::span<const std::byte> l4) noexcept -> std::uint16_t {
+    std::uint32_t sum = add_words(0, src);
+    sum = add_words(sum, dst);
+    const auto length = static_cast<std::uint32_t>(l4.size());
+    sum += (length >> 16U) + (length & 0xFFFFU);
+    sum += protocol;
+    return fold(add_words(sum, l4));
+}
+
+auto udp_datagram(std::uint16_t src_port, std::uint16_t dst_port,
+                  std::span<const std::byte> payload) -> std::vector<std::byte> {
+    std::vector<std::byte> u;
+    u.reserve(udp_header_size + payload.size());
+    wire::Writer w{u};
+    w.be16(src_port);
+    w.be16(dst_port);
+    w.be16(static_cast<std::uint16_t>(udp_header_size + payload.size()));
+    w.be16(0);
+    w.bytes(payload);
+    return u;
+}
+
+auto ipv6_packet(const MacAddress& dst_mac, const MacAddress& src_mac, const Ipv6Address& src,
+                 const Ipv6Address& dst, std::uint8_t next, std::span<const std::byte> payload,
+                 std::uint8_t hop_limit) -> std::vector<std::byte> {
+    std::vector<std::byte> f;
+    f.reserve(ethernet_header_size + ipv6_header_size + payload.size());
+    wire::Writer w{f};
+    write_ethernet(w, dst_mac, src_mac, neighbor::ethertype_ipv6);
+    w.be32(ipv6_version_word);
+    w.be16(static_cast<std::uint16_t>(payload.size()));
+    w.u8(next);
+    w.u8(hop_limit);
+    w.bytes(src);
+    w.bytes(dst);
+    w.bytes(payload);
+    return f;
+}
+
 }  // namespace
+
+auto build_ipv4_udp(const MacAddress& dst_mac, const MacAddress& src_mac, const Ipv4Address& src,
+                    const Ipv4Address& dst, std::uint16_t src_port, std::uint16_t dst_port,
+                    std::span<const std::byte> payload) -> std::vector<std::byte> {
+    auto udp = udp_datagram(src_port, dst_port, payload);
+    std::uint32_t pseudo = add_words(0, src);
+    pseudo = add_words(pseudo, dst);
+    pseudo += ipproto_udp;
+    pseudo += static_cast<std::uint32_t>(udp.size());
+    std::uint16_t sum = fold(add_words(pseudo, udp));
+    put16(udp, udp_checksum_offset, sum == 0 ? 0xFFFF : sum);  // RFC 768: 0 means none
+
+    std::vector<std::byte> f;
+    f.reserve(ethernet_header_size + ipv4_min_header_size + udp.size());
+    wire::Writer w{f};
+    write_ethernet(w, dst_mac, src_mac, neighbor::ethertype_ipv4);
+    w.u8(ipv4_vihl);
+    w.u8(0);
+    w.be16(static_cast<std::uint16_t>(ipv4_min_header_size + udp.size()));
+    w.be16(0);
+    w.be16(ipv4_dont_fragment);
+    w.u8(reply_hop_limit);
+    w.u8(ipproto_udp);
+    w.be16(0);
+    w.bytes(src);
+    w.bytes(dst);
+    put16(f, ethernet_header_size + ipv4_checksum_offset,
+          fold(add_words(0, std::span{f}.subspan(ethernet_header_size, ipv4_min_header_size))));
+    w.bytes(udp);
+    return f;
+}
+
+auto build_ipv6_udp(const MacAddress& dst_mac, const MacAddress& src_mac, const Ipv6Address& src,
+                    const Ipv6Address& dst, std::uint16_t src_port, std::uint16_t dst_port,
+                    std::span<const std::byte> payload) -> std::vector<std::byte> {
+    auto udp = udp_datagram(src_port, dst_port, payload);
+    const std::uint16_t sum = ipv6_l4_checksum(src, dst, ipproto_udp, udp);
+    put16(udp, udp_checksum_offset, sum == 0 ? 0xFFFF : sum);
+    return ipv6_packet(dst_mac, src_mac, src, dst, ipproto_udp, udp, reply_hop_limit);
+}
+
+auto build_icmpv6(const MacAddress& dst_mac, const MacAddress& src_mac, const Ipv6Address& src,
+                  const Ipv6Address& dst, std::uint8_t type, std::uint8_t code,
+                  std::span<const std::byte> body, std::uint8_t hop_limit)
+    -> std::vector<std::byte> {
+    std::vector<std::byte> m;
+    m.reserve(icmp_header_size + body.size());
+    wire::Writer w{m};
+    w.u8(type);
+    w.u8(code);
+    w.be16(0);
+    w.bytes(body);
+    put16(m, icmp_checksum_offset, ipv6_l4_checksum(src, dst, ipproto_icmpv6, m));
+    return ipv6_packet(dst_mac, src_mac, src, dst, ipproto_icmpv6, m, hop_limit);
+}
+
+auto build_ethernet(const MacAddress& dst_mac, const MacAddress& src_mac,
+                    std::span<const std::byte> ip_packet) -> std::vector<std::byte> {
+    const bool v6 = !ip_packet.empty() && (u8_at(ip_packet, 0) >> version_shift) == ip_version_6;
+    std::vector<std::byte> f;
+    f.reserve(ethernet_header_size + ip_packet.size());
+    wire::Writer w{f};
+    write_ethernet(w, dst_mac, src_mac, v6 ? neighbor::ethertype_ipv6 : neighbor::ethertype_ipv4);
+    w.bytes(ip_packet);
+    return f;
+}
 
 auto to_string(PacketError e) noexcept -> const char* {
     switch (e) {

@@ -18,3 +18,7 @@ Steering that applies to all of them is in `../steering/`.
 
 Suggested order: build-and-ci → harbor phases 1–2 → helm + hull (phase 3)
 → oar-blk (phase 4) → oar-net (phase 5) → controller-interface → GPU.
+
+The remaining AWS VPC features (subnets, route tables, security groups,
+gateways and more) are mapped against these specs in
+[docs/vpc-gap-analysis.md](../../docs/vpc-gap-analysis.md).

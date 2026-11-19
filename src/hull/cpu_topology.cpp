@@ -104,6 +104,30 @@ auto to_string(TopologyError e) noexcept -> const char* {
     return "unknown";
 }
 
+auto format_cpu_list(std::span<const CpuId> cpus) -> std::optional<std::string> {
+    std::string out;
+    std::size_t i = 0;
+    while (i < cpus.size()) {
+        if (i > 0 && cpus[i] <= cpus[i - 1]) {
+            return std::nullopt;
+        }
+        std::size_t j = i;
+        while (j + 1 < cpus.size() && cpus[j + 1] == cpus[j] + 1) {
+            ++j;
+        }
+        if (!out.empty()) {
+            out += ',';
+        }
+        out += std::to_string(cpus[i]);
+        if (j > i) {
+            out += '-';
+            out += std::to_string(cpus[j]);
+        }
+        i = j + 1;
+    }
+    return out;
+}
+
 auto parse_cpu_list(std::string_view text) -> std::expected<std::vector<CpuId>, CpuListError> {
     text = strip_newline(text);
     std::vector<CpuId> out;

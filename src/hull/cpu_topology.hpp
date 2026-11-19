@@ -16,6 +16,9 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <optional>
+#include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -44,6 +47,12 @@ enum class CpuListError : std::uint8_t {
 // empty when no CPU is isolated. Returns the CPUs in ascending order.
 [[nodiscard]] auto parse_cpu_list(std::string_view text)
     -> std::expected<std::vector<CpuId>, CpuListError>;
+
+// The inverse of parse_cpu_list(): formats strictly ascending CPUs in the
+// kernel's compact cpulist form ("0-3,8,10-11", no trailing newline), as
+// written to a cgroup's cpuset.cpus. Empty input gives "". Input that is
+// not strictly ascending is a programming error and yields std::nullopt.
+[[nodiscard]] auto format_cpu_list(std::span<const CpuId> cpus) -> std::optional<std::string>;
 
 // One physical core: its logical CPUs in ascending order (one entry without
 // SMT, two with 2-way SMT).

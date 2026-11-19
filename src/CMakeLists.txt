@@ -81,13 +81,15 @@ target_link_libraries(ak_helm
   PRIVATE OpenSSL::Crypto ak::warnings ak::hardening)
 
 # hull: host-agent command authentication (Ed25519 signatures and sequence
-# numbers) and the core / huge-page allocator.
+# numbers), the core / huge-page allocator, and the per-VMM jail and cgroup.
 add_library(ak_hull
   hull/command_auth.cpp
   hull/cpu_topology.cpp
+  hull/jail.cpp
   hull/resource_allocator.cpp
   hull/sequence_tracker.cpp
-  hull/signature_verifier.cpp)
+  hull/signature_verifier.cpp
+  hull/vm_cgroup.cpp)
 add_library(ak::hull ALIAS ak_hull)
 target_link_libraries(ak_hull
   PUBLIC ak::common ak::helm OpenSSL::Crypto

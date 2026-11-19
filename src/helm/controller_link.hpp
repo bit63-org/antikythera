@@ -31,9 +31,9 @@
 //     this server, then hands the slot to helm unmodified (Requirement
 //     1.4). It never verifies signatures: hull does, and helm is not
 //     trusted to (helm-control-plane design).
-//   - It checks each MapUpdate's shape and target the same way and hands
-//     it, with its exact signed bytes, to helm, which verifies it before
-//     oar-net applies it. GroupPolicy frames get the same treatment.
+//   - It checks each MapUpdate's and TunnelPeers frame's shape and target
+//     the same way and hands it, with its exact signed bytes, to helm,
+//     which forwards it to oar-net to verify and apply.
 //   - Any protocol violation (a malformed record, a record that only helm
 //     sends, an envelope for another server, an ack for a report never
 //     sent) ends the connection; the link reconnects and re-registers.
@@ -69,6 +69,7 @@
 #include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
 #include "proto/report.hpp"
+#include "proto/tunnel_peers.hpp"
 #include "tls/tls.hpp"
 
 namespace ak::helm {
@@ -93,6 +94,11 @@ public:
     // exact encoding, which helm forwards to the network roles unmodified
     // (GroupPolicyFanout). Ignored by sinks that predate it.
     virtual auto on_group_policy(const proto::GroupPolicy& /*policy*/,
+                                 std::span<const std::byte> /*frame*/) -> void {}
+    // A VTEP's tunnel peer set for this server; `frame` is its exact
+    // encoding, which the VTEP's network role verifies. The default drops
+    // it, for sinks that run no network role.
+    virtual auto on_tunnel_peers(const proto::TunnelPeers& /*peers*/,
                                  std::span<const std::byte> /*frame*/) -> void {}
 };
 

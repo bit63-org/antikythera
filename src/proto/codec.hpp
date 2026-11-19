@@ -11,7 +11,7 @@
 // antikythera library. It encodes and decodes frames and says which bytes
 // are signed; it never signs or verifies. Signing is the controller's job
 // (kythira's HSM/KMS) and verification is the receiver's (hull for slots,
-// helm/oar-net for mapping updates), each with its own Ed25519
+// oar-net for mapping updates and tunnel peer sets), each with its own Ed25519
 // implementation.
 //
 // All multi-byte fields are little-endian, matching the mailbox slot.
@@ -62,6 +62,9 @@ enum class DecodeError : std::uint8_t {
     server_id_mismatch,       // envelope server_id differs from the slot header's server_id
     bad_policy_version,       // group policy version 0 (versions start at 1)
     bad_group_limits,         // group policy limits that do not fit its mode or bounds
+    bad_peers_version,        // tunnel peer set version 0 (versions start at 1)
+    bad_public_key,           // a tunnel public key is all zero
+    duplicate_public_key,     // two tunnel peers share a public key
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -128,6 +131,12 @@ enum class DecodeError : std::uint8_t {
             return "group policy version 0";
         case DecodeError::bad_group_limits:
             return "group policy limits do not fit its mode";
+        case DecodeError::bad_peers_version:
+            return "tunnel peer set version 0";
+        case DecodeError::bad_public_key:
+            return "tunnel public key all zero";
+        case DecodeError::duplicate_public_key:
+            return "two tunnel peers share a public key";
     }
     return "unknown";
 }

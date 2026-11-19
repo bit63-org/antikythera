@@ -1,6 +1,6 @@
 # Implementation Plan — Controller interface and the kythira EC2 integration
 
-## Status: 9/12 tasks complete
+## Status: 10/13 tasks complete
 
 ## Tasks
 
@@ -49,6 +49,14 @@
   fuzz. _Requirements: 7.5_ — Done: kind 7, 96-byte entries with a
   `slot` byte (NIC IDs are unique only per network role), strictly
   ascending (slot, nic_id, attachment), at most 1024 per report.
+- [x] 13. Tunnel key distribution. _Requirements: 8_ (`TunnelPeers` frame
+  and link record type 7 in `src/proto/`, VTEP public keys in inventory
+  format 2, helm's `TunnelKeyring` (per-VTEP X25519 key pairs, newest peer
+  set per VTEP, role provisioning), the `tunnel_peers` sideband transfer,
+  and oar-net's `TunnelPeerSet`; `tunnel-peers` in the harbor test
+  controller's script. See design "TunnelPeers". Wiring the keyring into
+  `HelmDaemon` and `TunnelPeerSet` into `NetRole` follows helm main and
+  oar-net task 11.)
 - [ ] 6. Draft the kythira `ec2-compatible-api` spec in the kythira
   repository, from Requirement 6. _Requirements: 6_
 - [ ] 7. End-to-end: AWS CLI `run-instances` against kythira, landing in a

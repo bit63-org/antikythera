@@ -190,6 +190,21 @@ wraps in a report header and sends (Requirement 11). The role keeps a
 detached NIC's final meter until it has answered one `group_usage`; helm
 then keeps it until the controller acknowledges that report.
 
+`tunnel_peers` forwards a controller TunnelPeers frame (a VTEP's
+WireGuard peers and their public keys) the same way and in the same chunk
+format; a chunk of one transfer type never continues the other.
+
+Tunnel keys (`src/helm/tunnel_keyring.*`, controller-interface design
+"TunnelPeers"). helm keeps one X25519 key pair per VTEP, generated from
+the OpenSSL RNG when the VTEP's network role first attaches and held in
+`SecretBytes` for the life of the process. `TunnelKeyring::provision`
+sends a role its private key (`set_tunnel_key`) and then the newest
+controller peer set for its VTEP, on every attach, so a restarted role
+gets both back. `fill` puts the public keys in the inventory. Peer sets
+are kept per VTEP by version (a different frame of the same version
+replaces the held one, since helm cannot judge signatures) and forwarded
+unmodified; the role verifies them.
+
 `create_volume`, `delete_volume` and `rewrap_volume` are the storage
 role's half of the volume commands: the role keeps the wrapped key (opaque
 to it) in the volume's metadata and releases the space on delete. Other

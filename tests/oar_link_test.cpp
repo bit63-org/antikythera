@@ -121,6 +121,7 @@ public:
     std::vector<std::byte> key;
     ak::helm::VolumeId key_volume{0};
     std::vector<std::vector<std::byte>> frames;
+    std::vector<std::vector<std::byte>> peer_frames;
     std::optional<ak::helm::VolumeId> created;
     std::uint64_t created_sectors{0};
     std::vector<std::byte> created_key;
@@ -174,6 +175,10 @@ public:
         frames.emplace_back(frame.begin(), frame.end());
         return status;
     }
+    auto tunnel_peers(std::span<const std::byte> frame) -> oar::Status override {
+        peer_frames.emplace_back(frame.begin(), frame.end());
+        return status;
+    }
     auto health() -> std::expected<oar::Health, oar::Status> override {
         if (status != oar::Status::ok) {
             return std::unexpected(status);
@@ -209,6 +214,8 @@ auto exercise(Binding& helm_binding, Binding& oar_binding, std::size_t mtu) -> v
     OarLink link{helm_binding, config(long_timeout, mtu)};
     const auto key = sample_key();
     const auto frame = pattern(multi_chunk_frame);
+    auto peer_frame = pattern(multi_chunk_frame + 1);
+    peer_frame[0] = std::byte{0xEE};
     const auto wrapped = pattern(wrapped_size);
     const std::vector<std::byte> rewrapped(wrapped_size, std::byte{rewrapped_fill});
     const oar::PrepareFunction prep{.fn = sample_fn,
@@ -230,6 +237,7 @@ auto exercise(Binding& helm_binding, Binding& oar_binding, std::size_t mtu) -> v
         BOOST_TEST(link.clean_function({.fn = sample_fn, .action = CleaningAction::drop_volume_key})
                        .has_value());
         BOOST_TEST(link.map_update(frame).has_value());
+        BOOST_TEST(link.tunnel_peers(peer_frame).has_value());
         BOOST_TEST(link.create_volume({.volume_id = sample_volume,
                                        .owner_vm = sample_vm,
                                        .capacity_sectors = sample_sectors,
@@ -254,6 +262,8 @@ auto exercise(Binding& helm_binding, Binding& oar_binding, std::size_t mtu) -> v
     BOOST_TEST((fake.cleaned->action == CleaningAction::drop_volume_key));
     BOOST_REQUIRE(fake.frames.size() == 1U);
     BOOST_TEST((fake.frames[0] == frame));
+    BOOST_REQUIRE(fake.peer_frames.size() == 1U);
+    BOOST_TEST((fake.peer_frames[0] == peer_frame));
     BOOST_TEST((fake.created == sample_volume));
     BOOST_TEST(fake.created_sectors == sample_sectors);
     BOOST_TEST((fake.created_key == wrapped));
@@ -346,6 +356,9 @@ BOOST_AUTO_TEST_CASE(invalid_arguments_never_reach_the_wire) {
     BOOST_TEST((link.map_update({}).error().code == LinkErrc::bad_request));
     const std::vector<std::byte> too_big(oar::max_map_frame + 1);
     BOOST_TEST((link.map_update(too_big).error().code == LinkErrc::bad_request));
+    BOOST_TEST((link.tunnel_peers({}).error().code == LinkErrc::bad_request));
+    const std::vector<std::byte> too_many_peers(oar::max_tunnel_peers_frame + 1);
+    BOOST_TEST((link.tunnel_peers(too_many_peers).error().code == LinkErrc::bad_request));
 
     // A moved-from key holds nothing to deliver. Using it after the move is
     // the point of the check.
@@ -488,6 +501,11 @@ BOOST_AUTO_TEST_CASE(roles_without_a_volume_store_answer_unsupported) {
                      std::span{peer}.first(oar::remove_tunnel_peer_size), 4);
     serve_request(endpoint, role);
     BOOST_TEST((read_raw_status(*helm_b) == oar::Status::unsupported));
+    const auto peers_body =
+        oar::encode_map_chunk({.total = 3, .offset = 0, .chunk = std::span{peer}.first(3)}).value();
+    send_raw_request(*helm_b, mctp::VendorType::tunnel_peers, peers_body, 5);
+    serve_request(endpoint, role);
+    BOOST_TEST((read_raw_status(*helm_b) == oar::Status::unsupported));
 
     // A malformed volume body never reaches the handler.
     FakeOar fake;
@@ -522,6 +540,54 @@ BOOST_AUTO_TEST_CASE(map_transfer_must_be_contiguous) {
     serve_request(endpoint, fake);
     BOOST_TEST((read_raw_status(*helm_b) == oar::Status::bad_request));
     BOOST_TEST(fake.frames.empty());
+}
+
+// A map_update transfer and a tunnel_peers transfer share the endpoint's
+// reassembly buffer: a chunk of one type never continues the other.
+BOOST_AUTO_TEST_CASE(frame_transfers_do_not_mix) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    FakeOar fake;
+    OarEndpoint endpoint{*oar_b, oar_config(big_mtu)};
+    const auto data = pattern(oar::max_map_chunk);
+    constexpr std::uint32_t total = oar::max_map_chunk * 2;
+
+    auto body = oar::encode_map_chunk({.total = total, .offset = 0, .chunk = data}).value();
+    send_raw_request(*helm_b, mctp::VendorType::map_update, body, 0);
+    serve_request(endpoint, fake);
+    BOOST_TEST((read_raw_status(*helm_b) == oar::Status::ok));
+    body = oar::encode_map_chunk({.total = total, .offset = oar::max_map_chunk, .chunk = data})
+               .value();
+    send_raw_request(*helm_b, mctp::VendorType::tunnel_peers, body, 1);
+    serve_request(endpoint, fake);
+    BOOST_TEST((read_raw_status(*helm_b) == oar::Status::bad_request));
+    BOOST_TEST(fake.frames.empty());
+    BOOST_TEST(fake.peer_frames.empty());
+
+    // A tunnel_peers transfer may not announce more than its own limit,
+    // even though a MapUpdate of that size would be fine.
+    body =
+        oar::encode_map_chunk({.total = static_cast<std::uint32_t>(oar::max_tunnel_peers_frame + 1),
+                               .offset = 0,
+                               .chunk = data})
+            .value();
+    send_raw_request(*helm_b, mctp::VendorType::tunnel_peers, body, 2);
+    serve_request(endpoint, fake);
+    BOOST_TEST((read_raw_status(*helm_b) == oar::Status::bad_request));
+    BOOST_TEST(fake.peer_frames.empty());
+}
+
+BOOST_AUTO_TEST_CASE(largest_tunnel_peers_frame) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    FakeOar fake;
+    OarEndpoint endpoint{*oar_b, oar_config(big_mtu)};
+    OarLink link{*helm_b, config(long_timeout, big_mtu)};
+    const auto frame = pattern(oar::max_tunnel_peers_frame);
+    {
+        const Server server{endpoint, fake};
+        BOOST_TEST(link.tunnel_peers(frame).has_value());
+    }
+    BOOST_REQUIRE(fake.peer_frames.size() == 1U);
+    BOOST_TEST((fake.peer_frames[0] == frame));
 }
 
 BOOST_AUTO_TEST_CASE(largest_map_frame) {

@@ -13,7 +13,7 @@
 //
 // Header (little-endian, 0x20 bytes):
 //   0x00  magic       u32  'AKRP'
-//   0x04  version     u16  report format version (1)
+//   0x04  version     u16  report format version (2)
 //   0x06  kind        u16  ReportKind
 //   0x08  server_id   u64  reporting server; non-zero
 //   0x10  report_seq  u64  non-zero, strictly increasing within one helm boot
@@ -29,7 +29,8 @@
 //     0x10 cores_total u16 | cores_free u16 | health u8 | vtep_count u8 | rsvd u16
 //     0x18 pages_1g_total u32 | pages_1g_free u32
 //     0x20 function_count u16 | vm_count u16 | volume_count u16 | network_count u16
-//     0x28 vteps      vtep_count x 16 (IPv6 underlay addresses)
+//     0x28 vteps      vtep_count x 48:
+//                       address [16] (IPv6 underlay) | tunnel_key [32]
 //          functions  function_count x 16:
 //                       slot u8 | type u8 | function u16 | state u8 | rsvd [3] | owner_vm u64
 //          vms        vm_count x 16: vm_id u64 | vcpus u16 | rsvd u16 | memory_mib u32
@@ -69,6 +70,11 @@
 // assigned or releasing. map_version 0 in `networks` means the network
 // exists but no mapping has been applied yet.
 //
+// A VTEP's tunnel_key is the X25519 public key of its WireGuard key pair
+// (tunnel_peers.hpp), all zero until helm has one for it. The controller
+// sends it to the VTEP's peers. Format 2 added it; format 1 had 16-byte
+// VTEP entries.
+//
 // Enum values are shared with helm (FunctionType, FunctionState) and the
 // mailbox (Status, ExitReason, FaultCode); tests/proto_report_test.cpp
 // pins them together, since this header must not depend on helm.
@@ -88,11 +94,12 @@
 #include "common/wire.hpp"
 #include "proto/codec.hpp"
 #include "proto/map_update.hpp"
+#include "proto/tunnel_peers.hpp"
 
 namespace ak::proto {
 
 inline constexpr std::uint32_t report_magic = 0x5052'4B41;  // "AKRP" as little-endian bytes
-inline constexpr std::uint16_t report_version = 1;
+inline constexpr std::uint16_t report_version = 2;
 inline constexpr std::size_t report_header_size = 0x20;
 
 // Inventory bounds. They keep the largest report under 128 KiB; a server
@@ -104,6 +111,7 @@ inline constexpr std::size_t max_volumes = 1024;
 inline constexpr std::size_t max_networks = 4096;
 
 inline constexpr std::size_t inventory_fixed_size = 0x28;
+inline constexpr std::size_t inventory_vtep_size = vtep_address_size + tunnel_key_size;  // 48
 inline constexpr std::size_t inventory_function_size = 16;
 inline constexpr std::size_t inventory_vm_size = 16;
 inline constexpr std::size_t inventory_volume_size = 24;
@@ -114,7 +122,7 @@ inline constexpr std::size_t max_outcome_payload = 148;
 inline constexpr std::size_t fixed_event_size = 16;
 
 inline constexpr std::size_t max_inventory_size =
-    inventory_fixed_size + (max_vteps * vtep_address_size) +
+    inventory_fixed_size + (max_vteps * inventory_vtep_size) +
     (max_functions * inventory_function_size) + (max_vms * inventory_vm_size) +
     (max_volumes * inventory_volume_size) + (max_networks * inventory_network_size);
 inline constexpr std::size_t group_usage_fixed_size = 8;
@@ -233,6 +241,11 @@ struct Inventory {
     std::uint32_t pages_1g_total{0};
     std::uint32_t pages_1g_free{0};
     std::vector<VtepAddress> vteps;
+    // The VTEPs' tunnel public keys (encoded with `vteps`): empty when no
+    // VTEP has a key yet, or one per entry of `vteps`, in the same order,
+    // all zero for a VTEP with none yet. Decoding gives empty when every
+    // key is zero, so the encoding stays canonical.
+    std::vector<TunnelPublicKey> tunnel_keys;
     std::vector<InventoryFunction> functions;
     std::vector<InventoryVm> vms;
     std::vector<InventoryVolume> volumes;
@@ -387,6 +400,9 @@ namespace detail {
     }
     if (std::ranges::adjacent_find(inv.vteps, std::ranges::greater_equal{}) != inv.vteps.end()) {
         return std::unexpected(DecodeError::not_ascending);
+    }
+    if (!inv.tunnel_keys.empty() && inv.tunnel_keys.size() != inv.vteps.size()) {
+        return std::unexpected(DecodeError::bad_public_key);
     }
     for (const auto& f : inv.functions) {
         if (!known(f.type) || !known(f.state)) {
@@ -547,7 +563,7 @@ private:
 [[nodiscard]] inline auto inventory_size(std::size_t vteps, std::size_t functions, std::size_t vms,
                                          std::size_t volumes, std::size_t networks) noexcept
     -> std::size_t {
-    return inventory_fixed_size + (vteps * vtep_address_size) +
+    return inventory_fixed_size + (vteps * inventory_vtep_size) +
            (functions * inventory_function_size) + (vms * inventory_vm_size) +
            (volumes * inventory_volume_size) + (networks * inventory_network_size);
 }
@@ -589,8 +605,14 @@ private:
         return std::unexpected(DecodeError::trailing_bytes);
     }
     inv.vteps.resize(vtep_count);
-    for (auto& v : inv.vteps) {
-        in.bytes(v);
+    inv.tunnel_keys.resize(vtep_count);
+    for (std::size_t i = 0; i < vtep_count; ++i) {
+        in.bytes(inv.vteps[i]);
+        in.bytes(inv.tunnel_keys[i]);
+    }
+    if (std::ranges::all_of(inv.tunnel_keys,
+                            [](const TunnelPublicKey& k) { return all_zero(k); })) {
+        inv.tunnel_keys.clear();
     }
     inv.functions.resize(function_count);
     for (auto& f : inv.functions) {
@@ -644,8 +666,10 @@ inline auto write_inventory(wire::Writer& w, const Inventory& inv) -> void {
     w.le16(static_cast<std::uint16_t>(inv.vms.size()));
     w.le16(static_cast<std::uint16_t>(inv.volumes.size()));
     w.le16(static_cast<std::uint16_t>(inv.networks.size()));
-    for (const auto& v : inv.vteps) {
-        w.bytes(v);
+    for (std::size_t i = 0; i < inv.vteps.size(); ++i) {
+        constexpr TunnelPublicKey none{};
+        w.bytes(inv.vteps[i]);
+        w.bytes(inv.tunnel_keys.empty() ? none : inv.tunnel_keys[i]);
     }
     for (const auto& f : inv.functions) {
         w.u8(f.slot);

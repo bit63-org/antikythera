@@ -124,6 +124,9 @@ public:
     // way leaves the role's partial frame to be discarded by the next
     // transfer, which always starts again at offset 0.
     auto map_update(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
+    // Sends one controller TunnelPeers frame the same way; fails without
+    // sending if it is empty or larger than oar::max_tunnel_peers_frame.
+    auto tunnel_peers(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
     auto health() -> std::expected<oar::Health, LinkError>;
     // Forwards one controller GroupPolicy frame (exactly
     // oar::group_policy_frame_size bytes) to a network role.
@@ -144,6 +147,9 @@ private:
         -> std::expected<void, LinkError>;
     auto await_response(mctp::VendorType type, std::uint8_t tag)
         -> std::expected<std::vector<std::byte>, LinkError>;
+    // Sends a frame as consecutive chunks of `type` (map_update, tunnel_peers).
+    auto send_chunked(mctp::VendorType type, std::span<const std::byte> frame)
+        -> std::expected<void, LinkError>;
 
     Binding* _binding;
     LinkConfig _config;
@@ -207,6 +213,10 @@ public:
         -> std::expected<oar::UsagePage, oar::Status> {
         return std::unexpected(oar::Status::unsupported);
     }
+    // A whole, reassembled TunnelPeers frame, not yet decoded or verified.
+    virtual auto tunnel_peers(std::span<const std::byte> /*frame*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
 };
 
 class OarEndpoint {
@@ -228,16 +238,20 @@ public:
 private:
     auto dispatch(OarHandler& handler, mctp::VendorType type, std::span<const std::byte> body)
         -> std::vector<std::byte>;
-    auto map_chunk(OarHandler& handler, std::span<const std::byte> body) -> oar::Status;
-    auto reset_map() noexcept -> void;
+    // One chunk of a map_update or tunnel_peers transfer.
+    auto frame_chunk(OarHandler& handler, mctp::VendorType type, std::span<const std::byte> body)
+        -> oar::Status;
+    auto reset_frame() noexcept -> void;
 
     Binding* _binding;
     LinkConfig _config;
     mctp::Assembler _assembler;
     LinkStats _stats;
-    // MapUpdate transfer in progress: total length, bytes so far in _map_frame.
-    std::uint32_t _map_total{0};
-    std::vector<std::byte> _map_frame;
+    // Chunked transfer in progress: its type, total length, and the bytes
+    // so far in _frame.
+    mctp::VendorType _frame_type{mctp::VendorType::map_update};
+    std::uint32_t _frame_total{0};
+    std::vector<std::byte> _frame;
 };
 
 }  // namespace ak::helm

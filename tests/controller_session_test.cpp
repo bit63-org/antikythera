@@ -142,17 +142,18 @@ auto group_policy_record(std::uint64_t to) -> std::vector<std::byte> {
 }
 
 auto tunnel_peers_record(std::uint64_t to) -> std::vector<std::byte> {
-    proto::TunnelPeers t{.server_id = to,
-                         .key_id = key,
-                         .vtep = {},
-                         .peers_version = 4,
-                         .peers = {{.vtep = {}, .public_key = {}}},
-                         .signature = {}};
+    proto::TunnelPeers t{
+        .server_id = to,
+        .key_id = key,
+        .vtep = {},
+        .peers_version = 4,
+        .peers = {{.vtep = {}, .mode = proto::TunnelMode::wireguard, .spi = 0, .key = {}}},
+        .signature = {}};
     t.vtep[0] = std::byte{0xFD};
     t.vtep[15] = std::byte{1};
     t.peers[0].vtep = t.vtep;
     t.peers[0].vtep[15] = std::byte{2};
-    t.peers[0].public_key.fill(std::byte{0x42});
+    t.peers[0].key.fill(std::byte{0x42});
     auto b = proto::encode_tunnel_peers(t);
     BOOST_REQUIRE(b.has_value());
     return framed(RecordType::tunnel_peers, *b);

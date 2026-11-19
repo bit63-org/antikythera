@@ -25,6 +25,10 @@
 //      two peers at once), then every peer in the frame is set. Unchanged
 //      peers keep their sessions (Tunnel::set_peer leaves them alone).
 //
+// Every peer must be in WireGuard mode: the role advertises only WireGuard,
+// so a PSP peer is a controller error, and the whole frame is refused
+// (unsupported) before anything changes.
+//
 // Peers added directly with Tunnel::set_peer (helm's set_tunnel_peer, for
 // pre-shared keys) are left alone unless the frame names their VTEP, in
 // which case the frame's key replaces theirs and the pre-shared key is
@@ -65,6 +69,7 @@ enum class PeersResult : std::uint8_t {
     bad_signature,  // the signature does not verify
     stale,          // older than the version applied
     rejected,       // the Tunnel refused a peer's key
+    unsupported,    // a peer in a tunnel mode this role does not run (PSP)
 };
 
 [[nodiscard]] auto to_string(PeersResult r) noexcept -> const char*;
@@ -81,6 +86,7 @@ struct PeerSetCounters {
     std::uint64_t bad_signature{0};
     std::uint64_t stale{0};
     std::uint64_t rejected{0};
+    std::uint64_t unsupported{0};
     std::uint64_t peers_added{0};    // set_peer for a VTEP not installed before
     std::uint64_t peers_removed{0};  // removed: gone from the set, or re-keyed
 };

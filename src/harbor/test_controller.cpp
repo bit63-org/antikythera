@@ -305,18 +305,18 @@ auto tunnel_peer(std::string_view s) -> std::expected<proto::TunnelPeer, std::st
         return std::unexpected(v.error());
     }
     const auto hex = s.substr(c + 1);
-    proto::TunnelPeer p{.vtep = *v, .public_key = {}};
-    if (hex.size() != 2 * p.public_key.size()) {
+    proto::TunnelPeer p{.vtep = *v, .mode = proto::TunnelMode::wireguard, .spi = 0, .key = {}};
+    if (hex.size() != 2 * p.key.size()) {
         return std::unexpected("tunnel peer key must be 64 hex digits");
     }
-    for (std::size_t i = 0; i < p.public_key.size(); ++i) {
+    for (std::size_t i = 0; i < p.key.size(); ++i) {
         std::uint8_t b = 0;
         const char* first = hex.data() + (2 * i);
         const auto [end, ec] = std::from_chars(first, first + 2, b, 16);
         if (ec != std::errc{} || end != first + 2) {
             return std::unexpected("tunnel peer key must be 64 hex digits");
         }
-        p.public_key[i] = std::byte{b};
+        p.key[i] = std::byte{b};
     }
     return p;
 }

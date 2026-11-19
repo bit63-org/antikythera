@@ -89,8 +89,9 @@ public:
     // sending anything if the VTEP has no key pair (call ensure() first).
     auto provision(OarLink& link, const oar::Vtep& vtep) -> std::expected<void, LinkError>;
 
-    // Sets inv.tunnel_keys from inv.vteps: each VTEP's public key, zero for
-    // a VTEP with no key pair; left empty if none has one.
+    // Sets inv.tunnels from inv.vteps: each VTEP supports WireGuard (the
+    // only mode oar-net implements) and has its public key, zero for a
+    // VTEP with no key pair yet.
     auto fill(proto::Inventory& inv) const -> void;
 
     [[nodiscard]] auto size() const noexcept -> std::size_t { return _pairs.size(); }

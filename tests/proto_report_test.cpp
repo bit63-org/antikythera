@@ -50,6 +50,9 @@ auto vtep(std::uint8_t tag) -> proto::VtepAddress {
     return a;
 }
 
+constexpr proto::TunnelModes wg_bit = proto::tunnel_mode_bit(proto::TunnelMode::wireguard);
+constexpr proto::TunnelModes psp_bit = proto::tunnel_mode_bit(proto::TunnelMode::psp);
+
 auto tunnel_key(std::uint8_t fill) -> proto::TunnelPublicKey {
     proto::TunnelPublicKey k{};
     k.fill(std::byte{fill});
@@ -67,7 +70,8 @@ auto sample_inventory() -> proto::Inventory {
         .pages_1g_free = 192,
         .vteps = {vtep(1), vtep(2)},
         // The second VTEP has no key pair yet.
-        .tunnel_keys = {tunnel_key(0xA1), proto::TunnelPublicKey{}},
+        .tunnels = {{.modes = wg_bit, .public_key = tunnel_key(0xA1)},
+                    {.modes = wg_bit | psp_bit, .public_key = {}}},
         .functions = {{.slot = 1,
                        .type = proto::FunctionType::nic_vf,
                        .function = 0,
@@ -250,8 +254,7 @@ BOOST_AUTO_TEST_CASE(header_layout_is_little_endian) {
 BOOST_AUTO_TEST_CASE(inventory_size_follows_its_counts) {
     const auto inv = sample_inventory();
     const auto b = encoded(make_report(inv));
-    BOOST_TEST(proto::inventory_vtep_size == 48U);
-    BOOST_TEST(b.size() == proto::report_header_size + proto::inventory_fixed_size + (2 * 48) +
+    BOOST_TEST(b.size() == proto::report_header_size + proto::inventory_fixed_size + (2 * 56) +
                                (3 * 16) + (2 * 16) + (1 * 24) + (2 * 16));
 }
 
@@ -364,9 +367,12 @@ BOOST_AUTO_TEST_CASE(inventory_rules_are_enforced_both_ways) {
         {[](proto::Inventory& i) { i.networks[1].vni = 5; }, DecodeError::not_ascending},
         {[](proto::Inventory& i) { i.vteps.resize(proto::max_vteps + 1, i.vteps[0]); },
          DecodeError::too_many_entries},
-        {[](proto::Inventory& i) { i.tunnel_keys.pop_back(); }, DecodeError::bad_public_key},
-        {[](proto::Inventory& i) { i.tunnel_keys.push_back(tunnel_key(1)); },
+        {[](proto::Inventory& i) { i.tunnels.pop_back(); }, DecodeError::bad_public_key},
+        {[](proto::Inventory& i) { i.tunnels.push_back(i.tunnels[0]); },
          DecodeError::bad_public_key},
+        {[](proto::Inventory& i) { i.tunnels[1].modes = 0x04; }, DecodeError::unknown_value},
+        // A WireGuard key without the WireGuard mode.
+        {[](proto::Inventory& i) { i.tunnels[0].modes = psp_bit; }, DecodeError::bad_public_key},
     };
     for (const auto& c : cases) {
         auto inv = sample_inventory();
@@ -383,7 +389,8 @@ BOOST_AUTO_TEST_CASE(inventory_rules_are_enforced_both_ways) {
     BOOST_TEST((decode_error(b) == DecodeError::bad_owner));
 }
 
-// Format 2: each VTEP entry is its address, then its tunnel public key.
+// Format 2: each VTEP entry is its address, its tunnel modes, then its
+// WireGuard public key.
 BOOST_AUTO_TEST_CASE(inventory_carries_vtep_tunnel_keys) {
     const auto inv = sample_inventory();
     const auto b = encoded(make_report(inv));
@@ -392,22 +399,29 @@ BOOST_AUTO_TEST_CASE(inventory_carries_vtep_tunnel_keys) {
     const std::size_t entry0 = body + proto::inventory_fixed_size;
     const std::size_t entry1 = entry0 + proto::inventory_vtep_size;
     BOOST_TEST((b[entry0] == std::byte{ula_prefix}));
-    BOOST_TEST((b[entry0 + 16] == std::byte{0xA1}));
-    BOOST_TEST((b[entry0 + 47] == std::byte{0xA1}));
+    BOOST_TEST(proto::inventory_vtep_size == 56U);
+    BOOST_TEST((b[entry0 + 16] == std::byte{0x01}));  // wireguard
+    BOOST_TEST((b[entry0 + 24] == std::byte{0xA1}));
+    BOOST_TEST((b[entry0 + 55] == std::byte{0xA1}));
     BOOST_TEST((b[entry1 + last] == std::byte{2}));
-    BOOST_TEST((b[entry1 + 16] == std::byte{0}));
+    BOOST_TEST((b[entry1 + 16] == std::byte{0x03}));  // wireguard and psp
+    BOOST_TEST((b[entry1 + 24] == std::byte{0}));
+    // The reserved bytes after the modes must be zero.
+    auto bad = b;
+    bad[entry0 + 17] = std::byte{1};
+    BOOST_TEST((decode_error(bad) == DecodeError::reserved_not_zero));
 
     // No keys at all encodes as zeros and decodes as empty again, so the
     // encoding stays canonical.
     auto keyless = inv;
-    keyless.tunnel_keys.clear();
+    keyless.tunnels.clear();
     auto zeros = keyless;
-    zeros.tunnel_keys = {proto::TunnelPublicKey{}, proto::TunnelPublicKey{}};
+    zeros.tunnels = {proto::VtepTunnel{}, proto::VtepTunnel{}};
     const auto kb = encoded(make_report(keyless));
     BOOST_TEST(kb == encoded(make_report(zeros)));
     auto back = proto::decode_report(kb);
     BOOST_REQUIRE(back.has_value());
-    BOOST_TEST(std::get<proto::Inventory>(back->body).tunnel_keys.empty());
+    BOOST_TEST(std::get<proto::Inventory>(back->body).tunnels.empty());
     BOOST_TEST((back->body == proto::ReportBody{keyless}));
 }
 

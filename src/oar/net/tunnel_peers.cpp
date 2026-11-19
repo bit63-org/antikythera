@@ -26,6 +26,8 @@ auto to_string(PeersResult r) noexcept -> const char* {
             return "stale";
         case PeersResult::rejected:
             return "rejected";
+        case PeersResult::unsupported:
+            return "unsupported";
     }
     return "unknown";
 }
@@ -57,6 +59,9 @@ auto TunnelPeerSet::count(PeersResult r) -> PeersResult {
         case PeersResult::rejected:
             ++_counters.rejected;
             break;
+        case PeersResult::unsupported:
+            ++_counters.unsupported;
+            break;
     }
     return r;
 }
@@ -81,9 +86,14 @@ auto TunnelPeerSet::apply(std::span<const std::byte> frame) -> PeersResult {
         return count(PeersResult::stale);
     }
 
+    if (std::ranges::any_of(peers->peers, [](const proto::TunnelPeer& p) {
+            return p.mode != proto::TunnelMode::wireguard;
+        })) {
+        return count(PeersResult::unsupported);
+    }
     std::map<Ipv6Address, wg::Key> wanted;
     for (const auto& p : peers->peers) {
-        wanted.emplace(p.vtep, p.public_key);
+        wanted.emplace(p.vtep, p.key);
     }
     // Remove first, so a key moving from one VTEP to another is never held
     // by two peers (the Tunnel refuses duplicate keys).

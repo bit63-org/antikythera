@@ -4,8 +4,8 @@
 // Fuzzes the TunnelPeers decoder and TunnelPeerSet::apply. An accepted
 // frame must re-encode to identical bytes (the encoding is canonical) and
 // satisfy the invariants the role relies on (ascending, unique VTEPs and
-// keys, none the target). The verifier accepts everything, so whatever
-// decodes also reaches the Tunnel: applying it must leave the Tunnel with
+// WireGuard keys, none the target). A frame with a PSP peer is refused. The verifier accepts
+// everything, so whatever decodes also reaches the Tunnel: applying it must leave the Tunnel with
 // exactly the frame's peers, or report that the Tunnel refused one.
 
 #include <algorithm>
@@ -58,16 +58,23 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     net::TunnelPeerSet set{
         **tunnel, t->server_id, t->vtep,
         [](auto /*signed_bytes*/, auto /*signature*/, auto /*key_id*/) { return true; }};
+    const bool psp = std::ranges::any_of(t->peers, [](const proto::TunnelPeer& p) {
+        return p.mode != proto::TunnelMode::wireguard;
+    });
     const auto r = set.apply(bytes);
-    if (r == net::PeersResult::applied) {
+    if (psp) {
+        // The role runs only WireGuard: refused whole, nothing installed.
+        if (r != net::PeersResult::unsupported || !(*tunnel)->peers().empty()) {
+            std::abort();
+        }
+    } else if (r == net::PeersResult::applied) {
         if ((*tunnel)->peers().size() != t->peers.size() || set.version() != t->peers_version) {
             std::abort();
         }
     } else if (r != net::PeersResult::rejected) {
         std::abort();
     }
-    if (set.apply(bytes) != (r == net::PeersResult::applied ? net::PeersResult::redelivered
-                                                            : net::PeersResult::rejected)) {
+    if (set.apply(bytes) != (r == net::PeersResult::applied ? net::PeersResult::redelivered : r)) {
         std::abort();
     }
     return 0;

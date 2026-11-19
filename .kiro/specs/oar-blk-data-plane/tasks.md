@@ -1,6 +1,6 @@
 # Implementation Plan — oar-blk: the storage data plane
 
-## Status: 7/16 tasks complete
+## Status: 8/16 tasks complete
 
 ## Tasks
 
@@ -67,9 +67,21 @@
   against the image name, `chunk_matches` for fetched chunks, hex image
   names. `fuzz/fuzz_image_manifest.cpp` checks accepted manifests
   re-encode byte for byte.
-- [ ] 10. ObjectStore seam, ChunkCache, Fetcher with readahead,
+- [x] 10. ObjectStore seam, ChunkCache, Fetcher with readahead,
   Overlay and LazyImageBackend over an in-memory store.
   _Requirements: 8.1-8.7, 8.10, 7.3_
+  — `object_store.hpp` (thread-safe `get_range`/`get`, image object
+  keys), `chunk_cache.*` (per-image `O_TMPFILE`, shared by name, one LRU
+  and budget for all images, pinned reads, hole punching), `fetcher.*`
+  (worker threads, demand ahead of readahead, one fetch per chunk with
+  promotion, one deadline per chunk, jittered retries on io, malformed
+  and corrupt responses; returns the bytes so a full cache never fails a
+  read), `overlay.*` (unlinked sparse file plus bitmap, write before
+  bits, limit, discard), `lazy_image_backend.*` (overlay/image/zero runs,
+  K_img decrypt then K_eph encrypt, holes as plaintext zeros, readahead
+  window doubling to `max_readahead_chunks`, discard on `drop_keys`).
+  `tests/image_volume_test.cpp` covers each, plus a guest reading the
+  image and its own writes through `VirtioBlkFunction`.
 - [ ] 11. S3ObjectStore: HTTP/1.1 range GET over TCP/TLS, SigV4,
   response parser with fuzz target, MinIO test.
   _Requirements: 8.2, 8.9, 8.11, 7.3_

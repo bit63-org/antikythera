@@ -111,8 +111,9 @@ The function expects every block the backend returns to be ciphertext
 under K_eph. The backend therefore re-encrypts the blocks it takes from
 the image (or synthesises as zeros): decrypt with K_img if the image is
 encrypted, then encrypt with K_eph at the same logical block number. It
-holds its own copy of K_eph in a `KeySlot`, loaded and dropped together
-with the function's. This costs one or two extra XTS passes on image
+holds K_eph (and K_img) only as `XtsCipher` contexts, which OpenSSL
+cleanses when freed, loaded and dropped together with the function's
+key. This costs one or two extra XTS passes on image
 reads (several GB/s with AES-NI, far above object store throughput) and
 keeps the function's contract and its fuzzing intact. Plaintext exists
 only transiently in the backend's buffer, which is wiped, in the same

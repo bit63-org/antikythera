@@ -29,6 +29,15 @@
 // appear and disappear with map_updates. A new peer starts pending and gets
 // the same grace period before it is declared down.
 //
+// MTU (task 11, Requirement 6): with VtepConfig::max_payload set (the MTU
+// plan's max_geneve_payload, mtu.hpp) a datagram that would exceed it is
+// dropped and counted rather than sent, so a misconfigured function MTU
+// shows up as a counter instead of fragments; and every probe_interval each
+// peer gets an OAM mtu_probe padded to exactly max_payload. A probe that
+// arrives proves full-size datagrams cross the path from that peer, which
+// PeerStatus records (largest_probe, mtu_ok). The UDP endpoint disables
+// fragmentation, so an oversize probe is lost, not quietly fragmented.
+//
 // Time is passed in rather than read, so tests drive the clock. The caller
 // calls tick() at or before the time it returns.
 //
@@ -112,18 +121,29 @@ struct PeerStatus {
     PeerState state{PeerState::pending};
     std::uint64_t keepalives_rx{0};
     std::uint64_t last_sequence{0};  // of the last keepalive received
+    std::uint64_t probes_rx{0};
+    std::size_t largest_probe{0};  // largest mtu_probe payload received from this peer
+    // A probe of at least this VTEP's max_payload arrived from the peer:
+    // the path carries full-size datagrams. Always false without max_payload.
+    bool mtu_ok{false};
 };
 
 struct VtepConfig {
     std::chrono::milliseconds keepalive_interval{std::chrono::seconds{1}};
     unsigned keepalive_misses{3};  // intervals without a keepalive before a peer is down
     std::uint16_t peer_port{geneve::udp_port};
+    // Largest Geneve UDP payload to send (MtuPlan::max_geneve_payload); 0
+    // means no limit and no MTU probes.
+    std::uint32_t max_payload{0};
+    std::chrono::milliseconds probe_interval{std::chrono::seconds{10}};
 };
 
 enum class VtepConfigError : std::uint8_t {
-    bad_interval,  // not positive
-    bad_misses,    // zero
-    bad_port,      // zero
+    bad_interval,        // not positive
+    bad_misses,          // zero
+    bad_port,            // zero
+    bad_max_payload,     // non-zero but too small for an OAM message
+    bad_probe_interval,  // not positive while max_payload is set
 };
 
 [[nodiscard]] auto to_string(VtepConfigError e) noexcept -> const char*;
@@ -136,6 +156,7 @@ struct VtepCounters {
     std::uint64_t tx_bytes{0};          // their Geneve payload bytes
     std::uint64_t tx_encode_failed{0};  // the VSwitch asked for something unencodable
     std::uint64_t tx_send_failed{0};    // the sender refused (full queue, no route)
+    std::uint64_t tx_drop_too_big{0};   // larger than max_payload
     std::uint64_t rx_datagrams{0};      // payloads handed to receive()
     std::uint64_t rx_data{0};           // data packets returned for the VSwitch
     std::array<std::uint64_t, decode_error_count> rx_drop_decode{};  // by geneve::DecodeError
@@ -144,6 +165,9 @@ struct VtepCounters {
     std::uint64_t keepalives_tx{0};
     std::uint64_t keepalives_rx{0};
     std::uint64_t keepalive_send_failed{0};
+    std::uint64_t probes_tx{0};
+    std::uint64_t probes_rx{0};
+    std::uint64_t probe_send_failed{0};
 };
 
 class Vtep final : public Underlay {
@@ -174,6 +198,7 @@ private:
     struct Peer {
         PeerStatus status;
         VtepClock::time_point next_keepalive;
+        VtepClock::time_point next_probe;
         VtepClock::time_point deadline;  // down if nothing heard by then
     };
 
@@ -184,6 +209,7 @@ private:
     auto handle_oam(const geneve::Packet& packet, const Ipv6Address& outer_src,
                     VtepClock::time_point now) -> void;
     auto set_state(Peer& peer, PeerState state) -> void;
+    auto send_oam(const Ipv6Address& vtep, std::span<const std::byte> message) -> bool;
     [[nodiscard]] auto grace() const -> VtepClock::duration;
 
     const MappingTable* _mappings;
@@ -194,6 +220,7 @@ private:
     std::shared_ptr<const MappingSnapshot> _synced;
     std::map<Ipv6Address, Peer> _peers;
     std::uint64_t _keepalive_sequence{0};
+    std::uint64_t _probe_sequence{0};
     VtepCounters _counters;
 };
 

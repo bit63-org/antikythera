@@ -4,7 +4,13 @@
 // ak-oar-net: one virtio-net function served over vfio-user, for harbor
 // (.kiro/specs/oar-net-data-plane/ task 6).
 //
-//   ak-oar-net --socket PATH --nic-id ID --mac MAC --mtu N [--tap IFNAME]
+//   ak-oar-net --socket PATH --nic-id ID --mac MAC
+//              (--mtu N | --underlay-mtu N [--tunnel-overhead N]) [--tap IFNAME]
+//
+// --mtu sets the guest MTU directly. --underlay-mtu derives it from the
+// underlay the way the data plane must (task 11, mtu.hpp): the underlay MTU
+// less Geneve encapsulation and the tunnel's overhead (WireGuard over IPv6
+// is 80), and prints the plan.
 //
 // L0 QEMU attaches with vfio-user-pci; the L1 host binds the function to
 // vfio-pci and Cloud Hypervisor hands it to an L2 guest, whose stock
@@ -35,6 +41,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include "oar/net/mtu.hpp"
 #include "oar/net/virtio_net.hpp"
 #include "oar/vfu/virtio_binding.hpp"
 
@@ -46,6 +53,8 @@ constexpr std::string_view arg_socket = "--socket";
 constexpr std::string_view arg_nic_id = "--nic-id";
 constexpr std::string_view arg_mac = "--mac";
 constexpr std::string_view arg_mtu = "--mtu";
+constexpr std::string_view arg_underlay_mtu = "--underlay-mtu";
+constexpr std::string_view arg_tunnel_overhead = "--tunnel-overhead";
 constexpr std::string_view arg_tap = "--tap";
 constexpr std::string_view tun_device = "/dev/net/tun";
 constexpr int base_auto = 0;
@@ -59,8 +68,9 @@ constexpr std::size_t poll_tap = 1;
 constexpr int exit_usage = 2;
 
 auto usage() -> int {
-    std::println(stderr, "usage: ak-oar-net {} PATH {} ID {} MAC {} N [{} IFNAME]", arg_socket,
-                 arg_nic_id, arg_mac, arg_mtu, arg_tap);
+    std::println(stderr, "usage: ak-oar-net {} PATH {} ID {} MAC ({} N | {} N [{} N]) [{} IFNAME]",
+                 arg_socket, arg_nic_id, arg_mac, arg_mtu, arg_underlay_mtu, arg_tunnel_overhead,
+                 arg_tap);
     return exit_usage;
 }
 
@@ -136,6 +146,8 @@ auto main(int argc, char** argv) -> int {
     std::optional<std::uint64_t> nic_id;
     std::optional<net::MacAddress> mac;
     std::optional<std::uint64_t> mtu;
+    std::optional<std::uint64_t> underlay_mtu;
+    std::optional<std::uint64_t> tunnel_overhead = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg{argv[i]};
         if (i + 1 >= argc) {
@@ -150,11 +162,31 @@ auto main(int argc, char** argv) -> int {
             mac = parse_mac(value);
         } else if (arg == arg_mtu) {
             mtu = parse_u64(value);
+        } else if (arg == arg_underlay_mtu) {
+            underlay_mtu = parse_u64(value);
+        } else if (arg == arg_tunnel_overhead) {
+            tunnel_overhead = parse_u64(value);
         } else if (arg == arg_tap) {
             tap_name = value;
         } else {
             return usage();
         }
+    }
+    if (underlay_mtu) {
+        if (mtu || !tunnel_overhead || *underlay_mtu > UINT32_MAX ||
+            *tunnel_overhead > UINT32_MAX) {
+            return usage();
+        }
+        auto plan = net::plan_mtu(static_cast<std::uint32_t>(*underlay_mtu),
+                                  static_cast<std::uint32_t>(*tunnel_overhead));
+        if (!plan) {
+            std::println(stderr, "ak-oar-net: underlay MTU {} with tunnel overhead {}: {}",
+                         *underlay_mtu, *tunnel_overhead, net::to_string(plan.error()));
+            return exit_usage;
+        }
+        std::println(stderr, "ak-oar-net: underlay MTU {}, tunnel {}: guest MTU {}",
+                     plan->underlay_mtu, plan->tunnel_overhead, plan->guest_mtu);
+        mtu = plan->guest_mtu;
     }
     if (socket_path.empty() || !nic_id || !mac || !mtu || *mtu > UINT16_MAX) {
         return usage();

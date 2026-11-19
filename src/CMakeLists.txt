@@ -19,6 +19,7 @@ target_link_libraries(ak_proto INTERFACE ak::common)
 add_library(ak_oar_net
   oar/net/geneve.cpp
   oar/net/mapping_table.cpp
+  oar/net/mtu.cpp
   oar/net/neighbor.cpp
   oar/net/oam.cpp
   oar/net/udp_endpoint.cpp

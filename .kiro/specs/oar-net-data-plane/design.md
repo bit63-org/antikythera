@@ -47,6 +47,10 @@ ordinary UDP socket has one source port. OAM packets (`oam.hpp`, O bit
 set, VNI 0, own Protocol Type): keepalive every N seconds per peer VTEP;
 peers missing K keepalives are reported to helm through `PeerObserver`.
 Peers are the other VTEPs of VNIs with a local NIC, from the mappings.
+MTU (`mtu.hpp`): guest MTU = underlay MTU − 94 − tunnel overhead. The
+Vtep drops anything over the planned payload and sends each peer a
+full-size, unfragmentable OAM MTU probe every probe interval, so a peer
+whose probes arrive is known to share a full-size path.
 
 ### MappingTable
 

@@ -15,9 +15,15 @@
 //   type                 1 byte    1 = keepalive
 //   reserved             2 bytes   sent as 0, ignored on receipt
 //   sequence             8 bytes   per-sender counter, big-endian
+//   padding              mtu_probe only: any length, sent as 0, ignored
 //
 // OAM is between VTEPs, not VPCs, so it carries no VNI and no NIC-pair
-// option. The MTU probe (task 11) will be another type.
+// option.
+//
+// An MTU probe (task 11) is padded to the largest Geneve payload the
+// sender's MTU plan allows (mtu.hpp, MtuPlan::max_geneve_payload) and sent
+// with fragmentation disabled, so its arrival shows the path between two
+// VTEPs carries full-size datagrams. A keepalive has no padding.
 //
 // Nothing here is authenticated: until the WireGuard tunnel (task 10) wraps
 // the underlay, anyone who can reach the VTEP's port can forge a keepalive.
@@ -44,11 +50,13 @@ inline constexpr std::size_t message_size = geneve::base_header_size + body_size
 
 enum class Type : std::uint8_t {
     keepalive = 1,
+    mtu_probe = 2,
 };
 
 struct Message {
     Type type{Type::keepalive};
     std::uint64_t sequence{0};
+    std::size_t padding{0};  // mtu_probe: bytes after the body
     friend constexpr auto operator==(const Message&, const Message&) -> bool = default;
 };
 
@@ -59,7 +67,7 @@ enum class OamError : std::uint8_t {
     truncated,       // shorter than the body
     bad_version,     // body version is not oam::version
     unknown_type,    // a type this VTEP does not implement
-    trailing_bytes,  // bytes after the body
+    trailing_bytes,  // bytes after a keepalive's body
 };
 
 inline constexpr std::size_t oam_error_count =
@@ -67,8 +75,15 @@ inline constexpr std::size_t oam_error_count =
 
 [[nodiscard]] auto to_string(OamError e) noexcept -> const char*;
 
-// The complete Geneve UDP payload for `message`.
+// The complete Geneve UDP payload for `message`: message_size bytes, plus
+// `message.padding` zero bytes for an mtu_probe (a keepalive's padding is
+// ignored).
 [[nodiscard]] auto encode(const Message& message) -> std::vector<std::byte>;
+
+// An mtu_probe whose whole Geneve payload is `payload_size` bytes (at least
+// message_size).
+[[nodiscard]] auto encode_probe(std::uint64_t sequence, std::size_t payload_size)
+    -> std::vector<std::byte>;
 
 // Parses an OAM packet that geneve::decode() accepted.
 [[nodiscard]] auto parse(const geneve::Packet& packet) noexcept -> std::expected<Message, OamError>;

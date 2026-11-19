@@ -719,6 +719,188 @@ auto decode_inventory(std::span<const std::byte> body) -> std::expected<Inventor
     return inv;
 }
 
+auto encode_group_policy_frame(std::span<const std::byte> frame)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (auto ok = check_size(frame, group_policy_frame_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return std::vector<std::byte>(frame.begin(), frame.end());
+}
+
+auto decode_group_policy_frame(std::span<const std::byte> body) noexcept
+    -> std::expected<std::span<const std::byte>, BodyError> {
+    if (auto ok = check_size(body, group_policy_frame_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return body;
+}
+
+auto encode_usage_request(std::uint16_t cursor)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    std::vector<std::byte> out;
+    out.reserve(usage_request_size);
+    wire::Writer w{out};
+    w.le16(cursor);
+    w.le16(0);
+    return out;
+}
+
+auto decode_usage_request(std::span<const std::byte> body) noexcept
+    -> std::expected<std::uint16_t, BodyError> {
+    if (auto ok = check_size(body, usage_request_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    wire::Reader r{body};
+    const auto cursor = r.le16().value_or(0);
+    if (r.le16().value_or(1) != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    return cursor;
+}
+
+namespace {
+
+auto usage_key(const UsageEntry& e) noexcept -> std::pair<NicId, std::uint64_t> {
+    return {e.nic_id, e.attachment};
+}
+
+auto check_usage_entries(std::span<const UsageEntry> entries) noexcept
+    -> std::expected<void, BodyError> {
+    for (const auto& e : entries) {
+        if (e.nic_id == 0 || e.attachment == 0) {
+            return std::unexpected(BodyError::zero_id);
+        }
+        if (e.vni == 0 || e.vni > max_vni) {
+            return std::unexpected(BodyError::bad_vni);
+        }
+    }
+    if (std::ranges::adjacent_find(entries, [](const auto& a, const auto& b) {
+            return usage_key(a) >= usage_key(b);
+        }) != entries.end()) {
+        return std::unexpected(BodyError::not_increasing);
+    }
+    return {};
+}
+
+}  // namespace
+
+auto UsagePager::take(Snapshot fresh) -> void {
+    if (_open) {
+        // The last read stopped part way: its final readings were taken
+        // from the switch already, so they must not be lost.
+        for (const auto& e : _snapshot) {
+            if (e.detached) {
+                fresh.push_back(e);
+            }
+        }
+    }
+    std::ranges::sort(fresh, {}, usage_key);
+    const auto dup = std::ranges::unique(fresh, {}, usage_key);
+    fresh.erase(dup.begin(), dup.end());
+    if (fresh.size() > max_usage_entries) {
+        // Keep final readings first: they cannot be read again.
+        std::ranges::stable_partition(fresh, [](const UsageEntry& e) { return e.detached; });
+        fresh.resize(max_usage_entries);
+        std::ranges::sort(fresh, {}, usage_key);
+    }
+    _snapshot = std::move(fresh);
+    _open = true;
+}
+
+auto UsagePager::serve(std::uint16_t cursor) -> std::expected<UsagePage, Status> {
+    const std::size_t total = _snapshot.size();
+    if (!_open || cursor > total || (cursor == total && cursor != 0)) {
+        return std::unexpected(Status::bad_request);
+    }
+    const std::size_t count = std::min(max_usage_page, total - cursor);
+    UsagePage page{.total = static_cast<std::uint16_t>(total), .entries = {}};
+    const auto first = _snapshot.begin() + cursor;
+    page.entries.assign(first, first + static_cast<std::ptrdiff_t>(count));
+    if (cursor + count == total) {
+        _open = false;
+    }
+    return page;
+}
+
+auto encode_usage_page(const UsagePage& page, std::uint16_t cursor)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (page.total > max_usage_entries || page.entries.size() > max_usage_page) {
+        return std::unexpected(BodyError::too_many_entries);
+    }
+    if (std::size_t{cursor} + page.entries.size() > page.total ||
+        (page.entries.empty() && page.total != 0)) {
+        return std::unexpected(BodyError::bad_chunk);
+    }
+    if (auto ok = check_usage_entries(page.entries); !ok) {
+        return std::unexpected(ok.error());
+    }
+    std::vector<std::byte> out;
+    out.reserve(usage_head_size + (page.entries.size() * usage_entry_size));
+    wire::Writer w{out};
+    w.le16(page.total);
+    w.le16(static_cast<std::uint16_t>(page.entries.size()));
+    w.le32(0);
+    for (const auto& e : page.entries) {
+        w.le64(e.nic_id);
+        w.le32(e.vni);
+        w.u8(e.detached ? usage_detached : zero8);
+        w.u8(zero8);
+        w.le16(0);
+        w.le64(e.attachment);
+        for (const std::uint64_t v :
+             {e.frames, e.bytes, e.replicas_remote, e.replica_bytes_remote, e.replicas_local,
+              e.replica_bytes_local, e.drop_policy, e.drop_rate, e.drop_fanout}) {
+            w.le64(v);
+        }
+    }
+    return out;
+}
+
+auto decode_usage_page(std::span<const std::byte> body, std::uint16_t cursor)
+    -> std::expected<UsagePage, BodyError> {
+    if (body.size() < usage_head_size) {
+        return std::unexpected(BodyError::truncated);
+    }
+    wire::Reader r{body};
+    UsagePage page;
+    page.total = r.le16().value_or(0);
+    const std::size_t count = r.le16().value_or(0);
+    if (r.le32().value_or(1) != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    if (page.total > max_usage_entries || count > max_usage_page) {
+        return std::unexpected(BodyError::too_many_entries);
+    }
+    if (auto ok = check_size(body, usage_head_size + (count * usage_entry_size)); !ok) {
+        return std::unexpected(ok.error());
+    }
+    if (std::size_t{cursor} + count > page.total || (count == 0 && page.total != 0)) {
+        return std::unexpected(BodyError::bad_chunk);
+    }
+    page.entries.resize(count);
+    for (auto& e : page.entries) {
+        e.nic_id = r.le64().value_or(0);
+        e.vni = r.le32().value_or(0);
+        const auto flags = r.u8().value_or(0);
+        const auto pad8 = r.u8().value_or(0);
+        const auto pad16 = r.le16().value_or(0);
+        if ((flags & ~usage_detached) != 0 || pad8 != 0 || pad16 != 0) {
+            return std::unexpected(BodyError::reserved_not_zero);
+        }
+        e.detached = (flags & usage_detached) != 0;
+        e.attachment = r.le64().value_or(0);
+        for (std::uint64_t* v :
+             {&e.frames, &e.bytes, &e.replicas_remote, &e.replica_bytes_remote, &e.replicas_local,
+              &e.replica_bytes_local, &e.drop_policy, &e.drop_rate, &e.drop_fanout}) {
+            *v = r.le64().value_or(0);
+        }
+    }
+    if (auto ok = check_usage_entries(page.entries); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return page;
+}
+
 auto encode_health(const Health& h) -> std::expected<std::vector<std::byte>, BodyError> {
     if (!known_health(std::to_underlying(h.state))) {
         return std::unexpected(BodyError::unknown_enum);

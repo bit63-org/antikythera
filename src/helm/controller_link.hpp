@@ -33,7 +33,7 @@
 //     trusted to (helm-control-plane design).
 //   - It checks each MapUpdate's shape and target the same way and hands
 //     it, with its exact signed bytes, to helm, which verifies it before
-//     oar-net applies it.
+//     oar-net applies it. GroupPolicy frames get the same treatment.
 //   - Any protocol violation (a malformed record, a record that only helm
 //     sends, an envelope for another server, an ack for a report never
 //     sent) ends the connection; the link reconnects and re-registers.
@@ -66,6 +66,7 @@
 
 #include "proto/envelope.hpp"
 #include "proto/link.hpp"
+#include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
 #include "proto/report.hpp"
 #include "tls/tls.hpp"
@@ -88,6 +89,11 @@ public:
     // the receiver verifies map_update_signed_bytes(frame).
     virtual auto on_map_update(const proto::MapUpdate& update, std::span<const std::byte> frame)
         -> void = 0;
+    // A VPC's broadcast/multicast policy for this server; `frame` is its
+    // exact encoding, which helm forwards to the network roles unmodified
+    // (GroupPolicyFanout). Ignored by sinks that predate it.
+    virtual auto on_group_policy(const proto::GroupPolicy& /*policy*/,
+                                 std::span<const std::byte> /*frame*/) -> void {}
 };
 
 enum class SessionError : std::uint8_t {

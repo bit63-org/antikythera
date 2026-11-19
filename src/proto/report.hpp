@@ -46,6 +46,22 @@
 //     vni u32 | rsvd u32 | map_version u64
 //   host_fault
 //     code u16 | slot u8 | rsvd [5] | detail u64
+//   group_usage  -- cumulative per-NIC group meters (controller-interface
+//                   Requirement 7.5, design "Multicast policy and usage")
+//     count u16 | rsvd [6]
+//     entries  count x 96:
+//       nic_id u64 | vni u32 | flags u8 (bit 0: detached) | slot u8 | rsvd u16
+//       attachment u64
+//       frames u64 | bytes u64
+//       replicas_remote u64 | replica_bytes_remote u64   (billable)
+//       replicas_local u64 | replica_bytes_local u64
+//       drop_policy u64 | drop_rate u64 | drop_fanout u64
+//
+// group_usage entries are in strictly increasing (slot, nic_id, attachment)
+// order, at most max_group_usage_entries per report. Counters are
+// cumulative for one attachment: the controller bills the difference
+// between successive readings of a series keyed by (server, boot_id, slot,
+// nic_id, attachment). A detached entry is that series' final reading.
 //
 // Every inventory list is in strictly increasing key order (functions by
 // (slot, function), the others by ID), so the encoding is canonical and
@@ -101,7 +117,15 @@ inline constexpr std::size_t max_inventory_size =
     inventory_fixed_size + (max_vteps * vtep_address_size) +
     (max_functions * inventory_function_size) + (max_vms * inventory_vm_size) +
     (max_volumes * inventory_volume_size) + (max_networks * inventory_network_size);
-inline constexpr std::size_t max_report_size = report_header_size + max_inventory_size;
+inline constexpr std::size_t group_usage_fixed_size = 8;
+inline constexpr std::size_t group_usage_entry_size = 96;
+inline constexpr std::size_t max_group_usage_entries = 1024;
+inline constexpr std::size_t max_group_usage_size =
+    group_usage_fixed_size + (max_group_usage_entries * group_usage_entry_size);
+inline constexpr std::uint8_t group_usage_detached = 0x01;
+
+inline constexpr std::size_t max_report_size =
+    report_header_size + std::max(max_inventory_size, max_group_usage_size);
 
 // Values are part of the wire protocol: never renumber.
 enum class ReportKind : std::uint16_t {
@@ -111,6 +135,7 @@ enum class ReportKind : std::uint16_t {
     vm_exited = 4,
     map_applied = 5,
     host_fault = 6,
+    group_usage = 7,
 };
 
 enum class Health : std::uint8_t {
@@ -253,8 +278,33 @@ struct HostFaultReport {
     friend auto operator==(const HostFaultReport&, const HostFaultReport&) -> bool = default;
 };
 
+// One NIC attachment's group meter (oar-net VSwitch GroupMeter), with the
+// slot of the network role that keeps it.
+struct GroupUsageEntry {
+    std::uint8_t slot{0};
+    std::uint64_t nic_id{0};
+    std::uint32_t vni{0};
+    bool detached{false};
+    std::uint64_t attachment{0};
+    std::uint64_t frames{0};
+    std::uint64_t bytes{0};
+    std::uint64_t replicas_remote{0};
+    std::uint64_t replica_bytes_remote{0};
+    std::uint64_t replicas_local{0};
+    std::uint64_t replica_bytes_local{0};
+    std::uint64_t drop_policy{0};
+    std::uint64_t drop_rate{0};
+    std::uint64_t drop_fanout{0};
+    friend auto operator==(const GroupUsageEntry&, const GroupUsageEntry&) -> bool = default;
+};
+
+struct GroupUsage {
+    std::vector<GroupUsageEntry> entries;
+    friend auto operator==(const GroupUsage&, const GroupUsage&) -> bool = default;
+};
+
 using ReportBody = std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport,
-                                MapApplied, HostFaultReport>;
+                                MapApplied, HostFaultReport, GroupUsage>;
 
 struct Report {
     std::uint64_t server_id{0};
@@ -276,8 +326,11 @@ struct Report {
                 return ReportKind::vm_exited;
             } else if constexpr (std::is_same_v<T, MapApplied>) {
                 return ReportKind::map_applied;
-            } else {
+            } else if constexpr (std::is_same_v<T, HostFaultReport>) {
                 return ReportKind::host_fault;
+            } else {
+                static_assert(std::is_same_v<T, GroupUsage>);
+                return ReportKind::group_usage;
             }
         },
         body);
@@ -434,6 +487,30 @@ namespace detail {
 [[nodiscard]] inline auto check_body(const Inventory& inv) noexcept
     -> std::expected<void, DecodeError> {
     return check_inventory(inv);
+}
+
+[[nodiscard]] inline auto check_body(const GroupUsage& u) noexcept
+    -> std::expected<void, DecodeError> {
+    if (u.entries.size() > max_group_usage_entries) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    for (const auto& e : u.entries) {
+        if (e.nic_id == 0 || e.attachment == 0) {
+            return std::unexpected(DecodeError::bad_id);
+        }
+        if (e.vni == 0 || e.vni > max_vni) {
+            return std::unexpected(DecodeError::bad_vni);
+        }
+    }
+    const auto key = [](const GroupUsageEntry& e) {
+        return std::tuple{e.slot, e.nic_id, e.attachment};
+    };
+    if (std::ranges::adjacent_find(u.entries, [&](const auto& a, const auto& b) {
+            return key(a) >= key(b);
+        }) != u.entries.end()) {
+        return std::unexpected(DecodeError::not_ascending);
+    }
+    return {};
 }
 
 // A reader over a body whose length the header has already checked, so
@@ -675,6 +752,82 @@ template<typename T>
     return out;
 }
 
+[[nodiscard]] inline auto decode_group_usage(std::span<const std::byte> body)
+    -> std::expected<GroupUsage, DecodeError> {
+    BodyReader in{.r = wire::Reader{body}};
+    const std::size_t count = in.le16();
+    bool zero = in.zeros(group_usage_fixed_size - 2);
+    if (!in.ok) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (count > max_group_usage_entries) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    const std::size_t want = group_usage_fixed_size + (count * group_usage_entry_size);
+    if (body.size() < want) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (body.size() > want) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    GroupUsage u;
+    u.entries.resize(count);
+    for (auto& e : u.entries) {
+        e.nic_id = in.le64();
+        e.vni = in.le32();
+        const std::uint8_t flags = in.u8();
+        e.slot = in.u8();
+        zero = in.zeros(2) && zero;
+        if ((flags & ~group_usage_detached) != 0) {
+            zero = false;
+        }
+        e.detached = (flags & group_usage_detached) != 0;
+        e.attachment = in.le64();
+        e.frames = in.le64();
+        e.bytes = in.le64();
+        e.replicas_remote = in.le64();
+        e.replica_bytes_remote = in.le64();
+        e.replicas_local = in.le64();
+        e.replica_bytes_local = in.le64();
+        e.drop_policy = in.le64();
+        e.drop_rate = in.le64();
+        e.drop_fanout = in.le64();
+    }
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (auto ok = check_body(u); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return u;
+}
+
+inline auto write_group_usage(wire::Writer& w, const GroupUsage& u) -> void {
+    w.le16(static_cast<std::uint16_t>(u.entries.size()));
+    w.le16(0);
+    w.le32(0);
+    for (const auto& e : u.entries) {
+        w.le64(e.nic_id);
+        w.le32(e.vni);
+        w.u8(e.detached ? group_usage_detached : std::uint8_t{0});
+        w.u8(e.slot);
+        w.le16(0);
+        w.le64(e.attachment);
+        w.le64(e.frames);
+        w.le64(e.bytes);
+        w.le64(e.replicas_remote);
+        w.le64(e.replica_bytes_remote);
+        w.le64(e.replicas_local);
+        w.le64(e.replica_bytes_local);
+        w.le64(e.drop_policy);
+        w.le64(e.drop_rate);
+        w.le64(e.drop_fanout);
+    }
+}
+
 inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
     std::visit(
         [&w]<typename T>(const T& b) {
@@ -706,6 +859,8 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
                 w.le32(b.vni);
                 w.le32(0);
                 w.le64(b.map_version);
+            } else if constexpr (std::is_same_v<T, GroupUsage>) {
+                write_group_usage(w, b);
             } else {
                 w.le16(static_cast<std::uint16_t>(b.code));
                 w.u8(b.slot);
@@ -777,6 +932,8 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
             return wrap(detail::decode_fixed<MapApplied>(body));
         case ReportKind::host_fault:
             return wrap(detail::decode_fixed<HostFaultReport>(body));
+        case ReportKind::group_usage:
+            return wrap(detail::decode_group_usage(body));
     }
     return std::unexpected(DecodeError::unknown_value);
 }

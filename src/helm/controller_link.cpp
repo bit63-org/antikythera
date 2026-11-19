@@ -130,6 +130,17 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
             _sink->on_map_update(*update, rec.payload);
             return {};
         }
+        case proto::RecordType::group_policy: {
+            auto policy = proto::decode_group_policy(rec.payload);
+            if (!policy) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (policy->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_group_policy(*policy, rec.payload);
+            return {};
+        }
         case proto::RecordType::report_ack: {
             auto ack = proto::decode_report_ack(rec.payload);
             if (!ack) {

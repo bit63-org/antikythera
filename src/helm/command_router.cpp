@@ -90,6 +90,14 @@ auto OarLinkPort::clean_function(const oar::CleanFunction& request)
     return _link->clean_function(request);
 }
 
+auto OarLinkPort::group_policy(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
+    return _link->group_policy(frame);
+}
+
+auto OarLinkPort::group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError> {
+    return _link->group_usage();
+}
+
 auto OarLinkPort::deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key)
     -> std::expected<void, LinkError> {
     return _link->deliver_key(fn, volume, std::move(key));

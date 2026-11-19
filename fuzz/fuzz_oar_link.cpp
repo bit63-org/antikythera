@@ -79,6 +79,19 @@ auto decoders(std::span<const std::byte> body) -> void {
     if (auto h = oar::decode_health(body)) {
         same(body, oar::encode_health(*h));
     }
+    if (auto f = oar::decode_group_policy_frame(body)) {
+        same(body, oar::encode_group_policy_frame(*f));
+    }
+    if (auto c = oar::decode_usage_request(body)) {
+        same(body, oar::encode_usage_request(*c));
+    }
+    // A usage page is checked against the cursor it answers: try the first
+    // page and one further in.
+    for (const std::uint16_t cursor : {std::uint16_t{0}, std::uint16_t{oar::max_usage_page}}) {
+        if (auto u = oar::decode_usage_page(body, cursor)) {
+            same(body, oar::encode_usage_page(*u, cursor));
+        }
+    }
 }
 
 // Accepts whatever helm asks for; map frames are only counted.

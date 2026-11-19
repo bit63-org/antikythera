@@ -17,6 +17,7 @@
 //                                      every connection
 //   envelope      controller -> helm   an Envelope (envelope.hpp)
 //   map_update    controller -> helm   a MapUpdate (map_update.hpp)
+//   group_policy  controller -> helm   a GroupPolicy (group_policy.hpp)
 //   report        helm -> controller   a Report (report.hpp)
 //   report_ack    controller -> helm   server_id u64 | report_seq u64: every
 //                                      report up to report_seq is processed
@@ -44,6 +45,7 @@
 #include "common/wire.hpp"
 #include "proto/codec.hpp"
 #include "proto/envelope.hpp"
+#include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
 #include "proto/report.hpp"
 
@@ -53,7 +55,8 @@ inline constexpr std::size_t record_header_size = 8;
 inline constexpr std::size_t report_ack_size = 16;
 inline constexpr std::size_t hello_size = 16;
 inline constexpr std::size_t max_record_payload =
-    std::max({envelope_size, max_map_update_size, max_report_size, report_ack_size, hello_size});
+    std::max({envelope_size, max_map_update_size, max_report_size, report_ack_size, hello_size,
+              group_policy_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class RecordType : std::uint16_t {
@@ -62,6 +65,7 @@ enum class RecordType : std::uint16_t {
     report = 3,
     report_ack = 4,
     hello = 5,
+    group_policy = 6,
 };
 
 struct Record {
@@ -85,7 +89,7 @@ struct ReportAck {
 namespace detail {
 
 [[nodiscard]] constexpr auto known(RecordType t) noexcept -> bool {
-    return t >= RecordType::envelope && t <= RecordType::hello;
+    return t >= RecordType::envelope && t <= RecordType::group_policy;
 }
 
 }  // namespace detail

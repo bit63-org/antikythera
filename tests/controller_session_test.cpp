@@ -15,6 +15,7 @@
 
 #include "helm/controller_link.hpp"
 #include "helm/mailbox.hpp"
+#include "proto/group_policy.hpp"
 #include "proto/link.hpp"
 #include "test_support.hpp"
 
@@ -35,11 +36,16 @@ constexpr proto::KeyId key = 3;
 struct RecordingSink final : helm::ControllerSink {
     std::vector<proto::Envelope> envelopes;
     std::vector<std::pair<proto::MapUpdate, std::vector<std::byte>>> updates;
+    std::vector<std::pair<proto::GroupPolicy, std::vector<std::byte>>> policies;
 
     auto on_envelope(const proto::Envelope& e) -> void override { envelopes.push_back(e); }
     auto on_map_update(const proto::MapUpdate& u, std::span<const std::byte> frame)
         -> void override {
         updates.emplace_back(u, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
+    auto on_group_policy(const proto::GroupPolicy& p, std::span<const std::byte> frame)
+        -> void override {
+        policies.emplace_back(p, std::vector<std::byte>{frame.begin(), frame.end()});
     }
 };
 
@@ -109,6 +115,17 @@ auto map_update_record(std::uint64_t to) -> std::vector<std::byte> {
     auto b = proto::encode_map_update(m);
     BOOST_REQUIRE(b.has_value());
     return framed(RecordType::map_update, *b);
+}
+
+auto group_policy_record(std::uint64_t to) -> std::vector<std::byte> {
+    const proto::GroupPolicy p{.server_id = to,
+                               .key_id = key,
+                               .vni = 5,
+                               .mode = proto::GroupMode::drop,
+                               .policy_version = 2};
+    auto b = proto::encode_group_policy(p);
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::group_policy, *b);
 }
 
 auto ack_record(std::uint64_t seq, std::uint64_t to = server) -> std::vector<std::byte> {
@@ -228,9 +245,13 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
     auto report_payload =
         proto::encode_report({.server_id = server, .report_seq = 1, .body = exited(1)});
     auto hello_payload = proto::encode_hello({.server_id = server, .boot_id = 1});
+    auto bad_policy = group_policy_record(server);
+    bad_policy[proto::record_header_size] = std::byte{0};  // policy magic
     const Case cases[] = {
         {envelope_record(other_server, 10), SessionError::wrong_server},
         {map_update_record(other_server), SessionError::wrong_server},
+        {group_policy_record(other_server), SessionError::wrong_server},
+        {bad_policy, SessionError::bad_record},
         {bad_envelope, SessionError::bad_record},
         {framed(RecordType::report, *report_payload), SessionError::wrong_direction},
         {framed(RecordType::hello, *hello_payload), SessionError::wrong_direction},
@@ -246,7 +267,21 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
         BOOST_TEST((r.error() == c.want));
         BOOST_TEST(f.sink.envelopes.empty());
         BOOST_TEST(f.sink.updates.empty());
+        BOOST_TEST(f.sink.policies.empty());
     }
+}
+
+// Requirement 7.3: a GroupPolicy for this server reaches the sink as its
+// exact frame, for helm to forward unmodified.
+BOOST_FIXTURE_TEST_CASE(group_policies_reach_the_sink_unmodified, Fixture) {
+    session.on_connected();
+    const auto rec = group_policy_record(server);
+    BOOST_REQUIRE(session.on_bytes(rec).has_value());
+    BOOST_REQUIRE(sink.policies.size() == 1U);
+    BOOST_TEST(sink.policies[0].first.vni == 5U);
+    BOOST_TEST(sink.policies[0].first.policy_version == 2U);
+    BOOST_TEST(std::ranges::equal(sink.policies[0].second,
+                                  std::span{rec}.subspan(proto::record_header_size)));
 }
 
 BOOST_FIXTURE_TEST_CASE(bytes_without_a_connection_are_refused, Fixture) {

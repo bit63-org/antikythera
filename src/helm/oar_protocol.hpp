@@ -26,6 +26,8 @@
 //   drop_key            0  fn u16 | 2  reserved u16 | 4  reserved u32 | 8  volume_id u64
 //   map_update          0  total u32 | 4  offset u32 | 8  chunk (1..max_map_chunk bytes)
 //   health              (empty)
+//   group_policy        0  frame [group_policy_frame_size] (proto::GroupPolicy, signed)
+//   group_usage         0  cursor u16 | 2  reserved u16
 //   create_volume       0  volume_id u64 | 8  owner_vm u64 | 16 capacity_sectors u64
 //                       24 block_size u32 | 28 key_len u16 | 30 reserved u16
 //                       32 wrapped_key [key_len]
@@ -61,6 +63,14 @@
 // ended, and the chunk that reaches `total` completes it. Every chunk is
 // acknowledged; the last acknowledgement carries the result of applying it.
 //
+// group_policy forwards one controller GroupPolicy frame
+// (src/proto/group_policy.hpp) unmodified, like map_update; it fits one
+// message. group_usage reads the role's per-NIC group meters (oar-net
+// Requirement 10.6) a page at a time: cursor 0 takes a new snapshot,
+// later cursors page through it. A snapshot's final readings of detached
+// NICs are carried into the next snapshot until a read reaches its last
+// page, so an interrupted read loses nothing (UsagePager).
+//
 // Responses (oar -> helm) start with a 2-byte head:
 //
 //   0  status u8 (Status) | 1  reserved u8
@@ -73,6 +83,14 @@
 //                       22 count x { fn u16 | type u8 (FunctionType) | reserved u8 }
 //   health              2  state u8 (HealthState) | 3  reserved u8 | 4  fault_code u16
 //                       6  uptime_seconds u32
+//   group_usage         2  total u16 | 4  count u16 | 6  reserved u32
+//                       10 count x 96 (the proto group_usage report entry, slot 0):
+//                          nic_id u64 | vni u32 | flags u8 | reserved [3] | attachment u64
+//                          frames, bytes, replicas_remote, replica_bytes_remote,
+//                          replicas_local, replica_bytes_local, drop_policy,
+//                          drop_rate, drop_fanout: u64 each
+//                       entries [cursor, cursor + count) of the snapshot, which
+//                       is in strictly increasing (nic_id, attachment) order
 //
 // Every decoder here is strict (exact length, zero reserved bytes, known
 // enum values, non-zero identifiers) and every encoder enforces the same
@@ -85,6 +103,7 @@
 #include <cstdint>
 #include <expected>
 #include <span>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -145,6 +164,15 @@ inline constexpr std::size_t inventory_entry_size = 4;
 // Bounded so an inventory response fits one message with room to spare.
 inline constexpr std::size_t max_inventory_entries = 1000;
 inline constexpr std::size_t health_body_size = 8;
+// proto::group_policy_size, mirrored; tests/oar_protocol_test.cpp pins it.
+inline constexpr std::size_t group_policy_frame_size = 0x80;
+inline constexpr std::size_t usage_request_size = 4;
+inline constexpr std::size_t usage_head_size = 8;
+inline constexpr std::size_t usage_entry_size = 96;
+inline constexpr std::size_t max_usage_page = 40;  // 3848 bytes: one message
+// proto::max_group_usage_entries, mirrored: one role never meters more.
+inline constexpr std::size_t max_usage_entries = 1024;
+inline constexpr std::uint8_t usage_detached = 0x01;
 
 // Result of a request. Values are part of the wire protocol: never renumber.
 enum class Status : std::uint8_t {
@@ -356,6 +384,17 @@ struct MapChunk {
 [[nodiscard]] auto decode_remove_tunnel_peer(std::span<const std::byte> body) noexcept
     -> std::expected<RemoveTunnelPeer, BodyError>;
 
+[[nodiscard]] auto encode_group_policy_frame(std::span<const std::byte> frame)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+// The frame, a view into the body: exactly group_policy_frame_size bytes.
+[[nodiscard]] auto decode_group_policy_frame(std::span<const std::byte> body) noexcept
+    -> std::expected<std::span<const std::byte>, BodyError>;
+
+[[nodiscard]] auto encode_usage_request(std::uint16_t cursor)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_usage_request(std::span<const std::byte> body) noexcept
+    -> std::expected<std::uint16_t, BodyError>;
+
 // function_inventory and health requests have empty bodies.
 [[nodiscard]] auto decode_empty(std::span<const std::byte> body) noexcept
     -> std::expected<void, BodyError>;
@@ -385,6 +424,57 @@ struct Health {
     friend auto operator==(const Health&, const Health&) -> bool = default;
 };
 
+// One NIC attachment's cumulative group meter, as a network role keeps it
+// (oar-net VSwitch GroupUsage).
+struct UsageEntry {
+    NicId nic_id{0};
+    std::uint32_t vni{0};
+    bool detached{false};
+    std::uint64_t attachment{0};
+    std::uint64_t frames{0};
+    std::uint64_t bytes{0};
+    std::uint64_t replicas_remote{0};
+    std::uint64_t replica_bytes_remote{0};
+    std::uint64_t replicas_local{0};
+    std::uint64_t replica_bytes_local{0};
+    std::uint64_t drop_policy{0};
+    std::uint64_t drop_rate{0};
+    std::uint64_t drop_fanout{0};
+
+    friend auto operator==(const UsageEntry&, const UsageEntry&) -> bool = default;
+};
+
+struct UsagePage {
+    std::uint16_t total{0};  // entries in the whole snapshot
+    std::vector<UsageEntry> entries;
+
+    friend auto operator==(const UsagePage&, const UsagePage&) -> bool = default;
+};
+
+// The role's side of group_usage paging. `snapshot` is called on cursor 0
+// and returns every meter (attached NICs, then final readings of NICs
+// detached since its last call, which it forgets). Final readings of a
+// snapshot whose last page was never read are carried into the next one.
+class UsagePager {
+public:
+    using Snapshot = std::vector<UsageEntry>;
+
+    template<typename F>
+    auto page(std::uint16_t cursor, F&& snapshot) -> std::expected<UsagePage, Status> {
+        if (cursor == 0) {
+            take(std::forward<F>(snapshot)());
+        }
+        return serve(cursor);
+    }
+
+private:
+    auto take(Snapshot fresh) -> void;
+    auto serve(std::uint16_t cursor) -> std::expected<UsagePage, Status>;
+
+    Snapshot _snapshot;
+    bool _open{false};  // a snapshot whose last page has not been served
+};
+
 // A decoded response head. `body` is what follows it, empty unless status is ok.
 struct ResponseView {
     Status status{Status::ok};
@@ -402,6 +492,13 @@ struct ResponseView {
     -> std::expected<std::vector<std::byte>, BodyError>;
 [[nodiscard]] auto decode_inventory(std::span<const std::byte> body)
     -> std::expected<Inventory, BodyError>;
+
+// group_usage page bodies. decode checks the page against the cursor
+// it answers.
+[[nodiscard]] auto encode_usage_page(const UsagePage& page, std::uint16_t cursor)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_usage_page(std::span<const std::byte> body, std::uint16_t cursor)
+    -> std::expected<UsagePage, BodyError>;
 
 [[nodiscard]] auto encode_health(const Health& h)
     -> std::expected<std::vector<std::byte>, BodyError>;

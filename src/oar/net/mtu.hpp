@@ -23,9 +23,21 @@
 // That differs from a Linux wg device, which adds its own IPv6 and UDP
 // headers (80 in all) and pads to 16.
 //
-// With a 9000-byte underlay and WireGuard a guest gets 8874; with 1500 and
-// no tunnel, 1406 (Requirement 6.2 asks for at least 1500 from 9000).
+// The guest MTU is budgeted for the larger of WireGuard and PSP, so a later
+// switch of a server pair from WireGuard to NIC-offloaded PSP never changes
+// a guest's MTU (Requirement 6.3). PSP in transport mode over UDP inserts
+// its own UDP header (8), the PSP header (16), the optional 8-byte
+// virtualization cookie and a 16-byte ICV after the outer IP header: 48.
+// It keeps the outer IP header, so the underlay's IP version does not
+// change it; an IPv4 underlay only has a 20-byte smaller outer header than
+// the IPv6 one budgeted here. PSP tunnel mode would add an inner IP header
+// (88 over IPv6) but is not budgeted: Geneve already tunnels, so oar-net
+// has no use for it.
+//
+// With a 9000-byte underlay and that budget a guest gets 8858 (Requirement
+// 6.2 asks for at least 1500); with 1500, 1358.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -62,6 +74,13 @@ static_assert(max_underlay_mtu - encapsulation_overhead <= max_guest_mtu);
 // inside the Vtep's own IPv6/UDP datagram. Mirrors wg::transport_overhead
 // (task 10) until both are on main.
 inline constexpr std::size_t wireguard_overhead = 32;
+// PSP transport mode over UDP: UDP (8), PSP header (16), virtualization
+// cookie (8) and ICV (16).
+inline constexpr std::size_t psp_overhead = udp_header_size + 16 + 8 + 16;
+// What every plan should reserve for encryption: the larger of the two, so
+// moving between them never changes a guest MTU.
+inline constexpr std::size_t tunnel_overhead_budget = std::max(wireguard_overhead, psp_overhead);
+static_assert(tunnel_overhead_budget == 48);
 
 struct MtuPlan {
     std::uint32_t underlay_mtu{0};
@@ -82,7 +101,8 @@ enum class MtuError : std::uint8_t {
 [[nodiscard]] auto to_string(MtuError e) noexcept -> const char*;
 
 // The plan for an underlay of `underlay_mtu` bytes carrying a tunnel that
-// adds `tunnel_overhead` (0 without one).
+// adds up to `tunnel_overhead`. Production passes tunnel_overhead_budget
+// whichever tunnel a pair uses; 0 is for test rigs without encryption.
 [[nodiscard]] auto plan_mtu(std::uint32_t underlay_mtu, std::uint32_t tunnel_overhead = 0)
     -> std::expected<MtuPlan, MtuError>;
 

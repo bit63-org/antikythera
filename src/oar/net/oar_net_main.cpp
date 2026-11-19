@@ -9,8 +9,8 @@
 //
 // --mtu sets the guest MTU directly. --underlay-mtu derives it from the
 // underlay the way the data plane must (task 11, mtu.hpp): the underlay MTU
-// less Geneve encapsulation and the tunnel's overhead (oar-net's WireGuard
-// adds 32), and prints the plan.
+// less Geneve encapsulation and the tunnel's overhead (by default the
+// encryption budget, 48: the larger of WireGuard and PSP, mtu.hpp), and prints the plan.
 //
 // L0 QEMU attaches with vfio-user-pci; the L1 host binds the function to
 // vfio-pci and Cloud Hypervisor hands it to an L2 guest, whose stock
@@ -147,7 +147,7 @@ auto main(int argc, char** argv) -> int {
     std::optional<net::MacAddress> mac;
     std::optional<std::uint64_t> mtu;
     std::optional<std::uint64_t> underlay_mtu;
-    std::optional<std::uint64_t> tunnel_overhead = 0;
+    std::optional<std::uint64_t> tunnel_overhead = net::tunnel_overhead_budget;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg{argv[i]};
         if (i + 1 >= argc) {

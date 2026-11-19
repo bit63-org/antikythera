@@ -122,6 +122,11 @@ network rejected, since Geneve itself has no authentication.
    one guest VLAN tag; plus the tunnel's overhead) and advertise it through
    `VIRTIO_NET_F_MTU`.
 2. With a 9000-byte underlay, guests SHALL get at least 1500.
+3. The tunnel's overhead SHALL be budgeted as the larger of WireGuard (32
+   bytes inside the VTEP's UDP datagram) and PSP in transport mode over
+   UDP (48: UDP, PSP header, virtualization cookie, ICV), so moving a
+   server pair from one to the other never changes a guest's MTU. With a
+   9000-byte underlay guests get 8858.
 
 ### Requirement 7: Placements
 

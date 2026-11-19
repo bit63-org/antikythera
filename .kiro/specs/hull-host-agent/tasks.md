@@ -1,6 +1,6 @@
 # Implementation Plan — hull: the minimal host and its agent
 
-## Status: 3/11 tasks complete
+## Status: 4/11 tasks complete
 
 ## Tasks
 
@@ -13,9 +13,10 @@
   and builds the strict kernel, which boots under QEMU (TCG) to the
   missing-init panic with the IOMMU in strict mode and VFIO loaded. The
   2.4 command line comes with the UKI (task 10).
-- [ ] 2. Phase-1 check script for L1: IOMMU groups, ATS state, ACS on
-  ports, reset reaching the device server. Written as
-  `harbor/l1/phase1-check.sh` (harbor task 4); not yet run.
+- [x] 2. Phase-1 check script for L1: IOMMU groups, ATS state, ACS on
+  ports, reset reaching the device server. `harbor/l1/phase1-check.sh`
+  (harbor task 4); passes on nested KVM with the `rootports` topology
+  (2026-11-18).
   _Requirements: 5.2_
 - [ ] 3. Init binary: mounts, `vfio-pci` binding by allow-list, IOMMU group
   check. _Requirements: 3.1, 5.1, 5.2_

@@ -33,8 +33,10 @@ build also works against system packages. See
   authenticated TLS 1.3 ControllerLink. `ak_hull` links `OpenSSL::Crypto`
   for command signature verification, `ak_helm` for the key store (AES-256-GCM
   key wrapping, `RAND_bytes`, `OPENSSL_cleanse`), `ak_oar_blk` for
-  AES-256-XTS volume encryption and `ak_oar_net` for the WireGuard underlay
-  (X25519, ChaCha20-Poly1305, BLAKE2s). CI uses
+  AES-256-XTS volume encryption, `ak_oar_blk_image` for image digests,
+  `ak_oar_blk_s3` (`OpenSSL::SSL`) for TLS to object stores and SigV4
+  HMAC-SHA256, and `ak_oar_net` for the WireGuard underlay (X25519,
+  ChaCha20-Poly1305, BLAKE2s). CI uses
   Ubuntu 24.04's OpenSSL 3.0 (`libssl-dev`), so 3.0 is the configure
   floor.
 - **Purpose**: TLS 1.3 with mutual authentication (controller link),

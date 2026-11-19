@@ -78,6 +78,168 @@
   listening SOCK_SEQPACKET socket (re-listening if helm goes away), core
   dumps and ptrace off before anything is served.
 
+## Image volumes (Requirement 8)
+
+An image volume is a read-only base image in an S3-compatible object
+store with a per-attachment, throwaway overlay on top. It reuses the
+whole data path above `BlockBackend` unchanged: the function still
+encrypts every write and decrypts every read with the key helm delivered,
+so all the new code sits behind the backend seam.
+
+```
+ VirtioBlkFunction ── XtsCipher(K_eph) ──► LazyImageBackend (BlockBackend)
+                                             │ per logical block:
+                                             ├─ written?  Overlay (O_TMPFILE, ciphertext under K_eph)
+                                             ├─ in image? ChunkCache ─miss─► Fetcher ─► ObjectStore (S3 GET Range)
+                                             │              (shared per image)      readahead
+                                             └─ past end? zeros
+                                    base and zero blocks: [decrypt K_img] → encrypt K_eph
+```
+
+### Keys
+
+- **K_eph**, the attachment's volume key: helm draws it from `RAND_bytes`
+  at ATTACH_VOLUME, delivers it with the usual `deliver_key` after hull's
+  ok, and never wraps or stores it. The function encrypts writes with it,
+  so the overlay holds only ciphertext; dropping it (detach, FLR,
+  `drop_key`, role exit) crypto-erases the overlay.
+- **K_img**, only for encrypted images: the image's AES-256-XTS key,
+  held wrapped by helm like a volume key and delivered alongside K_eph.
+  Public images are stored in plaintext and have none.
+
+The function expects every block the backend returns to be ciphertext
+under K_eph. The backend therefore re-encrypts the blocks it takes from
+the image (or synthesises as zeros): decrypt with K_img if the image is
+encrypted, then encrypt with K_eph at the same logical block number. It
+holds its own copy of K_eph in a `KeySlot`, loaded and dropped together
+with the function's. This costs one or two extra XTS passes on image
+reads (several GB/s with AES-NI, far above object store throughput) and
+keeps the function's contract and its fuzzing intact. Plaintext exists
+only transiently in the backend's buffer, which is wiped, in the same
+process that already decrypts for the guest.
+
+When the key is dropped, the backend discards the overlay too (bitmap
+cleared, file hole-punched): a later key cannot read the old blocks, and
+the volume can never come back with an earlier attachment's writes.
+
+### Image format
+
+An image is two immutable objects under one name, the lowercase hex
+SHA-256 of its manifest (content addressing: the attach request carries
+the name, so the object store cannot substitute a manifest):
+
+```
+<prefix>/<name>/manifest
+<prefix>/<name>/data       image_bytes bytes, read with Range GETs
+```
+
+The manifest is little-endian, decoded with `ak::wire` as untrusted input
+(`fuzz/fuzz_image_manifest.cpp`):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | magic `AKIMAGE\0` |
+| 8 | 2 | version (1) |
+| 10 | 2 | flags: bit 0 encrypted (AES-256-XTS); other bits zero |
+| 12 | 4 | logical block size: 512 or 4096 |
+| 16 | 1 | chunk shift: 16..22 (64 KiB to 4 MiB; 20 = 1 MiB by default) |
+| 17 | 7 | zero |
+| 24 | 8 | image bytes: non-zero, whole logical blocks |
+| 32 | 4 | chunk count: ceil(image bytes / chunk size), at most 2^20 |
+| 36 | 4 | zero |
+| 40 | 16 | image key ID (zero unless encrypted) |
+| 56 | 32 × count | SHA-256 of each chunk as stored; all zero bytes = a hole |
+
+The last chunk may be short. A hole is a chunk of zeros that is never
+fetched or cached, so sparse images stay cheap. The manifest is exactly
+56 + 32 × count bytes; anything else is refused. For encrypted images the
+XTS data unit is the logical block and the tweak its block number, as
+for volumes, so the image is a valid ciphertext volume image under K_img.
+
+`ak-image-pack` (later task) turns a raw disk image into the two objects.
+
+### Components
+
+- **ImageManifest** (`image_manifest.*`) — the codec above plus
+  `manifest_name()` (SHA-256), chunk geometry helpers and the check that
+  a fetched chunk matches its digest.
+- **ObjectStore** (`object_store.hpp`) — the seam: `get_range(key,
+  offset, length, deadline)` into a caller buffer. `S3ObjectStore`
+  (`s3_object_store.*`) implements it with HTTP/1.1 over TCP or TLS
+  (server-authenticated, the store's CA bundle), path-style URLs (MinIO
+  and most S3-compatible stores; virtual-host style as an option), and
+  AWS Signature V4 (`UNSIGNED-PAYLOAD` is not needed: a GET's payload hash
+  is the empty-string SHA-256), or anonymous for public buckets. The
+  response parser (`http_response.*`, `fuzz/fuzz_http_response.cpp`)
+  accepts only `206` with a `Content-Range` equal to the requested range
+  and a matching `Content-Length` (or `200` with the whole object when the
+  range covers it); no chunked encoding, header block capped at 16 KiB,
+  body never longer than asked. Connections are kept alive and reused.
+  Credentials come from the role's store configuration and should be a
+  read-only key scoped to the image bucket.
+- **Fetcher** — a few worker threads (default 4), each with its own
+  connection. Demand fetches go ahead of readahead; a chunk has at most
+  one fetch in flight and every waiter shares it. Each fetch has a
+  deadline (default 5 s) and up to 3 retries with jittered backoff on
+  connection errors and 5xx; a digest mismatch is not retried against the
+  same response but counts as a failed attempt.
+- **ChunkCache** — one per image name, shared by every volume of that
+  image in the role: a sparse `O_TMPFILE` in the cache directory, an
+  in-memory index of resident chunks, and one byte budget for all images
+  in the role. Chunks enter only after their digest matched; eviction is
+  least recently used at chunk granularity (`FALLOC_FL_PUNCH_HOLE`), and
+  chunks being read are pinned. Once verified, a resident chunk is read
+  back from local media without re-hashing: local media is trusted for
+  integrity exactly as volume files are. The cache is not persisted
+  across role restarts (a later task may add an index that re-verifies
+  on first use).
+- **Readahead** — per volume: a read that starts where the previous one
+  ended (or in the next chunk) doubles a window from 1 up to
+  `max_readahead` chunks (default 8); any other read resets it. After
+  each read the window of chunks past it is queued for the fetcher at
+  low priority, skipping resident chunks and holes.
+- **Overlay** — the attachment's writes: a sparse `O_TMPFILE` in the
+  overlay directory (never linked, so a crash frees it too) sized to the
+  volume, and a bitmap of written logical blocks in memory. A write
+  lands in the file first and sets its bits after; a read is split into
+  runs of overlay, image and zero blocks. An optional limit on written
+  bytes completes writes past it with IOERR. `flush` is a no-op: the
+  overlay does not outlive the attachment, and the VM does not outlive a
+  host crash.
+- **LazyImageBackend** (`lazy_image_backend.*`) — the `BlockBackend` that
+  ties these together for one attachment: capacity at least the image
+  size (a larger volume reads zeros past the image), `load_key`/
+  `drop_key` for its K_eph copy (and K_img), counters (hits, misses,
+  fetched bytes, readahead hits, overlay blocks).
+
+### Blocking on a miss
+
+The role serves requests synchronously on one thread, so a demand miss
+blocks every function of the role until the chunk arrives or its deadline
+passes. Readahead keeps sequential boot reads mostly hitting, but a cold
+random read costs a round trip to the store. The fix is asynchronous
+completion in `VirtioBlkFunction`: park the request (as `await_key`
+already parks requests) and complete it when the fetcher calls back. That
+changes the function's request loop, so it is a separate task.
+
+### Lifecycle with helm
+
+| Command | Image volume |
+|---|---|
+| CREATE_VOLUME | carries an image source (store ID, image name) instead of a new key; the role writes `vol-<id>.akv` with a version-2 header: kind image, store ID, image name, capacity, no wrapped key (or K_img's wrapped key for an encrypted image) |
+| ATTACH_VOLUME | `prepare_function` fetches and checks the manifest and opens a LazyImageBackend with an empty overlay; helm creates K_eph and delivers it after hull's ok |
+| DETACH_VOLUME | cleaning drops K_eph and closes the overlay: the writes are gone |
+| DELETE_VOLUME | removes the descriptor; nothing to crypto-erase but the wrapped K_img copy |
+| REWRAP_VOLUME | changes owner; only meaningful for K_img |
+
+The protocol fields (controller, mailbox, sideband `DeliverKey` with a
+second key) belong to the task that wires this in; until then the
+backend is exercised from tests and a role option.
+
+Open: how a storage board reaches the object store (through an oar-net
+function, or its own uplink); on harbor the oar-blk process uses L1's
+network.
+
 ## Volume lifecycle with helm
 
 helm keeps the wrapped volume keys and the oar-blk role keeps the
@@ -115,3 +277,8 @@ useful speed. Throughput target for the first board: about Gen3 x2.
 - XTS vectors; parser fuzzing; key zeroization checked with a test hook.
 - harbor scenarios from Requirement 7.2, including grepping the backing
   file for a known plaintext pattern written by the guest.
+- Image volumes: unit tests over an in-memory ObjectStore (lazy fetch,
+  holes, digest mismatch, retries and deadlines, readahead, eviction,
+  overlay runs, discard on `drop_key`), the S3 client against a local
+  MinIO when `AK_S3_TEST_ENDPOINT` is set (skipped otherwise), and boot
+  from an image volume in harbor.

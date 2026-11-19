@@ -1,6 +1,6 @@
 # Implementation Plan — oar-blk: the storage data plane
 
-## Status: 6/8 tasks complete
+## Status: 6/16 tasks complete
 
 ## Tasks
 
@@ -59,6 +59,25 @@
   sideband socket (`VirtioBinding::retarget`, `set_reset_handler`).
 - [ ] 7. Boot from volume in harbor. _Requirements: 4_
 - [ ] 8. harbor encryption scenarios. _Requirements: 7.2_
+- [ ] 9. Image manifest codec, name and chunk digests, fuzz target.
+  _Requirements: 8.3, 8.11_
+- [ ] 10. ObjectStore seam, ChunkCache, Fetcher with readahead,
+  Overlay and LazyImageBackend over an in-memory store.
+  _Requirements: 8.1-8.7, 8.10, 7.3_
+- [ ] 11. S3ObjectStore: HTTP/1.1 range GET over TCP/TLS, SigV4,
+  response parser with fuzz target, MinIO test.
+  _Requirements: 8.2, 8.9, 8.11, 7.3_
+- [ ] 12. `ak-image-pack`: raw image to manifest and data objects
+  (optionally encrypted). _Requirements: 8.8_
+- [ ] 13. Image volumes through helm: CREATE_VOLUME image source,
+  version-2 volume header, K_eph at attach, discard at detach.
+  _Requirements: 8.6, 8.7, 3_
+- [ ] 14. Asynchronous miss completion in VirtioBlkFunction.
+  _Requirements: 8.10_
+- [ ] 15. Encrypted images: K_img wrapped in helm, delivered with K_eph.
+  _Requirements: 8.8_
+- [ ] 16. harbor: boot from an image volume served by MinIO.
+  _Requirements: 4, 7.3_
 
 ## Deferred
 

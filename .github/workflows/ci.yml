@@ -9,7 +9,7 @@
 #
 # Job names are the check names main's branch protection requires:
 #   build (gcc-14)     GCC 14 Debug build + ctest, and the kernel Geneve
-#                      interop test under sudo
+#                      interop test and the hull jail test under sudo
 #   build (clang-19)   Clang 19 Debug + ASan/UBSan + libFuzzer build, ctest,
 #                      and a short smoke run of every fuzz target
 #   lint               clang-format, clang-tidy, shellcheck
@@ -91,6 +91,19 @@ jobs:
             sudo modprobe geneve
           }
           sudo tests/geneve_interop.sh build/tests/geneve_interop_peer
+
+      # tests/jail_test runs unprivileged in ctest above (mapping the
+      # runner's own IDs, or skipping where user namespaces are refused).
+      # Run it again as root for the production path: a reserved UID,
+      # setgroups, and the cgroup v2 placement case (AK_JAIL_TEST_CGROUP=1
+      # lets it enable cpuset and hugetlb at the runner's root cgroup, as
+      # hull's init will). The probe is copied
+      # out of the workspace because the jailed UID cannot enter $HOME.
+      - name: Jail as root
+        if: matrix.compiler == 'gcc-14'
+        run: |
+          install -D -m 0755 build/tests/jail_probe /tmp/ak-jail-probe/jail_probe
+          sudo AK_JAIL_TEST_CGROUP=1 build/tests/jail_test --log_level=message -- /tmp/ak-jail-probe/jail_probe
 
       - name: Fuzz smoke
         if: matrix.compiler == 'clang-19'

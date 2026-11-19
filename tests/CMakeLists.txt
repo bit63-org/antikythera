@@ -22,13 +22,13 @@ else()
 endif()
 
 function(ak_add_test name)
-  cmake_parse_arguments(ARG "" "" "SOURCES;LIBS" ${ARGN})
+  cmake_parse_arguments(ARG "" "" "SOURCES;LIBS;ARGS" ${ARGN})
   add_executable(${name} ${ARG_SOURCES})
   target_link_libraries(${name} PRIVATE ${ARG_LIBS} Boost::unit_test_framework ak::warnings)
   if(_ak_boost_test_dyn)
     target_compile_definitions(${name} PRIVATE BOOST_TEST_DYN_LINK)
   endif()
-  add_test(NAME ${name} COMMAND ${name} --log_level=test_suite)
+  add_test(NAME ${name} COMMAND ${name} --log_level=test_suite ${ARG_ARGS})
   set_tests_properties(${name} PROPERTIES TIMEOUT 60)
 endfunction()
 
@@ -58,6 +58,22 @@ ak_add_test(signature_verifier_test SOURCES signature_verifier_test.cpp LIBS ak:
 ak_add_test(command_auth_test       SOURCES command_auth_test.cpp       LIBS ak::hull)
 ak_add_test(cpu_topology_test       SOURCES cpu_topology_test.cpp       LIBS ak::hull)
 ak_add_test(resource_allocator_test SOURCES resource_allocator_test.cpp LIBS ak::hull)
+
+# The jail (hull task 7): jail_test starts jail_probe inside real jails.
+# Without user namespaces or Landlock the spawn cases log "skipped" and
+# pass; CI also runs the binary under sudo for the privileged path and the
+# cgroup placement case.
+add_executable(jail_probe jail_probe.cpp)
+target_link_libraries(jail_probe PRIVATE ak::warnings)
+# The probe runs under Landlock with no /proc access, where the ASan
+# runtime cannot start (it reads /proc/self/maps), so it is never
+# sanitized or coverage-instrumented; what it checks is the jail, not itself.
+if(AK_SANITIZE OR AK_FUZZ)
+  target_compile_options(jail_probe PRIVATE -fno-sanitize=all)
+  target_link_options(jail_probe PRIVATE -fno-sanitize=all)
+endif()
+ak_add_test(jail_test SOURCES jail_test.cpp LIBS ak::hull
+            ARGS -- $<TARGET_FILE:jail_probe>)
 ak_add_test(proto_envelope_test   SOURCES proto_envelope_test.cpp   LIBS ak::proto ak::helm)
 ak_add_test(proto_map_update_test SOURCES proto_map_update_test.cpp LIBS ak::proto)
 ak_add_test(proto_report_test     SOURCES proto_report_test.cpp     LIBS ak::proto ak::helm)

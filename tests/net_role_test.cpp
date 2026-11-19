@@ -109,8 +109,13 @@ auto signer() -> const ak::test::TestSigner& {
 auto signed_map(std::uint64_t server, std::uint64_t version,
                 const std::vector<std::pair<std::uint64_t, std::uint8_t>>& nics)
     -> std::vector<std::byte> {
-    proto::MapUpdate m{
-        .server_id = server, .key_id = key_id, .vni = vpc, .map_version = version, .entries = {}};
+    // Member by member, so the frame format can grow fields (v2's guest
+    // addresses) without this needing every one spelled out.
+    proto::MapUpdate m{};
+    m.server_id = server;
+    m.key_id = key_id;
+    m.vni = vpc;
+    m.map_version = version;
     for (const auto& [nic, tail] : nics) {
         m.entries.push_back({.nic_id = nic, .mac = mac_of(nic), .owner_vtep = vtep(tail)});
     }

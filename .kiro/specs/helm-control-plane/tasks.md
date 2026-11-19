@@ -1,6 +1,6 @@
 # Implementation Plan — helm: the control-plane role
 
-## Status: 7/12 tasks complete
+## Status: 8/12 tasks complete
 
 ## Tasks
 
@@ -29,8 +29,11 @@
   wrapped-key fuzz target. _Requirements: 4_
 - [ ] 8. MailboxDevice as a vfio-user server (harbor). _Requirements: 1_
 - [ ] 9. CommandRouter with compensation and timeouts. _Requirements: 3, 9_
-- [ ] 10. PowerSequencer (harbor: process orchestration and L1 launch).
-  _Requirements: 6_
+- [x] 10. PowerSequencer (harbor: process orchestration and L1 launch).
+  _Requirements: 6_ (`src/helm/power_sequencer.*`: boot order, single-slot
+  power cycles, recovery after boot, over a `Backplane`; harbor's
+  `ProcessBackplane` runs board processes and the L1 QEMU. See design
+  "PowerSequencer".)
 - [ ] 11. Audit log and status reporting. _Requirements: 9.2, 9.3_
 - [ ] 12. harbor CI: both placements. _Requirements: 7, 10.3_
 

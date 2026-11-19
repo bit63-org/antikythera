@@ -41,3 +41,6 @@ ak_add_test(signature_verifier_test SOURCES signature_verifier_test.cpp LIBS ak:
 ak_add_test(command_auth_test       SOURCES command_auth_test.cpp       LIBS ak::hull)
 ak_add_test(cpu_topology_test       SOURCES cpu_topology_test.cpp       LIBS ak::hull)
 ak_add_test(resource_allocator_test SOURCES resource_allocator_test.cpp LIBS ak::hull)
+ak_add_test(proto_envelope_test   SOURCES proto_envelope_test.cpp   LIBS ak::proto ak::helm)
+ak_add_test(proto_map_update_test SOURCES proto_map_update_test.cpp LIBS ak::proto)
+ak_add_test(proto_vectors_test    SOURCES proto_vectors_test.cpp    LIBS ak::proto ak::hull)

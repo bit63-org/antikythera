@@ -22,7 +22,7 @@ antikythera/
 │   │   ├── virtio/        shared virtio device core                [planned]
 │   │   ├── vfu/           libvfio-user adapter (harbor transport)
 │   │   └── testdev/       phase-1 vfio-user test device
-│   └── proto/             helm<->oar and helm<->controller protocols [planned]
+│   └── proto/             helm<->controller protocols (ak::proto); helm<->oar [planned]
 ├── tests/                 Boost.Test, one executable per file, run with ctest
 ├── fuzz/                  libFuzzer target per untrusted-input parser
 ├── harbor/                virt-on-virt environment: scripts, kernel configs, topologies

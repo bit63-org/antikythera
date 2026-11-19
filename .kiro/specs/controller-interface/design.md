@@ -22,11 +22,35 @@ Envelope {
   slot         [256]byte    // exact mailbox slot image, signature included
 }
 MapUpdate {
-  server_id, vni u32, version u64,
+  server_id u64, key_id u16, vni u32, map_version u64,
   entries [] { nic_id u64, mac [6], owner_vtep [16] },
   signature [64]            // Ed25519 over everything above
 }
 ```
+
+The byte layouts are in `src/proto/envelope.hpp` and
+`src/proto/map_update.hpp` (little-endian, a magic and a format version
+first). Both decoders are strict: exact length, non-zero server and key
+IDs, zero reserved bytes. Encoders enforce the same rules, so the
+controller cannot emit a frame helm would refuse. The codecs never sign or
+verify; `src/proto/test_vectors.hpp` pins the exact bytes and signatures a
+controller must produce under the RFC 8032 test keys.
+
+A MapUpdate carries its own `key_id` (rotation, Requirement 1.3) and
+`server_id`, both inside the signed bytes, since no slot header covers
+them. It is a full snapshot of the VPC's mapping, not a delta, so applying
+one is idempotent and a server that missed versions catches up from the
+newest alone. Entries are in strictly increasing NIC ID order (a canonical
+encoding with no duplicates), MACs must be locally administered unicast
+(Requirement 4.2), owner VTEPs must be unicast IPv6 (IPv4-mapped allowed),
+and a frame holds at most 4096 entries; a larger VPC needs a new format
+version.
+
+Open question: the envelope's `server_id` is not signed, and the slot
+header has no server field, so a command signed for one server would
+verify on another whose sequence floor is lower. Today only mTLS to the
+right helm prevents that. Closing it means either a server ID in the slot
+header (mailbox v3) or per-server signing keys.
 
 `key_id` is carried in the slot header as well, so hull can pick the
 verification key without trusting the envelope wrapper. Mailbox protocol
@@ -63,6 +87,6 @@ controller's compensation (destroy in reverse order).
 
 | Piece | Repository |
 |---|---|
-| Envelope and MapUpdate codecs, signing test vectors | antikythera `src/proto/` (header-only, consumable by kythira) |
+| Envelope and MapUpdate codecs, signing test vectors | antikythera `src/proto/` (header-only, consumable by kythira; done) |
 | helm's ControllerLink | antikythera |
 | EC2 API, placement, Raft state | kythira `services/ec2/` |

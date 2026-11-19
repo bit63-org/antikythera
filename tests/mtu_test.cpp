@@ -28,7 +28,7 @@ constexpr std::uint32_t requirement_guest_floor = 1500;  // Requirement 6.2
 BOOST_AUTO_TEST_CASE(overheads_add_up, *boost::unit_test::timeout(unit_timeout_seconds)) {
     // 40 IPv6 + 8 UDP + 8 Geneve + 20 NIC-pair + 14 Ethernet + 4 VLAN.
     BOOST_TEST(net::encapsulation_overhead == 94U);
-    BOOST_TEST(net::wireguard_ipv6_overhead == 80U);
+    BOOST_TEST(net::wireguard_overhead == 32U);
 }
 
 BOOST_AUTO_TEST_CASE(plain_underlay, *boost::unit_test::timeout(unit_timeout_seconds)) {
@@ -42,11 +42,11 @@ BOOST_AUTO_TEST_CASE(plain_underlay, *boost::unit_test::timeout(unit_timeout_sec
 
 BOOST_AUTO_TEST_CASE(jumbo_with_wireguard_gives_at_least_1500,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
-    auto plan = net::plan_mtu(jumbo_mtu, net::wireguard_ipv6_overhead);
+    auto plan = net::plan_mtu(jumbo_mtu, net::wireguard_overhead);
     BOOST_REQUIRE(plan.has_value());
-    BOOST_TEST(plan->guest_mtu == 8826U);
+    BOOST_TEST(plan->guest_mtu == 8874U);
     BOOST_TEST(plan->guest_mtu >= requirement_guest_floor);
-    BOOST_TEST(plan->max_geneve_payload == jumbo_mtu - 80U - 48U);
+    BOOST_TEST(plan->max_geneve_payload == jumbo_mtu - 32U - 48U);
 }
 
 BOOST_AUTO_TEST_CASE(largest_guest_frame_fills_the_underlay,
@@ -55,7 +55,7 @@ BOOST_AUTO_TEST_CASE(largest_guest_frame_fills_the_underlay,
     // all headers is exactly the underlay MTU: nothing fragments and nothing
     // is wasted.
     for (std::uint32_t underlay : {1280U, 1500U, 4000U, 9000U}) {
-        for (std::uint32_t tunnel : {0U, 80U}) {
+        for (std::uint32_t tunnel : {0U, 32U}) {
             auto plan = net::plan_mtu(underlay, tunnel);
             BOOST_REQUIRE(plan.has_value());
             const std::size_t inner = plan->guest_mtu + net::inner_frame_overhead;

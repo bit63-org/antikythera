@@ -16,13 +16,14 @@
 // but guest tags are payload (Requirement 2.2) and VirtioNetFunction admits
 // one on top of the MTU, so a tagged full-size frame would not fit with 90.
 //
-// The tunnel (task 10) wraps the whole Geneve datagram. WireGuard over IPv6
-// adds an outer IPv6 header, UDP and its 32 bytes of header and tag: 80,
-// the same figure Linux uses for a wg device's default MTU. WireGuard pads
-// the plaintext to a multiple of 16 but never past its own MTU, which this
-// plan keeps every datagram under, so padding needs no allowance here.
+// The tunnel (task 10) wraps the Geneve payload inside the same outer
+// IPv6/UDP datagram: oar-net's WireGuard sends through the Vtep's
+// UdpEndpoint, so it adds only its 16-byte message header and 16-byte
+// Poly1305 tag (wg::transport_overhead in wireguard.hpp) and does not pad.
+// That differs from a Linux wg device, which adds its own IPv6 and UDP
+// headers (80 in all) and pads to 16.
 //
-// With a 9000-byte underlay and WireGuard a guest gets 8826; with 1500 and
+// With a 9000-byte underlay and WireGuard a guest gets 8874; with 1500 and
 // no tunnel, 1406 (Requirement 6.2 asks for at least 1500 from 9000).
 
 #include <cstddef>
@@ -57,9 +58,10 @@ static_assert(encapsulation_overhead == 94);
 // So every guest MTU a valid underlay yields fits virtio-net's u16 field.
 static_assert(max_underlay_mtu - encapsulation_overhead <= max_guest_mtu);
 
-// WireGuard over IPv6: outer IPv6 (40), UDP (8), message header (16) and
-// Poly1305 tag (16).
-inline constexpr std::size_t wireguard_ipv6_overhead = ipv6_header_size + udp_header_size + 32;
+// oar-net's WireGuard tunnel: message header (16) and Poly1305 tag (16),
+// inside the Vtep's own IPv6/UDP datagram. Mirrors wg::transport_overhead
+// (task 10) until both are on main.
+inline constexpr std::size_t wireguard_overhead = 32;
 
 struct MtuPlan {
     std::uint32_t underlay_mtu{0};

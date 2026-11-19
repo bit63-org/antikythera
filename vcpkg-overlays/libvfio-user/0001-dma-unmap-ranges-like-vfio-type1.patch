@@ -1,0 +1,227 @@
+dma: unmap address ranges the way VFIO type1 does
+
+libvfio-user v0.8 removes a DMA region only when the unmap exactly matches
+it, and fails anything else with ENOENT. QEMU's intel-iommu, with the
+guest's IOMMU enabled, unmaps whole power-of-two blocks of the address
+space on invalidation, each of which may cover many regions or none. All
+of those unmaps fail, the regions stay behind, and the next map of a
+reused IOVA with a different offset fails with "bad offset for new DMA
+region". QEMU then drops the connection and the device is gone.
+
+The kernel's VFIO type1 removes every mapping inside the range, succeeds
+if there is none, and refuses with EINVAL a mapping that straddles the
+range's edge. This patch makes dma_controller_remove_region do the same,
+checking for a straddle before removing anything. Not yet upstream
+(nutanix/libvfio-user master still has the exact-match check).
+
+diff --git a/lib/dma.c b/lib/dma.c
+index c0bea6d..9ced775 100644
+--- a/lib/dma.c
++++ b/lib/dma.c
+@@ -196,7 +196,15 @@ dma_controller_destroy_region(dma_controller_t *dma, dma_memory_region_t *region
+     free(region);
+ }
+ 
+-/* FIXME not thread safe */
++/*
++ * Removes every region inside [dma_addr, dma_addr + size), as VFIO type1
++ * does: a range may cover several regions (QEMU's intel-iommu unmaps whole
++ * address-space ranges on invalidation) or none, which succeeds. A region
++ * that straddles the range's edge is refused with EINVAL and nothing is
++ * removed, again as type1 does.
++ *
++ * FIXME not thread safe
++ */
+ int
+ MOCK_DEFINE(dma_controller_remove_region)(dma_controller_t *dma,
+                                           vfu_dma_addr_t dma_addr, size_t size,
+@@ -205,22 +213,36 @@ MOCK_DEFINE(dma_controller_remove_region)(dma_controller_t *dma,
+ {
+     dma_memory_region_t *region;
+     btree_iter_t iter;
++    uintptr_t first = (uintptr_t)dma_addr;
++    uintptr_t last;
+ 
+     assert(dma != NULL);
+ 
+-    btree_iter_init(&dma->regions, (uintptr_t)dma_addr, &iter);
+-    region = btree_iter_get(&iter, NULL);
+-    if (region == NULL) {
+-        return ERROR_INT(ENOENT);
++    if (size == 0) {
++        return ERROR_INT(EINVAL);
+     }
+-
+-    if (region->info.iova.iov_base != dma_addr ||
+-        region->info.iova.iov_len != size) {
+-        return ERROR_INT(ENOENT);
++    last = first + (size - 1) < first ? UINTPTR_MAX : first + (size - 1);
++
++    /* Regions are keyed by their last byte, so this finds the first region
++     * that ends at or after the range's start. */
++    btree_iter_init(&dma->regions, first, &iter);
++    for (region = btree_iter_get(&iter, NULL);
++         region != NULL &&
++         (uintptr_t)region->info.iova.iov_base <= last;
++         region = btree_iter_next(&iter)) {
++        uintptr_t r_first = (uintptr_t)region->info.iova.iov_base;
++        uintptr_t r_last = r_first + region->info.iova.iov_len - 1;
++        if (r_first < first || r_last > last) {
++            return ERROR_INT(EINVAL);
++        }
+     }
+ 
+-    btree_iter_remove(&iter);
+-    dma_controller_destroy_region(dma, region, dma_unregister, data);
++    btree_iter_init(&dma->regions, first, &iter);
++    while ((region = btree_iter_get(&iter, NULL)) != NULL &&
++           (uintptr_t)region->info.iova.iov_base <= last) {
++        btree_iter_remove(&iter);
++        dma_controller_destroy_region(dma, region, dma_unregister, data);
++    }
+ 
+     return 0;
+ }
+diff --git a/test/py/test_dma_unmap.py b/test/py/test_dma_unmap.py
+index b21e072..db8cb7f 100644
+--- a/test/py/test_dma_unmap.py
++++ b/test/py/test_dma_unmap.py
+@@ -130,14 +130,35 @@ def test_dma_unmap():
+     msg(ctx, client.sock, VFIO_USER_DMA_UNMAP, payload)
+ 
+ 
+-def test_dma_unmap_invalid_addr():
++def test_dma_unmap_nothing_mapped():
++    """As with VFIO type1, unmapping a range with nothing in it succeeds."""
+ 
+     setup_dma_regions()
+     payload = vfio_user_dma_unmap(argsz=len(vfio_user_dma_unmap()),
+                                   addr=0x10 << PAGE_SHIFT, size=PAGE_SIZE)
+ 
+-    msg(ctx, client.sock, VFIO_USER_DMA_UNMAP, payload,
+-        expect=errno.ENOENT)
++    msg(ctx, client.sock, VFIO_USER_DMA_UNMAP, payload)
++
++
++def test_dma_unmap_range():
++    """One unmap removes every region inside its range."""
++
++    setup_dma_regions([(0x0, PAGE_SIZE), (2 * PAGE_SIZE, PAGE_SIZE)])
++    payload = vfio_user_dma_unmap(argsz=len(vfio_user_dma_unmap()),
++                                  addr=0x0, size=4 * PAGE_SIZE)
++    msg(ctx, client.sock, VFIO_USER_DMA_UNMAP, payload)
++
++    # Both are gone: a region spanning them no longer overlaps anything.
++    setup_dma_regions([(0x0, 4 * PAGE_SIZE)])
++
++
++def test_dma_unmap_range_straddles():
++    """A region crossing the range's edge is refused, as VFIO type1 does."""
++
++    setup_dma_regions([(0x0, 2 * PAGE_SIZE)])
++    payload = vfio_user_dma_unmap(argsz=len(vfio_user_dma_unmap()),
++                                  addr=0x0, size=PAGE_SIZE)
++    msg(ctx, client.sock, VFIO_USER_DMA_UNMAP, payload, expect=errno.EINVAL)
+ 
+ 
+ @patch('libvfio_user.quiesce_cb')
+diff --git a/test/unit-tests.c b/test/unit-tests.c
+index 7377052..a8b10d8 100644
+--- a/test/unit-tests.c
++++ b/test/unit-tests.c
+@@ -472,6 +472,85 @@ test_dma_controller_remove_region_unmapped(void **state UNUSED)
+             mock_dma_unregister, &vfu_ctx));
+ }
+ 
++/* A range unmap removes every region inside it, as VFIO type1 does. */
++static void
++test_dma_controller_remove_region_range(void **state UNUSED)
++{
++    dma_memory_region_t r1 = {
++        .info.iova.iov_base = (void *)0x10000,
++        .info.iova.iov_len = 0x1000,
++        .fd = -1,
++    };
++    dma_memory_region_t r2 = {
++        .info.iova.iov_base = (void *)0x12000,
++        .info.iova.iov_len = 0x1000,
++        .fd = -1,
++    };
++    dma_memory_region_t r3 = {
++        .info.iova.iov_base = (void *)0x20000,
++        .info.iova.iov_len = 0x1000,
++        .fd = -1,
++    };
++    stage_dma_region(vfu_ctx.dma, &r1);
++    stage_dma_region(vfu_ctx.dma, &r2);
++    stage_dma_region(vfu_ctx.dma, &r3);
++
++    expect_uint_value(mock_dma_unregister, vfu_ctx, (uintptr_t)&vfu_ctx);
++    expect_check_data(mock_dma_unregister, info, check_dma_info,
++                      cast_ptr_to_cmocka_value(&r1.info));
++    expect_uint_value(mock_dma_unregister, vfu_ctx, (uintptr_t)&vfu_ctx);
++    expect_check_data(mock_dma_unregister, info, check_dma_info,
++                      cast_ptr_to_cmocka_value(&r2.info));
++    patch("dma_controller_unmap_region");
++    assert_int_equal(0,
++        dma_controller_remove_region(vfu_ctx.dma, (void *)0x10000, 0x10000,
++            mock_dma_unregister, &vfu_ctx));
++    assert_int_equal(1, btree_size(&vfu_ctx.dma->regions));
++    verify_dma_region(vfu_ctx.dma, &r3);
++}
++
++/* Nothing mapped in the range: the unmap succeeds and changes nothing. */
++static void
++test_dma_controller_remove_region_range_empty(void **state UNUSED)
++{
++    dma_memory_region_t r1 = {
++        .info.iova.iov_base = (void *)0x20000,
++        .info.iova.iov_len = 0x1000,
++        .fd = -1,
++    };
++    stage_dma_region(vfu_ctx.dma, &r1);
++
++    assert_int_equal(0,
++        dma_controller_remove_region(vfu_ctx.dma, (void *)0x10000, 0x10000,
++            mock_dma_unregister, &vfu_ctx));
++    assert_int_equal(1, btree_size(&vfu_ctx.dma->regions));
++}
++
++/* A region that straddles the range's edge is refused, and the regions
++ * wholly inside the range are kept. */
++static void
++test_dma_controller_remove_region_range_straddle(void **state UNUSED)
++{
++    dma_memory_region_t r1 = {
++        .info.iova.iov_base = (void *)0x10000,
++        .info.iova.iov_len = 0x1000,
++        .fd = -1,
++    };
++    dma_memory_region_t r2 = {
++        .info.iova.iov_base = (void *)0x1f000,
++        .info.iova.iov_len = 0x2000,
++        .fd = -1,
++    };
++    stage_dma_region(vfu_ctx.dma, &r1);
++    stage_dma_region(vfu_ctx.dma, &r2);
++
++    assert_int_equal(-1,
++        dma_controller_remove_region(vfu_ctx.dma, (void *)0x10000, 0x10000,
++            mock_dma_unregister, &vfu_ctx));
++    assert_int_equal(EINVAL, errno);
++    assert_int_equal(2, btree_size(&vfu_ctx.dma->regions));
++}
++
+ static void
+ test_dma_addr_to_sgl(void **state UNUSED)
+ {
+@@ -674,6 +753,9 @@ main(void)
+         CM_TEST_ENTRY(test_dma_controller_add_region_twice),
+         CM_TEST_ENTRY(test_dma_controller_remove_region_mapped),
+         CM_TEST_ENTRY(test_dma_controller_remove_region_unmapped),
++        CM_TEST_ENTRY(test_dma_controller_remove_region_range),
++        CM_TEST_ENTRY(test_dma_controller_remove_region_range_empty),
++        CM_TEST_ENTRY(test_dma_controller_remove_region_range_straddle),
+         CM_TEST_ENTRY(test_dma_addr_to_sgl),
+         CM_TEST_ENTRY(test_vfu_setup_device_dma),
+         CM_TEST_ENTRY(test_device_is_stopped_and_copying),

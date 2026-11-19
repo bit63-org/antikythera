@@ -19,7 +19,19 @@
 ## Components
 
 - **VirtioBlkFunction** — virtio-blk on the shared core; `VIRTIO_BLK_T_IN`,
-  `T_OUT`, `T_FLUSH`, `T_GET_ID`; discard later.
+  `T_OUT`, `T_FLUSH`, `T_GET_ID`; discard later. A `virtio::Device` behind
+  `PciFunction`, so both transports serve it as they serve virtio-net.
+  Offers VERSION_1, ACCESS_PLATFORM, INDIRECT_DESC, EVENT_IDX, SIZE_MAX,
+  SEG_MAX, BLK_SIZE, FLUSH, RO when read-only and MQ with several queues;
+  `size_max` is `max_transfer_bytes / seg_max` (at least one page), so no
+  request a driver builds exceeds the parser's transfer cap. Requests are
+  served synchronously from a per-queue bounce buffer: writes copy guest
+  plaintext once, encrypt in place and hand only ciphertext to the
+  backend; reads decrypt in place, copy out and wipe. Without a key IN and
+  OUT fail with IOERR. FLR (`function_reset`) and helm's `drop_key` wipe
+  the key; a driver reset (status 0) does not, because the guest driver
+  resets the device on every probe. helm therefore delivers the key after
+  the VMM has opened (and reset) the function during attach.
 - **RequestParser** — validates header, sector range against the volume
   size, and descriptor chain shapes before any I/O. It takes the readable
   and writable buffers of a chain the shared virtqueue already validated,

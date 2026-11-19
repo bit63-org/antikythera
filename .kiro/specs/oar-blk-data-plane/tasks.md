@@ -1,6 +1,6 @@
 # Implementation Plan — oar-blk: the storage data plane
 
-## Status: 3/8 tasks complete
+## Status: 4/8 tasks complete
 
 ## Tasks
 
@@ -21,8 +21,18 @@
   and alignment, overflow-safe sector range, seg_max and transfer caps;
   UNSUPP for other types. `fuzz/fuzz_blk_request.cpp` checks that
   accepted I/O stays inside the volume and parsing never writes.
-- [ ] 4. VirtioBlkFunction on the shared virtio core (vfio-user).
+- [x] 4. VirtioBlkFunction on the shared virtio core (vfio-user).
   _Requirements: 1_
+  — `src/oar/blk/virtio_blk_function.*`: a `virtio::Device` behind the
+  shared `PciFunction` seam (so the vfio-user binding from oar-net task 6
+  serves it unchanged). Read-only `virtio_blk_config`; IN/OUT through a
+  per-queue bounce buffer (plaintext copied once, encrypted in place,
+  only ciphertext reaches the `BlockBackend`; reads wiped after use);
+  FLUSH, GET_ID; per-queue budget with `poll()`. Key in a `KeySlot` plus
+  one `XtsCipher` per queue; FLR and `drop_key` wipe both, a driver reset
+  keeps them. `fuzz/fuzz_virtio_blk.cpp` drives it as a hostile guest
+  and checks every backend access stays inside the volume. The
+  `ak-oar-blk` vfio-user server comes with the file backend (task 5).
 - [ ] 5. File backend with volume metadata header. _Requirements: 3.1_
 - [ ] 6. helm integration: create/attach/detach/delete/rewrap volume flows.
   _Requirements: 3_

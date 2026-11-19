@@ -114,7 +114,9 @@
   the requirement's 90: guest VLAN tags are payload and VirtioNetFunction
   admits one beyond the MTU, so a tagged full-size frame needs the extra 4.
   oar-net's WireGuard adds 32 inside the same UDP datagram
-  (`wireguard_overhead`); 9000 with WireGuard gives guests 8874, 1500 without a tunnel 1406. `ak-oar-net
+  (`wireguard_overhead`), PSP transport mode 48 (`psp_overhead`), and
+  plans reserve the larger (`tunnel_overhead_budget`, Requirement 6.3)
+  so a later move to PSP keeps guest MTUs; 9000 gives guests 8858, 1500 gives 1358. `ak-oar-net
   --underlay-mtu N [--tunnel-overhead N]` advertises the planned MTU
   through `VIRTIO_NET_F_MTU`. `VtepConfig::max_payload` drops and counts
   (`tx_drop_too_big`) any datagram over the plan, and every

@@ -1,6 +1,6 @@
 # Implementation Plan — oar-net: the network data plane
 
-## Status: 10/14 tasks complete
+## Status: 11/14 tasks complete
 
 ## Tasks
 
@@ -164,13 +164,22 @@
   frame's guest addresses (MapUpdate v2) to `VSwitch::set_neighbors` after
   applying the mapping, failing closed (no proxy answers for the VNI) if
   they were ever refused.
-- [ ] 12. Group policy in the VSwitch: drop group frames by default,
+- [x] 12. Group policy in the VSwitch: drop group frames by default,
   opt-in `multicast` mode per VNI with per-NIC frame/byte token buckets
   and the flood-list cap, receive-side admission, cumulative per-NIC
   `GroupMeter`s with retained final readings, tests and fuzz.
-  _Requirements: 10.1–10.4, 10.6_ Note: with drop as the default, ARP and
-  ND between VTEPs depend on the proxy, which `NetRole` feeds from
-  MapUpdate v2 (task 11).
+  _Requirements: 10.1–10.4, 10.6_ — `VSwitch::set_group_policy()` takes a
+  validated `GroupPolicy` per VNI (`drop` erases it). Group frames the
+  proxy did not consume go through `replicate()`: admission by MAC, then
+  the flood-list cap (dropped whole, local copies too), then the sender's
+  bucket, which is primed full and refilled from an injected clock
+  (`VSwitch::Now`, default `steady_clock::now`). `receive()` applies the
+  local policy to broadcast-NIC-ID packets (`rx_drop_group`).
+  `group_meter()` and `group_usage()` expose the meters with an attachment
+  number per attach. `fuzz_vswitch` opts one VNI in and checks that the
+  drop VNI never replicates and that meters stay consistent. With drop
+  as the default, ARP and ND between VTEPs depend on the proxy, which
+  `NetRole` feeds from MapUpdate v2 (task 11).
 - [ ] 13. `GroupPolicy` frame (controller-interface task 10) applied by
   `NetRole` over OarLink `group_policy`, and `group_usage` answered from
   the VSwitch meters. _Requirements: 10.2, 10.6, 10.7_

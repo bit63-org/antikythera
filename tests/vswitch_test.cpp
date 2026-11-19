@@ -1,13 +1,16 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-// .kiro/specs/oar-net-data-plane/ Requirements 2 and 7 (task 8): VSwitch
-// forwarding, head-end replication, the ARP/ND proxy and the dead VPC.
+// .kiro/specs/oar-net-data-plane/ Requirements 2, 7 and 10 (tasks 8, 12):
+// VSwitch forwarding, the ARP/ND proxy, the dead VPC, and the group policy:
+// group frames dropped by default, opt-in multicast with head-end
+// replication, rate limits, the flood-list cap and per-NIC meters.
 
 #define BOOST_TEST_MODULE vswitch_test
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <initializer_list>
 #include <cstdint>
@@ -79,6 +82,27 @@ auto broadcast_mac() -> net::MacAddress {
     net::MacAddress m{};
     m.fill(std::byte{0xff});
     return m;
+}
+
+// 224.0.0.251 (mDNS).
+auto mdns_mac() -> net::MacAddress {
+    return {std::byte{0x01}, std::byte{0x00}, std::byte{0x5e},
+            std::byte{0x00}, std::byte{0x00}, std::byte{0xfb}};
+}
+
+constexpr std::uint32_t test_rate_frames = 10;
+constexpr std::uint32_t test_burst_frames = 4;
+constexpr std::uint64_t test_rate_bytes = 1'000'000;
+constexpr std::uint64_t test_burst_bytes = 100'000;
+constexpr std::uint32_t test_max_remote_vteps = 8;
+
+auto multicast_policy() -> net::GroupPolicy {
+    return {.mode = net::GroupMode::multicast,
+            .rate_frames = test_rate_frames,
+            .burst_frames = test_burst_frames,
+            .rate_bytes = test_rate_bytes,
+            .burst_bytes = test_burst_bytes,
+            .max_remote_vteps = test_max_remote_vteps};
 }
 
 auto entry(NicId id, std::uint8_t vtep_tail) -> MapEntry {
@@ -216,6 +240,10 @@ struct Fixture {
         BOOST_REQUIRE(sw.attach(nic_x, port_x));
     }
 
+    auto opt_in(const net::GroupPolicy& policy = multicast_policy()) -> void {
+        BOOST_REQUIRE(sw.set_group_policy(vpc, policy));
+    }
+
     auto send(NicId from, const std::vector<std::byte>& f) -> void {
         sw.transmit({.source = from, .frame = f});
     }
@@ -227,7 +255,8 @@ struct Fixture {
 
     net::MappingTable table{vtep(self_tail)};
     FakeUnderlay underlay;
-    net::VSwitch sw{table, underlay};
+    net::VSwitch::Clock::time_point now{};
+    net::VSwitch sw{table, underlay, [this] { return now; }};
     FakePort port_a;
     FakePort port_b;
     FakePort port_x;
@@ -289,8 +318,19 @@ BOOST_AUTO_TEST_CASE(vpcs_are_isolated, *boost::unit_test::timeout(unit_timeout_
     BOOST_TEST(sw.counters().tx_drop_unknown_unicast == 3);
 }
 
-BOOST_AUTO_TEST_CASE(broadcast_replication, *boost::unit_test::timeout(unit_timeout_seconds)) {
-    const auto f = frame(broadcast_mac(), mac_of(nic_a));
+BOOST_AUTO_TEST_CASE(group_dropped_by_default, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    send(nic_a, frame(broadcast_mac(), mac_of(nic_a)));
+    send(nic_a, frame(mdns_mac(), mac_of(nic_a)));
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().tx_drop_group == 2);
+    BOOST_TEST(sw.counters().tx_flooded == 0);
+    BOOST_TEST(sw.group_meter(nic_a)->drop_policy == 2);
+    BOOST_TEST(sw.group_meter(nic_a)->frames == 0);
+}
+
+BOOST_AUTO_TEST_CASE(multicast_replication, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in();
+    const auto f = frame(mdns_mac(), mac_of(nic_a));
     send(nic_a, f);
     BOOST_TEST(port_a.frames.empty());  // never back to the sender
     BOOST_REQUIRE(port_b.frames.size() == 1);
@@ -307,14 +347,178 @@ BOOST_AUTO_TEST_CASE(broadcast_replication, *boost::unit_test::timeout(unit_time
     BOOST_TEST(sw.counters().tx_flooded == 1);
     BOOST_TEST(sw.counters().tx_replicas_local == 1);
     BOOST_TEST(sw.counters().tx_replicas_remote == 2);
+    const net::GroupMeter expected{.frames = 1,
+                                   .bytes = f.size(),
+                                   .replicas_remote = 2,
+                                   .replica_bytes_remote = 2 * f.size(),
+                                   .replicas_local = 1,
+                                   .replica_bytes_local = f.size()};
+    BOOST_TEST((*sw.group_meter(nic_a) == expected));
 }
 
-BOOST_AUTO_TEST_CASE(multicast_is_flooded, *boost::unit_test::timeout(unit_timeout_seconds)) {
-    const net::MacAddress mdns{std::byte{0x01}, std::byte{0x00}, std::byte{0x5e},
-                               std::byte{0x00}, std::byte{0x00}, std::byte{0xfb}};
-    send(nic_a, frame(mdns, mac_of(nic_a)));
-    BOOST_TEST(port_b.frames.size() == 1);
+BOOST_AUTO_TEST_CASE(only_ip_multicast_when_opted_in,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in();
+    const auto mac = [](std::initializer_list<std::uint8_t> b) {
+        net::MacAddress m{};
+        std::ranges::transform(b, m.begin(), [](std::uint8_t v) { return std::byte{v}; });
+        return m;
+    };
+    // Refused: broadcast, 01:00:5e upper half (not IPv4 multicast),
+    // solicited-node (ND), and other group addresses (STP).
+    for (const auto& dst :
+         {broadcast_mac(), mac({0x01, 0x00, 0x5e, 0x80, 0x00, 0x01}),
+          mac({0x33, 0x33, 0xff, 0x00, 0x00, 0x01}), mac({0x01, 0x80, 0xc2, 0x00, 0x00, 0x00})}) {
+        send(nic_a, frame(dst, mac_of(nic_a)));
+    }
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.group_meter(nic_a)->drop_policy == 4);
+    // Admitted: IPv4 multicast and IPv6 all-nodes / other groups.
+    for (const auto& dst :
+         {mac({0x01, 0x00, 0x5e, 0x7f, 0xff, 0xfa}), mac({0x33, 0x33, 0x00, 0x00, 0x00, 0x01})}) {
+        send(nic_a, frame(dst, mac_of(nic_a)));
+    }
+    BOOST_TEST(port_b.frames.size() == 2);
+    BOOST_TEST(sw.group_meter(nic_a)->frames == 2);
+}
+
+BOOST_AUTO_TEST_CASE(rate_limited_per_nic, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in();
+    const auto f = frame(mdns_mac(), mac_of(nic_a));
+    for (std::uint32_t i = 0; i < test_burst_frames + 2; ++i) {
+        send(nic_a, f);
+    }
+    BOOST_TEST(sw.group_meter(nic_a)->frames == test_burst_frames);
+    BOOST_TEST(sw.group_meter(nic_a)->drop_rate == 2);
+    // b has its own bucket.
+    send(nic_b, frame(mdns_mac(), mac_of(nic_b)));
+    BOOST_TEST(sw.group_meter(nic_b)->frames == 1);
+    // 10 frames/s: one more after 100 ms, and never more than the burst.
+    now += std::chrono::milliseconds{100};
+    send(nic_a, f);
+    send(nic_a, f);
+    BOOST_TEST(sw.group_meter(nic_a)->frames == test_burst_frames + 1);
+    now += std::chrono::hours{1};
+    for (std::uint32_t i = 0; i < test_burst_frames + 1; ++i) {
+        send(nic_a, f);
+    }
+    BOOST_TEST(sw.group_meter(nic_a)->frames == 2 * test_burst_frames + 1);
+    BOOST_TEST(sw.group_meter(nic_a)->drop_rate == 4);
+}
+
+BOOST_AUTO_TEST_CASE(byte_rate_limited, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto policy = multicast_policy();
+    policy.burst_bytes = 100;  // two 46-byte test frames fit, a third does not
+    policy.rate_bytes = 46;    // one frame's worth per second
+    opt_in(policy);
+    const auto f = frame(mdns_mac(), mac_of(nic_a));
+    BOOST_REQUIRE(f.size() == 46);
+    send(nic_a, f);
+    send(nic_a, f);
+    send(nic_a, f);
+    BOOST_TEST(sw.group_meter(nic_a)->frames == 2);
+    BOOST_TEST(sw.group_meter(nic_a)->drop_rate == 1);
+    // 8 bytes of credit left; 38 more take 826 ms at 46 bytes/s.
+    now += std::chrono::milliseconds{800};
+    send(nic_a, f);
+    BOOST_TEST(sw.group_meter(nic_a)->frames == 2);
+    now += std::chrono::milliseconds{30};
+    send(nic_a, f);
+    BOOST_TEST(sw.group_meter(nic_a)->frames == 3);
+}
+
+BOOST_AUTO_TEST_CASE(flood_list_cap, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto policy = multicast_policy();
+    policy.max_remote_vteps = 1;  // vpc spans peer and third
+    opt_in(policy);
+    send(nic_a, frame(mdns_mac(), mac_of(nic_a)));
+    BOOST_TEST(nothing_delivered());  // dropped whole, local copies too
+    BOOST_TEST(sw.group_meter(nic_a)->drop_fanout == 1);
+    policy.max_remote_vteps = 2;
+    opt_in(policy);
+    send(nic_a, frame(mdns_mac(), mac_of(nic_a)));
     BOOST_TEST(underlay.sent.size() == 2);
+}
+
+BOOST_AUTO_TEST_CASE(policy_validation, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    using net::GroupPolicyError;
+    BOOST_TEST(
+        (sw.set_group_policy(0, multicast_policy()).error() == GroupPolicyError::vni_out_of_range));
+    BOOST_TEST((sw.set_group_policy(geneve::vni_max + 1, multicast_policy()).error() ==
+                GroupPolicyError::vni_out_of_range));
+    auto p = multicast_policy();
+    p.mode = static_cast<net::GroupMode>(7);
+    BOOST_TEST((sw.set_group_policy(vpc, p).error() == GroupPolicyError::unknown_mode));
+    for (int field = 0; field < 5; ++field) {
+        p = multicast_policy();
+        switch (field) {
+            case 0:
+                p.rate_frames = 0;
+                break;
+            case 1:
+                p.burst_frames = 0;
+                break;
+            case 2:
+                p.rate_bytes = 0;
+                break;
+            case 3:
+                p.burst_bytes = 0;
+                break;
+            default:
+                p.max_remote_vteps = 0;
+                break;
+        }
+        BOOST_TEST((sw.set_group_policy(vpc, p).error() == GroupPolicyError::missing_limit));
+    }
+    for (int field = 0; field < 5; ++field) {
+        p = multicast_policy();
+        switch (field) {
+            case 0:
+                p.rate_frames = net::group_rate_frames_max + 1;
+                break;
+            case 1:
+                p.burst_frames = net::group_burst_frames_max + 1;
+                break;
+            case 2:
+                p.rate_bytes = net::group_rate_bytes_max + 1;
+                break;
+            case 3:
+                p.burst_bytes = net::group_burst_bytes_max + 1;
+                break;
+            default:
+                p.max_remote_vteps = net::group_max_remote_vteps_max + 1;
+                break;
+        }
+        BOOST_TEST((sw.set_group_policy(vpc, p).error() == GroupPolicyError::limit_too_large));
+    }
+    BOOST_TEST(
+        (sw.set_group_policy(vpc, {.mode = net::GroupMode::drop, .rate_frames = 1}).error() ==
+         GroupPolicyError::nonzero_limits));
+
+    // A rejected policy leaves the previous one; drop restores the default.
+    opt_in();
+    p = multicast_policy();
+    p.burst_frames = 0;
+    BOOST_TEST(!sw.set_group_policy(vpc, p));
+    BOOST_TEST((sw.group_policy(vpc).mode == net::GroupMode::multicast));
+    BOOST_REQUIRE(sw.set_group_policy(vpc, {}));
+    BOOST_TEST((sw.group_policy(vpc).mode == net::GroupMode::drop));
+    send(nic_a, frame(mdns_mac(), mac_of(nic_a)));
+    BOOST_TEST(nothing_delivered());
+}
+
+BOOST_AUTO_TEST_CASE(lowered_burst_clamps_tokens,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in();
+    const auto f = frame(mdns_mac(), mac_of(nic_a));
+    send(nic_a, f);  // primes a full bucket of 4, leaves 3
+    auto p = multicast_policy();
+    p.burst_frames = 1;
+    opt_in(p);
+    send(nic_a, f);
+    send(nic_a, f);
+    BOOST_TEST(sw.group_meter(nic_a)->frames == 2);
+    BOOST_TEST(sw.group_meter(nic_a)->drop_rate == 1);
 }
 
 BOOST_AUTO_TEST_CASE(spoofed_source_mac, *boost::unit_test::timeout(unit_timeout_seconds)) {
@@ -386,12 +590,13 @@ BOOST_AUTO_TEST_CASE(detached_by_map_update, *boost::unit_test::timeout(unit_tim
     // helm moves b to the dead VPC by dropping it from the VNI (Requirement 8.2).
     BOOST_REQUIRE(table.apply(
         {.vni = vpc, .version = 2, .entries = {entry(nic_a, self_tail), entry(nic_c, peer_tail)}}));
+    opt_in();
     send(nic_a, frame(mac_of(nic_b), mac_of(nic_a)));
-    send(nic_a, frame(broadcast_mac(), mac_of(nic_a)));
+    send(nic_a, frame(mdns_mac(), mac_of(nic_a)));
     send(nic_b, frame(mac_of(nic_a), mac_of(nic_b)));
     BOOST_TEST(port_b.frames.empty());
     BOOST_TEST(port_a.frames.empty());
-    BOOST_TEST(underlay.sent.size() == 1);  // a's broadcast, to c's VTEP
+    BOOST_TEST(underlay.sent.size() == 1);  // a's multicast, to c's VTEP
     BOOST_TEST(sw.counters().tx_drop_unknown_unicast == 1);
     BOOST_TEST(sw.counters().tx_drop_dead_vpc == 1);
 }
@@ -421,15 +626,18 @@ BOOST_AUTO_TEST_CASE(answers_arp, *boost::unit_test::timeout(unit_timeout_second
     BOOST_TEST(sw.counters().arp_replies == 2);
 }
 
-BOOST_AUTO_TEST_CASE(floods_unanswerable_arp, *boost::unit_test::timeout(unit_timeout_seconds)) {
+BOOST_AUTO_TEST_CASE(drops_unanswerable_arp, *boost::unit_test::timeout(unit_timeout_seconds)) {
     // x is registered in vpc but mapped in other_vpc: never answered for.
     BOOST_REQUIRE(sw.set_neighbors({.vni = vpc, .ipv4 = {{ip4(1), nic_a}, {ip4(9), nic_x}}}));
     send(nic_a, arp_request(nic_a, ip4(1), ip4(7)));  // unknown
     send(nic_a, arp_request(nic_a, ip4(1), ip4(9)));  // other VPC
     send(nic_a, arp_request(nic_a, ip4(1), ip4(1)));  // gratuitous
-    BOOST_TEST(port_a.frames.empty());
-    BOOST_TEST(port_b.frames.size() == 3);
+    BOOST_TEST(nothing_delivered());  // broadcast is never flooded (Requirement 10.1)
     BOOST_TEST(sw.counters().arp_replies == 0);
+    BOOST_TEST(sw.counters().tx_drop_group == 3);
+    opt_in();  // not even in a multicast VPC
+    send(nic_a, arp_request(nic_a, ip4(1), ip4(7)));
+    BOOST_TEST(nothing_delivered());
 }
 
 BOOST_AUTO_TEST_CASE(drops_arp_spoofing, *boost::unit_test::timeout(unit_timeout_seconds)) {
@@ -438,10 +646,12 @@ BOOST_AUTO_TEST_CASE(drops_arp_spoofing, *boost::unit_test::timeout(unit_timeout
     send(nic_a, arp_request(nic_a, ip4(1), ip4(2), mac_of(nic_b)));  // sender MAC is b's
     BOOST_TEST(nothing_delivered());
     BOOST_TEST(sw.counters().tx_drop_neighbor_spoofed == 2);
-    // Unregistered sender addresses and probes from 0.0.0.0 are forwarded.
+    // Unregistered sender addresses and probes from 0.0.0.0 pass the spoofing
+    // check and then meet the group policy.
     send(nic_a, arp_request(nic_a, ip4(5), ip4(7)));
     send(nic_a, arp_request(nic_a, nb::Ipv4Address{}, ip4(7)));
-    BOOST_TEST(port_b.frames.size() == 2);
+    BOOST_TEST(sw.counters().tx_drop_neighbor_spoofed == 2);
+    BOOST_TEST(sw.counters().tx_drop_group == 2);
 }
 
 BOOST_AUTO_TEST_CASE(answers_neighbor_solicitation,
@@ -464,9 +674,9 @@ BOOST_AUTO_TEST_CASE(never_answers_dad, *boost::unit_test::timeout(unit_timeout_
     BOOST_REQUIRE(sw.set_neighbors({.vni = vpc, .ipv6 = {{ip6(1), nic_a}, {ip6(2), nic_b}}}));
     send(nic_a, neighbor_solicitation(nic_a, net::Ipv6Address{}, ip6(1)));
     send(nic_a, neighbor_solicitation(nic_a, net::Ipv6Address{}, ip6(2)));
-    BOOST_TEST(port_a.frames.empty());
-    BOOST_TEST(port_b.frames.size() == 2);
+    BOOST_TEST(nothing_delivered());  // unanswered, and solicited-node never floods
     BOOST_TEST(sw.counters().nd_replies == 0);
+    BOOST_TEST(sw.counters().tx_drop_group == 2);
 }
 
 BOOST_AUTO_TEST_CASE(neighbor_update_validation, *boost::unit_test::timeout(unit_timeout_seconds)) {
@@ -497,7 +707,7 @@ BOOST_AUTO_TEST_CASE(neighbor_update_validation, *boost::unit_test::timeout(unit
     BOOST_REQUIRE(sw.set_neighbors({.vni = vpc}));
     send(nic_a, arp_request(nic_a, ip4(1), ip4(2)));
     BOOST_TEST(sw.counters().arp_replies == 1);
-    BOOST_TEST(port_b.frames.size() == 1);
+    BOOST_TEST(sw.counters().tx_drop_group == 1);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
@@ -516,14 +726,28 @@ BOOST_AUTO_TEST_CASE(unicast_from_peer, *boost::unit_test::timeout(unit_timeout_
     BOOST_TEST(sw.counters().rx_delivered == 1);
 }
 
-BOOST_AUTO_TEST_CASE(broadcast_from_peer, *boost::unit_test::timeout(unit_timeout_seconds)) {
-    const Inbound in{nic_c, geneve::nic_broadcast, vpc, frame(broadcast_mac(), mac_of(nic_c))};
+BOOST_AUTO_TEST_CASE(multicast_from_peer, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in();
+    const Inbound in{nic_c, geneve::nic_broadcast, vpc, frame(mdns_mac(), mac_of(nic_c))};
     BOOST_REQUIRE(sw.receive(in.packet, vtep(peer_tail)).has_value());
     BOOST_TEST(port_a.frames.size() == 1);
     BOOST_TEST(port_b.frames.size() == 1);
     BOOST_TEST(port_x.frames.empty());
     BOOST_TEST(underlay.sent.empty());  // never re-flooded
     BOOST_TEST(sw.counters().rx_delivered == 2);
+}
+
+BOOST_AUTO_TEST_CASE(receiver_applies_its_own_policy,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // A peer with a stale or hostile policy: this VTEP has not opted in.
+    const Inbound mcast{nic_c, geneve::nic_broadcast, vpc, frame(mdns_mac(), mac_of(nic_c))};
+    BOOST_TEST(sw.receive(mcast.packet, vtep(peer_tail)).has_value());
+    // Opted in, but broadcast is never admitted.
+    opt_in();
+    const Inbound bcast{nic_c, geneve::nic_broadcast, vpc, frame(broadcast_mac(), mac_of(nic_c))};
+    BOOST_TEST(sw.receive(bcast.packet, vtep(peer_tail)).has_value());
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().rx_drop_group == 2);
 }
 
 BOOST_AUTO_TEST_CASE(policy_drops_counted, *boost::unit_test::timeout(unit_timeout_seconds)) {
@@ -566,6 +790,44 @@ BOOST_AUTO_TEST_CASE(attach_rules, *boost::unit_test::timeout(unit_timeout_secon
     BOOST_TEST(sw.detach(nic_a));
     BOOST_TEST(!sw.detach(nic_a));
     BOOST_TEST(!sw.attached(nic_a));
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(metering, Fixture)
+
+BOOST_AUTO_TEST_CASE(usage_reports_attached_then_retired,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in();
+    send(nic_b, frame(mdns_mac(), mac_of(nic_b)));
+    send(nic_a, frame(mdns_mac(), mac_of(nic_a)));
+    auto usage = sw.group_usage();
+    BOOST_REQUIRE(usage.size() == 3);  // a, b, x in NIC ID order
+    BOOST_TEST((usage[0].nic == nic_a));
+    BOOST_TEST((usage[1].nic == nic_b));
+    BOOST_TEST((usage[2].nic == nic_x));
+    BOOST_TEST(usage[0].meter.replicas_remote == 2);
+    BOOST_TEST(usage[1].meter.replicas_remote == 2);
+    BOOST_TEST(usage[2].meter.frames == 0);
+    BOOST_TEST(!usage[0].detached);
+    const std::uint64_t first_a = usage[0].attachment;
+
+    // Detach keeps a's final reading for exactly one read.
+    BOOST_REQUIRE(sw.detach(nic_a));
+    BOOST_TEST(!sw.group_meter(nic_a).has_value());
+    usage = sw.group_usage();
+    BOOST_REQUIRE(usage.size() == 3);  // b, x, then retired a
+    BOOST_TEST((usage[2].nic == nic_a));
+    BOOST_TEST(usage[2].detached);
+    BOOST_TEST(usage[2].attachment == first_a);
+    BOOST_TEST(usage[2].meter.replicas_remote == 2);
+    BOOST_TEST(sw.group_usage().size() == 2);
+
+    // Re-attaching starts a new series from zero.
+    BOOST_REQUIRE(sw.attach(nic_a, port_a));
+    BOOST_TEST(sw.group_meter(nic_a)->replicas_remote == 0);
+    usage = sw.group_usage();
+    BOOST_TEST(usage[0].attachment > first_a);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
@@ -625,10 +887,12 @@ BOOST_AUTO_TEST_CASE(boards_talk_through_geneve, *boost::unit_test::timeout(unit
     BOOST_REQUIRE(port_b.frames.size() == 1);
     BOOST_TEST(port_b.frames[0] == to_b);
 
-    const auto bcast = frame(broadcast_mac(), mac_of(nic_b));
-    board2.transmit({.source = nic_b, .frame = bcast});
+    BOOST_REQUIRE(board1.set_group_policy(vpc, multicast_policy()));
+    BOOST_REQUIRE(board2.set_group_policy(vpc, multicast_policy()));
+    const auto mcast = frame(mdns_mac(), mac_of(nic_b));
+    board2.transmit({.source = nic_b, .frame = mcast});
     BOOST_REQUIRE(port_a.frames.size() == 1);
-    BOOST_TEST(port_a.frames[0] == bcast);
+    BOOST_TEST(port_a.frames[0] == mcast);
     BOOST_TEST(board1.counters().tx_remote == 1);
     BOOST_TEST(board2.counters().tx_replicas_remote == 1);
 }

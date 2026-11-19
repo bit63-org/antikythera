@@ -46,6 +46,15 @@ enum class DecodeError : std::uint8_t {
     nic_ids_not_ascending,  // entries not in strictly increasing NIC ID order
     bad_mac,                // MAC not a locally administered unicast address
     bad_vtep,               // owner VTEP address unspecified (all zero) or multicast
+    bad_report_seq,         // report sequence number 0
+    bad_boot_id,            // inventory boot ID 0
+    bad_id,                 // a VM, volume or command identifier that must be non-zero is 0
+    unknown_value,          // an enum field holds a value the protocol does not define
+    bad_capacity,           // a free count larger than its total
+    not_ascending,          // a list that must be in strictly increasing key order is not
+    bad_owner,              // a function's owner VM disagrees with its state
+    bad_record_type,        // a link record type this code does not speak
+    record_too_large,       // a link record longer than max_record_payload
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -80,6 +89,24 @@ enum class DecodeError : std::uint8_t {
             return "MAC not locally administered unicast";
         case DecodeError::bad_vtep:
             return "owner VTEP unspecified or multicast";
+        case DecodeError::bad_report_seq:
+            return "report sequence 0";
+        case DecodeError::bad_boot_id:
+            return "boot id 0";
+        case DecodeError::bad_id:
+            return "identifier 0";
+        case DecodeError::unknown_value:
+            return "unknown enum value";
+        case DecodeError::bad_capacity:
+            return "free count exceeds total";
+        case DecodeError::not_ascending:
+            return "list not strictly ascending";
+        case DecodeError::bad_owner:
+            return "function owner disagrees with its state";
+        case DecodeError::bad_record_type:
+            return "unknown link record type";
+        case DecodeError::record_too_large:
+            return "link record too large";
     }
     return "unknown";
 }

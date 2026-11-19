@@ -150,3 +150,41 @@ network rejected, since Geneve itself has no authentication.
    device in a network namespace. _(Done: tests/geneve_interop.sh.)_
 3. harbor SHALL verify cross-server reachability within a VPC, isolation
    between VPCs, rejection of forged VNIs and NIC IDs, and MTU behaviour.
+
+### Requirement 10: Broadcast and multicast
+
+**User Story:** As a tenant, I want a VPC that behaves like an AWS VPC by
+default, with multicast available when I ask and pay for it; as the
+operator, I want no tenant able to turn replication into an amplifier.
+
+#### Acceptance Criteria
+
+1. By default a VPC SHALL carry no broadcast or multicast: group-addressed
+   frames that the ARP/ND proxy (Requirement 2.6) does not consume SHALL
+   be dropped and counted. DHCP SHALL be answered locally (when built),
+   not flooded.
+2. A subnet (until subnets exist, a VPC) MAY be opted in to multicast by a
+   controller-signed group policy delivered through helm. In an opted-in
+   subnet, IPv4 and IPv6 multicast frames SHALL be replicated to the other
+   local NICs in the VNI and once to each other VTEP hosting it, as
+   unicast Geneve with the broadcast NIC ID (head-end replication).
+   Broadcast, IPv6 solicited-node groups and every other group address
+   SHALL still be dropped.
+3. A receiving VTEP SHALL deliver a replicated frame only if its own
+   policy for the VNI admits it, and SHALL count those it drops.
+4. Replication SHALL be limited per source NIC by a frame rate and a byte
+   rate with bounded bursts, and a frame SHALL be dropped whole when the
+   VNI spans more remote VTEPs than the policy's flood-list cap. An
+   opted-in policy without every limit SHALL be rejected.
+5. Once oar-net parses IP: it SHALL snoop guest IGMPv2/v3 and MLDv1/v2
+   membership, report joins and leaves through helm, cap the groups per
+   NIC, and replicate a known group only to the VTEPs the controller lists
+   for it, falling back to the whole subnet for unknown groups.
+6. oar-net SHALL keep cumulative group counters per NIC attachment: frames
+   and bytes accepted for replication, replicas and replica bytes sent to
+   other VTEPs and delivered locally, and drops by cause (policy, rate,
+   flood-list cap). It SHALL keep a detached NIC's final counters until
+   helm has read them.
+7. Policy changes SHALL apply atomically per VNI; a malformed or unsigned
+   policy SHALL be rejected whole, leaving the previous one.
+

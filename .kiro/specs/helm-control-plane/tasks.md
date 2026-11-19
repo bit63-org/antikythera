@@ -1,6 +1,6 @@
 # Implementation Plan — helm: the control-plane role
 
-## Status: 10/12 tasks complete
+## Status: 10/13 tasks complete
 
 ## Tasks
 
@@ -45,6 +45,9 @@
   exits, host faults and map versions, and builds the inventory
   snapshot. See design "Audit log".)
 - [ ] 12. harbor CI: both placements. _Requirements: 7, 10.3_
+- [ ] 13. OarLink `group_policy` and `group_usage`, policy fan-out to
+  network roles, periodic and on-detach usage reports with final readings
+  held until acknowledged. _Requirements: 11_
 
 ## Deferred
 

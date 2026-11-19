@@ -159,7 +159,8 @@ non-regular file, group/other permission bits, or the wrong size.
 
 One per data-plane role. MCTP message types (vendor-defined) for:
 `function_inventory`, `prepare_function`, `clean_function`,
-`deliver_key`, `drop_key`, `map_update`, `health`. Transport binding:
+`deliver_key`, `drop_key`, `map_update`, `group_policy`, `group_usage`,
+`health`. Transport binding:
 `SmbusBinding` (hardware), `I3cBinding` (later), `SocketBinding` (harbor,
 one Unix socket per slot), `InProcessBinding` (combined placement).
 
@@ -182,6 +183,13 @@ signature included, so the role can check it itself. A frame (up to
 consecutive chunks (`total`, `offset`, bytes); offset 0 restarts a
 transfer, any gap or changed total aborts it, and the last chunk's answer
 is the result of applying the frame.
+
+`group_policy` forwards the controller's GroupPolicy frame the same way
+(it fits one message). `group_usage` asks a network role for its per-NIC
+group meters; the answer is the `group_usage` report body, which helm
+wraps in a report header and sends (Requirement 11). The role keeps a
+detached NIC's final meter until it has answered one `group_usage`; helm
+then keeps it until the controller acknowledges that report.
 
 `create_volume`, `delete_volume` and `rewrap_volume` are the storage
 role's half of the volume commands: the role keeps the wrapped key (opaque

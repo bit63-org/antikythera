@@ -1,6 +1,6 @@
 # Implementation Plan — oar-net: the network data plane
 
-## Status: 8/11 tasks complete
+## Status: 8/14 tasks complete
 
 ## Tasks
 
@@ -79,3 +79,16 @@
   _Requirements: 5_
 - [ ] 11. MTU computation and advertisement; harbor multi-server tests.
   _Requirements: 6, 9.3_
+- [ ] 12. Group policy in the VSwitch: drop group frames by default,
+  opt-in `multicast` mode per VNI with per-NIC frame/byte token buckets
+  and the flood-list cap, receive-side admission, cumulative per-NIC
+  `GroupMeter`s with retained final readings, tests and fuzz.
+  _Requirements: 10.1–10.4, 10.6_ Note: with drop as the default, ARP and
+  ND between VTEPs depend on the proxy, so `NetRole` must feed
+  `set_neighbors()` from MapUpdate v2 before the harbor multi-server
+  tests.
+- [ ] 13. `GroupPolicy` frame (controller-interface task 8) applied by
+  `NetRole` over OarLink `group_policy`, and `group_usage` answered from
+  the VSwitch meters. _Requirements: 10.2, 10.6, 10.7_
+- [ ] 14. IGMP/MLD snooping, per-NIC group cap, join reports through helm
+  and per-group VTEP lists. Needs the L3 parser. _Requirements: 10.5_

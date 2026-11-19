@@ -1,6 +1,6 @@
 # Implementation Plan — Controller interface and the kythira EC2 integration
 
-## Status: 5/7 tasks complete
+## Status: 5/10 tasks complete
 
 ## Tasks
 
@@ -32,3 +32,11 @@
   repository, from Requirement 6. _Requirements: 6_
 - [ ] 7. End-to-end: AWS CLI `run-instances` against kythira, landing in a
   harbor server. _Requirements: 6.1_
+- [ ] 8. `GroupPolicy` codec in `src/proto/`, `group_policy` link record,
+  signing vectors, tests, fuzz; `ak-test-controller` can send it.
+  _Requirements: 7.3_
+- [ ] 9. `group_usage` report kind in `src/proto/report.hpp`, tests,
+  fuzz. _Requirements: 7.5_
+- [ ] 10. Controller policy state, admission checks and usage metering
+  (kythira `ec2-compatible-api` spec and module). _Requirements: 7.2,
+  7.4, 7.6–7.8_

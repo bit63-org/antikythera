@@ -23,6 +23,7 @@
 #include "oar/net/geneve.hpp"
 #include "oar/net/mapping_table.hpp"
 #include "oar/net/neighbor.hpp"
+#include "oar/net/dhcp6.hpp"
 #include "oar/net/packet.hpp"
 #include "oar/net/vswitch.hpp"
 #include "test_support.hpp"
@@ -1086,7 +1087,8 @@ BOOST_AUTO_TEST_CASE(local_only_sources, *boost::unit_test::timeout(unit_timeout
                      dhcp6_server));
     BOOST_TEST(nothing_delivered());
     BOOST_TEST(sw.counters().dhcp4_no_config == 1);
-    BOOST_TEST(sw.counters().tx_drop_local_only == 4);
+    BOOST_TEST(sw.counters().rs_dropped == 1);  // no IPv6 gateway for the RS
+    BOOST_TEST(sw.counters().tx_drop_local_only == 3);
     // 0.0.0.0 for anything but a DHCP client message is a forgery.
     send(nic_a, udp4(mac_of(nic_b), mac_of(nic_a), any, ip4(22)));
     BOOST_TEST(sw.counters().tx_drop_ip_spoofed == 1);
@@ -1474,6 +1476,315 @@ BOOST_AUTO_TEST_CASE(gateway_routes_nothing_yet, *boost::unit_test::timeout(unit
     send(nic_a, udp4(gw_mac(), mac_of(nic_a), ip4(11), ip4(22)));
     BOOST_TEST(nothing_delivered());
     BOOST_TEST(sw.counters().tx_drop_no_route == 2);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// Requirements 12.4-12.5 (task 18): router advertisements and DHCPv6.
+BOOST_FIXTURE_TEST_SUITE(gateway6, Fixture)
+
+namespace {
+
+constexpr std::uint16_t dhcp6_client_port = 546;
+constexpr std::uint16_t dhcp6_server_port = 547;
+constexpr std::uint16_t opt_client_id = 1;
+constexpr std::uint16_t opt_server_id = 2;
+constexpr std::uint16_t opt_ia_na = 3;
+constexpr std::uint16_t opt_status = 13;
+constexpr std::uint16_t opt_rapid_commit = 14;
+constexpr std::uint32_t iaid = 77;
+constexpr std::size_t udp6_payload = ethernet_header_size + nb::ipv6_header_size + 8;
+constexpr std::size_t icmp6_body = ethernet_header_size + nb::ipv6_header_size + 4;
+
+auto all_routers() -> net::Ipv6Address {
+    net::Ipv6Address a{};
+    a[0] = std::byte{0xff};
+    a[1] = std::byte{0x02};
+    a[ipv6_last] = std::byte{2};
+    return a;
+}
+
+auto multicast_mac(const net::Ipv6Address& group) -> net::MacAddress {
+    return {std::byte{0x33}, std::byte{0x33}, group[12], group[13], group[14], group[15]};
+}
+
+auto router_solicitation(NicId from, const net::Ipv6Address& src,
+                         std::uint8_t hop_limit = nb::nd_hop_limit) -> std::vector<std::byte> {
+    const std::vector<std::byte> reserved(4, std::byte{0});
+    return fr::ipv6(multicast_mac(all_routers()), mac_of(from), src, all_routers(),
+                    pk::ipproto_icmpv6, fr::icmpv6(src, all_routers(), 133, 0, reserved),
+                    hop_limit);
+}
+
+auto client_duid(NicId n) -> std::vector<std::byte> {
+    return {std::byte{0}, std::byte{3}, std::byte{0}, std::byte{1}, mac_of(n)[0],
+            mac_of(n)[1], mac_of(n)[2], mac_of(n)[3], mac_of(n)[4], mac_of(n)[5]};
+}
+
+auto dhcp6(NicId from, std::uint8_t type, std::vector<fr::DhcpOption6> options)
+    -> std::vector<std::byte> {
+    return fr::ipv6(
+        multicast_mac(ak::oar::net::dhcp6::all_servers), mac_of(from), link_local(from),
+        ak::oar::net::dhcp6::all_servers, pk::ipproto_udp,
+        fr::udp(dhcp6_client_port, dhcp6_server_port, fr::dhcp6_message(type, 1, options)));
+}
+
+auto reply_options(const std::vector<std::byte>& frame) {
+    return fr::dhcp6_options(std::span{frame}.subspan(udp6_payload));
+}
+
+auto has(const std::vector<std::pair<std::uint16_t, std::vector<std::byte>>>& opts,
+         std::uint16_t code) -> const std::vector<std::byte>* {
+    for (const auto& [c, v] : opts) {
+        if (c == code) {
+            return &v;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(answers_router_solicitation,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    send(nic_a, router_solicitation(nic_a, link_local(nic_a)));
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().rs_dropped == 1);
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, gateway::config()));
+    BOOST_REQUIRE(sw.detach(nic_a));
+    BOOST_REQUIRE(sw.attach(nic_a, port_a, 8874));
+    send(nic_a, router_solicitation(nic_a, link_local(nic_a)));
+    BOOST_REQUIRE(port_a.frames.size() == 1);
+    const auto& f = port_a.frames[0];
+    const auto p = pk::parse(f);
+    BOOST_REQUIRE(p.has_value());
+    BOOST_TEST(p->hop_limit == nb::nd_hop_limit);
+    BOOST_TEST((p->src6 == net::gateway_link_local(gateway::gw_mac())));
+    BOOST_TEST((p->dst6 == link_local(nic_a)));
+    BOOST_TEST(p->l4->icmp_type == 134);
+    BOOST_TEST(nb::icmpv6_checksum(p->src6, p->dst6, p->l4_data) == 0);
+    BOOST_TEST(std::to_integer<int>(f[icmp6_body + 1]) == 0xC0);  // M | O
+    BOOST_TEST(sw.counters().ra_sent == 1);
+    // From :: the answer goes to all-nodes; a hop limit other than 255 is
+    // not a real solicitation (RFC 4861 6.1.1).
+    send(nic_a, router_solicitation(nic_a, net::Ipv6Address{}));
+    BOOST_REQUIRE(port_a.frames.size() == 2);
+    BOOST_TEST(std::to_integer<int>(pk::parse(port_a.frames[1])->dst6[1]) == 0x02);
+    send(nic_a, router_solicitation(nic_a, link_local(nic_a), 64));
+    BOOST_TEST(port_a.frames.size() == 2);
+    BOOST_TEST(sw.counters().rs_dropped == 2);
+    BOOST_TEST(port_b.frames.empty());
+    BOOST_TEST(underlay.sent.empty());
+}
+
+BOOST_AUTO_TEST_CASE(periodic_advertisements, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    sw.poll();
+    BOOST_TEST(nothing_delivered());  // no IPv6 gateway anywhere
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, gateway::config()));
+    sw.poll();
+    BOOST_TEST(port_a.frames.size() == 1);
+    BOOST_TEST(port_b.frames.size() == 1);
+    BOOST_TEST(port_x.frames.empty());  // other VPC
+    now += std::chrono::seconds{199};
+    sw.poll();
+    BOOST_TEST(port_a.frames.size() == 1);
+    now += std::chrono::seconds{1};
+    sw.poll();
+    BOOST_TEST(port_a.frames.size() == 2);
+    BOOST_TEST(port_b.frames.size() == 2);
+    // A re-attached NIC gets one at the next poll.
+    BOOST_REQUIRE(sw.detach(nic_b));
+    BOOST_REQUIRE(sw.attach(nic_b, port_b));
+    sw.poll();
+    BOOST_TEST(port_b.frames.size() == 3);
+    BOOST_TEST(port_a.frames.size() == 2);
+    BOOST_TEST(underlay.sent.empty());
+}
+
+BOOST_AUTO_TEST_CASE(dhcp6_solicit_request, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    send(nic_a, dhcp6(nic_a, 1, {{opt_client_id, client_duid(nic_a)}}));
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().dhcp6_no_config == 1);
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, gateway::config()));
+
+    send(nic_a,
+         dhcp6(nic_a, 1, {{opt_client_id, client_duid(nic_a)}, {opt_ia_na, fr::ia_na(iaid)}}));
+    BOOST_REQUIRE(port_a.frames.size() == 1);
+    const auto p = pk::parse(port_a.frames[0]);
+    BOOST_REQUIRE(p.has_value());
+    BOOST_TEST((p->dst6 == link_local(nic_a)));
+    BOOST_TEST(p->l4->src_port == dhcp6_server_port);
+    BOOST_TEST(std::to_integer<int>(port_a.frames[0][udp6_payload]) == 2);  // Advertise
+    auto opts = reply_options(port_a.frames[0]);
+    const auto* server = has(opts, opt_server_id);
+    BOOST_REQUIRE(server != nullptr);
+    const auto* ia = has(opts, opt_ia_na);
+    BOOST_REQUIRE(ia != nullptr);
+    BOOST_TEST(ia->size() == 12 + 28);  // a's one address, fd10::11
+    BOOST_TEST(std::ranges::equal(std::span{*ia}.subspan(16, 16), ip6(11)));
+
+    // Request naming us gets a Reply; naming someone else is ignored.
+    const std::vector<std::byte> ours = *server;
+    send(nic_a, dhcp6(nic_a, 3,
+                      {{opt_client_id, client_duid(nic_a)},
+                       {opt_server_id, ours},
+                       {opt_ia_na, fr::ia_na(iaid)}}));
+    BOOST_REQUIRE(port_a.frames.size() == 2);
+    BOOST_TEST(std::to_integer<int>(port_a.frames[1][udp6_payload]) == 7);
+    send(nic_a, dhcp6(nic_a, 3,
+                      {{opt_client_id, client_duid(nic_a)},
+                       {opt_server_id, client_duid(nic_b)},
+                       {opt_ia_na, fr::ia_na(iaid)}}));
+    send(nic_a, dhcp6(nic_a, 1, {{opt_client_id, client_duid(nic_a)}, {opt_server_id, ours}}));
+    BOOST_TEST(port_a.frames.size() == 2);
+    BOOST_TEST(sw.counters().dhcp6_ignored == 2);
+
+    // Rapid commit: straight to a Reply that says so.
+    send(nic_a, dhcp6(nic_a, 1,
+                      {{opt_client_id, client_duid(nic_a)},
+                       {opt_ia_na, fr::ia_na(iaid)},
+                       {opt_rapid_commit, {}}}));
+    BOOST_REQUIRE(port_a.frames.size() == 3);
+    BOOST_TEST(std::to_integer<int>(port_a.frames[2][udp6_payload]) == 7);
+    BOOST_TEST(has(reply_options(port_a.frames[2]), opt_rapid_commit) != nullptr);
+    BOOST_TEST(underlay.sent.empty());
+    BOOST_TEST(port_b.frames.empty());
+}
+
+BOOST_AUTO_TEST_CASE(dhcp6_confirm_info_release, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, gateway::config()));
+    const auto ours = ak::oar::net::dhcp6::server_duid(gateway::gw_mac());
+    net::Ipv6Address elsewhere{};
+    elsewhere[0] = std::byte{0x20};
+    send(nic_a,
+         dhcp6(nic_a, 4,
+               {{opt_client_id, client_duid(nic_a)}, {opt_ia_na, fr::ia_na(iaid, {ip6(11)})}}));
+    send(nic_a,
+         dhcp6(nic_a, 4,
+               {{opt_client_id, client_duid(nic_a)}, {opt_ia_na, fr::ia_na(iaid, {elsewhere})}}));
+    send(nic_a, dhcp6(nic_a, 11, {}));  // information-request, no client ID needed
+    send(nic_a, dhcp6(nic_a, 8,
+                      {{opt_client_id, client_duid(nic_a)},
+                       {opt_server_id, ours},
+                       {opt_ia_na, fr::ia_na(iaid, {ip6(11)})}}));
+    BOOST_REQUIRE(port_a.frames.size() == 4);
+    BOOST_TEST(std::to_integer<int>((*has(reply_options(port_a.frames[0]), opt_status))[1]) == 0);
+    BOOST_TEST(std::to_integer<int>((*has(reply_options(port_a.frames[1]), opt_status))[1]) == 4);
+    BOOST_TEST(has(reply_options(port_a.frames[2]), opt_ia_na) == nullptr);
+    BOOST_TEST(has(reply_options(port_a.frames[2]), 24) != nullptr);  // domain list
+    BOOST_TEST(std::to_integer<int>((*has(reply_options(port_a.frames[3]), opt_status))[1]) == 0);
+    // No client ID on a Solicit is malformed.
+    send(nic_a, dhcp6(nic_a, 1, {}));
+    BOOST_TEST(sw.counters().dhcp6_bad == 1);
+    BOOST_TEST(sw.counters().dhcp6_replies == 4);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// Requirement 13.1-13.3 (task 19): the metadata intercept.
+BOOST_FIXTURE_TEST_SUITE(metadata, Fixture)
+
+namespace {
+
+class FakeEndpoint final : public net::MetadataEndpoint {
+public:
+    auto deliver(NicId nic, std::span<const std::byte> ip) -> void override {
+        got.push_back({nic, {ip.begin(), ip.end()}});
+    }
+    struct Got {
+        NicId nic;
+        std::vector<std::byte> ip;
+    };
+    std::vector<Got> got;
+};
+
+constexpr std::uint16_t http = 80;
+
+// The IP part of a frame.
+auto ip_of(const std::vector<std::byte>& frame) -> std::vector<std::byte> {
+    return {frame.begin() + ethernet_header_size, frame.end()};
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(intercepted_with_trusted_nic,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, gateway::config()));
+    const auto syn4 = fr::ipv4(gateway::gw_mac(), mac_of(nic_a), ip4(11), net::metadata_ipv4,
+                               pk::ipproto_tcp, fr::tcp(40000, http));
+    send(nic_a, syn4);
+    BOOST_TEST(sw.counters().metadata_no_endpoint == 1);
+    FakeEndpoint ep;
+    sw.set_metadata_endpoint(&ep);
+    send(nic_a, syn4);
+    send(nic_b, fr::ipv6(gateway::gw_mac(), mac_of(nic_b), ip6(22), net::metadata_ipv6,
+                         pk::ipproto_tcp, fr::tcp(40000, http)));
+    BOOST_REQUIRE(ep.got.size() == 2);
+    BOOST_TEST((ep.got[0].nic == nic_a));
+    BOOST_TEST(ep.got[0].ip == ip_of(syn4));
+    BOOST_TEST((ep.got[1].nic == nic_b));
+    BOOST_TEST(nothing_delivered());  // never into the fabric
+    // A forged source is stopped before the endpoint sees it (13.2).
+    send(nic_a, fr::ipv4(gateway::gw_mac(), mac_of(nic_a), ip4(22), net::metadata_ipv4,
+                         pk::ipproto_tcp, fr::tcp(40000, http)));
+    BOOST_TEST(ep.got.size() == 2);
+    BOOST_TEST(sw.counters().tx_drop_ip_spoofed == 1);
+    // The metadata address at a guest's MAC is just an unowned destination.
+    send(nic_a, fr::ipv4(mac_of(nic_b), mac_of(nic_a), ip4(11), net::metadata_ipv4, pk::ipproto_tcp,
+                         fr::tcp(40000, http)));
+    BOOST_TEST(ep.got.size() == 2);
+    BOOST_TEST(sw.counters().tx_drop_ip_dst == 1);
+}
+
+BOOST_AUTO_TEST_CASE(rate_limited_per_nic, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, gateway::config()));
+    FakeEndpoint ep;
+    sw.set_metadata_endpoint(&ep);
+    const auto pkt = fr::ipv4(gateway::gw_mac(), mac_of(nic_a), ip4(11), net::metadata_ipv4,
+                              pk::ipproto_tcp, fr::tcp(40000, http));
+    for (std::uint32_t i = 0; i < net::metadata_burst + 10; ++i) {
+        send(nic_a, pkt);
+    }
+    BOOST_TEST(ep.got.size() == net::metadata_burst);
+    BOOST_TEST(sw.counters().metadata_drop_rate == 10);
+    send(nic_b, fr::ipv4(gateway::gw_mac(), mac_of(nic_b), ip4(22), net::metadata_ipv4,
+                         pk::ipproto_tcp, fr::tcp(40000, http)));
+    BOOST_TEST(ep.got.size() == net::metadata_burst + 1);  // b has its own bucket
+    now += std::chrono::milliseconds{10};                  // ~10 packets at 1024/s
+    for (int i = 0; i < 20; ++i) {
+        send(nic_a, pkt);
+    }
+    BOOST_TEST(ep.got.size() == net::metadata_burst + 1 + 10);
+}
+
+BOOST_AUTO_TEST_CASE(injected_replies_checked, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, gateway::config()));
+    const auto reply4 = ip_of(fr::ipv4(mac_of(nic_a), gateway::gw_mac(), net::metadata_ipv4,
+                                       ip4(11), pk::ipproto_tcp, fr::tcp(http, 40000)));
+    BOOST_TEST(sw.inject_metadata(nic_a, reply4));
+    BOOST_REQUIRE(port_a.frames.size() == 1);
+    BOOST_TEST(std::ranges::equal(std::span{port_a.frames[0]}.first(mac_size), mac_of(nic_a)));
+    BOOST_TEST(std::ranges::equal(std::span{port_a.frames[0]}.subspan(mac_size, mac_size),
+                                  gateway::gw_mac()));
+    const auto reply6 = ip_of(fr::ipv6(mac_of(nic_b), gateway::gw_mac(), net::metadata_ipv6,
+                                       ip6(22), pk::ipproto_tcp, fr::tcp(http, 40000)));
+    BOOST_TEST(sw.inject_metadata(nic_b, reply6));
+    BOOST_TEST(port_b.frames.size() == 1);
+
+    // Refused: to b's address through a; not from the metadata address;
+    // garbage; a NIC that is not attached; a VNI without a gateway.
+    BOOST_TEST(!sw.inject_metadata(
+        nic_a, ip_of(fr::ipv4(mac_of(nic_a), gateway::gw_mac(), net::metadata_ipv4, ip4(22),
+                              pk::ipproto_tcp, fr::tcp(http, 1)))));
+    BOOST_TEST(
+        !sw.inject_metadata(nic_a, ip_of(fr::ipv4(mac_of(nic_a), gateway::gw_mac(), ip4(33),
+                                                  ip4(11), pk::ipproto_tcp, fr::tcp(http, 1)))));
+    BOOST_TEST(!sw.inject_metadata(nic_a, std::vector<std::byte>(10, std::byte{0x45})));
+    BOOST_TEST(!sw.inject_metadata(nic_c, reply4));
+    BOOST_TEST(!sw.inject_metadata(nic_x, reply4));
+    BOOST_TEST(sw.counters().metadata_inject_refused == 5);
+    BOOST_TEST(port_a.frames.size() == 1);
+    BOOST_TEST(underlay.sent.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

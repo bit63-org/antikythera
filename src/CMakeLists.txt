@@ -183,6 +183,17 @@ target_link_libraries(ak_oar_blk_image
   PUBLIC ak::oar_blk Threads::Threads
   PRIVATE ak::warnings ak::hardening)
 
+# The S3 client behind image volumes: HTTP/1.1 range GETs over TCP or TLS
+# with Signature V4 (oar-blk task 11).
+add_library(ak_oar_blk_s3
+  oar/blk/http_response.cpp
+  oar/blk/s3_object_store.cpp
+  oar/blk/sigv4.cpp)
+add_library(ak::oar_blk_s3 ALIAS ak_oar_blk_s3)
+target_link_libraries(ak_oar_blk_s3
+  PUBLIC ak::oar_blk_image OpenSSL::SSL OpenSSL::Crypto
+  PRIVATE ak::warnings ak::hardening)
+
 # The storage role as helm drives it over the sideband: volume files and
 # one virtio-blk function per transport (oar-blk task 6). Kept apart from
 # ak_oar_blk so the data path does not depend on helm's library.

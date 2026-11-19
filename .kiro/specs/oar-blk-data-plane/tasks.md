@@ -1,6 +1,6 @@
 # Implementation Plan — oar-blk: the storage data plane
 
-## Status: 8/16 tasks complete
+## Status: 9/16 tasks complete
 
 ## Tasks
 
@@ -82,9 +82,20 @@
   window doubling to `max_readahead_chunks`, discard on `drop_keys`).
   `tests/image_volume_test.cpp` covers each, plus a guest reading the
   image and its own writes through `VirtioBlkFunction`.
-- [ ] 11. S3ObjectStore: HTTP/1.1 range GET over TCP/TLS, SigV4,
+- [x] 11. S3ObjectStore: HTTP/1.1 range GET over TCP/TLS, SigV4,
   response parser with fuzz target, MinIO test.
   _Requirements: 8.2, 8.9, 8.11, 7.3_
+  — library `ak_oar_blk_s3`: `sigv4.*` (checked against AWS's documented
+  GET-with-Range example), `http_response.*` (strict head parser,
+  `fuzz/fuzz_http_response.cpp`), `s3_object_store.*` (path or
+  virtual-host style, keep-alive pool with one retry on an idle-closed
+  connection, TLS 1.2+ verifying name and chain, 206 with the exact
+  Content-Range or 200 with exactly the bytes, deadline on every socket
+  call). `tests/s3_object_store_test.cpp` runs a loopback S3 emulator
+  that verifies every signature (plain and TLS) and misbehaving servers,
+  then the image volume path over S3; with `AK_S3_TEST_ENDPOINT` set it
+  also seeds and reads an image on a real S3-compatible server (run
+  against SeaweedFS's S3 gateway; any MinIO works the same way).
 - [ ] 12. `ak-image-pack`: raw image to manifest and data objects
   (optionally encrypted). _Requirements: 8.8_
 - [ ] 13. Image volumes through helm: CREATE_VOLUME image source,

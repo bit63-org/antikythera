@@ -17,6 +17,41 @@ constexpr std::byte group_bit{0x01};
 constexpr std::byte ipv4_first_multicast{224};  // 224.0.0.0 and up: multicast, reserved, broadcast
 constexpr std::byte ipv6_multicast_prefix{0xff};
 
+constexpr std::uint64_t nano = 1'000'000'000;
+constexpr std::byte ipv4_multicast_mac_0{0x01};
+constexpr std::byte ipv4_multicast_mac_1{0x00};
+constexpr std::byte ipv4_multicast_mac_2{0x5e};
+constexpr std::byte ipv4_multicast_mac_3_reserved{0x80};
+constexpr std::byte ipv6_multicast_mac_0{0x33};
+constexpr std::byte ipv6_solicited_node_mac_2{0xff};
+
+// Requirement 10.2: IPv4 multicast (01:00:5e, low half) and IPv6 multicast
+// (33:33) other than solicited-node groups (33:33:ff), which belong to ND.
+auto ip_multicast(const MacAddress& dst) noexcept -> bool {
+    if (dst[0] == ipv4_multicast_mac_0 && dst[1] == ipv4_multicast_mac_1 &&
+        dst[2] == ipv4_multicast_mac_2) {
+        return (dst[3] & ipv4_multicast_mac_3_reserved) == std::byte{0};
+    }
+    return dst[0] == ipv6_multicast_mac_0 && dst[1] == ipv6_multicast_mac_0 &&
+           dst[2] != ipv6_solicited_node_mac_2;
+}
+
+auto admits(const GroupPolicy& policy, const MacAddress& dst) noexcept -> bool {
+    return policy.mode == GroupMode::multicast && ip_multicast(dst);
+}
+
+// Adds rate x elapsed to `tokens`, capped at burst (all scaled by `nano`).
+// Elapsed is capped first, at the time a refill from empty takes, so the
+// product cannot overflow: rate x cap <= burst x nano, which the policy
+// bounds keep under 2^63.
+auto refill(std::uint64_t tokens, std::uint64_t rate, std::uint64_t burst,
+            std::uint64_t elapsed_ns) noexcept -> std::uint64_t {
+    const std::uint64_t cap = burst * nano;
+    const std::uint64_t full_ns = (cap + rate - 1) / rate;
+    const std::uint64_t add = std::min(elapsed_ns, full_ns) * rate;
+    return std::min(cap, tokens + add);
+}
+
 auto mac_at(std::span<const std::byte> frame, std::size_t offset) noexcept -> MacAddress {
     MacAddress mac{};
     std::copy_n(frame.begin() + static_cast<std::ptrdiff_t>(offset), mac.size(), mac.begin());
@@ -89,12 +124,28 @@ auto to_string(AttachError e) noexcept -> const char* {
     return "unknown";
 }
 
+auto to_string(GroupPolicyError e) noexcept -> const char* {
+    switch (e) {
+        case GroupPolicyError::vni_out_of_range:
+            return "vni_out_of_range";
+        case GroupPolicyError::unknown_mode:
+            return "unknown_mode";
+        case GroupPolicyError::missing_limit:
+            return "missing_limit";
+        case GroupPolicyError::limit_too_large:
+            return "limit_too_large";
+        case GroupPolicyError::nonzero_limits:
+            return "nonzero_limits";
+    }
+    return "unknown";
+}
+
 auto VSwitch::NicIdHash::operator()(geneve::NicId id) const noexcept -> std::size_t {
     return std::hash<std::uint64_t>{}(id.value);
 }
 
-VSwitch::VSwitch(const MappingTable& mappings, Underlay& underlay)
-    : _mappings{&mappings}, _underlay{&underlay} {}
+VSwitch::VSwitch(const MappingTable& mappings, Underlay& underlay, Now now)
+    : _mappings{&mappings}, _underlay{&underlay}, _now{std::move(now)} {}
 
 auto VSwitch::attach(geneve::NicId nic, RxPort& port) -> std::expected<void, AttachError> {
     if (!valid_nic(nic)) {
@@ -103,11 +154,106 @@ auto VSwitch::attach(geneve::NicId nic, RxPort& port) -> std::expected<void, Att
     if (!_ports.try_emplace(nic, &port).second) {
         return std::unexpected(AttachError::already_attached);
     }
+    _group.insert_or_assign(nic, NicGroupState{.attachment = ++_attachments});
     return {};
 }
 
 auto VSwitch::detach(geneve::NicId nic) -> bool {
-    return _ports.erase(nic) != 0;
+    if (_ports.erase(nic) == 0) {
+        return false;
+    }
+    const auto it = _group.find(nic);
+    if (it != _group.end()) {
+        _retired.push_back({.nic = nic,
+                            .attachment = it->second.attachment,
+                            .detached = true,
+                            .meter = it->second.meter});
+        _group.erase(it);
+    }
+    return true;
+}
+
+auto VSwitch::set_group_policy(std::uint32_t vni, const GroupPolicy& policy)
+    -> std::expected<void, GroupPolicyError> {
+    if (vni == 0 || vni > geneve::vni_max) {
+        return std::unexpected(GroupPolicyError::vni_out_of_range);
+    }
+    switch (policy.mode) {
+        case GroupMode::drop:
+            if (policy.rate_frames != 0 || policy.burst_frames != 0 || policy.rate_bytes != 0 ||
+                policy.burst_bytes != 0 || policy.max_remote_vteps != 0) {
+                return std::unexpected(GroupPolicyError::nonzero_limits);
+            }
+            _group_policies.erase(vni);
+            return {};
+        case GroupMode::multicast:
+            break;
+        default:
+            return std::unexpected(GroupPolicyError::unknown_mode);
+    }
+    if (policy.rate_frames == 0 || policy.burst_frames == 0 || policy.rate_bytes == 0 ||
+        policy.burst_bytes == 0 || policy.max_remote_vteps == 0) {
+        return std::unexpected(GroupPolicyError::missing_limit);
+    }
+    if (policy.rate_frames > group_rate_frames_max ||
+        policy.burst_frames > group_burst_frames_max || policy.rate_bytes > group_rate_bytes_max ||
+        policy.burst_bytes > group_burst_bytes_max ||
+        policy.max_remote_vteps > group_max_remote_vteps_max) {
+        return std::unexpected(GroupPolicyError::limit_too_large);
+    }
+    _group_policies.insert_or_assign(vni, policy);
+    return {};
+}
+
+auto VSwitch::group_policy(std::uint32_t vni) const -> GroupPolicy {
+    const auto it = _group_policies.find(vni);
+    return it == _group_policies.end() ? GroupPolicy{} : it->second;
+}
+
+auto VSwitch::group_meter(geneve::NicId nic) const -> std::optional<GroupMeter> {
+    const auto it = _group.find(nic);
+    if (it == _group.end()) {
+        return std::nullopt;
+    }
+    return it->second.meter;
+}
+
+auto VSwitch::group_usage() -> std::vector<GroupUsage> {
+    std::vector<GroupUsage> out;
+    out.reserve(_group.size() + _retired.size());
+    for (const auto& [nic, state] : _group) {
+        out.push_back({.nic = nic, .attachment = state.attachment, .meter = state.meter});
+    }
+    std::ranges::sort(out, {}, [](const GroupUsage& u) { return u.nic.value; });
+    out.insert(out.end(), _retired.begin(), _retired.end());
+    _retired.clear();
+    return out;
+}
+
+auto VSwitch::take_tokens(Bucket& bucket, const GroupPolicy& policy, std::size_t bytes) -> bool {
+    const Clock::time_point now = _now();
+    const std::uint64_t frame_cap = std::uint64_t{policy.burst_frames} * nano;
+    const std::uint64_t byte_cap = policy.burst_bytes * nano;
+    if (!bucket.primed) {
+        bucket = {.frames = frame_cap, .bytes = byte_cap, .last = now, .primed = true};
+    } else {
+        const auto elapsed = now > bucket.last ? now - bucket.last : Clock::duration::zero();
+        const auto ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+        // min() also clamps to a burst lowered by a policy change.
+        bucket.frames =
+            refill(std::min(bucket.frames, frame_cap), policy.rate_frames, policy.burst_frames, ns);
+        bucket.bytes =
+            refill(std::min(bucket.bytes, byte_cap), policy.rate_bytes, policy.burst_bytes, ns);
+        bucket.last = std::max(bucket.last, now);
+    }
+    const std::uint64_t need_bytes = static_cast<std::uint64_t>(bytes) * nano;
+    if (bucket.frames < nano || bucket.bytes < need_bytes) {
+        return false;
+    }
+    bucket.frames -= nano;
+    bucket.bytes -= need_bytes;
+    return true;
 }
 
 auto VSwitch::attached(geneve::NicId nic) const -> bool {
@@ -196,7 +342,7 @@ auto VSwitch::transmit(const TxFrame& tx) -> void {
         if (handle_nd(*snap, tx.source, *binding, tx.frame)) {
             return;
         }
-        flood(*snap, tx.source, binding->vni, tx.frame);
+        replicate(*snap, tx.source, binding->vni, tx.frame);
         return;
     }
 
@@ -288,20 +434,50 @@ auto VSwitch::handle_nd(const MappingSnapshot& snap, geneve::NicId src, const Ni
     return true;
 }
 
-auto VSwitch::flood(const MappingSnapshot& snap, geneve::NicId src, std::uint32_t vni,
-                    std::span<const std::byte> frame) -> void {
-    ++_counters.tx_flooded;
+auto VSwitch::replicate(const MappingSnapshot& snap, geneve::NicId src, std::uint32_t vni,
+                        std::span<const std::byte> frame) -> void {
+    NicGroupState& state = _group[src];  // attached senders always have one
+    GroupMeter& meter = state.meter;
+    const auto policy_it = _group_policies.find(vni);
+    if (policy_it == _group_policies.end() ||
+        !admits(policy_it->second, mac_at(frame, dst_mac_offset))) {
+        ++meter.drop_policy;
+        ++_counters.tx_drop_group;
+        return;
+    }
+    const GroupPolicy& policy = policy_it->second;
+
+    std::vector<geneve::NicId> locals;
     std::vector<Ipv6Address> vteps;
     for (const MapEntry& e : snap.entries(vni)) {
         if (e.nic_id == src) {
             continue;
         }
         if (snap.is_local(e.nic_id)) {
-            if (deliver(e.nic_id, frame)) {
-                ++_counters.tx_replicas_local;
-            }
+            locals.push_back(e.nic_id);
         } else if (std::ranges::find(vteps, e.owner_vtep) == vteps.end()) {
             vteps.push_back(e.owner_vtep);
+        }
+    }
+    if (vteps.size() > policy.max_remote_vteps) {
+        ++meter.drop_fanout;
+        ++_counters.tx_drop_group;
+        return;
+    }
+    if (!take_tokens(state.bucket, policy, frame.size())) {
+        ++meter.drop_rate;
+        ++_counters.tx_drop_group;
+        return;
+    }
+
+    ++_counters.tx_flooded;
+    ++meter.frames;
+    meter.bytes += frame.size();
+    for (const geneve::NicId nic : locals) {
+        if (deliver(nic, frame)) {
+            ++_counters.tx_replicas_local;
+            ++meter.replicas_local;
+            meter.replica_bytes_local += frame.size();
         }
     }
     for (const Ipv6Address& vtep : vteps) {
@@ -310,6 +486,8 @@ auto VSwitch::flood(const MappingSnapshot& snap, geneve::NicId src, std::uint32_
                          .nics = {.src = src, .dst = geneve::nic_broadcast},
                          .frame = frame});
         ++_counters.tx_replicas_remote;
+        ++meter.replicas_remote;
+        meter.replica_bytes_remote += frame.size();
     }
 }
 
@@ -323,6 +501,12 @@ auto VSwitch::receive(const geneve::Packet& packet, const Ipv6Address& outer_src
         return dst;
     }
     if (*dst == geneve::nic_broadcast) {
+        const auto policy_it = _group_policies.find(packet.vni);
+        if (policy_it == _group_policies.end() ||
+            !admits(policy_it->second, mac_at(packet.inner, dst_mac_offset))) {
+            ++_counters.rx_drop_group;
+            return dst;
+        }
         for (const MapEntry& e : snap->entries(packet.vni)) {
             if (snap->is_local(e.nic_id) && deliver(e.nic_id, packet.inner)) {
                 ++_counters.rx_delivered;

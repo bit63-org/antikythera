@@ -96,15 +96,17 @@ target_link_libraries(ak-test-controller
   PRIVATE ak::harbor_controller ak::warnings ak::hardening)
 install(TARGETS ak-test-controller RUNTIME DESTINATION bin)
 
-# oar-blk: AES-256-XTS volume encryption, the locked key slot and the
-# virtio-blk request parser (storage data plane).
+# oar-blk: AES-256-XTS volume encryption, the locked key slot, the
+# virtio-blk request parser and the virtio-blk function on the shared
+# virtio core (storage data plane).
 add_library(ak_oar_blk
   oar/blk/key_slot.cpp
   oar/blk/request_parser.cpp
+  oar/blk/virtio_blk_function.cpp
   oar/blk/xts_cipher.cpp)
 add_library(ak::oar_blk ALIAS ak_oar_blk)
 target_link_libraries(ak_oar_blk
-  PUBLIC ak::common OpenSSL::Crypto
+  PUBLIC ak::common ak::oar_virtio OpenSSL::Crypto
   PRIVATE ak::warnings ak::hardening)
 
 # vfio-user device servers, built against libvfio-user (the `vfio-user`

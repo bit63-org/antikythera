@@ -34,6 +34,7 @@ constexpr KeyId key_c = 3;
 constexpr KeyId absent_key = 0x7777;
 // Header key ID for sample slots; verify_slot() is told the key explicitly.
 constexpr KeyId sample_key_id = key_a;
+constexpr ak::helm::mailbox::ServerId sample_server = 7;
 constexpr std::byte flip{0x01};
 constexpr std::uint64_t sample_seq = 9;
 constexpr std::uint8_t body_fill = 0x5C;
@@ -64,7 +65,8 @@ auto sample_slot(const TestSigner& signer) -> mb::Slot {
     return signer.signed_slot({.type = mb::Type::create_vm,
                                .seq = sample_seq,
                                .body_len = static_cast<std::uint16_t>(body.size()),
-                               .key_id = sample_key_id},
+                               .key_id = sample_key_id,
+                               .server_id = sample_server},
                               body);
 }
 

@@ -36,12 +36,15 @@ constexpr std::uint16_t too_many_vcpus = 2000;
 constexpr std::uint64_t destroy_vm_id = 5;
 constexpr std::uint8_t unknown_destroy_flag = 0x02;
 
-constexpr std::size_t documented_max_body = 168;
-constexpr std::uint16_t documented_version = 2;
+constexpr std::size_t documented_max_body = 160;
+constexpr std::uint16_t documented_version = 3;
 constexpr std::size_t documented_reserved_size = 4;
 
 constexpr mb::KeyId sample_key = 1;
 constexpr mb::KeyId rotated_key = 0xBEEF;
+constexpr mb::ServerId sample_server = 7;
+constexpr mb::ServerId wide_server = 0x0102'0304'0506'0708;
+constexpr std::size_t documented_header_size = 32;
 
 // Byte offsets inside the slot header (see mailbox.hpp).
 constexpr std::size_t magic_offset = 0;
@@ -51,10 +54,11 @@ constexpr std::size_t body_len_offset = 16;
 constexpr std::size_t key_id_offset = 18;
 constexpr std::size_t reserved_offset = 20;
 constexpr std::size_t last_reserved_offset = 23;
+constexpr std::size_t server_id_offset = 24;
 
 constexpr std::byte not_magic{'X'};
-constexpr std::byte retired_version{1};
-constexpr std::byte future_version{3};
+constexpr std::byte retired_version{2};
+constexpr std::byte future_version{4};
 constexpr std::byte unknown_type_byte{0xEE};
 constexpr std::byte nonzero{1};
 
@@ -88,14 +92,17 @@ auto destroy_vm_body(std::uint64_t vm, std::uint8_t flags) -> std::vector<std::b
     return b;
 }
 
-// Commands get sample_key by default; responses and events get no key.
+// Commands get sample_key and sample_server by default; responses and
+// events get neither.
 auto slot_for(mb::Type type, std::span<const std::byte> body, std::uint64_t seq = first_seq,
-              std::optional<mb::KeyId> key = std::nullopt) -> mb::Slot {
+              std::optional<mb::KeyId> key = std::nullopt,
+              std::optional<mb::ServerId> server = std::nullopt) -> mb::Slot {
     mb::Header h;
     h.type = type;
     h.seq = seq;
     h.body_len = static_cast<std::uint16_t>(body.size());
     h.key_id = key.value_or(mb::is_command(type) ? sample_key : mb::no_key_id);
+    h.server_id = server.value_or(mb::is_command(type) ? sample_server : mb::no_server_id);
     auto s = mb::encode(h, body, sig());
     BOOST_REQUIRE(s.has_value());
     return *s;
@@ -112,7 +119,11 @@ BOOST_AUTO_TEST_CASE(layout_constants_fit_the_slot,
     BOOST_TEST(mb::header_key_id_offset == key_id_offset);
     BOOST_TEST(mb::header_reserved_offset == reserved_offset);
     BOOST_TEST(mb::header_reserved_size == documented_reserved_size);
-    static_assert(mb::header_reserved_offset + mb::header_reserved_size == mb::header_size);
+    BOOST_TEST(mb::header_server_id_offset == server_id_offset);
+    BOOST_TEST(mb::header_size == documented_header_size);
+    static_assert(mb::header_reserved_offset + mb::header_reserved_size ==
+                  mb::header_server_id_offset);
+    static_assert(mb::header_server_id_offset + sizeof(mb::ServerId) == mb::header_size);
 }
 
 BOOST_AUTO_TEST_CASE(magic_is_akmb_in_little_endian,
@@ -193,6 +204,7 @@ BOOST_AUTO_TEST_CASE(commands_need_a_key_id, *boost::unit_test::timeout(unit_tim
     mb::Header h;
     h.type = mb::Type::list_vms;
     h.key_id = mb::no_key_id;
+    h.server_id = sample_server;
     BOOST_TEST((mb::encode(h, {}, sig()).error() == DecodeError::bad_key_id));
 }
 
@@ -211,6 +223,47 @@ BOOST_AUTO_TEST_CASE(responses_and_events_carry_no_key_id,
         h.type = type;
         h.key_id = sample_key;
         BOOST_TEST((mb::encode(h, {}, sig()).error() == DecodeError::bad_key_id));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(server_id_is_little_endian_in_the_signed_header,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto s = slot_for(mb::Type::list_vms, {}, first_seq, sample_key, wide_server);
+    for (std::size_t i = 0; i < sizeof(mb::ServerId); ++i) {
+        BOOST_TEST((s[server_id_offset + i] == std::byte(sizeof(mb::ServerId) - i)));
+    }
+    static_assert(server_id_offset + sizeof(mb::ServerId) <= mb::signature_offset);
+
+    auto msg = mb::decode(s);
+    BOOST_REQUIRE(msg.has_value());
+    BOOST_TEST(msg->header.server_id == wide_server);
+}
+
+BOOST_AUTO_TEST_CASE(commands_need_a_server_id, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto s = slot_for(mb::Type::destroy_vm, destroy_vm_body(destroy_vm_id, 0));
+    s[server_id_offset] = std::byte{0};
+    BOOST_TEST((mb::decode(s).error() == DecodeError::bad_server_id));
+
+    mb::Header h;
+    h.type = mb::Type::list_vms;
+    h.key_id = sample_key;
+    h.server_id = mb::no_server_id;
+    BOOST_TEST((mb::encode(h, {}, sig()).error() == DecodeError::bad_server_id));
+}
+
+BOOST_AUTO_TEST_CASE(responses_and_events_carry_no_server_id,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    for (const auto type : {mb::Type::response, mb::Type::vm_exited, mb::Type::device_released,
+                            mb::Type::host_fault, mb::Type::scrub_done}) {
+        auto s = slot_for(type, {});
+        BOOST_TEST(mb::decode(s)->header.server_id == mb::no_server_id);
+        s[server_id_offset + sizeof(mb::ServerId) - 1] = nonzero;
+        BOOST_TEST((mb::decode(s).error() == DecodeError::bad_server_id));
+
+        mb::Header h;
+        h.type = type;
+        h.server_id = sample_server;
+        BOOST_TEST((mb::encode(h, {}, sig()).error() == DecodeError::bad_server_id));
     }
 }
 

@@ -24,9 +24,11 @@
   _Requirements: 3_
 - [x] 5. SignatureVerifier (OpenSSL Ed25519) and sequence tracking.
   _Requirements: 4_ — `src/hull/`: `SignatureVerifier`, `SequenceTracker`
-  and `authenticate()` (decode, signature, sequence). The compiled-in key
-  table arrives with the agent binary (task 3); `authenticate()` takes the
-  key ID from the signed slot header (mailbox protocol v2).
+  and `authenticate()` (decode, server ID, signature, sequence). The
+  compiled-in key table arrives with the agent binary (task 3);
+  `authenticate()` takes the key ID and server ID from the signed slot
+  header (mailbox protocol v3) and the agent's own server ID as an
+  argument.
 - [x] 6. Resource allocator: cores (whole, SMT-aware) and 1 GiB pages.
   _Requirements: 6.1, 8.1_ — `src/hull/`: `CpuTopology` (strict cpulist
   parser, fuzzed; sysfs SMT siblings, isolated CPUs, free 1 GiB pages) and

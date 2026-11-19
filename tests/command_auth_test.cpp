@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // .kiro/specs/hull-host-agent/ Requirements 3.4, 4.2 and 4.3: decode, then
-// signature, then sequence number, with the sequence advancing only for
-// authentic commands.
+// the server the command names, then signature, then sequence number, with the sequence advancing
+// only for authentic commands.
 
 #define BOOST_TEST_MODULE command_auth_test
 #include <boost/test/unit_test.hpp>
@@ -35,6 +35,8 @@ namespace {
 
 constexpr KeyId controller = 1;
 constexpr KeyId other_key = 2;
+constexpr mb::ServerId this_server = 7;
+constexpr mb::ServerId other_server = 8;
 constexpr std::uint64_t first_seq = 1;
 constexpr std::uint64_t second_seq = 2;
 constexpr std::uint64_t gap_seq = 50;
@@ -74,17 +76,21 @@ struct Fixture {
 
     // `key` goes in the slot header; responses and events carry no key ID.
     [[nodiscard]] auto command(const TestSigner& by, std::uint64_t seq,
-                               mb::Type type = mb::Type::create_vm, KeyId key = controller) const
-        -> mb::Slot {
+                               mb::Type type = mb::Type::create_vm, KeyId key = controller,
+                               mb::ServerId server = this_server) const -> mb::Slot {
         const auto body = create_vm_body();
+        const bool cmd = mb::is_command(type);
         return by.signed_slot({.type = type,
                                .seq = seq,
                                .body_len = static_cast<std::uint16_t>(body.size()),
-                               .key_id = mb::is_command(type) ? key : mb::no_key_id},
+                               .key_id = cmd ? key : mb::no_key_id,
+                               .server_id = cmd ? server : mb::no_server_id},
                               body);
     }
 
-    auto auth(const mb::Slot& slot) { return ak::hull::authenticate(slot, verifier, sequence); }
+    auto auth(const mb::Slot& slot) {
+        return ak::hull::authenticate(slot, this_server, verifier, sequence);
+    }
 };
 
 auto failure(AuthFailure f) -> AuthError {
@@ -166,6 +172,33 @@ BOOST_AUTO_TEST_CASE(rejects_malformed_before_signature,
     BOOST_TEST((auth(slot).error() == AuthError{.failure = AuthFailure::malformed,
                                                 .decode = mb::DecodeError::bad_magic}));
     BOOST_TEST(sequence.last_accepted() == 0);
+}
+
+BOOST_AUTO_TEST_CASE(rejects_commands_for_another_server,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // Genuinely signed, fresh, but for server 8: refused before the
+    // signature check, and it consumes nothing.
+    const auto theirs = command(signer, forged_seq, mb::Type::create_vm, controller, other_server);
+    BOOST_TEST((auth(theirs).error() == failure(AuthFailure::wrong_server)));
+    BOOST_TEST(sequence.last_accepted() == 0);
+
+    // Rewriting the server ID to ours breaks the signature: it is signed.
+    auto rewritten = theirs;
+    rewritten[mb::header_server_id_offset] = std::byte{this_server};
+    BOOST_TEST((auth(rewritten).error() == failure(AuthFailure::bad_signature)));
+    BOOST_TEST(sequence.last_accepted() == 0);
+
+    // A forgery for another server is reported as wrong_server too: the
+    // server check comes first and needs no crypto.
+    BOOST_TEST(
+        (auth(command(forger, first_seq, mb::Type::create_vm, controller, other_server)).error() ==
+         failure(AuthFailure::wrong_server)));
+
+    // An unprovisioned hull (server 0) refuses every command.
+    BOOST_TEST(
+        (ak::hull::authenticate(command(signer, first_seq), mb::no_server_id, verifier, sequence)
+             .error() == failure(AuthFailure::wrong_server)));
+    BOOST_TEST(auth(command(signer, first_seq)).has_value());
 }
 
 BOOST_AUTO_TEST_CASE(rejects_non_command_types, *boost::unit_test::timeout(unit_timeout_seconds)) {

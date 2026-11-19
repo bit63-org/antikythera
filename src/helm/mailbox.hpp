@@ -22,10 +22,11 @@
 //   0x300  EVT_SLOT     256 bytes, host writes, device reads
 //
 // Slot layout (256 bytes):
-//   0x00  header (24 bytes):
+//   0x00  header (32 bytes):
 //           0x00 magic u32 | 0x04 version u16 | 0x06 type u16 | 0x08 seq u64
 //           0x10 body_len u16 | 0x12 key_id u16 | 0x14 reserved (4 bytes, zero)
-//   0x18  body   (up to 168 bytes; body_len says how much is meaningful)
+//           0x18 server_id u64
+//   0x20  body   (up to 160 bytes; body_len says how much is meaningful)
 //   0xC0  Ed25519 signature (64 bytes) over bytes [0x00, 0xC0) -- commands only
 
 #include <array>
@@ -40,8 +41,10 @@ namespace ak::helm::mailbox {
 
 inline constexpr std::uint32_t magic = 0x424D'4B41;  // "AKMB" read as little-endian bytes
 // Version 2 assigned key_id (two of version 1's six reserved header bytes).
-// Nothing speaks version 1 any more, so decode accepts version 2 only.
-inline constexpr std::uint16_t protocol_version = 2;
+// Version 3 grew the header to 32 bytes for server_id, so a signed command
+// names the one server it is for, and gave ATTACH_DEVICE the NIC's VPC,
+// NIC ID and MAC. Nothing speaks older versions, so decode accepts 3 only.
+inline constexpr std::uint16_t protocol_version = 3;
 
 namespace reg {
 inline constexpr std::size_t magic = 0x000;
@@ -56,13 +59,14 @@ inline constexpr std::size_t bar0_size = 0x1000;
 }  // namespace reg
 
 inline constexpr std::size_t slot_size = 256;
-inline constexpr std::size_t header_size = 24;
+inline constexpr std::size_t header_size = 32;
 inline constexpr std::size_t signature_size = 64;
 inline constexpr std::size_t signature_offset = slot_size - signature_size;  // 0xC0
-inline constexpr std::size_t max_body = signature_offset - header_size;      // 168
+inline constexpr std::size_t max_body = signature_offset - header_size;      // 160
 inline constexpr std::size_t header_key_id_offset = 0x12;
 inline constexpr std::size_t header_reserved_offset = 0x14;
-inline constexpr std::size_t header_reserved_size = header_size - header_reserved_offset;  // 4
+inline constexpr std::size_t header_reserved_size = 4;
+inline constexpr std::size_t header_server_id_offset = 0x18;
 
 // Which controller signing key signed a command
 // (.kiro/specs/controller-interface/ Requirement 1.3). It sits inside the
@@ -72,6 +76,14 @@ inline constexpr std::size_t header_reserved_size = header_size - header_reserve
 // carry no_key_id.
 using KeyId = std::uint16_t;
 inline constexpr KeyId no_key_id = 0;
+
+// The server a command is for (.kiro/specs/controller-interface/ Requirement
+// 1.2, design "Envelope"). Like key_id it lies inside the signed bytes, so a
+// command signed for one server is refused by every other server's hull
+// before any other check, whatever their sequence floors. Commands carry a
+// non-zero server ID; responses and events carry no_server_id.
+using ServerId = std::uint64_t;
+inline constexpr ServerId no_server_id = 0;
 
 using Slot = std::array<std::byte, slot_size>;
 
@@ -112,6 +124,7 @@ struct Header {
     std::uint64_t seq{0};
     std::uint16_t body_len{0};
     KeyId key_id{no_key_id};
+    ServerId server_id{no_server_id};
 };
 
 // A message copied out of a slot. Owns its bytes, so it stays valid after
@@ -133,6 +146,7 @@ enum class DecodeError : std::uint8_t {
     body_too_long,
     reserved_not_zero,  // reserved header bytes or bytes past body_len are non-zero
     bad_key_id,         // a command with no_key_id, or a response/event with a key ID
+    bad_server_id,      // a command with no_server_id, or a response/event with one
 };
 
 [[nodiscard]] auto to_string(DecodeError e) noexcept -> const char*;
@@ -228,12 +242,22 @@ struct VmStatus {
     friend auto operator==(const VmStatus&, const VmStatus&) -> bool = default;
 };
 
-// ATTACH_DEVICE: vm_id u64 | device (4)  (12 bytes)
+// ATTACH_DEVICE: vm_id u64 | device (4) | vni u32 | nic_id u64 | mac [6] |
+// rsvd [2]  (32 bytes)
 // Storage functions are attached only with ATTACH_VOLUME, which is what
 // makes helm deliver the volume key, so device.type must not be blk_fn.
+// For a NIC VF the controller names the VPC (1 <= vni <= 0xFFFFFF), the
+// region-unique NIC ID (non-zero) and the MAC (locally administered
+// unicast); helm hands them to oar-net, the only place they are set
+// (helm-control-plane Requirement 8.1). For a GPU they must all be zero.
+using Mac = std::array<std::byte, 6>;
+
 struct AttachDevice {
     std::uint64_t vm_id{0};
     DeviceRef device;
+    std::uint32_t vni{0};
+    std::uint64_t nic_id{0};
+    Mac mac{};
     friend auto operator==(const AttachDevice&, const AttachDevice&) -> bool = default;
 };
 
@@ -322,6 +346,7 @@ enum class Status : std::uint16_t {
     timed_out = 10,
     internal_error = 11,
     unsupported = 12,
+    wrong_server = 13,  // the command names another server (protocol v3 server_id)
 };
 
 inline constexpr std::size_t response_fixed_size = 12;

@@ -328,15 +328,12 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
     }
 
     if (const auto* a = std::get_if<mailbox::AttachDevice>(&body)) {
-        const auto id = function_id(a->device);
         const auto type = static_cast<FunctionType>(a->device.type);
         oar::FunctionConfig config;
         if (type == FunctionType::nic_vf) {
-            auto nic = _config.nic_config ? _config.nic_config(a->vm_id, id) : std::nullopt;
-            if (!nic) {
-                return std::unexpected(Status::unsupported);
-            }
-            config = *nic;
+            // decode_attach_device has checked these (non-zero VNI and NIC
+            // ID, locally administered unicast MAC).
+            config = oar::NicConfig{.nic_id = a->nic_id, .vni = a->vni, .mac = a->mac};
         }
         auto reserved = reserve(a->vm_id, a->device, undo);
         if (!reserved) {

@@ -88,7 +88,7 @@ auto framed(RecordType t, const std::vector<std::byte>& payload) -> std::vector<
 }
 
 auto envelope_record(std::uint64_t to, std::uint64_t seq) -> std::vector<std::byte> {
-    const mb::Header h{.type = mb::Type::list_vms, .seq = seq, .key_id = key};
+    const mb::Header h{.type = mb::Type::list_vms, .seq = seq, .key_id = key, .server_id = to};
     std::array<std::byte, mb::signature_size> sig{};
     auto slot = mb::encode(h, {}, sig);
     BOOST_REQUIRE(slot.has_value());

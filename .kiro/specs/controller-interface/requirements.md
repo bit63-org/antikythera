@@ -32,7 +32,8 @@ EC2 concepts map onto it.
 1. The controller SHALL sign each command with Ed25519 over the exact
    mailbox slot image bytes `[0x00, 0xC0)` that hull will verify.
 2. Envelopes SHALL name the target server and carry a per-server, strictly
-   increasing sequence number.
+   increasing sequence number, both inside the signed bytes, so a command
+   signed for one server is refused by every other.
 3. Signing keys SHALL be held in kythira's virtual HSM or KMS and SHALL
    support rotation by key ID; hull SHALL accept any compiled-in key ID.
 4. helm SHALL relay envelopes without modification.

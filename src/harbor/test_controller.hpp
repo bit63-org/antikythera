@@ -27,7 +27,8 @@
 //   destroy-vm VM [persist]
 //   list-vms
 //   vm-status VM
-//   attach-device VM SLOT nic|gpu|gpu-vf FN
+//   attach-device VM SLOT nic FN VNI NIC_ID MAC   e.g. 1 2 nic 0 0x10 0x10 02:00:00:00:00:10
+//   attach-device VM SLOT gpu|gpu-vf FN
 //   detach-device VM SLOT nic|gpu|gpu-vf FN TIMEOUT_S force|destroy-vm
 //   create-volume VOLUME OWNER_VM SIZE_GIB
 //   delete-volume VOLUME
@@ -40,7 +41,7 @@
 //                        e.g. 0x10,02:00:00:00:00:10,fd00::1,10.0.0.5,fd12::5
 //                        (guest IPs are what the ARP/ND proxy answers for)
 //   expect STATUS        the last command's outcome must be STATUS
-//                        (ok, accepted, bad_signature, stale_sequence, ...)
+//                        (ok, accepted, bad_signature, stale_sequence, wrong_server, ...)
 //   wait KIND            wait for a report of KIND (inventory, command_outcome,
 //                        pool_state, vm_exited, map_applied, host_fault)
 //

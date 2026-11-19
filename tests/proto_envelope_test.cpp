@@ -33,7 +33,10 @@ constexpr std::uint8_t sig_fill = 0xEE;
 // A command slot as hull would see it (signature bytes are filler: the
 // envelope never verifies).
 auto sample_slot() -> proto::Slot {
-    const mb::Header h{.type = mb::Type::list_vms, .seq = sample_seq, .key_id = sample_key};
+    const mb::Header h{.type = mb::Type::list_vms,
+                       .seq = sample_seq,
+                       .key_id = sample_key,
+                       .server_id = sample_server};
     std::array<std::byte, mb::signature_size> sig{};
     sig.fill(std::byte{sig_fill});
     auto slot = mb::encode(h, {}, sig);
@@ -58,6 +61,7 @@ BOOST_AUTO_TEST_SUITE(envelope, *boost::unit_test::timeout(unit_timeout_seconds)
 BOOST_AUTO_TEST_CASE(slot_geometry_matches_the_mailbox) {
     static_assert(proto::slot_size == mb::slot_size);
     static_assert(proto::slot_key_id_offset == mb::header_key_id_offset);
+    static_assert(proto::slot_server_id_offset == mb::header_server_id_offset);
     static_assert(proto::slot_signed_size == mb::signature_offset);
     static_assert(std::is_same_v<proto::KeyId, mb::KeyId>);
     static_assert(proto::no_key_id == mb::no_key_id);
@@ -65,6 +69,7 @@ BOOST_AUTO_TEST_CASE(slot_geometry_matches_the_mailbox) {
     const auto slot = sample_slot();
     BOOST_TEST(proto::slot_key_id(slot) == sample_key);
     BOOST_TEST(proto::slot_seq(slot) == sample_seq);
+    BOOST_TEST(proto::slot_server_id(slot) == sample_server);
     BOOST_TEST(proto::slot_signed_bytes(slot).data() == slot.data());
 }
 
@@ -154,6 +159,21 @@ BOOST_AUTO_TEST_CASE(envelope_key_must_match_slot_key) {
     BOOST_TEST((proto::decode_envelope(bytes).error() == DecodeError::key_id_mismatch));
 }
 
+BOOST_AUTO_TEST_CASE(envelope_server_must_match_slot_server) {
+    auto env = sample_envelope();
+    env.server_id = sample_server + 1;
+    BOOST_TEST((proto::encode_envelope(env).error() == DecodeError::server_id_mismatch));
+
+    // A relay that readdresses only the envelope, or only the slot, is
+    // caught before the mailbox (and hull would refuse the slot anyway).
+    auto bytes = encoded();
+    bytes[8] ^= std::byte{1};
+    BOOST_TEST((proto::decode_envelope(bytes).error() == DecodeError::server_id_mismatch));
+    bytes = encoded();
+    bytes[proto::envelope_header_size + proto::slot_server_id_offset] ^= std::byte{1};
+    BOOST_TEST((proto::decode_envelope(bytes).error() == DecodeError::server_id_mismatch));
+}
+
 BOOST_AUTO_TEST_CASE(slot_contents_pass_through_unparsed) {
     // helm relays the slot as-is: the envelope does not judge it, so even a
     // slot hull would reject (here, bad slot magic) survives a round trip
@@ -170,7 +190,7 @@ BOOST_AUTO_TEST_CASE(slot_contents_pass_through_unparsed) {
 
 BOOST_AUTO_TEST_CASE(errors_have_names) {
     for (auto e = static_cast<std::uint8_t>(DecodeError::truncated);
-         e <= static_cast<std::uint8_t>(DecodeError::bad_vtep); ++e) {
+         e <= static_cast<std::uint8_t>(DecodeError::server_id_mismatch); ++e) {
         BOOST_TEST(std::string_view{proto::to_string(static_cast<DecodeError>(e))} != "unknown");
     }
 }

@@ -1,6 +1,6 @@
 # Implementation Plan — Controller interface and the kythira EC2 integration
 
-## Status: 6/8 tasks complete
+## Status: 7/9 tasks complete
 
 ## Tasks
 
@@ -28,6 +28,12 @@
   Ed25519 signer that reproduces `src/proto/test_vectors.hpp`, a script
   language for commands, mapping updates and expected outcomes, and the
   mTLS server side of the ControllerLink. See `harbor/README.md`.)
+- [x] 8. Mailbox protocol v3: a signed `server_id` in the slot header and
+  the NIC's VPC, NIC ID and MAC in `ATTACH_DEVICE`. _Requirements: 1.2_
+  (32-byte header, `server_id` u64 at 0x18, body limit 160; hull refuses
+  a slot for another server as `wrong_server` before verifying it; the
+  envelope's `server_id` must equal the slot's; helm's CommandRouter
+  configures oar-net from the signed command. See design "Envelope".)
 - [x] 9. MapUpdate format v2: guest IPv4 and IPv6 addresses per NIC for
   oar-net's ARP/ND proxy. _Requirements: 4, 5_ (Sorted, unique, unicast,
   each owned by a NIC in the same frame; vectors regenerated; harbor's

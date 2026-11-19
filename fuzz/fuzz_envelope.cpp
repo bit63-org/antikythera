@@ -20,7 +20,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     }
     auto again = ak::proto::encode_envelope(*env);
     if (!again || !std::ranges::equal(*again, bytes) ||
-        ak::proto::slot_key_id(env->slot) != env->key_id) {
+        ak::proto::slot_key_id(env->slot) != env->key_id ||
+        ak::proto::slot_server_id(env->slot) != env->server_id) {
         std::abort();
     }
     return 0;

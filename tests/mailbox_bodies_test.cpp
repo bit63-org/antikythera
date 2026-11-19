@@ -56,6 +56,18 @@ constexpr std::uint8_t too_long_timeout = 0x59;  // low byte of 601 (0x0259)
 constexpr std::uint8_t too_long_timeout_hi = 0x02;
 
 constexpr mb::KeyId sample_key = 1;
+constexpr mb::ServerId sample_server = 7;
+constexpr std::uint64_t nic_id = 0x10;
+constexpr mb::Mac guest_mac{std::byte{0x02}, std::byte{0x00}, std::byte{0x00},
+                            std::byte{0x00}, std::byte{0x00}, std::byte{0x10}};
+
+// ATTACH_DEVICE body offsets past the device ref (protocol v3).
+constexpr std::size_t attach_vni = 12;
+constexpr std::size_t attach_nic_id = 16;
+constexpr std::size_t attach_mac = 24;
+constexpr std::size_t attach_rsvd = 30;
+constexpr std::byte multicast_mac{0x03};  // locally administered but multicast
+constexpr std::byte vendor_mac{0x00};     // unicast but universally administered
 
 auto sig() -> std::array<std::byte, mb::signature_size> {
     return {};
@@ -66,8 +78,9 @@ auto message(mb::Type type, std::span<const std::byte> body) -> mb::Message {
     h.type = type;
     h.seq = sample_seq;
     h.body_len = static_cast<std::uint16_t>(body.size());
-    // Protocol v2: commands name their signing key, responses and events don't.
+    // Commands name their signing key and server, responses and events don't.
     h.key_id = mb::is_command(type) ? sample_key : mb::no_key_id;
+    h.server_id = mb::is_command(type) ? sample_server : mb::no_server_id;
     auto slot = mb::encode(h, body, sig());
     BOOST_REQUIRE(slot.has_value());
     auto msg = mb::decode(*slot);
@@ -91,6 +104,10 @@ auto expect_invalid(const mb::Body& body, std::size_t offset, std::byte value) -
     BOOST_REQUIRE(offset < bytes.size());
     bytes[offset] = value;
     BOOST_TEST((decode_error(mb::type_of(body), bytes) == BodyError::invalid_field));
+}
+
+auto nic_attach() -> mb::AttachDevice {
+    return {.vm_id = vm_a, .device = nic, .vni = vni, .nic_id = nic_id, .mac = guest_mac};
 }
 
 auto ok_response() -> mb::Response {
@@ -118,7 +135,7 @@ auto every_body() -> std::vector<mb::Body> {
         mb::VmStatus{.vm_id = vm_a},
         mb::CreateVm{.vm_id = vm_a, .vcpus = sample_vcpus, .memory_mib = sample_memory_mib},
         mb::DestroyVm{.vm_id = vm_a, .persist_volumes = true},
-        mb::AttachDevice{.vm_id = vm_a, .device = nic},
+        nic_attach(),
         mb::AttachDevice{.vm_id = vm_a, .device = gpu},
         mb::DetachDevice{.vm_id = vm_a,
                          .device = nic,
@@ -190,6 +207,39 @@ BOOST_AUTO_TEST_CASE(wire_layouts_are_fixed, *boost::unit_test::timeout(unit_tim
                     .code = mb::FaultCode::device_lost, .slot = fault_slot, .detail = 1}) ==
                 bytes_of(4, 0, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0)));
     BOOST_TEST((mb::encode_body(mb::CreateNetwork{.vni = vni}) == bytes_of(0xEF, 0xCD, 0xAB, 0)));
+    BOOST_TEST((mb::encode_body(nic_attach()) == bytes_of(0x44, 0x44, 0x33, 0x33, 0x22, 0x22, 0x11,
+                                                          0x11,                 // vm_id
+                                                          2, 1, 0x02, 0x01,     // nic_vf 0x0102
+                                                          0xEF, 0xCD, 0xAB, 0,  // vni
+                                                          0x10, 0, 0, 0, 0, 0, 0, 0,  // nic_id
+                                                          0x02, 0, 0, 0, 0, 0x10,     // mac
+                                                          0, 0)));                    // rsvd
+}
+
+// A NIC attach carries its VPC, NIC ID and MAC (protocol v3), so helm can
+// configure oar-net from the signed command alone; a GPU attach carries none.
+BOOST_AUTO_TEST_CASE(nic_attach_fields, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto no_vni = nic_attach();
+    no_vni.vni = 0;
+    BOOST_TEST((decode_error(mb::Type::attach_device, mb::encode_body(no_vni)) ==
+                BodyError::invalid_field));
+    auto wide_vni = nic_attach();
+    wide_vni.vni = mb::max_vni + 1;
+    BOOST_TEST((decode_error(mb::Type::attach_device, mb::encode_body(wide_vni)) ==
+                BodyError::invalid_field));
+    auto no_nic_id = nic_attach();
+    no_nic_id.nic_id = 0;
+    BOOST_TEST((decode_error(mb::Type::attach_device, mb::encode_body(no_nic_id)) ==
+                BodyError::invalid_field));
+    expect_invalid(nic_attach(), attach_mac, multicast_mac);
+    expect_invalid(nic_attach(), attach_mac, vendor_mac);
+    expect_invalid(nic_attach(), attach_rsvd, nonzero);
+    expect_invalid(nic_attach(), attach_rsvd + 1, nonzero);
+
+    const mb::AttachDevice gpu_attach{.vm_id = vm_a, .device = gpu};
+    expect_invalid(gpu_attach, attach_vni, nonzero);
+    expect_invalid(gpu_attach, attach_nic_id, nonzero);
+    expect_invalid(gpu_attach, attach_mac, std::byte{0x02});
 }
 
 BOOST_AUTO_TEST_CASE(wrong_lengths_are_rejected, *boost::unit_test::timeout(unit_timeout_seconds)) {
@@ -216,7 +266,7 @@ BOOST_AUTO_TEST_CASE(zero_identifiers_are_rejected,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
     const std::vector<mb::Body> bodies = {
         mb::VmStatus{},
-        mb::AttachDevice{.device = nic},
+        mb::AttachDevice{.device = nic, .vni = vni, .nic_id = nic_id, .mac = guest_mac},
         mb::DetachDevice{.device = nic, .timeout_s = timeout_s},
         mb::CreateVolume{.owner_vm = vm_a, .size_gib = volume_gib},
         mb::CreateVolume{.volume_id = volume, .size_gib = volume_gib},
@@ -263,16 +313,17 @@ BOOST_AUTO_TEST_CASE(device_types_match_the_command,
         BOOST_TEST(
             (decode_error(mb::type_of(body), mb::encode_body(body)) == BodyError::invalid_field));
     };
+    auto blk_attach = nic_attach();
+    blk_attach.device = blk;
+    rejects(blk_attach);
     rejects(mb::AttachDevice{.vm_id = vm_a, .device = blk});
     rejects(mb::DetachDevice{.vm_id = vm_a, .device = blk, .timeout_s = timeout_s});
     rejects(mb::AttachVolume{.volume_id = volume, .vm_id = vm_a, .device = nic});
     rejects(mb::DetachVolume{.volume_id = volume, .vm_id = vm_a, .device = gpu, .timeout_s = 1});
     rejects(mb::ScrubDone{.device = nic});
 
-    expect_invalid(mb::AttachDevice{.vm_id = vm_a, .device = nic}, after_vm_id + device_type_in_ref,
-                   zero);
-    expect_invalid(mb::AttachDevice{.vm_id = vm_a, .device = nic}, after_vm_id + device_type_in_ref,
-                   bad_device_type);
+    expect_invalid(nic_attach(), after_vm_id + device_type_in_ref, zero);
+    expect_invalid(nic_attach(), after_vm_id + device_type_in_ref, bad_device_type);
     expect_invalid(mb::DeviceReleased{.vm_id = vm_a, .device = nic},
                    after_vm_id + device_type_in_ref, bad_device_type);
 }
@@ -339,7 +390,7 @@ BOOST_AUTO_TEST_CASE(response_rules, *boost::unit_test::timeout(unit_timeout_sec
     resp[command_hi] = std::byte{0x02};  // 0x0200 = vm_exited
     BOOST_TEST((decode_error(mb::Type::response, resp) == BodyError::invalid_field));
 
-    expect_invalid(ok_response(), status_lo, std::byte{13});
+    expect_invalid(ok_response(), status_lo, std::byte{14});
 
     // A reply to a command that can never be built yet is still a reply.
     auto reserved = ok_response();

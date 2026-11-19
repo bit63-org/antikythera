@@ -117,9 +117,10 @@ BOOST_AUTO_TEST_CASE(every_command_verifies_under_hull) {
     std::uint64_t seq = 1;
     for (const auto* line :
          {"list-vms", "vm-status 7", "create-vm 7 2 1024", "destroy-vm 7 persist",
-          "attach-device 7 1 nic 0", "detach-device 7 1 nic 0 30 force", "create-volume 9 7 20",
-          "delete-volume 9", "attach-volume 9 7 2 0", "detach-volume 9 7 2 0 30 destroy-vm",
-          "rewrap-volume 9 7 8", "create-network 0x55", "delete-network 0x55"}) {
+          "attach-device 7 1 nic 0 0x55 0x10 02:00:00:00:00:10", "attach-device 7 3 gpu 1",
+          "detach-device 7 1 nic 0 30 force", "create-volume 9 7 20", "delete-volume 9",
+          "attach-volume 9 7 2 0", "detach-volume 9 7 2 0 30 destroy-vm", "rewrap-volume 9 7 8",
+          "create-network 0x55", "delete-network 0x55"}) {
         auto env = s.envelope(7, 2, seq++, body_of(line));
         BOOST_REQUIRE_MESSAGE(env.has_value(), line);
         auto decoded = proto::decode_envelope(*env);
@@ -129,6 +130,7 @@ BOOST_AUTO_TEST_CASE(every_command_verifies_under_hull) {
         auto msg = mb::decode(decoded->slot);
         BOOST_REQUIRE(msg.has_value());
         BOOST_TEST(mb::decode_body(*msg).has_value(), line);
+        BOOST_TEST(msg->header.server_id == 7U, line);
     }
 }
 
@@ -172,6 +174,16 @@ BOOST_AUTO_TEST_CASE(commands_parse_to_their_bodies) {
                     .device = {.slot = 3, .type = mb::DeviceType::gpu_vf, .function = 2},
                     .timeout_s = 60,
                     .policy = mb::DetachPolicy::destroy_vm}}));
+    BOOST_TEST((body_of("attach-device 7 1 nic 2 0x55 0x10 02:00:00:00:00:10") ==
+                mb::Body{mb::AttachDevice{
+                    .vm_id = 7,
+                    .device = {.slot = 1, .type = mb::DeviceType::nic_vf, .function = 2},
+                    .vni = 0x55,
+                    .nic_id = 0x10,
+                    .mac = {std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+                            std::byte{0x10}}}}));
+    BOOST_TEST((body_of("destroy-vm 7 persist") ==
+                mb::Body{mb::DestroyVm{.vm_id = 7, .persist_volumes = true}}));
     BOOST_TEST((body_of("attach-volume 9 7 2 1") ==
                 mb::Body{mb::AttachVolume{
                     .volume_id = 9,
@@ -212,6 +224,8 @@ BOOST_AUTO_TEST_CASE(map_updates_parse_and_sort) {
 BOOST_AUTO_TEST_CASE(expectations_parse) {
     auto e = action("expect stale_sequence");
     BOOST_TEST((std::get<harbor::ExpectOutcome>(e).status == proto::CommandStatus::stale_sequence));
+    auto ws = action("expect wrong_server");
+    BOOST_TEST((std::get<harbor::ExpectOutcome>(ws).status == proto::CommandStatus::wrong_server));
     auto w = action("wait map_applied");
     BOOST_TEST((std::get<harbor::WaitReport>(w).kind == proto::ReportKind::map_applied));
 }
@@ -222,6 +236,16 @@ BOOST_AUTO_TEST_CASE(mistakes_are_named) {
     BOOST_TEST(parse_error("create-vm x 2 1024").find("bad VM id") != std::string::npos);
     BOOST_TEST(parse_error("vm-status 0x").find("bad VM id") != std::string::npos);
     BOOST_TEST(parse_error("attach-device 7 1 disk 0").find("device type") != std::string::npos);
+    // A NIC needs its VPC, NIC ID and MAC; a GPU takes none.
+    BOOST_TEST(parse_error("attach-device 7 1 nic 0").find("invalid command") != std::string::npos);
+    BOOST_TEST(parse_error("attach-device 7 1 nic 0 0x55 0x10").find("wrong number") !=
+               std::string::npos);
+    BOOST_TEST(parse_error("attach-device 7 1 nic 0 0x55 0x10 01:00:00:00:00:10")
+                   .find("invalid command") != std::string::npos);
+    BOOST_TEST(parse_error("attach-device 7 1 nic 0 0x55 0x10 02:00").find("MAC") !=
+               std::string::npos);
+    BOOST_TEST(parse_error("attach-device 7 3 gpu 0 0x55 0x10 02:00:00:00:00:10")
+                   .find("invalid command") != std::string::npos);
     BOOST_TEST(parse_error("destroy-vm 7 keep").find("persist") != std::string::npos);
     BOOST_TEST(parse_error("expect fine").find("unknown status") != std::string::npos);
     BOOST_TEST(parse_error("wait forever").find("unknown report kind") != std::string::npos);

@@ -233,7 +233,8 @@ auto command_slot(std::uint64_t seq, const mb::Body& body) -> mb::Slot {
     auto slot = mb::encode({.type = mb::type_of(body),
                             .seq = seq,
                             .body_len = static_cast<std::uint16_t>(bytes.size()),
-                            .key_id = key_id},
+                            .key_id = key_id,
+                            .server_id = server},
                            bytes, sig);
     BOOST_REQUIRE(slot);
     return *slot;
@@ -285,6 +286,12 @@ auto test_nic_config() -> oar::NicConfig {
     return c;
 }
 
+// A NIC attach naming the VPC, NIC ID and MAC of test_nic_config().
+auto nic_attach(VmId vm, std::uint16_t fn) -> mb::AttachDevice {
+    const auto c = test_nic_config();
+    return {.vm_id = vm, .device = nic(fn), .vni = c.vni, .nic_id = c.nic_id, .mac = c.mac};
+}
+
 // One helm, wired to fakes, with a blk, a net and a GPU slot registered
 // and their functions cleaned (free).
 struct Helm {
@@ -299,25 +306,17 @@ struct Helm {
     FakeOar net_role;
     FakeOar gpu_role;
     Clock::time_point t{};
-    bool have_nic_config{true};
     std::uint64_t seq{0};
     helm::CommandRouter router;
 
     explicit Helm(std::size_t max_queued = helm::RouterConfig{}.max_queued, bool with_blk = true)
-        : router{helm::RouterConfig{
-                     .last_seq = 0,
-                     .command_timeout = command_timeout,
-                     .release_timeout = release_timeout,
-                     .clean_timeout = clean_timeout,
-                     .max_queued = max_queued,
-                     .outcome_history = helm::RouterConfig{}.outcome_history,
-                     .nic_config = [this](VmId, FunctionId) -> std::optional<oar::NicConfig> {
-                         if (!have_nic_config) {
-                             return std::nullopt;
-                         }
-                         return test_nic_config();
-                     },
-                     .clock = [this] { return t; }},
+        : router{helm::RouterConfig{.last_seq = 0,
+                                    .command_timeout = command_timeout,
+                                    .release_timeout = release_timeout,
+                                    .clean_timeout = clean_timeout,
+                                    .max_queued = max_queued,
+                                    .outcome_history = helm::RouterConfig{}.outcome_history,
+                                    .clock = [this] { return t; }},
                  pool,
                  keys,
                  host,
@@ -591,49 +590,50 @@ BOOST_AUTO_TEST_CASE(a_role_refusal_fails_the_command_before_hull,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
     Helm h;
     h.net_role.prepare_error = LinkError{.code = LinkErrc::refused, .status = oar::Status::busy};
-    h.send(mb::AttachDevice{.vm_id = vm_one, .device = nic(fn_zero)});
+    h.send(nic_attach(vm_one, fn_zero));
     BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::conflict));
     BOOST_TEST(h.host.posted.empty());
     BOOST_TEST((h.state(net_slot, fn_zero) == FunctionState::free));
     BOOST_TEST(h.net_role.cleaned.size() == 1U);
 
     h.net_role.prepare_error = LinkError{.code = LinkErrc::timed_out};
-    h.send(mb::AttachDevice{.vm_id = vm_one, .device = nic(fn_zero)});
+    h.send(nic_attach(vm_one, fn_zero));
     BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::timed_out));
 }
 
-BOOST_AUTO_TEST_CASE(nic_attach_needs_a_nic_config,
+BOOST_AUTO_TEST_CASE(nic_attach_configures_oar_net_from_the_command,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
     Helm h;
-    h.have_nic_config = false;
+    // A NIC attach without its VPC, NIC ID and MAC does not decode: it is
+    // refused as malformed and never reaches oar-net or hull.
     h.send(mb::AttachDevice{.vm_id = vm_one, .device = nic(fn_zero)});
-    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::unsupported));
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::malformed));
     BOOST_TEST(h.net_role.prepared.empty());
+    BOOST_TEST(h.host.posted.empty());
     BOOST_TEST((h.state(net_slot, fn_zero) == FunctionState::free));
 
-    h.have_nic_config = true;
-    const mb::AttachDevice attach{.vm_id = vm_one, .device = nic(fn_zero)};
+    const auto attach = nic_attach(vm_one, fn_zero);
     h.run(attach);
     BOOST_REQUIRE(h.net_role.prepared.size() == 1U);
     BOOST_TEST((h.net_role.prepared.at(0).config == oar::FunctionConfig{test_nic_config()}));
     BOOST_TEST((h.state(net_slot, fn_zero) == FunctionState::assigned));
 
     // Already assigned: a second attach (to any VM) conflicts.
-    h.send(mb::AttachDevice{.vm_id = vm_two, .device = nic(fn_zero)});
+    h.send(nic_attach(vm_two, fn_zero));
     BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::conflict));
     // Unknown function or a type that does not match the pool.
-    h.send(mb::AttachDevice{.vm_id = vm_two, .device = nic(9)});
+    h.send(nic_attach(vm_two, 9));
     BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::unknown_device));
-    h.send(mb::AttachDevice{
-        .vm_id = vm_two,
-        .device = {.slot = blk_slot, .type = mb::DeviceType::nic_vf, .function = fn_zero}});
+    auto wrong_slot = nic_attach(vm_two, fn_zero);
+    wrong_slot.device.slot = blk_slot;
+    h.send(wrong_slot);
     BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::unknown_device));
 }
 
 BOOST_AUTO_TEST_CASE(timeouts_report_and_keep_reservations,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
     Helm h;
-    const mb::AttachDevice attach{.vm_id = vm_one, .device = nic(fn_one)};
+    const auto attach = nic_attach(vm_one, fn_one);
     const auto a = h.send(attach);
     const mb::ListVms list{};
     const auto l = h.send(list);
@@ -726,7 +726,7 @@ BOOST_AUTO_TEST_CASE(destroy_vm_releases_functions_and_crypto_erases,
     h.run(mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib});
     h.run(mb::CreateVolume{.volume_id = vol_one, .owner_vm = vm_one, .size_gib = size_gib});
     h.run(mb::AttachVolume{.volume_id = vol_one, .vm_id = vm_one, .device = blk(fn_zero)});
-    h.run(mb::AttachDevice{.vm_id = vm_one, .device = nic(fn_zero)});
+    h.run(nic_attach(vm_one, fn_zero));
 
     // hull resets the NIC before helm has seen DESTROY_VM's response.
     const mb::DestroyVm destroy{.vm_id = vm_one, .persist_volumes = false};
@@ -856,7 +856,7 @@ BOOST_AUTO_TEST_CASE(stuck_releases_fault_until_a_power_cycle,
                                   .device = nic(fn_one),
                                   .timeout_s = detach_timeout_s,
                                   .policy = mb::DetachPolicy::force};
-    h.run(mb::AttachDevice{.vm_id = vm_one, .device = nic(fn_one)});
+    h.run(nic_attach(vm_one, fn_one));
     h.run(detach);
     BOOST_TEST((h.state(net_slot, fn_one) == FunctionState::releasing));
 
@@ -909,7 +909,7 @@ BOOST_AUTO_TEST_CASE(gpu_cleaning_waits_for_scrub_done,
 BOOST_AUTO_TEST_CASE(failed_resets_fault_and_events_are_reported,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
     Helm h;
-    h.run(mb::AttachDevice{.vm_id = vm_one, .device = nic(fn_zero)});
+    h.run(nic_attach(vm_one, fn_zero));
     h.run(mb::DetachDevice{.vm_id = vm_one,
                            .device = nic(fn_zero),
                            .timeout_s = detach_timeout_s,
@@ -919,7 +919,7 @@ BOOST_AUTO_TEST_CASE(failed_resets_fault_and_events_are_reported,
     BOOST_TEST((h.state(net_slot, fn_zero) == FunctionState::faulted));
 
     // A DEVICE_RELEASED naming the wrong VM changes nothing.
-    h.run(mb::AttachDevice{.vm_id = vm_one, .device = nic(fn_one)});
+    h.run(nic_attach(vm_one, fn_one));
     h.router.on_host_slot(host_slot(
         mb::DeviceReleased{.vm_id = vm_two, .device = nic(fn_one), .reset = mb::ResetResult::ok}));
     BOOST_TEST((h.state(net_slot, fn_one) == FunctionState::assigned));
@@ -947,7 +947,7 @@ BOOST_AUTO_TEST_CASE(a_mailbox_write_failure_is_compensated,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
     Helm h;
     h.host.fail = true;
-    h.send(mb::AttachDevice{.vm_id = vm_one, .device = nic(fn_zero)});
+    h.send(nic_attach(vm_one, fn_zero));
     BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::internal_error));
     BOOST_TEST((h.state(net_slot, fn_zero) == FunctionState::free));
     BOOST_TEST(!h.router.busy());
@@ -956,7 +956,7 @@ BOOST_AUTO_TEST_CASE(a_mailbox_write_failure_is_compensated,
 BOOST_AUTO_TEST_CASE(inventory_lists_every_function,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
     Helm h;
-    h.run(mb::AttachDevice{.vm_id = vm_one, .device = nic(fn_one)});
+    h.run(nic_attach(vm_one, fn_one));
     const auto inv = h.router.inventory();
     BOOST_TEST(inv.functions.size() == 6U);
     const auto it = std::ranges::find_if(inv.functions, [](const proto::InventoryFunction& f) {

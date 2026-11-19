@@ -28,7 +28,7 @@ constexpr std::uint16_t max_vcpus = 1024;
 
 constexpr std::size_t list_vms_body_len = 0;
 constexpr std::size_t vm_status_body_len = 8;
-constexpr std::size_t attach_device_body_len = 12;
+constexpr std::size_t attach_device_body_len = 32;
 constexpr std::size_t detach_device_body_len = 16;
 constexpr std::size_t create_volume_body_len = 20;
 constexpr std::size_t delete_volume_body_len = 8;
@@ -71,6 +71,11 @@ constexpr auto known_type(std::uint16_t raw) noexcept -> bool {
 // Commands must name their signing key; unsigned messages must not.
 auto key_id_fits(Type type, KeyId key_id) noexcept -> bool {
     return is_command(type) ? key_id != no_key_id : key_id == no_key_id;
+}
+
+// Commands must name the server they are for; unsigned messages must not.
+auto server_id_fits(Type type, ServerId server_id) noexcept -> bool {
+    return is_command(type) ? server_id != no_server_id : server_id == no_server_id;
 }
 
 auto all_zero(std::span<const std::byte> b) noexcept -> bool {
@@ -117,12 +122,21 @@ constexpr auto valid_vni(std::uint32_t vni) noexcept -> bool {
     return vni != 0 && vni <= max_vni;
 }
 
+// A guest NIC's MAC: unicast (I/G bit clear) and locally administered (U/L
+// bit set), so it can never collide with a vendor-assigned address.
+constexpr std::byte mac_multicast_bit{0x01};
+constexpr std::byte mac_local_bit{0x02};
+
+auto valid_nic_mac(const Mac& mac) noexcept -> bool {
+    return (mac[0] & mac_multicast_bit) == std::byte{0} && (mac[0] & mac_local_bit) != std::byte{0};
+}
+
 constexpr auto is_gpu(DeviceType t) noexcept -> bool {
     return t == DeviceType::gpu_whole || t == DeviceType::gpu_vf;
 }
 
 constexpr auto valid_status(std::uint16_t raw) noexcept -> bool {
-    return raw <= std::to_underlying(Status::unsupported);
+    return raw <= std::to_underlying(Status::wrong_server);
 }
 
 constexpr auto takes_payload(Type command) noexcept -> bool {
@@ -173,10 +187,21 @@ auto decode_attach_device(const Message& msg) noexcept -> std::expected<AttachDe
     AttachDevice out;
     out.vm_id = *r->le64();
     const auto dev = read_device(*r);
-    if (out.vm_id == 0 || !dev || dev->type == DeviceType::blk_fn) {
+    out.vni = *r->le32();
+    out.nic_id = *r->le64();
+    const auto mac = *r->bytes(out.mac.size());
+    std::ranges::copy(mac, out.mac.begin());
+    const std::uint16_t rsvd = *r->le16();
+    if (out.vm_id == 0 || !dev || dev->type == DeviceType::blk_fn || rsvd != 0) {
         return invalid();
     }
     out.device = *dev;
+    const bool nic_fields_ok = out.device.type == DeviceType::nic_vf
+                                   ? valid_vni(out.vni) && out.nic_id != 0 && valid_nic_mac(out.mac)
+                                   : out.vni == 0 && out.nic_id == 0 && all_zero(out.mac);
+    if (!nic_fields_ok) {
+        return invalid();
+    }
     return out;
 }
 
@@ -429,6 +454,8 @@ auto to_string(DecodeError e) noexcept -> const char* {
             return "reserved_not_zero";
         case DecodeError::bad_key_id:
             return "bad_key_id";
+        case DecodeError::bad_server_id:
+            return "bad_server_id";
     }
     return "unknown";
 }
@@ -458,6 +485,7 @@ auto decode(const Slot& slot) noexcept -> std::expected<Message, DecodeError> {
     msg.header.body_len = *r.le16();
     msg.header.key_id = *r.le16();
     const auto reserved = *r.bytes(header_reserved_size);
+    msg.header.server_id = *r.le64();
 
     if (msg.header.magic != magic) {
         return std::unexpected(DecodeError::bad_magic);
@@ -477,6 +505,9 @@ auto decode(const Slot& slot) noexcept -> std::expected<Message, DecodeError> {
     }
     if (!key_id_fits(msg.header.type, msg.header.key_id)) {
         return std::unexpected(DecodeError::bad_key_id);
+    }
+    if (!server_id_fits(msg.header.type, msg.header.server_id)) {
+        return std::unexpected(DecodeError::bad_server_id);
     }
 
     const auto body_region = std::span{slot}.subspan(header_size, max_body);
@@ -502,6 +533,9 @@ auto encode(const Header& header, std::span<const std::byte> body,
     if (!key_id_fits(header.type, header.key_id)) {
         return std::unexpected(DecodeError::bad_key_id);
     }
+    if (!server_id_fits(header.type, header.server_id)) {
+        return std::unexpected(DecodeError::bad_server_id);
+    }
     Slot slot{};
     wire::SpanWriter w{slot};
     // Fixed-size slot: these writes cannot overflow.
@@ -511,6 +545,8 @@ auto encode(const Header& header, std::span<const std::byte> body,
     (void)w.write(header.seq, wire::Order::little);
     (void)w.write(header.body_len, wire::Order::little);
     (void)w.write(header.key_id, wire::Order::little);
+    (void)w.write(std::uint32_t{0}, wire::Order::little);  // reserved
+    (void)w.write(header.server_id, wire::Order::little);
     std::ranges::copy(body, slot.begin() + header_size);
     std::ranges::copy(signature, slot.begin() + signature_offset);
     return slot;
@@ -647,6 +683,10 @@ auto encode_body(const Body& body) -> std::vector<std::byte> {
                    [&](const AttachDevice& b) {
                        w.le64(b.vm_id);
                        write_device(w, b.device);
+                       w.le32(b.vni);
+                       w.le64(b.nic_id);
+                       w.bytes(b.mac);
+                       w.le16(0);
                    },
                    [&](const DetachDevice& b) {
                        w.le64(b.vm_id);

@@ -89,11 +89,10 @@
 // relay record cannot be written the command is not relayed (fails
 // closed, internal_error); other audit failures are counted.
 //
-// NIC configuration. ATTACH_DEVICE for a NIC VF carries no VPC, MAC or NIC
-// ID (mailbox v2), yet oar-net needs them to prepare the VF (Requirement
-// 8.1). Until a signed command carries them, the router asks
-// RouterConfig::nic_config, and refuses the attach as `unsupported` when
-// it has no answer.
+// NIC configuration. ATTACH_DEVICE for a NIC VF carries the VPC, NIC ID
+// and MAC inside the signed command (mailbox v3), and the router hands
+// exactly those to oar-net to prepare the VF (Requirement 8.1): helm adds
+// no network identity of its own.
 //
 // Not thread-safe: the router, the pool, the key store and the ports
 // belong to helm's event-loop thread.
@@ -196,7 +195,6 @@ public:
 
 struct RouterConfig {
     using Clock = std::chrono::steady_clock;
-    using NicLookup = std::function<std::optional<oar::NicConfig>(VmId, FunctionId)>;
 
     // Highest sequence number already delivered (hull's floor, if known).
     std::uint64_t last_seq{0};
@@ -209,7 +207,6 @@ struct RouterConfig {
     std::size_t max_queued{64};
     // Finished outcomes kept for answering retries.
     std::size_t outcome_history{256};
-    NicLookup nic_config;
     // Empty: steady_clock::now.
     std::function<Clock::time_point()> clock;
 };

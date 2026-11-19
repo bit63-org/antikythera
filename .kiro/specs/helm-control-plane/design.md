@@ -82,10 +82,9 @@ Built in `src/helm/command_router.*`. Decisions made in the implementation:
 - Cleaning: NIC and storage functions are cleaned synchronously over the
   sideband; GPU functions wait for `SCRUB_DONE`. A function waiting in
   `releasing` or GPU `cleaning` past its timeout is faulted.
-- ATTACH_DEVICE for a NIC VF carries no VPC, MAC or NIC ID in mailbox v2,
-  so the router takes them from a lookup helm is configured with and
-  refuses the attach as `unsupported` without one. Open question: a
-  signed command should carry them (a mailbox v3 body change).
+- ATTACH_DEVICE for a NIC VF carries its VPC (VNI), NIC ID and MAC in the
+  signed command (mailbox v3), and the router prepares the VF on oar-net
+  with exactly those; helm holds no network identity of its own.
 
 ### Audit log
 

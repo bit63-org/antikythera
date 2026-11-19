@@ -17,15 +17,17 @@
 //   0x110 (end: an envelope is always exactly 272 bytes)
 //
 // helm relays `slot` into the mailbox unmodified (Requirement 1.4). hull
-// trusts only the slot: it verifies the signature and takes the key ID
-// and sequence number from the signed slot header, never from this
-// wrapper. The envelope's key_id must still equal the slot's, so a helm
-// that routes or logs by envelope key_id sees the truth, and a relay
-// that rewrote one but not the other is caught before the mailbox.
+// trusts only the slot: it verifies the signature and takes the key ID,
+// server ID and sequence number from the signed slot header (mailbox
+// protocol v3), never from this wrapper. The envelope's key_id and
+// server_id must still equal the slot's, so a helm that routes or logs by
+// the envelope sees the truth, and a relay that rewrote one but not the
+// other is caught before the mailbox.
 //
 // The decoder does not otherwise parse the slot: hull decodes it strictly
-// (helm::mailbox::decode) and verifies it. Only the two header fields helm
-// needs for routing and reporting are exposed, by slot_key_id and slot_seq.
+// (helm::mailbox::decode) and verifies it. Only the header fields helm
+// needs for routing and reporting are exposed, by slot_key_id,
+// slot_server_id and slot_seq.
 
 #include <array>
 #include <cstddef>
@@ -43,6 +45,7 @@ namespace ak::proto {
 inline constexpr std::size_t slot_size = 256;
 inline constexpr std::size_t slot_seq_offset = 0x08;
 inline constexpr std::size_t slot_key_id_offset = 0x12;
+inline constexpr std::size_t slot_server_id_offset = 0x18;
 inline constexpr std::size_t slot_signed_size = 0xC0;
 using Slot = std::array<std::byte, slot_size>;
 
@@ -65,6 +68,12 @@ struct Envelope {
 [[nodiscard]] inline auto slot_key_id(const Slot& slot) noexcept -> KeyId {
     wire::Reader r{std::span<const std::byte>{slot}.subspan(slot_key_id_offset)};
     return r.le16().value_or(no_key_id);
+}
+
+// The server ID in the slot header (little-endian u64 at 0x18).
+[[nodiscard]] inline auto slot_server_id(const Slot& slot) noexcept -> std::uint64_t {
+    wire::Reader r{std::span<const std::byte>{slot}.subspan(slot_server_id_offset)};
+    return r.le64().value_or(0);
 }
 
 // The per-server command sequence number in the slot header (u64 at 0x08).
@@ -93,13 +102,16 @@ namespace detail {
     if (slot_key_id(slot) != key_id) {
         return std::unexpected(DecodeError::key_id_mismatch);
     }
+    if (slot_server_id(slot) != server_id) {
+        return std::unexpected(DecodeError::server_id_mismatch);
+    }
     return {};
 }
 
 }  // namespace detail
 
 // Strict decode: exactly envelope_size bytes, known magic and version,
-// non-zero key and server IDs, envelope key ID equal to the slot's.
+// non-zero key and server IDs, each equal to the slot's.
 [[nodiscard]] inline auto decode_envelope(std::span<const std::byte> bytes) noexcept
     -> std::expected<Envelope, DecodeError> {
     wire::Reader r{bytes};

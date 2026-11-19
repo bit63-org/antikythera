@@ -49,7 +49,14 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     mb::Slot slot{};
     std::ranges::copy(input.first(std::min(size, slot.size())), slot.begin());
     ak::hull::SequenceTracker sequence;
-    if (ak::hull::authenticate(slot, verifier, sequence) || sequence.last_accepted() != 0) {
+    // Claim to be whichever server the slot names, so the fuzzer reaches the
+    // signature check instead of stopping at wrong_server.
+    mb::ServerId server = mb::no_server_id;
+    for (std::size_t i = sizeof(mb::ServerId); i-- > 0;) {
+        server =
+            (server << 8U) | std::to_integer<mb::ServerId>(slot[mb::header_server_id_offset + i]);
+    }
+    if (ak::hull::authenticate(slot, server, verifier, sequence) || sequence.last_accepted() != 0) {
         std::abort();
     }
 

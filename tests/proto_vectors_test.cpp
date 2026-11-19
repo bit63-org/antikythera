@@ -122,7 +122,8 @@ BOOST_AUTO_TEST_CASE(envelope1_reproduces_and_hull_accepts_it) {
     const mb::Header h{.type = mb::Type::create_vm,
                        .seq = vec::envelope1_seq,
                        .body_len = static_cast<std::uint16_t>(body.size()),
-                       .key_id = vec::envelope1_key_id};
+                       .key_id = vec::envelope1_key_id,
+                       .server_id = vec::envelope1_server_id};
     const auto slot = signer.signed_slot(h, body);
     auto bytes = proto::encode_envelope(
         {.server_id = vec::envelope1_server_id, .key_id = vec::envelope1_key_id, .slot = slot});
@@ -138,12 +139,14 @@ BOOST_AUTO_TEST_CASE(envelope1_reproduces_and_hull_accepts_it) {
     BOOST_TEST(env->server_id == vec::envelope1_server_id);
     BOOST_TEST(env->key_id == vec::envelope1_key_id);
     BOOST_TEST(proto::slot_seq(env->slot) == vec::envelope1_seq);
+    BOOST_TEST(proto::slot_server_id(env->slot) == vec::envelope1_server_id);
 
     // What helm relays is what hull checks: a strict slot decode, then the
     // signature under the key the signed slot header names.
     auto msg = mb::decode(env->slot);
     BOOST_REQUIRE(msg.has_value());
     BOOST_TEST(msg->header.key_id == vec::envelope1_key_id);
+    BOOST_TEST(msg->header.server_id == vec::envelope1_server_id);
     BOOST_TEST(verifier().verify_slot(env->slot, msg->header.key_id).has_value());
 }
 

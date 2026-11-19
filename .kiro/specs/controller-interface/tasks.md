@@ -1,6 +1,6 @@
 # Implementation Plan — Controller interface and the kythira EC2 integration
 
-## Status: 3/7 tasks complete
+## Status: 4/7 tasks complete
 
 ## Tasks
 
@@ -12,8 +12,11 @@
   depending only on `ak::common`; vectors in `src/proto/test_vectors.hpp`
   use the RFC 8032 test keys. MapUpdate carries `key_id` and is a full
   per-VPC snapshot; see design "Envelope".)
-- [ ] 3. helm ControllerLink over mTLS with reconnect and reconciliation.
-  _Requirements: 2, 3_
+- [x] 3. helm ControllerLink over mTLS with reconnect and reconciliation.
+  _Requirements: 2, 3_ (`src/helm/controller_link.*` over `ak::tls`
+  in `src/tls/`; see design "ControllerLink". The management-NIC binding of
+  Requirement 2.1 is deployment configuration: helm dials the controller
+  address it is given.)
 - [x] 4. Inventory/status report schema. _Requirements: 3_ (`Report` in
   `src/proto/report.hpp`: inventory snapshot plus command outcome,
   pool-state, VM-exit, map-applied and host-fault events; link record

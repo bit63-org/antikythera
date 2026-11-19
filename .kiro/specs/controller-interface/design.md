@@ -109,6 +109,38 @@ wrong direction is a protocol error. A record header announcing more than
 the largest frame (a full MapUpdate, about 128 KiB) ends the connection
 before any payload is buffered.
 
+## ControllerLink
+
+helm's side of the link is `src/helm/controller_link.{hpp,cpp}`, in two
+layers. `ControllerSession` is the protocol with no I/O, tested byte by
+byte. `ControllerLink` drives a session over `ak::tls` (`src/tls/`): TLS 1.3
+only, both sides present certificates, helm trusts only kythira's CA and
+checks the controller's DNS or IP name, the controller trusts only the CA
+that issues server certificates and may pin a server's name. No session
+resumption, so every connection re-authenticates both sides.
+
+On every connection helm sends `hello`, then every report the controller
+has not acknowledged (original order and sequence numbers), then a fresh
+inventory with the newest sequence number. An unacknowledged older
+inventory is dropped rather than replayed: the new one supersedes it. The
+controller processes reports in order, drops `(boot_id, report_seq)` pairs
+it has seen, and acknowledges the highest it processed; helm then forgets
+everything up to it. Unacknowledged reports are capped at 4096; past that
+the oldest are dropped and counted, and the next inventory restates the
+state they described.
+
+helm checks each envelope and MapUpdate strictly and that it names this
+server, then passes it on unmodified (the slot to the mailbox, the exact
+MapUpdate bytes to whoever verifies them). It verifies no signatures. Any
+protocol violation (malformed record, a record type only helm sends, a
+frame for another server, an ack for a report never sent) closes the
+connection; helm reconnects with capped exponential backoff (1 s to 60 s,
+up to 25% jitter) and re-registers. Losing the link touches nothing on the
+host: only controller envelopes reach the mailbox (Requirement 2.3).
+
+The process ignores SIGPIPE, since OpenSSL writes to the socket with
+`write(2)`.
+
 ## Placement inputs
 
 From inventory: free whole cores, free 1 GiB pages, free functions by type,

@@ -5,6 +5,8 @@
 # own BOOST_TEST_MODULE. vcpkg supplies a static Boost.Test; a system build
 # may be shared, which needs BOOST_TEST_DYN_LINK.
 find_package(Boost REQUIRED COMPONENTS unit_test_framework)
+# The TLS tests build a throwaway PKI with OpenSSL (tls_test_support.hpp).
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
 
 set(_ak_boost_test_dyn OFF)
 get_target_property(_ak_bt_type Boost::unit_test_framework TYPE)
@@ -49,6 +51,8 @@ ak_add_test(proto_map_update_test SOURCES proto_map_update_test.cpp LIBS ak::pro
 ak_add_test(proto_report_test     SOURCES proto_report_test.cpp     LIBS ak::proto ak::helm)
 ak_add_test(proto_link_test       SOURCES proto_link_test.cpp       LIBS ak::proto)
 ak_add_test(proto_vectors_test    SOURCES proto_vectors_test.cpp    LIBS ak::proto ak::hull)
+ak_add_test(controller_session_test SOURCES controller_session_test.cpp LIBS ak::helm)
+ak_add_test(controller_link_test    SOURCES controller_link_test.cpp    LIBS ak::helm OpenSSL::Crypto)
 ak_add_test(key_store_test     SOURCES key_store_test.cpp     LIBS ak::helm)
 ak_add_test(virtqueue_test    SOURCES virtqueue_test.cpp    LIBS ak::oar_virtio)
 ak_add_test(virtio_pci_test   SOURCES virtio_pci_test.cpp   LIBS ak::oar_virtio)

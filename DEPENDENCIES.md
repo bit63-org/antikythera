@@ -29,13 +29,15 @@ build also works against system packages. See
 - **Installation**: `vcpkg install`, or `sudo apt-get install libboost-test-dev`.
 
 ### OpenSSL
-- **Status**: Required. `ak_hull` links `OpenSSL::Crypto` for command
-  signature verification, `ak_helm` for the key store (AES-256-GCM
+- **Status**: Required. `ak_tls` links `OpenSSL::SSL` for the mutually
+  authenticated TLS 1.3 ControllerLink. `ak_hull` links `OpenSSL::Crypto`
+  for command signature verification, `ak_helm` for the key store (AES-256-GCM
   key wrapping, `RAND_bytes`, `OPENSSL_cleanse`) and `ak_oar_blk` for
   AES-256-XTS volume encryption. CI uses
   Ubuntu 24.04's OpenSSL 3.0 (`libssl-dev`), so 3.0 is the configure
   floor.
-- **Purpose**: Ed25519 command signatures, AES-256-GCM key wrapping in
+- **Purpose**: TLS 1.3 with mutual authentication (controller link),
+  Ed25519 command signatures, AES-256-GCM key wrapping in
   the helm key store, AES-256-XTS for oar-blk, `OPENSSL_cleanse` for key
   zeroization.
 - **Minimum version**: 3.6.5, taken from the `microsoft/vcpkg` git

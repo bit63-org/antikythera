@@ -294,6 +294,45 @@ BOOST_FIXTURE_TEST_CASE(memory_change_while_live_needs_reset, Fixture,
     BOOST_TEST((fn->status() & virtio::status_device_needs_reset) != 0);
 }
 
+BOOST_FIXTURE_TEST_CASE(unmapping_a_range_without_rings_keeps_the_driver, Fixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(driver->bring_up(features, {0}));
+    using ak::test::VirtioDriver;
+    // Far away (another device's BAR window), right below the descriptor
+    // table, between the rings, and at the very top of the address space.
+    fn->memory_changing(0xFE00'0000, 0x4000);
+    fn->memory_changing(VirtioDriver::desc_gpa(0) - 0x1000, 0x1000);
+    fn->memory_changing(
+        VirtioDriver::desc_gpa(0) + virtio::desc_table_bytes(ak::test::test_queue_size),
+        VirtioDriver::avail_gpa(0) - VirtioDriver::desc_gpa(0) -
+            virtio::desc_table_bytes(ak::test::test_queue_size));
+    fn->memory_changing(~std::uint64_t{0} - 0xFFF, 0x1000);
+    fn->memory_changing(VirtioDriver::desc_gpa(0), 0);
+    BOOST_TEST(fn->live());
+    BOOST_TEST((fn->status() & virtio::status_device_needs_reset) == 0);
+}
+
+BOOST_FIXTURE_TEST_CASE(unmapping_a_ring_needs_reset, Fixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    using ak::test::VirtioDriver;
+    const std::vector<virtio::Gpa> hits{
+        VirtioDriver::desc_gpa(0),       // descriptor table start
+        VirtioDriver::avail_gpa(0) + 3,  // inside the available ring
+        VirtioDriver::used_gpa(0) + virtio::used_ring_bytes(ak::test::test_queue_size) -
+            1,  // last used-ring byte
+    };
+    for (const virtio::Gpa at : hits) {
+        BOOST_REQUIRE(driver->bring_up(features, {0}));
+        fn->memory_changing(at, 1);
+        BOOST_TEST(!fn->live(), "at " << at);
+        BOOST_TEST((fn->status() & virtio::status_device_needs_reset) != 0);
+    }
+    // A wide range that covers everything.
+    BOOST_REQUIRE(driver->bring_up(features, {0}));
+    fn->memory_changing(0, ~std::uint64_t{0});
+    BOOST_TEST(!fn->live());
+}
+
 BOOST_FIXTURE_TEST_CASE(poll_reaches_the_device_only_when_live, Fixture,
                         *boost::unit_test::timeout(unit_timeout_seconds)) {
     BOOST_TEST(!fn->poll());

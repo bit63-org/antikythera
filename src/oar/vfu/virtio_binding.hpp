@@ -85,7 +85,7 @@ public:
     // Internal: libvfio-user's C callbacks reach the binding through these.
     auto bar_access(char* buf, std::size_t count, std::int64_t offset, bool is_write) -> long;
     auto dma_register(std::uint64_t iova, void* vaddr, std::size_t len) -> void;
-    auto dma_unregister(std::uint64_t iova) -> void;
+    auto dma_unregister(std::uint64_t iova, std::size_t len) -> void;
     auto device_reset() -> void;
     auto log(const char* message) const -> void;
 

@@ -59,7 +59,8 @@ auto dma_register_cb(vfu_ctx_t* ctx, vfu_dma_info_t* info) -> void {
 }
 
 auto dma_unregister_cb(vfu_ctx_t* ctx, vfu_dma_info_t* info) -> void {
-    binding_of(ctx).dma_unregister(reinterpret_cast<std::uint64_t>(info->iova.iov_base));
+    binding_of(ctx).dma_unregister(reinterpret_cast<std::uint64_t>(info->iova.iov_base),
+                                   info->iova.iov_len);
 }
 
 auto reset_cb(vfu_ctx_t* ctx, vfu_reset_type_t /*type*/) -> int {
@@ -249,9 +250,12 @@ auto VirtioBinding::dma_register(std::uint64_t iova, void* vaddr, std::size_t le
     }
 }
 
-auto VirtioBinding::dma_unregister(std::uint64_t iova) -> void {
+auto VirtioBinding::dma_unregister(std::uint64_t iova, std::size_t len) -> void {
+    // libvfio-user reports every region the client unmaps, including ones
+    // we ignored as unmappable (another device's BAR): only rings in the
+    // range matter.
     if (_function != nullptr) {
-        _function->memory_changing();
+        _function->memory_changing(iova, len);
     }
     static_cast<void>(_memory.remove_region(iova));  // not_found: it was never added
 }

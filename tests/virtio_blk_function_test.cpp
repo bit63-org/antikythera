@@ -800,4 +800,27 @@ BOOST_AUTO_TEST_CASE(ring_error_needs_reset, *boost::unit_test::timeout(unit_tim
     BOOST_TEST(rig.fn().counters().queue_errors == 1U);
 }
 
+// The harbor L1 hang: while L1's own virtio_blk driver had the disk live,
+// L1 reset or probed another function, the VMM unmapped that function's
+// BAR window, and every unmap reached this function as DEVICE_NEEDS_RESET.
+// Linux does not recover from that, so I/O stalled and boot never ended.
+// An unmap that misses the rings must leave the driver working.
+BOOST_AUTO_TEST_CASE(unrelated_unmap_keeps_io_flowing,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig;
+    rig.deliver_key();
+    const auto plain = pattern(40, blk::sector_size);
+    BOOST_TEST(rig.write(40, plain).status == ok());
+
+    constexpr vio::Gpa other_bar = 0xFE00'0000;
+    constexpr std::uint64_t bar_size = vio::bar_layout::bar_size;
+    rig.fn().pci().memory_changing(other_bar, bar_size);
+    BOOST_TEST((rig.status() & vio::status_device_needs_reset) == 0);
+    BOOST_TEST(rig.read(40, blk::sector_size).data == plain, boost::test_tools::per_element());
+
+    // Unmapping the rings themselves still resets, as it must.
+    rig.fn().pci().memory_changing(VirtioDriver::desc_gpa(queue0), 1);
+    BOOST_TEST((rig.status() & vio::status_device_needs_reset) != 0);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -234,7 +234,13 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
                 dev.drop_key();
                 break;
             case 8:
-                pci.memory_changing();
+                // The VMM unmapping something: often a range with no ring
+                // (a BAR window), sometimes all of guest memory.
+                if ((in.u8() & 1U) != 0) {
+                    pci.memory_changing();
+                } else {
+                    pci.memory_changing(ram_base + in.u16(), in.u16());
+                }
                 break;
             default: {
                 // The guest rewrites a byte of its own RAM mid-run.

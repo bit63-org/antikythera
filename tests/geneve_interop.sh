@@ -14,7 +14,10 @@
 #
 #   1. kernel -> codec: a UDP datagram sent into gnv0 is encapsulated by
 #      the kernel; the peer must decode it to the configured VNI and NIC
-#      pair and re-encode it to the same bytes.
+#      pair and re-encode it to the same bytes. The kernel leaves the C
+#      bit clear for options set through tc tunnel_key (only Open vSwitch
+#      sets IP_TUNNEL_CRIT_OPT), so the peer first checks that the codec
+#      drops that packet, then decodes it with C set.
 #   2. codec -> kernel: the peer encodes an inner Ethernet/IPv4/UDP frame;
 #      the kernel must decapsulate it, match the option in flower, and
 #      deliver the inner datagram to a socket in ns B.

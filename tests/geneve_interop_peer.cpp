@@ -9,7 +9,10 @@
 //   recv  bind [addr]:port, wait for a datagram whose inner frame carries
 //         the marker, and check that it decodes to the expected VNI and
 //         NIC pair. Any datagram the codec rejects fails the test: the
-//         kernel built it, so a rejection is an interop bug.
+//         kernel built it, so a rejection is an interop bug. The one
+//         exception is a critical option with the C bit clear, which tc
+//         tunnel_key produces (see run_recv): the codec must drop it, and
+//         the rest of the framing is then checked with C set.
 //   send  build an inner Ethernet/IPv4/UDP frame carrying the marker,
 //         encode it with the NIC-pair option and send it to [addr]:port.
 //
@@ -63,6 +66,8 @@ constexpr unsigned byte_bits = 8;
 constexpr std::uint32_t low16_mask = 0xFFFF;
 constexpr int hex_base = 16;
 constexpr int decimal_base = 10;
+constexpr std::size_t flags_offset = 1;       // Geneve base header byte holding O and C
+constexpr std::uint8_t flag_critical = 0x40;  // C bit within that byte
 
 using Args = std::map<std::string, std::string, std::less<>>;
 using Mac = std::array<std::byte, mac_size>;
@@ -313,6 +318,7 @@ auto run_recv(const Args& args) -> int {
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
     std::vector<std::byte> buf(max_datagram);
+    std::vector<std::byte> patched;
     while (std::chrono::steady_clock::now() < deadline) {
         const auto left = std::chrono::duration_cast<std::chrono::microseconds>(
             deadline - std::chrono::steady_clock::now());
@@ -331,8 +337,22 @@ auto run_recv(const Args& args) -> int {
             std::perror("recv");
             return exit_fail;
         }
-        const std::span<const std::byte> payload{buf.data(), static_cast<std::size_t>(n)};
+        std::span<const std::byte> payload{buf.data(), static_cast<std::size_t>(n)};
         auto pkt = geneve::decode(payload);
+        if (!pkt && pkt.error() == geneve::DecodeError::critical_flag_mismatch) {
+            // Known kernel gap: the geneve driver sets the C bit only when
+            // IP_TUNNEL_CRIT_OPT is set, which Open vSwitch does and tc
+            // tunnel_key does not. The codec must drop such a packet
+            // (Requirement 4.1), and did. Check the rest of the kernel's
+            // framing by setting C in a copy and decoding that strictly.
+            std::puts(
+                "note: kernel sent a critical option with the C bit clear; codec dropped it "
+                "(critical_flag_mismatch) as Requirement 4.1 requires");
+            patched.assign(payload.begin(), payload.end());
+            patched[flags_offset] |= std::byte{flag_critical};
+            payload = patched;
+            pkt = geneve::decode(payload);
+        }
         if (!pkt) {
             std::fprintf(stderr, "FAIL: codec rejected a %zd-byte kernel datagram: %s\n", n,
                          geneve::to_string(pkt.error()));
@@ -350,7 +370,8 @@ auto run_recv(const Args& args) -> int {
             std::fputs("FAIL: decoded fields differ from the kernel's configuration\n", stderr);
             return exit_fail;
         }
-        // The kernel must re-encode to the same bytes we would have sent.
+        // The kernel's datagram must re-encode to the same bytes we would
+        // have sent (after the C-bit fix-up above, where it applied).
         auto again =
             geneve::encode({.vni = pkt->vni, .nics = *pkt->nics, .oam = false}, pkt->inner);
         if (!again || !std::ranges::equal(*again, payload)) {

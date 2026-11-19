@@ -18,7 +18,8 @@
 //                       queues and state are cleared (Requirement 8.2)
 //   map_update          decode the controller's frame, check that it names
 //                       this server and that its signature verifies, then
-//                       apply it to the MappingTable
+//                       apply it to the MappingTable and hand its guest
+//                       addresses to the VSwitch's ARP/ND proxy
 //   health              ok, or degraded while any peer VTEP is down
 //
 // Keys and volumes are not the network role's: deliver_key, drop_key and
@@ -115,6 +116,7 @@ struct RoleCounters {
     std::uint64_t map_wrong_server{0};  // for another server
     std::uint64_t map_bad_signature{0};
     std::uint64_t map_rejected{0};  // MappingTable refused it (stale version, bad entries)
+    std::uint64_t map_neighbors_rejected{0};  // the VSwitch refused its proxy addresses
 };
 
 // The identity a function carries between attachments: never in any

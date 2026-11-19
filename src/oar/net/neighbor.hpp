@@ -90,9 +90,11 @@ struct NeighborSolicitation {
 
 // A solicited neighbor advertisement (S and O set, R clear) for
 // `ns.target_ip` at `target_mac` with a target link-layer address option,
-// addressed to the soliciting host. `ns` must not be a DAD probe.
+// addressed to the soliciting host. `ns` must not be a DAD probe. `router`
+// sets the R flag: the VPC gateway must, or hosts drop it from their
+// default router list (RFC 4861 7.2.5).
 [[nodiscard]] auto build_neighbor_advertisement(const NeighborSolicitation& ns,
-                                                const MacAddress& target_mac)
+                                                const MacAddress& target_mac, bool router = false)
     -> std::vector<std::byte>;
 
 // The ICMPv6 checksum (RFC 4443 2.3) of `message` between the two

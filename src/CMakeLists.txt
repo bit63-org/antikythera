@@ -6,8 +6,8 @@ add_library(ak_common INTERFACE)
 add_library(ak::common ALIAS ak_common)
 target_include_directories(ak_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 
-# ak_proto: header-only controller wire formats (Envelope, MapUpdate) and
-# their signing test vectors. Depends only on ak_common so kythira's EC2
+# ak_proto: header-only controller wire formats (Envelope, MapUpdate,
+# Report, link records) and the signing test vectors. Depends only on ak_common so kythira's EC2
 # module can include it directly (.kiro/specs/controller-interface/).
 add_library(ak_proto INTERFACE)
 add_library(ak::proto ALIAS ak_proto)

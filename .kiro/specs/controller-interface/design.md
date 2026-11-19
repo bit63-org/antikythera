@@ -62,6 +62,53 @@ not signed, must carry 0. A slot that breaks either rule is rejected
 before signature verification. The envelope's `key_id` must equal the
 slot's; helm may check this, but hull trusts only the slot.
 
+## Inventory and status reports
+
+helm reports to the controller with `Report` frames
+(`src/proto/report.hpp`): a 32-byte header (magic, format version, kind,
+`server_id`, `report_seq`, `body_len`) and one body per kind.
+
+| Kind | Body | Requirement |
+|---|---|---|
+| `inventory` | full snapshot: boot ID, last command sequence hull accepted, cores and 1 GiB pages (total, free), health, VTEPs, every function with type/state/owner, VMs, local volumes, networks with applied mapping version | 3.1, placement inputs |
+| `command_outcome` | hull's response: command sequence and type, status, optional payload | 3.2 |
+| `pool_state` | one device-pool transition (function, from, to, VM) | 3.2 |
+| `vm_exited` | a VM exit hull did not cause | 3.2 |
+| `map_applied` | VNI and mapping version oar-net swapped in | 3.2, 5.3 |
+| `host_fault` | hull's fault code, slot and detail | 3.2 |
+
+Reports are not signed. mTLS authenticates helm, and the controller only
+trusts a server about that server (Requirement 3.3). The inventory is a
+snapshot rather than a delta, for the same reason MapUpdate is: after a
+reconnect or a helm reboot the controller replaces what it knew about the
+server with the newest inventory, with nothing to replay. `boot_id` is fresh
+on every helm boot, so the controller can tell a reconnect (same boot ID:
+report sequence numbers continue) from a reboot (new boot ID: they restart).
+`last_command_seq` tells the controller where its per-server command
+sequence resumes (Requirement 2.3).
+
+Every list in an inventory is in strictly increasing key order and bounded
+(8 VTEPs, 1024 functions, 512 VMs, 1024 volumes, 4096 networks), so the
+encoding is canonical and the largest report is under 128 KiB. A function
+names an owner VM exactly when it is `assigned` or `releasing`. Enum values
+are helm's (`FunctionType`, `FunctionState`) and the mailbox's (`Status`,
+`ExitReason`, `FaultCode`), pinned by `tests/proto_report_test.cpp`.
+
+## Link framing
+
+The mTLS stream carries records (`src/proto/link.hpp`): `length u32 | type
+u16 | reserved u16 | payload`. Controller to helm: `envelope`, `map_update`,
+`report_ack` (`server_id u64 | report_seq u64`, acknowledging every report
+up to that sequence). Helm to controller: `hello` (`server_id u64 | boot_id
+u64`, the first record on every connection) and `report`. Report sequence
+numbers restart when helm reboots, so the controller keys them by the
+connection's boot ID and drops any `(boot_id, report_seq)` it has already
+processed; that makes helm's replay after a reconnect idempotent. The framing only
+delimits; each payload goes to its own strict decoder, and a record in the
+wrong direction is a protocol error. A record header announcing more than
+the largest frame (a full MapUpdate, about 128 KiB) ends the connection
+before any payload is buffered.
+
 ## Placement inputs
 
 From inventory: free whole cores, free 1 GiB pages, free functions by type,

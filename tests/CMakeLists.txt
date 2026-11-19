@@ -46,6 +46,8 @@ ak_add_test(cpu_topology_test       SOURCES cpu_topology_test.cpp       LIBS ak:
 ak_add_test(resource_allocator_test SOURCES resource_allocator_test.cpp LIBS ak::hull)
 ak_add_test(proto_envelope_test   SOURCES proto_envelope_test.cpp   LIBS ak::proto ak::helm)
 ak_add_test(proto_map_update_test SOURCES proto_map_update_test.cpp LIBS ak::proto)
+ak_add_test(proto_report_test     SOURCES proto_report_test.cpp     LIBS ak::proto ak::helm)
+ak_add_test(proto_link_test       SOURCES proto_link_test.cpp       LIBS ak::proto)
 ak_add_test(proto_vectors_test    SOURCES proto_vectors_test.cpp    LIBS ak::proto ak::hull)
 ak_add_test(key_store_test     SOURCES key_store_test.cpp     LIBS ak::helm)
 ak_add_test(virtqueue_test    SOURCES virtqueue_test.cpp    LIBS ak::oar_virtio)

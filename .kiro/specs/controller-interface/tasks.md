@@ -1,6 +1,6 @@
 # Implementation Plan — Controller interface and the kythira EC2 integration
 
-## Status: 2/7 tasks complete
+## Status: 3/7 tasks complete
 
 ## Tasks
 
@@ -14,7 +14,11 @@
   per-VPC snapshot; see design "Envelope".)
 - [ ] 3. helm ControllerLink over mTLS with reconnect and reconciliation.
   _Requirements: 2, 3_
-- [ ] 4. Inventory/status report schema. _Requirements: 3_
+- [x] 4. Inventory/status report schema. _Requirements: 3_ (`Report` in
+  `src/proto/report.hpp`: inventory snapshot plus command outcome,
+  pool-state, VM-exit, map-applied and host-fault events; link record
+  framing and report acks in `src/proto/link.hpp`; tests and fuzz targets.
+  See design "Inventory and status reports" and "Link framing".)
 - [ ] 5. A minimal test controller in harbor (C++ CLI that signs and sends
   envelopes) to drive phases 3–5 before kythira's module exists.
   _Requirements: 1, 5_

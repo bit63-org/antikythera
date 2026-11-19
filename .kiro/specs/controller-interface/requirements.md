@@ -108,3 +108,40 @@ work against kythira, backed by antikythera servers.
 4. Features with no backing yet (subnets beyond one per VPC, security
    groups, Elastic IPs, internet gateways) SHALL be refused with EC2's
    `UnsupportedOperation`, never silently accepted.
+
+### Requirement 7: Opt-in multicast and its billing
+
+**User Story:** As a kythira user, I want to turn multicast on for a
+subnet and see what it costs; as the operator, I want to charge for it and
+keep it from being abused.
+
+#### Acceptance Criteria
+
+1. Broadcast and multicast SHALL be off by default for every VPC and
+   subnet (oar-net Requirement 10.1).
+2. The controller SHALL record a per-subnet multicast setting (until
+   subnets exist, per VPC) with its limits: per-NIC frame and byte rates
+   and bursts, a flood-list cap (most servers the subnet may span) and,
+   with snooping, a per-NIC group cap. Region-wide defaults and maxima
+   SHALL bound what a tenant may set.
+3. The controller SHALL deliver the setting as a signed, versioned
+   `GroupPolicy` frame to every server hosting a NIC in the VNI, signed
+   like `MAP_UPDATE` and applied before the first NIC of an opted-in
+   subnet can send.
+4. The controller SHALL refuse to opt in a subnet that spans more servers
+   than its flood-list cap, and SHALL refuse a placement that would push an
+   opted-in subnet past it, with a clear error.
+5. helm SHALL report per-NIC group usage (`group_usage` report) at least
+   every 60 seconds while a NIC has new usage, and once more with the final
+   counters when a NIC is detached.
+6. The controller SHALL turn successive cumulative readings into usage
+   deltas per NIC attachment, attribute them to the NIC's account, and
+   record billable usage: replica bytes and frames sent to other servers.
+   A reading lower than the previous one for the same attachment SHALL be
+   treated as a fault and never billed negatively.
+7. The controller SHALL record enablement time per opted-in subnet as a
+   second billable quantity.
+8. The EC2 module SHALL expose the setting and the usage (design in the
+   kythira spec); prices are kythira billing configuration, not part of
+   this interface.
+

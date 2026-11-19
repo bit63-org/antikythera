@@ -101,6 +101,7 @@ helm reports to the controller with `Report` frames
 | `vm_exited` | a VM exit hull did not cause | 3.2 |
 | `map_applied` | VNI and mapping version oar-net swapped in | 3.2, 5.3 |
 | `host_fault` | hull's fault code, slot and detail | 3.2 |
+| `group_usage` | cumulative per-NIC group meters (see "Multicast policy and usage") | 7.5 |
 
 Reports are not signed. mTLS authenticates helm, and the controller only
 trusts a server about that server (Requirement 3.3). The inventory is a
@@ -119,10 +120,58 @@ names an owner VM exactly when it is `assigned` or `releasing`. Enum values
 are helm's (`FunctionType`, `FunctionState`) and the mailbox's (`Status`,
 `ExitReason`, `FaultCode`), pinned by `tests/proto_report_test.cpp`.
 
+## Multicast policy and usage
+
+Requirement 7 and oar-net Requirement 10; the decision and its reasoning
+are in `docs/vpc-gap-analysis.md` ("Broadcast and multicast").
+
+```
+GroupPolicy {                 // controller -> helm -> oar-net, signed
+  magic 'AKGP' u32, version u16 (1), reserved u16,
+  server_id u64, key_id u16, reserved u16, vni u32,
+  policy_version u64,         // per VNI, strictly increasing
+  mode u8 (0 drop, 1 multicast), reserved [3],
+  rate_frames u32, burst_frames u32,
+  rate_bytes u64, burst_bytes u64,
+  max_remote_vteps u32, max_groups_per_nic u16, reserved u16,
+  signature [64]              // Ed25519 over everything above
+}
+```
+
+Like MapUpdate it is a full per-VNI snapshot carrying its own server and
+key IDs inside the signed bytes, so applying it is idempotent and a server
+that missed versions catches up from the newest. A `drop` policy has
+every limit zero; a `multicast` policy has every limit non-zero
+(`max_groups_per_nic` may be zero until snooping is built) and within the
+oar-net bounds. Per-subnet policies come with subnets: a later version
+carries one entry per subnet. Phase 2 adds a `GroupMembers` frame (VNI,
+version, per-group VTEP lists) built from snooped joins.
+
+The `group_usage` report body is `count u16 | rsvd [6]` then `count`
+entries of 96 bytes, in strictly increasing `(nic_id, attachment)` order:
+
+```
+nic_id u64 | vni u32 | flags u8 (bit 0: detached, final) | rsvd [3]
+attachment u64          // per oar-net run; with boot_id and slot, unique
+frames u64 | bytes u64
+replicas_remote u64 | replica_bytes_remote u64   // billable
+replicas_local u64 | replica_bytes_local u64
+drop_policy u64 | drop_rate u64 | drop_fanout u64
+```
+
+Billing keys a series by `(server_id, boot_id, slot, nic_id,
+attachment)`. Counters only grow within a series, so the controller bills
+`reading − previous reading` and a lost or replayed report only delays or
+repeats a reading, never double-counts it. A new series (re-attach, oar-net
+restart, helm reboot) starts from zero. Nothing is billed for a NIC whose
+VNI was never opted in, though drops are still reported for visibility.
+Enablement hours come from the controller's own record of when each
+subnet's policy was in force.
+
 ## Link framing
 
 The mTLS stream carries records (`src/proto/link.hpp`): `length u32 | type
-u16 | reserved u16 | payload`. Controller to helm: `envelope`, `map_update`,
+u16 | reserved u16 | payload`. Controller to helm: `envelope`, `map_update`, `group_policy`,
 `report_ack` (`server_id u64 | report_seq u64`, acknowledging every report
 up to that sequence). Helm to controller: `hello` (`server_id u64 | boot_id
 u64`, the first record on every connection) and `report`. Report sequence

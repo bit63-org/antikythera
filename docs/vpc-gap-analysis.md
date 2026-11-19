@@ -78,7 +78,7 @@ spec).
 | Client VPN | missing | None | Lower priority; can be a tenant-run appliance once source/destination check opt-out and NIC route targets exist |
 | Encryption in transit | in review | WireGuard between VTEPs (#47), keys via controller (#48); IPsec ESP kept as an option in oar-net Req 5 | Land #47/#48, wire the keyring into the helm daemon and the peer set into NetRole. No per-tenant keys by design; tenants needing their own keys encrypt in the guest. PSP or inline crypto offload later for line rate |
 | Jumbo frames / MTU | in review | MTU plan and probes (#45): 8874 with a 9000 underlay and WireGuard | Land #45/#46 and the harbor multi-server tests |
-| Broadcast / multicast | differs | VSwitch floods group frames to local members and head-end replicates to remote VTEPs | AWS VPCs carry no broadcast or multicast. With ARP/ND proxied and DHCP answered locally, oar-net can drop remaining broadcast and multicast, which removes head-end replication and its cost. Decide whether to match AWS or keep L2 flooding as an extension |
+| Broadcast / multicast | decided, specced | VSwitch floods group frames to local members and head-end replicates to remote VTEPs | **Decision (2026-11-19): drop by default, like AWS; opt-in, metered and billable multicast per subnet.** ARP/ND stay answered by the proxy and DHCP will be answered locally, so nothing a stock guest needs crosses the fabric as broadcast. A VPC that opts in gets IP multicast (never broadcast) replicated by head-end replication over the encrypted tunnels, with IGMP/MLD snooping and controller-pushed per-group server lists, hard per-NIC rate limits, a per-NIC group cap and a flood-list cap. Every replica sent to the fabric is metered per NIC and reported through helm, so the controller can bill usage, plus an hourly charge per opted-in subnet. Spec: oar-net Requirement 10, controller-interface Requirement 7, helm Requirement 11. See "Broadcast and multicast" below |
 | Scale limits | partial | MapUpdate holds at most 4096 NICs and 8192 addresses per family per VPC, as a full snapshot | Fine for early tenants. Large VPCs need a new format (sharded or delta updates), and peering/TGW make the set of mappings a VTEP needs larger than "VPCs with a NIC here" |
 
 ## Biggest gaps
@@ -106,31 +106,82 @@ spec).
    #47, #48, #42), wire the keyring and peer set into the helm daemon and
    NetRole, and run harbor's multi-server reachability, isolation and MTU
    tests on tikhov. Everything below builds on it.
-2. **L3 foundation and guest bring-up.** VPC and subnet CIDRs in the
+2. **Group policy.** Drop group traffic by default in oar-net, with the
+   opt-in multicast mode, rate limits and usage meters, then the signed
+   `GroupPolicy` frame and the `group_usage` report (small; see
+   "Broadcast and multicast"). IGMP/MLD snooping follows the L3 parser.
+3. **L3 foundation and guest bring-up.** VPC and subnet CIDRs in the
    controller model and a signed per-VPC config frame; an L3/L4 parser in
    oar-net; IP source/destination check; DHCPv4/DHCPv6/RA answered from the
    mapping; the IMDS intercept. After this a stock image boots with an
    address and metadata.
-3. **Subnets and the implicit router.** Per-subnet gateway addresses,
+4. **Subnets and the implicit router.** Per-subnet gateway addresses,
    distributed routing between subnets at the source VTEP, and route tables
    with the `local` target only.
-4. **Security groups,** with conntrack in oar-net and the `SecurityPolicy`
+5. **Security groups,** with conntrack in oar-net and the `SecurityPolicy`
    frame. Flow logs right after, since they read the same conntrack.
-5. **NACLs,** reusing the parser and rule distribution.
-6. **Gateway role spec and build:** IGW with Elastic IPs, then NAT gateway
+6. **NACLs,** reusing the parser and rule distribution.
+7. **Gateway role spec and build:** IGW with Elastic IPs, then NAT gateway
    and the egress-only IGW, then the DNS resolver behind it. Route-table
    targets for each.
-7. **VPC peering,** then gateway endpoints for kythira services.
-8. **Site-to-site VPN** (IPsec/IKEv2 + BGP) and **transit gateway.**
-9. **PrivateLink, traffic mirroring, client VPN** as demand appears.
+8. **VPC peering,** then gateway endpoints for kythira services.
+9. **Site-to-site VPN** (IPsec/IKEv2 + BGP) and **transit gateway.**
+10. **PrivateLink, traffic mirroring, client VPN** as demand appears.
 
 IPv6 is not a separate step: each step above should handle both families
 as it goes, since the underlay and ND proxy are already IPv6.
 
+## Broadcast and multicast
+
+Decided 2026-11-19: match AWS by default, and sell multicast as an opt-in
+feature the way AWS sells Transit Gateway multicast.
+
+**Default: drop.** oar-net drops every group-addressed frame the ARP/ND
+proxy does not consume. ARP and ND for mapped addresses are answered
+locally, DHCP will be answered locally (build order step 2), and DAD
+probes and ARP for unknown addresses go unanswered, as in AWS. This
+removes head-end replication, and with it the amplification risk, from
+every VPC that has not asked for it.
+
+**Opt-in: multicast per subnet.** Until subnets exist a VPC has one
+subnet, so the first build is per VPC. An opted-in subnet carries IPv4
+and IPv6 multicast, never broadcast, and never IPv6 solicited-node groups
+(those are ND and stay with the proxy). The sending VTEP replicates each
+frame once to every other VTEP hosting the subnet, as unicast Geneve
+inside WireGuard (head-end replication), so the physical network needs
+no multicast. First build: every multicast frame goes to every VTEP in
+the subnet. Second build: oar-net snoops guest IGMP/MLD joins, reports
+them through helm, and the controller pushes per-group VTEP lists, so a
+frame goes only where a member is; unknown groups still go to the whole
+subnet.
+
+**Abuse limits.** Isolation between tenants is unaffected, since
+replication never leaves the VNI. The risks are within a tenant and on
+the fabric, and each has a hard limit enforced in oar-net, outside host
+and guest:
+
+| Risk | Limit |
+|---|---|
+| Amplification (one sender, N copies) | Per-NIC frame and byte token bucket on replicated traffic; a flood-list cap per subnet (the controller refuses to opt in, or to grow, a subnet past it, and oar-net drops frames for a larger one) |
+| Noisy neighbor on the server uplink | The same per-NIC buckets; replication counted apart from unicast |
+| Join floods | A per-NIC group cap on snooped joins |
+| Rogue DHCP, gratuitous ARP spoofing | No broadcast at all, even when opted in; the ARP/ND proxy and source checks stay authoritative |
+| A peer VTEP with a stale or hostile policy | The receiving VTEP applies its own policy too |
+
+**Billing.** Two charges, both collected by the controller:
+
+- *Enablement:* per opted-in subnet per hour, from controller state alone.
+- *Usage:* replicas sent to the fabric. oar-net keeps cumulative per-NIC
+  meters (frames and bytes accepted, replicas and replica bytes sent to
+  other VTEPs and delivered locally, drops by cause). helm reads them
+  periodically and on detach and reports them as a `group_usage` report;
+  the controller turns successive readings into deltas per NIC and bills
+  the NIC's account for remote replica bytes. Cumulative counters mean a
+  lost report delays billing but never loses usage. Local copies and
+  drops are reported for visibility and are not billed by default.
+
 ## Open questions
 
-- Do we match AWS and drop broadcast and multicast inside a VPC, or keep
-  L2 flooding as a deliberate extension?
 - Where does the gateway role run: on dedicated servers with a public
   uplink, or as a placement option of the existing oar-net boards?
 - Which kythira services get gateway endpoints first?

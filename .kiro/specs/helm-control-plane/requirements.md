@@ -200,3 +200,20 @@ another VPC.
 2. The device-pool state machine SHALL be tested exhaustively for illegal
    transitions.
 3. harbor SHALL run helm in both placements (combined and split) in CI.
+
+### Requirement 11: Group policy and usage metering
+
+**User Story:** As the operator, I want multicast enabled only where the
+controller allows it, and every replica it causes billed.
+
+#### Acceptance Criteria
+
+1. helm SHALL forward controller `GroupPolicy` frames, unmodified, to every
+   network role hosting a NIC in the VNI, and to a role that gains such a
+   NIC before that NIC is plugged.
+2. helm SHALL read every network role's per-NIC group meters at least
+   every 60 seconds, and after every NIC detach, and report them to the
+   controller as `group_usage` reports.
+3. helm SHALL keep a detached NIC's final reading until the controller
+   acknowledges the report that carries it.
+

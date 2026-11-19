@@ -1,6 +1,6 @@
 # Implementation Plan — oar-net: the network data plane
 
-## Status: 9/11 tasks complete
+## Status: 10/14 tasks complete
 
 ## Tasks
 
@@ -164,3 +164,15 @@
   frame's guest addresses (MapUpdate v2) to `VSwitch::set_neighbors` after
   applying the mapping, failing closed (no proxy answers for the VNI) if
   they were ever refused.
+- [ ] 12. Group policy in the VSwitch: drop group frames by default,
+  opt-in `multicast` mode per VNI with per-NIC frame/byte token buckets
+  and the flood-list cap, receive-side admission, cumulative per-NIC
+  `GroupMeter`s with retained final readings, tests and fuzz.
+  _Requirements: 10.1–10.4, 10.6_ Note: with drop as the default, ARP and
+  ND between VTEPs depend on the proxy, which `NetRole` feeds from
+  MapUpdate v2 (task 11).
+- [ ] 13. `GroupPolicy` frame (controller-interface task 10) applied by
+  `NetRole` over OarLink `group_policy`, and `group_usage` answered from
+  the VSwitch meters. _Requirements: 10.2, 10.6, 10.7_
+- [ ] 14. IGMP/MLD snooping, per-NIC group cap, join reports through helm
+  and per-group VTEP lists. Needs the L3 parser. _Requirements: 10.5_

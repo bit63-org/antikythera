@@ -50,7 +50,7 @@ build also works against system packages. See
 - **Status**: Optional. Enabled by the `vfio-user` vcpkg feature
   (`vcpkg install --x-feature=vfio-user`). Linux only.
 - **Purpose**: the vfio-user server library behind `ak-testdev` and,
-  later, the harbor transports for helm's mailbox, oar-net and oar-blk.
+  `ak-oar-net` (the shared `VirtioBinding` transport), and later helm's mailbox and oar-blk.
   Real boards use Linux `pci-epf` instead.
 - **Version**: v0.8, commit `37491ed9af828fc161238dacd82e83ea35a09f87`,
   from the overlay port in `vcpkg-overlays/libvfio-user/` (it is not in

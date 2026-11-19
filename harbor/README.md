@@ -69,6 +69,23 @@ inventory, as the real controller's do. The full script language is in
 `src/harbor/test_controller.hpp`. Exit status 0 means every line passed,
 1 that one failed (its line number is printed), 2 a usage or setup error.
 
+## oar-net virtio-net function
+
+`ak-oar-net` (built with `-DAK_VFIO_USER=ON`) serves one virtio-net NIC
+over vfio-user, with the MAC, MTU and NIC ID helm would assign. Until the
+VSwitch exists, `--tap IFNAME` bridges its frames to a TAP device:
+
+```bash
+sudo build/src/ak-oar-net --socket /tmp/n.sock --nic-id 7 \
+    --mac 02:00:5e:10:20:30 --mtu 1500 --tap aknet0 &
+sudo harbor/oar_net_smoke.py /tmp/n.sock aknet0
+```
+
+`oar_net_smoke.py` plays the vfio-user client and the guest driver itself
+(no QEMU), checking the PCI identity and capabilities, a frame each way
+through the TAP, and that the guest cannot rewrite the MAC. Passing the
+function through to an L2 guest is the next harbor step.
+
 ## Layout
 
 | Path | Purpose |
@@ -79,4 +96,5 @@ inventory, as the real controller's do. The full script language is in
 | `l1/run.sh`, `l1/stop.sh` | start and stop one server (board processes, then QEMU) |
 | `l1/phase1-check.sh`, `l1/testdev_mmio.py` | the checks that run inside L1 |
 | `phase1.sh` | phase 1 end to end |
+| `oar_net_smoke.py` | drives a running `ak-oar-net` over vfio-user without QEMU (see below) |
 | `kernel/` | hull kernel fragments (strict `hull.config`, per-arch, `l1-debug.config`), resolver and checker; see [`kernel/README.md`](kernel/README.md) |

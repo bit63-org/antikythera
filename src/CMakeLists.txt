@@ -13,21 +13,23 @@ add_library(ak_proto INTERFACE)
 add_library(ak::proto ALIAS ak_proto)
 target_link_libraries(ak_proto INTERFACE ak::common)
 
-# oar-net: Geneve encapsulation, VTEP ingress policy and the controller
-# mapping table (network data plane).
+# oar-net: Geneve encapsulation, VTEP ingress policy, the controller
+# mapping table and the virtio-net function (network data plane).
 add_library(ak_oar_net
   oar/net/geneve.cpp
   oar/net/mapping_table.cpp
+  oar/net/virtio_net.cpp
   oar/net/vtep_policy.cpp)
 add_library(ak::oar_net ALIAS ak_oar_net)
 target_link_libraries(ak_oar_net
-  PUBLIC ak::common
+  PUBLIC ak::common ak::oar_virtio
   PRIVATE ak::warnings ak::hardening)
 
 # oar/virtio: the shared virtio device core (guest memory, split virtqueue,
 # modern PCI capabilities and common configuration), written once and bound
 # to vfio-user or pci-epf by each device.
 add_library(ak_oar_virtio
+  oar/virtio/function.cpp
   oar/virtio/guest_memory.cpp
   oar/virtio/pci.cpp
   oar/virtio/split_queue.cpp)
@@ -176,6 +178,20 @@ if(LIBVFIO_USER_FOUND)
   # structs; keep our strict flags but do not fail on its headers.
   target_compile_options(ak-testdev PRIVATE -Wno-pedantic)
   install(TARGETS ak-testdev RUNTIME DESTINATION bin)
+
+  # The harbor transport for every virtio device: a PciFunction served over
+  # vfio-user (oar/vfu/virtio_binding.hpp).
+  add_library(ak_vfu_virtio oar/vfu/virtio_binding.cpp)
+  add_library(ak::vfu_virtio ALIAS ak_vfu_virtio)
+  target_link_libraries(ak_vfu_virtio
+    PUBLIC ak::oar_virtio
+    PRIVATE ak_libvfio_user ak::warnings ak::hardening)
+  target_compile_options(ak_vfu_virtio PRIVATE -Wno-pedantic)
+
+  add_executable(ak-oar-net oar/net/oar_net_main.cpp)
+  target_link_libraries(ak-oar-net
+    PRIVATE ak::vfu_virtio ak::oar_net ak::warnings ak::hardening)
+  install(TARGETS ak-oar-net RUNTIME DESTINATION bin)
 elseif(_ak_vfio_user_required)
   message(FATAL_ERROR
     "libvfio-user not found, but it is required because ${_ak_vfio_user_reason}.\n"
@@ -189,7 +205,7 @@ else()
   if(AK_VFIO_USER STREQUAL "OFF")
     message(STATUS "AK_VFIO_USER=OFF: vfio-user device servers not built")
   else()
-    message(WARNING "libvfio-user not found: vfio-user device servers (ak-testdev) not built. "
+    message(WARNING "libvfio-user not found: vfio-user device servers (ak-testdev, ak-oar-net) not built. "
                     "Install the `vfio-user` vcpkg feature to enable them, or pass "
                     "-DAK_VFIO_USER=OFF to silence this warning.")
   endif()

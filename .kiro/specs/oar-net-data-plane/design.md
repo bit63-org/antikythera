@@ -167,7 +167,8 @@ check any better); IPv6 version 6, payload length within the frame, at
 most 8 extension headers (hop-by-hop only first; routing, fragment,
 destination options, AH by length), anything else ends the walk as the
 upper-layer protocol. TCP needs data offset ≥ 5 within the packet, UDP a
-length that matches the IP payload, ICMP/ICMPv6 four bytes. Errors are a
+length between 8 and the rest of the IP payload (unfragmented), ICMP/ICMPv6
+four bytes; a first fragment too short for its L4 header is refused. Errors are a
 `PacketError` enum, each counted (`tx_drop_malformed`).
 
 Each IPv4/IPv6 neighbor table entry already names its NIC, so the source
@@ -186,7 +187,7 @@ Transmit order, after the existing dead-VPC, length and source-MAC checks:
 5. Local responders, which consume what they match: DHCPv4 (UDP 68→67),
    ICMPv6 RS, NS (gateway target, then the existing proxy), DHCPv6
    (UDP 546→547), then the metadata intercept.
-6. `local_only` packets left are `tx_drop_link_local`.
+6. `local_only` packets left are `tx_drop_local_only`.
 7. Destination MAC is the gateway MAC: `tx_drop_no_route`.
 8. Group frame: group policy; admitted frames also need an IP multicast
    destination (`tx_drop_ip_dst`).

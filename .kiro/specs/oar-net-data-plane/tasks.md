@@ -1,6 +1,6 @@
 # Implementation Plan — oar-net: the network data plane
 
-## Status: 5/11 tasks complete
+## Status: 6/11 tasks complete
 
 ## Tasks
 
@@ -11,8 +11,15 @@
   tests. _Requirements: 4.2, 4.3_
 - [x] 3. Bring existing code to the steering standards (`_member` naming,
   trailing return types, test timeouts, named constants). _Requirements: 9_
-- [ ] 4. Kernel Geneve interop test in a network namespace.
-  _Requirements: 9.2_
+- [x] 4. Kernel Geneve interop test in a network namespace.
+  _Requirements: 9.2_ — `tests/geneve_interop.sh` with
+  `tests/geneve_interop_peer.cpp`: the codec on a UDP socket in one
+  namespace, a kernel geneve device (external mode, tc `tunnel_key` adding
+  the NIC-pair option, flower matching it on ingress) in another, IPv6
+  underlay. Checked both ways: kernel-built packets decode to the
+  configured VNI and NIC pair and re-encode byte for byte; codec-built
+  packets match flower and reach a socket behind the kernel device. Needs
+  root, so plain ctest skips it; CI's `build (gcc-14)` runs it under sudo.
 - [x] 5. Shared virtio core: PCI capabilities, split virtqueue with bounds
   checks, fuzz target. _Requirements: 1.4_ — `src/oar/virtio/`:
   `GuestMemory` (registered DMA regions, no straddling), `SplitQueue`

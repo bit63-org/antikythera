@@ -147,6 +147,6 @@ network rejected, since Geneve itself has no authentication.
 1. The Geneve codec and ingress policy SHALL have unit tests and a fuzz
    target. _(Done for codec and policy.)_
 2. The codec SHALL be cross-checked against the Linux kernel's Geneve
-   device in a network namespace.
+   device in a network namespace. _(Done: tests/geneve_interop.sh.)_
 3. harbor SHALL verify cross-server reachability within a VPC, isolation
    between VPCs, rejection of forged VNIs and NIC IDs, and MTU behaviour.

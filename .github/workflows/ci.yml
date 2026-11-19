@@ -8,7 +8,8 @@
 # The OCI build cache stays an accelerant for later (needs real-cloud spend).
 #
 # Job names are the check names main's branch protection requires:
-#   build (gcc-14)     GCC 14 Debug build + ctest
+#   build (gcc-14)     GCC 14 Debug build + ctest, and the kernel Geneve
+#                      interop test under sudo
 #   build (clang-19)   Clang 19 Debug + ASan/UBSan + libFuzzer build, ctest,
 #                      and a short smoke run of every fuzz target
 #   lint               clang-format, clang-tidy, shellcheck
@@ -78,6 +79,18 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure --parallel 4
+
+      # tests/geneve_interop.sh needs root for its network namespaces, so
+      # the ctest run above skips it; run it here under sudo. Azure kernels
+      # may ship geneve in linux-modules-extra.
+      - name: Kernel Geneve interop
+        if: matrix.compiler == 'gcc-14'
+        run: |
+          sudo modprobe geneve || {
+            sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe geneve
+          }
+          sudo tests/geneve_interop.sh build/tests/geneve_interop_peer
 
       - name: Fuzz smoke
         if: matrix.compiler == 'clang-19'

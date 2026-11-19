@@ -21,6 +21,7 @@
 #include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
 #include "proto/report.hpp"
+#include "proto/tunnel_peers.hpp"
 #include "test_support.hpp"
 
 namespace oar = ak::helm::oar;
@@ -90,6 +91,7 @@ BOOST_AUTO_TEST_SUITE(oar_protocol, *boost::unit_test::timeout(unit_timeout_seco
 
 BOOST_AUTO_TEST_CASE(map_frame_limit_matches_proto) {
     BOOST_TEST(oar::max_map_frame == ak::proto::max_map_update_size);
+    BOOST_TEST(oar::max_tunnel_peers_frame == ak::proto::max_tunnel_peers_size);
     BOOST_TEST(oar::max_map_chunk + oar::map_chunk_head_size + ak::helm::mctp::vendor_header_size ==
                ak::helm::mctp::max_message_size);
 }

@@ -12,7 +12,8 @@
 //
 //   Signer          pure Ed25519 (RFC 8032) over the exact bytes hull and
 //                   oar-net verify: slot bytes [0x00, 0xC0), and a
-//                   MapUpdate's every byte before its signature.
+//                   MapUpdate's or TunnelPeers frame's every byte before
+//                   its signature.
 //   parse_line      the script language below, one action per line.
 //   TestController  the mTLS server side of the ControllerLink: accepts
 //                   helm, acknowledges its reports, sends signed
@@ -44,6 +45,9 @@
 //   group-policy VNI VERSION multicast RATE_FRAMES BURST_FRAMES RATE_BYTES BURST_BYTES
 //                MAX_REMOTE_VTEPS [MAX_GROUPS_PER_NIC]
 //                        the VPC's broadcast/multicast policy (oar-net Requirement 10)
+//   tunnel-peers VTEP VERSION [PEER_VTEP,KEY ...]
+//                        the WireGuard peers of this server's VTEP; KEY is the
+//                        peer's X25519 public key as 64 hex digits
 //   expect STATUS        the last command's outcome must be STATUS
 //                        (ok, accepted, bad_signature, stale_sequence, wrong_server, ...)
 //   wait KIND            wait for a report of KIND (inventory, command_outcome,
@@ -74,6 +78,7 @@
 #include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
 #include "proto/report.hpp"
+#include "proto/tunnel_peers.hpp"
 #include "tls/tls.hpp"
 
 namespace ak::harbor {
@@ -107,6 +112,9 @@ public:
         -> std::optional<std::vector<std::byte>>;
     [[nodiscard]] auto map_update(const proto::MapUpdate& update) const
         -> std::optional<std::vector<std::byte>>;
+    // `peers` encoded and signed (its signature field is ignored).
+    [[nodiscard]] auto tunnel_peers(const proto::TunnelPeers& peers) const
+        -> std::optional<std::vector<std::byte>>;
 
 private:
     struct Impl;
@@ -137,6 +145,11 @@ struct SendGroupPolicy {
     std::uint32_t max_remote_vteps{0};
     std::uint16_t max_groups_per_nic{0};
 };
+struct SendTunnelPeers {
+    proto::VtepAddress vtep{};
+    std::uint64_t peers_version{0};
+    std::vector<proto::TunnelPeer> peers;
+};
 struct ExpectOutcome {
     proto::CommandStatus status{proto::CommandStatus::ok};
 };
@@ -144,7 +157,8 @@ struct WaitReport {
     proto::ReportKind kind{proto::ReportKind::inventory};
 };
 
-using Action = std::variant<SendCommand, SendMapUpdate, SendGroupPolicy, ExpectOutcome, WaitReport>;
+using Action = std::variant<SendCommand, SendMapUpdate, SendGroupPolicy, SendTunnelPeers,
+                            ExpectOutcome, WaitReport>;
 
 // One script line: an action, nothing (blank or comment), or a message
 // saying what is wrong with it.

@@ -14,8 +14,8 @@ add_library(ak::proto ALIAS ak_proto)
 target_link_libraries(ak_proto INTERFACE ak::common)
 
 # oar-net: Geneve encapsulation, VTEP ingress policy and runtime, the
-# WireGuard underlay, the controller mapping table, the VSwitch and the
-# virtio-net function (network data plane).
+# WireGuard underlay and its controller peer sets, the controller mapping
+# table, the VSwitch and the virtio-net function (network data plane).
 add_library(ak_oar_net
   oar/net/geneve.cpp
   oar/net/mapping_table.cpp
@@ -23,6 +23,7 @@ add_library(ak_oar_net
   oar/net/neighbor.cpp
   oar/net/oam.cpp
   oar/net/tunnel.cpp
+  oar/net/tunnel_peers.cpp
   oar/net/udp_endpoint.cpp
   oar/net/virtio_net.cpp
   oar/net/vswitch.cpp
@@ -31,7 +32,7 @@ add_library(ak_oar_net
   oar/net/wireguard.cpp)
 add_library(ak::oar_net ALIAS ak_oar_net)
 target_link_libraries(ak_oar_net
-  PUBLIC ak::common ak::oar_virtio
+  PUBLIC ak::common ak::proto ak::oar_virtio
   PRIVATE ak::warnings ak::hardening)
 
 # oar/virtio: the shared virtio device core (guest memory, split virtqueue,
@@ -65,8 +66,8 @@ target_link_libraries(ak_tls
 # helm: control-plane mailbox protocol and register file, device pool, MCTP sideband framing,
 # OarLink (sideband protocol and its transport bindings), key store, the
 # ControllerLink, the CommandRouter, the audit log, the PowerSequencer
-# (with harbor's process backplane) and the daemon that wires them
-# (HelmDaemon, ak-helm's configuration).
+# (with harbor's process backplane), the VTEP WireGuard keyring and the
+# daemon that wires them (HelmDaemon, ak-helm's configuration).
 add_library(ak_helm
   helm/audit_log.cpp
   helm/command_router.cpp
@@ -84,7 +85,8 @@ add_library(ak_helm
   helm/power_sequencer.cpp
   helm/scoped_key.cpp
   helm/secure_element.cpp
-  helm/sideband_binding.cpp)
+  helm/sideband_binding.cpp
+  helm/tunnel_keyring.cpp)
 add_library(ak::helm ALIAS ak_helm)
 target_link_libraries(ak_helm
   PUBLIC ak::common ak::proto ak::tls

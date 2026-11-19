@@ -16,6 +16,7 @@
 #include <span>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "helm/device_pool.hpp"
@@ -52,6 +53,12 @@ auto vtep(std::uint8_t tag) -> proto::VtepAddress {
     return a;
 }
 
+auto tunnel_key(std::uint8_t fill) -> proto::TunnelPublicKey {
+    proto::TunnelPublicKey k{};
+    k.fill(std::byte{fill});
+    return k;
+}
+
 auto sample_inventory() -> proto::Inventory {
     return proto::Inventory{
         .boot_id = sample_boot,
@@ -62,6 +69,8 @@ auto sample_inventory() -> proto::Inventory {
         .pages_1g_total = 256,
         .pages_1g_free = 192,
         .vteps = {vtep(1), vtep(2)},
+        // The second VTEP has no key pair yet.
+        .tunnel_keys = {tunnel_key(0xA1), proto::TunnelPublicKey{}},
         .functions = {{.slot = 1,
                        .type = proto::FunctionType::nic_vf,
                        .function = 0,
@@ -361,7 +370,8 @@ BOOST_AUTO_TEST_CASE(header_layout_is_little_endian) {
 BOOST_AUTO_TEST_CASE(inventory_size_follows_its_counts) {
     const auto inv = sample_inventory();
     const auto b = encoded(make_report(inv));
-    BOOST_TEST(b.size() == proto::report_header_size + proto::inventory_fixed_size + (2 * 16) +
+    BOOST_TEST(proto::inventory_vtep_size == 48U);
+    BOOST_TEST(b.size() == proto::report_header_size + proto::inventory_fixed_size + (2 * 48) +
                                (3 * 16) + (2 * 16) + (1 * 24) + (2 * 16));
 }
 
@@ -399,9 +409,12 @@ BOOST_AUTO_TEST_CASE(header_rules) {
     auto b = good;
     b[0] = std::byte{0};
     BOOST_TEST((decode_error(b) == DecodeError::bad_magic));
-    b = good;
-    b[4] = std::byte{2};
-    BOOST_TEST((decode_error(b) == DecodeError::bad_version));
+    // Format 1 (16-byte VTEP entries) and anything newer are refused.
+    for (const auto v : {std::byte{1}, std::byte{3}}) {
+        b = good;
+        b[4] = v;
+        BOOST_TEST((decode_error(b) == DecodeError::bad_version));
+    }
     b = good;
     set_le16(b, off_kind, 0);
     BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
@@ -471,6 +484,9 @@ BOOST_AUTO_TEST_CASE(inventory_rules_are_enforced_both_ways) {
         {[](proto::Inventory& i) { i.networks[1].vni = 5; }, DecodeError::not_ascending},
         {[](proto::Inventory& i) { i.vteps.resize(proto::max_vteps + 1, i.vteps[0]); },
          DecodeError::too_many_entries},
+        {[](proto::Inventory& i) { i.tunnel_keys.pop_back(); }, DecodeError::bad_public_key},
+        {[](proto::Inventory& i) { i.tunnel_keys.push_back(tunnel_key(1)); },
+         DecodeError::bad_public_key},
     };
     for (const auto& c : cases) {
         auto inv = sample_inventory();
@@ -481,15 +497,44 @@ BOOST_AUTO_TEST_CASE(inventory_rules_are_enforced_both_ways) {
     // The decoder enforces the same rules on bytes the encoder refused to
     // make: patch a good frame. Function 1 (free) gets an owner VM.
     auto b = encoded(make_report(sample_inventory()));
-    const std::size_t fn1 = body + proto::inventory_fixed_size + (2 * 16) + 16;
+    const std::size_t fn1 =
+        body + proto::inventory_fixed_size + (2 * proto::inventory_vtep_size) + 16;
     b[fn1 + 8] = std::byte{7};
     BOOST_TEST((decode_error(b) == DecodeError::bad_owner));
+}
+
+// Format 2: each VTEP entry is its address, then its tunnel public key.
+BOOST_AUTO_TEST_CASE(inventory_carries_vtep_tunnel_keys) {
+    const auto inv = sample_inventory();
+    const auto b = encoded(make_report(inv));
+    BOOST_TEST((b[4] == std::byte{proto::report_version}));
+    BOOST_TEST(proto::report_version == 2U);
+    const std::size_t entry0 = body + proto::inventory_fixed_size;
+    const std::size_t entry1 = entry0 + proto::inventory_vtep_size;
+    BOOST_TEST((b[entry0] == std::byte{ula_prefix}));
+    BOOST_TEST((b[entry0 + 16] == std::byte{0xA1}));
+    BOOST_TEST((b[entry0 + 47] == std::byte{0xA1}));
+    BOOST_TEST((b[entry1 + last] == std::byte{2}));
+    BOOST_TEST((b[entry1 + 16] == std::byte{0}));
+
+    // No keys at all encodes as zeros and decodes as empty again, so the
+    // encoding stays canonical.
+    auto keyless = inv;
+    keyless.tunnel_keys.clear();
+    auto zeros = keyless;
+    zeros.tunnel_keys = {proto::TunnelPublicKey{}, proto::TunnelPublicKey{}};
+    const auto kb = encoded(make_report(keyless));
+    BOOST_TEST(kb == encoded(make_report(zeros)));
+    auto back = proto::decode_report(kb);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST(std::get<proto::Inventory>(back->body).tunnel_keys.empty());
+    BOOST_TEST((back->body == proto::ReportBody{keyless}));
 }
 
 BOOST_AUTO_TEST_CASE(inventory_reserved_bytes_must_be_zero) {
     const auto good = encoded(make_report(sample_inventory()));
     const std::size_t lists = body + proto::inventory_fixed_size;
-    const std::size_t fns = lists + (2 * 16);
+    const std::size_t fns = lists + (2 * proto::inventory_vtep_size);
     const std::size_t vms = fns + (3 * 16);
     const std::size_t vols = vms + (2 * 16);
     const std::size_t nets = vols + 24;
@@ -616,11 +661,12 @@ BOOST_AUTO_TEST_CASE(group_usage_rules_are_enforced_both_ways) {
 }
 
 BOOST_AUTO_TEST_CASE(errors_have_names) {
-    for (auto e :
-         {DecodeError::bad_report_seq, DecodeError::bad_boot_id, DecodeError::bad_id,
-          DecodeError::unknown_value, DecodeError::bad_capacity, DecodeError::not_ascending,
-          DecodeError::bad_owner, DecodeError::bad_record_type, DecodeError::record_too_large,
-          DecodeError::server_id_mismatch, DecodeError::bad_epoch, DecodeError::bad_source}) {
+    for (auto e : {DecodeError::bad_report_seq, DecodeError::bad_boot_id, DecodeError::bad_id,
+                   DecodeError::unknown_value, DecodeError::bad_capacity,
+                   DecodeError::not_ascending, DecodeError::bad_owner, DecodeError::bad_record_type,
+                   DecodeError::record_too_large, DecodeError::server_id_mismatch,
+                   DecodeError::bad_epoch, DecodeError::bad_source, DecodeError::bad_peers_version,
+                   DecodeError::bad_public_key, DecodeError::duplicate_public_key}) {
         BOOST_TEST(std::string_view{proto::to_string(e)} != "unknown");
     }
 }

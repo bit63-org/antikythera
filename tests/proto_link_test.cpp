@@ -60,6 +60,7 @@ BOOST_AUTO_TEST_CASE(records_split_at_every_byte_reassemble) {
         {.type = RecordType::envelope, .payload = bytes_of(1, 2, 3, 4)},
         {.type = RecordType::report_ack, .payload = {}},
         {.type = RecordType::map_update, .payload = std::vector<std::byte>(300, std::byte{7})},
+        {.type = RecordType::tunnel_peers, .payload = bytes_of(5, 6)},
     };
     for (const auto& r : want) {
         const auto b = framed(r.type, r.payload);
@@ -97,7 +98,7 @@ BOOST_AUTO_TEST_CASE(oversized_record_fails_before_its_payload_arrives) {
 BOOST_AUTO_TEST_CASE(bad_type_and_reserved_break_the_stream) {
     for (const auto& [bytes, want] :
          {std::pair{bytes_of(0, 0, 0, 0, 0, 0, 0, 0), DecodeError::bad_record_type},
-          std::pair{bytes_of(0, 0, 0, 0, 7, 0, 0, 0), DecodeError::bad_record_type},
+          std::pair{bytes_of(0, 0, 0, 0, 8, 0, 0, 0), DecodeError::bad_record_type},
           std::pair{bytes_of(0, 0, 0, 0, 1, 0, 0, 1), DecodeError::reserved_not_zero}}) {
         proto::RecordDecoder d;
         d.feed(bytes);
@@ -105,6 +106,11 @@ BOOST_AUTO_TEST_CASE(bad_type_and_reserved_break_the_stream) {
         BOOST_REQUIRE(!r.has_value());
         BOOST_TEST((r.error() == want));
     }
+}
+
+BOOST_AUTO_TEST_CASE(largest_tunnel_peer_set_fits_a_record) {
+    BOOST_TEST(static_cast<std::uint16_t>(RecordType::tunnel_peers) == 7U);
+    BOOST_TEST(proto::max_record_payload >= proto::max_tunnel_peers_size);
 }
 
 BOOST_AUTO_TEST_CASE(encode_refuses_what_decode_would) {

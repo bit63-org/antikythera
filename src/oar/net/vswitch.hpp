@@ -24,6 +24,17 @@
 //     neighbor solicitation (not a DAD probe) for an address helm registered
 //     for another NIC in the VNI is answered locally (Requirement 2.6), and
 //     anything else is forwarded like any frame;
+//   - a VPC carries only IPv4, IPv6 and ARP (Requirement 11): every other
+//     EtherType, VLAN tags included, is dropped, and IP frames go through
+//     the packet parser (packet.hpp) and the source/destination check. An IP
+//     source must be one of the sending NIC's guest addresses (the
+//     set_neighbors() table, fed from MapUpdate v2); 0.0.0.0, :: and
+//     link-local sources are only for traffic consumed here, never
+//     forwarded. A unicast destination must belong to the NIC owning the
+//     destination MAC, and replicated frames need an IP multicast
+//     destination. Guests never act as routers or address servers: router
+//     advertisements, redirects and DHCP server messages are dropped. ARP
+//     senders and NA targets must be the NIC's own addresses;
 //   - unicast to a NIC of this VTEP is delivered to its function; unicast to
 //     a NIC of another VTEP goes to the underlay with {vni, src, dst} for
 //     Geneve encapsulation (Requirement 7.2: in split placement two boards
@@ -42,7 +53,10 @@
 //
 // Receive (VSwitch::receive, a decoded Geneve packet from the Vtep): the
 // ingress policy (vtep_policy.hpp) runs against the same snapshot used to
-// deliver, then the frame goes to the destination NIC, or for a replicated
+// deliver, the inner frame gets the same EtherType and IP address checks as
+// on transmit, against this VTEP's own tables (Requirement 11.8, so a
+// compromised sending VTEP cannot skip them), then the frame goes to the
+// destination NIC, or for a replicated
 // frame to every attached local NIC in the VNI, if this VTEP's GroupPolicy
 // for the VNI admits it too (a sender with a stale or hostile policy cannot
 // push group traffic into a VNI that has not opted in).
@@ -66,7 +80,9 @@
 // carries that NIC's MAC from the current snapshot, so a NIC that leaves the
 // VNI stops being answered for at once. The addresses arrive in the same
 // signed map_update frame as the mapping (proto::MapUpdate ipv4 and ipv6,
-// format v2).
+// format v2). The same table is the source check's list of each NIC's
+// addresses, so the proxy and the check cannot disagree, and a VNI with no
+// addresses carries no IP.
 //
 // Threading: a VSwitch belongs to one data-plane thread. transmit(),
 // receive(), attach(), detach() and set_neighbors() must all be called from
@@ -88,6 +104,7 @@
 #include "oar/net/geneve.hpp"
 #include "oar/net/mapping_table.hpp"
 #include "oar/net/neighbor.hpp"
+#include "oar/net/packet.hpp"
 #include "oar/net/virtio_net.hpp"
 #include "oar/net/vtep_policy.hpp"
 
@@ -221,7 +238,13 @@ struct SwitchCounters {
     std::uint64_t tx_drop_short{0};       // shorter than an Ethernet header
     std::uint64_t tx_drop_spoofed{0};     // source MAC is not the NIC's mapped MAC
     std::uint64_t tx_drop_neighbor_spoofed{
-        0};                                    // ARP/NS sender MAC, or ARP sender IP, not the NIC's
+        0};  // ARP/NS sender MAC, ARP sender IP or NA target not the NIC's
+    std::uint64_t tx_drop_ethertype{0};        // not IPv4, IPv6 or ARP (VLAN tags included)
+    std::uint64_t tx_drop_malformed{0};        // IPv4/IPv6 frame the packet parser refused
+    std::uint64_t tx_drop_ip_spoofed{0};       // IP source not one of the NIC's addresses
+    std::uint64_t tx_drop_local_only{0};       // 0.0.0.0, :: or link-local source nothing consumed
+    std::uint64_t tx_drop_router_msg{0};       // RA, redirect or DHCP server message from a guest
+    std::uint64_t tx_drop_ip_dst{0};           // IP destination not owned by the destination NIC
     std::uint64_t tx_drop_unknown_unicast{0};  // no NIC holds the destination MAC
     std::uint64_t tx_drop_hairpin{0};          // unicast to the sender's own MAC
     std::uint64_t tx_drop_unattached{0};       // local destination with no function attached
@@ -230,7 +253,11 @@ struct SwitchCounters {
     std::uint64_t rx_frames{0};     // packets handed to receive()
     std::uint64_t rx_delivered{0};  // copies delivered to local NICs
     std::uint64_t rx_drop_unattached{0};
-    std::uint64_t rx_drop_group{0};  // replicated frames this VTEP's policy does not admit
+    std::uint64_t rx_drop_group{0};       // replicated frames this VTEP's policy does not admit
+    std::uint64_t rx_drop_ethertype{0};   // inner frame not IPv4, IPv6 or ARP
+    std::uint64_t rx_drop_malformed{0};   // inner IP frame the packet parser refused
+    std::uint64_t rx_drop_ip_spoofed{0};  // inner IP source not the source NIC's
+    std::uint64_t rx_drop_ip_dst{0};      // inner IP destination not the destination NIC's
     std::array<std::uint64_t, policy_error_count> rx_drop_policy{};  // by PolicyError
     std::uint64_t deliver_failed{0};  // a port refused a frame (it counts why)
 };
@@ -308,8 +335,19 @@ private:
     auto handle_nd(const MappingSnapshot& snap, geneve::NicId src, const NicBinding& binding,
                    std::span<const std::byte> frame) -> bool;
     auto replicate(const MappingSnapshot& snap, geneve::NicId src, std::uint32_t vni,
-                   std::span<const std::byte> frame) -> void;
+                   std::span<const std::byte> frame, bool ip_ok) -> void;
+    // Group replication or unicast delivery once the frame passed every
+    // check; `ip` is the parsed packet for IP frames, null for ARP.
+    auto forward(const MappingSnapshot& snap, geneve::NicId src, const NicBinding& binding,
+                 std::span<const std::byte> frame, const packet::ParsedPacket* ip) -> void;
+    // The inner-frame checks of receive(); false if the frame was dropped.
+    auto inner_allowed(const geneve::Packet& packet, geneve::NicId dst) -> bool;
     auto take_tokens(Bucket& bucket, const GroupPolicy& policy, std::size_t bytes) -> bool;
+    // The NIC whose guest address is the packet's source (or destination).
+    [[nodiscard]] auto owner(std::uint32_t vni, const packet::ParsedPacket& p, bool source) const
+        -> std::optional<geneve::NicId>;
+    [[nodiscard]] auto own_na_target(const packet::ParsedPacket& p, geneve::NicId src,
+                                     std::uint32_t vni) const -> bool;
     auto deliver(geneve::NicId nic, std::span<const std::byte> frame) -> bool;
     auto deliver_to(RxPort& port, std::span<const std::byte> frame) -> bool;
     [[nodiscard]] auto port(geneve::NicId nic) const -> RxPort*;

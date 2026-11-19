@@ -27,6 +27,7 @@
 #include "helm/oar_link.hpp"
 #include "helm/sideband_binding.hpp"
 #include "hull/signature_verifier.hpp"
+#include "net_frames.hpp"
 #include "oar/net/net_role.hpp"
 #include "proto/map_update.hpp"
 #include "test_support.hpp"
@@ -63,7 +64,9 @@ constexpr std::uint8_t peer_tail = 2;
 constexpr std::uint16_t rx = net::virtio_net_rx_queue;
 constexpr std::uint16_t tx = net::virtio_net_tx_queue;
 constexpr std::size_t hdr = net::virtio_net_hdr_size;
-constexpr std::uint16_t ethertype_test = 0x88B5;  // IEEE local experimental
+constexpr std::uint8_t ipproto_udp = 17;
+constexpr std::size_t ipv4_udp_headers = 20 + 8;
+constexpr std::uint16_t udp_port = 4000;
 constexpr std::size_t payload_size = 64;
 constexpr std::uint8_t payload_fill = 0x5A;
 constexpr std::size_t ipv6_last = 15;
@@ -89,15 +92,17 @@ auto mac_of(std::uint64_t nic) -> net::MacAddress {
     return m;
 }
 
-auto frame(const net::MacAddress& dst, const net::MacAddress& src,
-           std::size_t payload = payload_size) -> std::vector<std::byte> {
-    std::vector<std::byte> f;
-    f.insert(f.end(), dst.begin(), dst.end());
-    f.insert(f.end(), src.begin(), src.end());
-    f.push_back(static_cast<std::byte>(ethertype_test >> 8U));
-    f.push_back(static_cast<std::byte>(ethertype_test & 0xFFU));
-    f.insert(f.end(), payload, std::byte{payload_fill});
-    return f;
+auto guest_ip(std::uint64_t nic) -> proto::Ipv4Address;
+
+// An IPv4/UDP frame from one guest to another, between their guest_ip()
+// addresses: the VSwitch only forwards IP from the sender's own address to
+// the destination NIC's, so both must be in the map. `size` is the IP
+// packet's length, so the guest MTU makes a full-size frame.
+auto frame(std::uint64_t dst, std::uint64_t src, std::size_t size = payload_size)
+    -> std::vector<std::byte> {
+    const std::vector<std::byte> payload(size - ipv4_udp_headers, std::byte{payload_fill});
+    return ak::test::frames::ipv4(mac_of(dst), mac_of(src), guest_ip(src), guest_ip(dst),
+                                  ipproto_udp, ak::test::frames::udp(udp_port, udp_port, payload));
 }
 
 auto signer() -> const ak::test::TestSigner& {
@@ -331,7 +336,10 @@ BOOST_FIXTURE_TEST_CASE(placeholder_advertises_the_plan_and_reaches_nothing, One
     // A stray driver on the placeholder transmits into the dead VPC.
     driver(fn0);
     const auto id = role->function(fn0)->identity();
-    send(fn0, frame(mac_of(nic_a), id.mac));
+    const std::vector<std::byte> payload(payload_size, std::byte{payload_fill});
+    send(fn0,
+         ak::test::frames::ipv4(mac_of(nic_a), id.mac, guest_ip(nic_b), guest_ip(nic_a),
+                                ipproto_udp, ak::test::frames::udp(udp_port, udp_port, payload)));
     BOOST_TEST(role->vswitch().counters().tx_drop_dead_vpc == 1U);
     BOOST_TEST(role->vswitch().counters().tx_local == 0U);
 }
@@ -458,13 +466,14 @@ BOOST_FIXTURE_TEST_CASE(map_update_feeds_the_proxy, One,
 BOOST_FIXTURE_TEST_CASE(local_guests_talk_through_the_vswitch, One,
                         *boost::unit_test::timeout(unit_timeout_seconds)) {
     BOOST_REQUIRE(role->map_update(signed_map(
-                      server_one, 1, {{nic_a, self_tail}, {nic_b, self_tail}})) == Status::ok);
+                      server_one, 1, {{nic_a, self_tail}, {nic_b, self_tail}}, {nic_a, nic_b})) ==
+                  Status::ok);
     BOOST_REQUIRE(prepare(fn0, nic_a) == Status::ok);
     BOOST_REQUIRE(prepare(fn1, nic_b) == Status::ok);
     driver(fn0);
     driver(fn1);
     const auto buf = post_rx(fn1);
-    const auto f = frame(mac_of(nic_b), mac_of(nic_a));
+    const auto f = frame(nic_b, nic_a);
     send(fn0, f);
     BOOST_TEST(role->vswitch().counters().tx_local == 1U);
     auto got = received(fn1, buf);
@@ -479,9 +488,11 @@ BOOST_AUTO_TEST_CASE(guests_on_two_vteps_talk_over_the_underlay,
     Board two{server_two, peer_tail};
     // The controller sends each server the same VPC, addressed to it.
     BOOST_REQUIRE(one.role->map_update(signed_map(
-                      server_one, 1, {{nic_a, self_tail}, {nic_c, peer_tail}})) == Status::ok);
+                      server_one, 1, {{nic_a, self_tail}, {nic_c, peer_tail}}, {nic_a, nic_c})) ==
+                  Status::ok);
     BOOST_REQUIRE(two.role->map_update(signed_map(
-                      server_two, 1, {{nic_a, self_tail}, {nic_c, peer_tail}})) == Status::ok);
+                      server_two, 1, {{nic_a, self_tail}, {nic_c, peer_tail}}, {nic_a, nic_c})) ==
+                  Status::ok);
     BOOST_REQUIRE(one.prepare(fn0, nic_a) == Status::ok);
     BOOST_REQUIRE(two.prepare(fn1, nic_c) == Status::ok);
     one.driver(fn0);
@@ -490,7 +501,7 @@ BOOST_AUTO_TEST_CASE(guests_on_two_vteps_talk_over_the_underlay,
 
     // A full-size frame: the guest MTU plus Ethernet fits the plan exactly.
     const auto mtu = one.role->function(fn0)->identity().mtu;
-    const auto f = frame(mac_of(nic_c), mac_of(nic_a), mtu);
+    const auto f = frame(nic_c, nic_a, mtu);
     one.send(fn0, f);
     BOOST_TEST(one.role->vswitch().counters().tx_remote == 1U);
     BOOST_REQUIRE(one.wire.sent.size() == 1U);
@@ -516,7 +527,8 @@ BOOST_AUTO_TEST_CASE(guests_on_two_vteps_talk_over_the_underlay,
 BOOST_FIXTURE_TEST_CASE(clean_returns_to_the_dead_vpc, One,
                         *boost::unit_test::timeout(unit_timeout_seconds)) {
     BOOST_REQUIRE(role->map_update(signed_map(
-                      server_one, 1, {{nic_a, self_tail}, {nic_b, self_tail}})) == Status::ok);
+                      server_one, 1, {{nic_a, self_tail}, {nic_b, self_tail}}, {nic_a, nic_b})) ==
+                  Status::ok);
     BOOST_REQUIRE(prepare(fn0, nic_a) == Status::ok);
     BOOST_REQUIRE(prepare(fn1, nic_b) == Status::ok);
     driver(fn0);
@@ -536,7 +548,7 @@ BOOST_FIXTURE_TEST_CASE(clean_returns_to_the_dead_vpc, One,
     BOOST_TEST((role->function(fn1)->identity().mac != mac_of(nic_b)));
 
     // Frames for the cleaned NIC are no longer delivered.
-    send(fn0, frame(mac_of(nic_b), mac_of(nic_a)));
+    send(fn0, frame(nic_b, nic_a));
     BOOST_TEST(role->vswitch().counters().tx_drop_unattached == 1U);
 
     // Cleaning an unattached function is fine, and it can be prepared again.
@@ -547,7 +559,8 @@ BOOST_FIXTURE_TEST_CASE(clean_returns_to_the_dead_vpc, One,
 BOOST_FIXTURE_TEST_CASE(health_degrades_when_a_peer_goes_down, One,
                         *boost::unit_test::timeout(unit_timeout_seconds)) {
     BOOST_REQUIRE(role->map_update(signed_map(
-                      server_one, 1, {{nic_a, self_tail}, {nic_c, peer_tail}})) == Status::ok);
+                      server_one, 1, {{nic_a, self_tail}, {nic_c, peer_tail}}, {nic_a, nic_c})) ==
+                  Status::ok);
     const auto t0 = net::VtepClock::now();
     static_cast<void>(role->tick(t0));
     BOOST_TEST((role->health()->state == oar::HealthState::ok));  // pending, not down

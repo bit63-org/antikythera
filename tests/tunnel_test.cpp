@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "net_frames.hpp"
 #include "oar/net/geneve.hpp"
 #include "oar/net/mapping_table.hpp"
 #include "oar/net/tunnel.hpp"
@@ -574,13 +575,19 @@ auto mac_of(geneve::NicId id) -> net::MacAddress {
     return m;
 }
 
-auto frame(const net::MacAddress& dst, const net::MacAddress& src) -> std::vector<std::byte> {
-    std::vector<std::byte> f(dst.begin(), dst.end());
-    f.insert(f.end(), src.begin(), src.end());
-    f.push_back(std::byte{0x88});
-    f.push_back(std::byte{0xB5});
-    f.resize(f.size() + 32, std::byte{0x5a});
-    return f;
+// Each guest is at 10.0.0.<NIC ID>; the VSwitch only forwards IP from the
+// sender's own address to the destination NIC's (Requirement 11).
+auto ip_of(geneve::NicId id) -> net::neighbor::Ipv4Address {
+    return {std::byte{10}, std::byte{0}, std::byte{0}, static_cast<std::byte>(id.value)};
+}
+
+auto frame(geneve::NicId dst, geneve::NicId src) -> std::vector<std::byte> {
+    constexpr std::uint8_t ipproto_udp = 17;
+    constexpr std::uint16_t client_port = 40000;
+    constexpr std::uint16_t server_port = 80;
+    const std::vector<std::byte> payload(32, std::byte{0x5a});
+    return ak::test::frames::ipv4(mac_of(dst), mac_of(src), ip_of(src), ip_of(dst), ipproto_udp,
+                                  ak::test::frames::udp(client_port, server_port, payload));
 }
 
 auto mappings(net::MappingTable& t, const net::Ipv6Address& one, const net::Ipv6Address& two)
@@ -608,6 +615,10 @@ struct Side {
         BOOST_REQUIRE(v.has_value());
         vtep_ = std::move(*v);
         sw = std::make_unique<net::VSwitch>(table, *vtep_);
+        BOOST_REQUIRE(sw->set_neighbors(
+            {.vni = vpc,
+             .ipv4 = {{.ip = ip_of(nic_a), .nic = nic_a}, {.ip = ip_of(nic_c), .nic = nic_c}},
+             .ipv6 = {}}));
     }
     Node node;
     net::MappingTable table;
@@ -651,7 +662,7 @@ BOOST_AUTO_TEST_CASE(vteps_over_the_tunnel, *boost::unit_test::timeout(unit_time
     BOOST_TEST((one.vtep_->peers().at(0).state == net::PeerState::up));
     BOOST_TEST((two.vtep_->peers().at(0).state == net::PeerState::up));
 
-    const auto f = frame(mac_of(nic_c), mac_of(nic_a));
+    const auto f = frame(nic_c, nic_a);
     one.sw->transmit({.source = nic_a, .frame = f});
     run();
     BOOST_REQUIRE(port_c.frames.size() == 1U);
@@ -659,8 +670,7 @@ BOOST_AUTO_TEST_CASE(vteps_over_the_tunnel, *boost::unit_test::timeout(unit_time
 
     // A raw Geneve packet (no WireGuard) from the peer's address never
     // reaches the decoder.
-    auto forged =
-        geneve::encode({.vni = vpc, .nics = {nic_c, nic_a}}, frame(mac_of(nic_a), mac_of(nic_c)));
+    auto forged = geneve::encode({.vni = vpc, .nics = {nic_c, nic_a}}, frame(nic_a, nic_c));
     BOOST_REQUIRE(forged.has_value());
     BOOST_TEST(!one.node.tunnel->receive(*forged, two.node.addr).has_value());
     BOOST_TEST(port_a.frames.empty());

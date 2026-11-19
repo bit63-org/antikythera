@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include "common/wire.hpp"
+#include "net_frames.hpp"
 #include "oar/net/geneve.hpp"
 #include "oar/net/mapping_table.hpp"
 #include "oar/net/mtu.hpp"
@@ -112,6 +113,27 @@ auto frame(const net::MacAddress& dst, const net::MacAddress& src) -> std::vecto
     w.be16(ethertype_test);
     f.resize(f.size() + payload_size, std::byte{0x5a});
     return f;
+}
+
+// An IPv4/UDP frame between two guests, each at 10.0.0.<NIC ID>: the
+// VSwitch only forwards IP from the sender's own address to the
+// destination NIC's address (Requirement 11).
+auto ip_of(NicId id) -> net::neighbor::Ipv4Address {
+    return {std::byte{10}, std::byte{0}, std::byte{0}, static_cast<std::byte>(id.value)};
+}
+
+auto guest_frame(NicId dst, NicId src) -> std::vector<std::byte> {
+    const std::vector<std::byte> payload(payload_size, std::byte{0x5a});
+    return ak::test::frames::ipv4(mac_of(dst), mac_of(src), ip_of(src), ip_of(dst), ipproto_udp,
+                                  ak::test::frames::udp(client_port, server_port, payload));
+}
+
+auto guest_neighbors() -> net::NeighborUpdate {
+    return {.vni = vpc,
+            .ipv4 = {{.ip = ip_of(nic_a), .nic = nic_a},
+                     {.ip = ip_of(nic_c), .nic = nic_c},
+                     {.ip = ip_of(nic_d), .nic = nic_d}},
+            .ipv6 = {}};
 }
 
 // An Ethernet/IPv4/UDP frame, optionally VLAN-tagged or a non-first fragment.
@@ -670,6 +692,7 @@ struct Side {
         BOOST_REQUIRE(v.has_value());
         vtep_ = std::move(*v);
         sw = std::make_unique<net::VSwitch>(table, *vtep_);
+        BOOST_REQUIRE(sw->set_neighbors(guest_neighbors()));
         wire.self = this;
     }
     net::Ipv6Address addr;
@@ -711,20 +734,19 @@ BOOST_AUTO_TEST_CASE(two_vteps_end_to_end, *boost::unit_test::timeout(unit_timeo
     BOOST_TEST((state_of(*one.vtep_, two.addr) == PeerState::up));
     BOOST_TEST((state_of(*two.vtep_, one.addr) == PeerState::up));
 
-    const auto f = frame(mac_of(nic_c), mac_of(nic_a));
+    const auto f = guest_frame(nic_c, nic_a);
     one.sw->transmit({.source = nic_a, .frame = f});
     BOOST_REQUIRE(port_c.frames.size() == 1);
     BOOST_TEST(port_c.frames[0] == f);
 
-    const auto back = frame(mac_of(nic_a), mac_of(nic_c));
+    const auto back = guest_frame(nic_a, nic_c);
     two.sw->transmit({.source = nic_c, .frame = back});
     BOOST_REQUIRE(port_a.frames.size() == 1);
     BOOST_TEST(port_a.frames[0] == back);
 
     // A frame claiming to come from d (VTEP 3) but sent by VTEP 2 is refused
     // by the receiving side's ingress policy.
-    auto forged =
-        geneve::encode({.vni = vpc, .nics = {nic_d, nic_a}}, frame(mac_of(nic_a), mac_of(nic_d)));
+    auto forged = geneve::encode({.vni = vpc, .nics = {nic_d, nic_a}}, guest_frame(nic_a, nic_d));
     BOOST_REQUIRE(forged.has_value());
     BOOST_TEST(two.wire.send_to(one.addr, geneve::udp_port, net::flow_port_base, *forged));
     BOOST_TEST(port_a.frames.size() == 1);
@@ -791,12 +813,13 @@ BOOST_AUTO_TEST_CASE(pump_feeds_vtep_and_vswitch,
     auto v = net::Vtep::create(table, **ep, nullptr, config());
     BOOST_REQUIRE(v.has_value());
     net::VSwitch sw{table, **v};
+    BOOST_REQUIRE(sw.set_neighbors(guest_neighbors()));
     FakePort port_a;
     BOOST_REQUIRE(sw.attach(nic_a, port_a));
     const auto now = net::VtepClock::now();
 
     // Keepalive and data, both from ::1 to the endpoint's port.
-    const auto f = frame(mac_of(nic_a), mac_of(nic_c));
+    const auto f = guest_frame(nic_a, nic_c);
     auto data = geneve::encode({.vni = vpc, .nics = {nic_c, nic_a}}, f);
     BOOST_REQUIRE(data.has_value());
     const auto ka = oam::encode({.sequence = 1});

@@ -15,6 +15,7 @@
 //         underlay send carries the true source NIC and VNI.
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -110,7 +111,18 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
         std::abort();
     }
     Recorder underlay;
-    net::VSwitch sw{table, underlay};
+    net::VSwitch::Clock::time_point now{};
+    net::VSwitch sw{table, underlay, [&now] { return now; }};
+    // vpc_one opts in to multicast (one remote VTEP, cap 1); vpc_two keeps
+    // the default drop policy.
+    if (!sw.set_group_policy(vpc_one, {.mode = net::GroupMode::multicast,
+                                       .rate_frames = 2,
+                                       .burst_frames = 3,
+                                       .rate_bytes = 512,
+                                       .burst_bytes = 1024,
+                                       .max_remote_vteps = 1})) {
+        std::abort();
+    }
     std::array<Port, nic_count> ports{};
     for (std::size_t i = 0; i < nic_count; ++i) {
         if (i != remote_index && !sw.attach(geneve::NicId{nic_ids.at(i)}, ports.at(i))) {
@@ -129,6 +141,7 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
     bool transmit = true;
     while (in.size() >= 2) {
         const std::size_t src = std::to_integer<std::size_t>(in[0]) % nic_count;
+        now += std::chrono::milliseconds{std::to_integer<int>(in[0]) >> 3};
         const std::size_t len = std::min(std::to_integer<std::size_t>(in[1]), in.size() - 2);
         const auto bytes = in.subspan(2, len);
         in = in.subspan(2 + len);
@@ -145,6 +158,19 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
             sw.transmit({.source = geneve::NicId{nic_ids.at(src)}, .frame = bytes});
             for (const auto& s : underlay.sent) {
                 if (src == dead_index || s.vni != vni || s.nics.src.value != nic_ids.at(src)) {
+                    std::abort();
+                }
+            }
+            // A drop-policy VNI never replicates: the only delivery a group
+            // frame there can cause is a proxy reply to the sender.
+            const bool group = !bytes.empty() && (bytes[0] & std::byte{1}) == std::byte{1};
+            if (group && vni == vpc_two) {
+                for (std::size_t i = 0; i < nic_count; ++i) {
+                    if (i != src && ports.at(i).frames != before.at(i)) {
+                        std::abort();
+                    }
+                }
+                if (!underlay.sent.empty()) {
                     std::abort();
                 }
             }
@@ -165,6 +191,17 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
             }
         }
         transmit = !transmit;
+    }
+
+    // Meters are consistent: one remote VTEP, so at most one remote replica
+    // per accepted frame, and replica bytes follow frame bytes.
+    for (const auto& u : sw.group_usage()) {
+        const auto& m = u.meter;
+        if (m.replicas_remote > m.frames || m.replica_bytes_remote > m.bytes ||
+            m.replicas_local > m.frames || m.replica_bytes_local > m.bytes ||
+            (u.nic.value == nic_ids[3] && m.frames != 0)) {
+            std::abort();
+        }
     }
 }
 

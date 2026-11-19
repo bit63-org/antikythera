@@ -77,6 +77,19 @@ auto to_string(LinkErrc e) noexcept -> const char* {
 
 // ---- OarLink -----------------------------------------------------------------
 
+namespace {
+
+// A request whose ok answer carries nothing after the head.
+auto expect_empty(const std::expected<std::vector<std::byte>, LinkError>& response)
+    -> std::expected<void, LinkError> {
+    if (!response) {
+        return std::unexpected(response.error());
+    }
+    return response->empty() ? std::expected<void, LinkError>{} : std::unexpected(bad_response());
+}
+
+}  // namespace
+
 OarLink::OarLink(Binding& binding, const LinkConfig& config)
     : _binding{&binding}, _config{config}, _assembler{config.address.local_eid} {}
 
@@ -146,6 +159,30 @@ auto OarLink::drop_key(const oar::DropKey& request) -> std::expected<void, LinkE
         return std::unexpected(response.error());
     }
     return response->empty() ? std::expected<void, LinkError>{} : std::unexpected(bad_response());
+}
+
+auto OarLink::create_volume(const oar::CreateVolume& request) -> std::expected<void, LinkError> {
+    auto body = oar::encode_create_volume(request);
+    if (!body) {
+        return std::unexpected(bad_request());
+    }
+    return expect_empty(transact(mctp::VendorType::create_volume, *body));
+}
+
+auto OarLink::delete_volume(const oar::DeleteVolume& request) -> std::expected<void, LinkError> {
+    auto body = oar::encode_delete_volume(request);
+    if (!body) {
+        return std::unexpected(bad_request());
+    }
+    return expect_empty(transact(mctp::VendorType::delete_volume, *body));
+}
+
+auto OarLink::rewrap_volume(const oar::RewrapVolume& request) -> std::expected<void, LinkError> {
+    auto body = oar::encode_rewrap_volume(request);
+    if (!body) {
+        return std::unexpected(bad_request());
+    }
+    return expect_empty(transact(mctp::VendorType::rewrap_volume, *body));
 }
 
 auto OarLink::map_update(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
@@ -382,6 +419,18 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
         case mctp::VendorType::drop_key: {
             auto req = oar::decode_drop_key(body);
             return status_only(req ? handler.drop_key(*req) : oar::Status::bad_request);
+        }
+        case mctp::VendorType::create_volume: {
+            auto req = oar::decode_create_volume(body);
+            return status_only(req ? handler.create_volume(*req) : oar::Status::bad_request);
+        }
+        case mctp::VendorType::delete_volume: {
+            auto req = oar::decode_delete_volume(body);
+            return status_only(req ? handler.delete_volume(*req) : oar::Status::bad_request);
+        }
+        case mctp::VendorType::rewrap_volume: {
+            auto req = oar::decode_rewrap_volume(body);
+            return status_only(req ? handler.rewrap_volume(*req) : oar::Status::bad_request);
         }
         case mctp::VendorType::map_update:
             return status_only(map_chunk(handler, body));

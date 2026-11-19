@@ -26,6 +26,20 @@
 //   drop_key            0  fn u16 | 2  reserved u16 | 4  reserved u32 | 8  volume_id u64
 //   map_update          0  total u32 | 4  offset u32 | 8  chunk (1..max_map_chunk bytes)
 //   health              (empty)
+//   create_volume       0  volume_id u64 | 8  owner_vm u64 | 16 capacity_sectors u64
+//                       24 block_size u32 | 28 key_len u16 | 30 reserved u16
+//                       32 wrapped_key [key_len]
+//   delete_volume       0  volume_id u64
+//   rewrap_volume       0  volume_id u64 | 8  owner_vm u64 | 16 key_len u16
+//                       18 reserved u16 | 20 reserved u32 | 24 wrapped_key [key_len]
+//
+// The volume requests are the storage role's half of CREATE_VOLUME,
+// DELETE_VOLUME and REWRAP_VOLUME (oar-blk Requirement 3): the role keeps
+// the wrapped volume key with the volume's metadata on the media and
+// releases the space on delete. The wrapped key is helm's KeyStore blob,
+// opaque to the role (helm authenticates it on unwrap); key_len is 1 to
+// max_wrapped_volume_key. capacity_sectors counts 512-byte sectors, is
+// non-zero and a whole number of logical blocks; block_size is 512 or 4096.
 //
 // map_update forwards one controller MapUpdate frame (src/proto/map_update.hpp)
 // unmodified, signature included, so the role can check it itself. A full
@@ -91,6 +105,16 @@ inline constexpr std::size_t clean_function_size = 4;
 inline constexpr std::size_t deliver_key_size = 16 + volume_key_size;
 inline constexpr std::size_t drop_key_size = 16;
 inline constexpr std::size_t map_chunk_head_size = 8;
+inline constexpr std::size_t create_volume_head_size = 32;
+inline constexpr std::size_t delete_volume_size = 8;
+inline constexpr std::size_t rewrap_volume_head_size = 24;
+// Room for a later wrapped-key format; helm's format 1 is 95 bytes. Equal
+// to oar-blk's max_wrapped_key_size (the field in its volume header).
+inline constexpr std::size_t max_wrapped_volume_key = 256;
+inline constexpr std::uint32_t sector_size = 512;
+// Largest volume a request may describe: its byte size still fits an off_t
+// with room for the role's metadata.
+inline constexpr std::uint64_t max_capacity_sectors = std::uint64_t{1} << 53U;
 inline constexpr std::size_t max_map_chunk = max_body_size - map_chunk_head_size;
 // Largest MapUpdate frame (proto::max_map_update_size: 32-byte header,
 // 4096 entries of 32 bytes, 64-byte signature). Mirrored so this header
@@ -150,6 +174,8 @@ enum class BodyError : std::uint8_t {
     too_many_entries,   // inventory larger than max_inventory_entries
     bad_chunk,          // map_update total, offset or chunk length out of range
     status_with_body,   // a non-ok response carries bytes after its head
+    bad_geometry,       // block size not 512/4096, or capacity zero, ragged or too large
+    bad_key_length,     // wrapped key empty, too long, or not the length the body says
 };
 
 [[nodiscard]] auto to_string(BodyError e) noexcept -> const char*;
@@ -205,6 +231,29 @@ struct DropKey {
     friend auto operator==(const DropKey&, const DropKey&) -> bool = default;
 };
 
+// The storage role's half of CREATE_VOLUME. `wrapped_key` views into the
+// caller's blob when encoding, into the message when decoding.
+struct CreateVolume {
+    VolumeId volume_id{0};
+    VmId owner_vm{0};
+    std::uint64_t capacity_sectors{0};
+    std::uint32_t block_size{sector_size};
+    std::span<const std::byte> wrapped_key;
+};
+
+struct DeleteVolume {
+    VolumeId volume_id{0};
+
+    friend auto operator==(const DeleteVolume&, const DeleteVolume&) -> bool = default;
+};
+
+// REWRAP_VOLUME: the new owner and the key helm re-wrapped for it.
+struct RewrapVolume {
+    VolumeId volume_id{0};
+    VmId owner_vm{0};
+    std::span<const std::byte> wrapped_key;
+};
+
 // One chunk of a MapUpdate frame. `chunk` views into the message.
 struct MapChunk {
     std::uint32_t total{0};
@@ -237,6 +286,21 @@ struct MapChunk {
     -> std::expected<std::vector<std::byte>, BodyError>;
 [[nodiscard]] auto decode_map_chunk(std::span<const std::byte> body) noexcept
     -> std::expected<MapChunk, BodyError>;
+
+[[nodiscard]] auto encode_create_volume(const CreateVolume& c)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_create_volume(std::span<const std::byte> body) noexcept
+    -> std::expected<CreateVolume, BodyError>;
+
+[[nodiscard]] auto encode_delete_volume(const DeleteVolume& d)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_delete_volume(std::span<const std::byte> body) noexcept
+    -> std::expected<DeleteVolume, BodyError>;
+
+[[nodiscard]] auto encode_rewrap_volume(const RewrapVolume& v)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_rewrap_volume(std::span<const std::byte> body) noexcept
+    -> std::expected<RewrapVolume, BodyError>;
 
 // function_inventory and health requests have empty bodies.
 [[nodiscard]] auto decode_empty(std::span<const std::byte> body) noexcept

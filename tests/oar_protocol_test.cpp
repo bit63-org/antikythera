@@ -55,6 +55,14 @@ constexpr std::uint8_t key_fill = 0xA5;
 constexpr std::uint32_t small_total = 100;
 constexpr std::uint32_t mid_offset = 40;
 constexpr std::size_t fn_count = 3;
+constexpr std::uint64_t sample_sectors = 0x20'0000;  // 1 GiB
+constexpr std::size_t wrapped_size = 95;             // helm's format-1 volume blob
+constexpr std::uint8_t wrapped_fill = 0x3C;
+constexpr std::size_t key_len_offset = 28;
+constexpr std::size_t create_reserved_offset = 30;
+constexpr std::size_t block_size_offset = 24;
+constexpr std::size_t rewrap_key_len_offset = 16;
+constexpr std::size_t rewrap_reserved_offset = 20;
 
 auto nic_request() -> oar::PrepareFunction {
     return {.fn = sample_fn,
@@ -225,6 +233,103 @@ BOOST_AUTO_TEST_CASE(drop_key_round_trip_and_rejects) {
     BOOST_TEST((oar::decode_drop_key(b).error() == BodyError::trailing_bytes));
 }
 
+BOOST_AUTO_TEST_CASE(create_volume_layout_and_round_trip) {
+    const std::vector<std::byte> wrapped(wrapped_size, std::byte{wrapped_fill});
+    const oar::CreateVolume c{.volume_id = sample_volume,
+                              .owner_vm = sample_vm,
+                              .capacity_sectors = sample_sectors,
+                              .block_size = oar::sector_size,
+                              .wrapped_key = wrapped};
+    auto body = oar::encode_create_volume(c);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::create_volume_head_size + wrapped_size);
+    BOOST_TEST(std::to_integer<std::size_t>((*body)[key_len_offset]) == wrapped_size);
+    auto back = oar::decode_create_volume(*body);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST(back->volume_id == sample_volume);
+    BOOST_TEST(back->owner_vm == sample_vm);
+    BOOST_TEST(back->capacity_sectors == sample_sectors);
+    BOOST_TEST(back->block_size == oar::sector_size);
+    BOOST_TEST(std::ranges::equal(back->wrapped_key, wrapped));
+    BOOST_TEST(back->wrapped_key.data() == body->data() + oar::create_volume_head_size);
+
+    auto b = *body;
+    b[create_reserved_offset] = std::byte{1};
+    BOOST_TEST((oar::decode_create_volume(b).error() == BodyError::reserved_not_zero));
+    b = *body;
+    b.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_create_volume(b).error() == BodyError::bad_key_length));
+    b = *body;
+    b.resize(oar::create_volume_head_size - 1);
+    BOOST_TEST((oar::decode_create_volume(b).error() == BodyError::truncated));
+    b = *body;
+    b[block_size_offset + 1] = std::byte{0x04};  // 1024 + 0 = not 512/4096
+    BOOST_TEST((oar::decode_create_volume(b).error() == BodyError::bad_geometry));
+}
+
+BOOST_AUTO_TEST_CASE(create_volume_rules) {
+    const std::vector<std::byte> wrapped(wrapped_size, std::byte{wrapped_fill});
+    const std::vector<std::byte> too_long(oar::max_wrapped_volume_key + 1, std::byte{1});
+    const oar::CreateVolume good{.volume_id = sample_volume,
+                                 .owner_vm = sample_vm,
+                                 .capacity_sectors = sample_sectors,
+                                 .block_size = 4096,
+                                 .wrapped_key = wrapped};
+    BOOST_TEST(oar::encode_create_volume(good).has_value());
+    auto c = good;
+    c.owner_vm = 0;
+    BOOST_TEST((oar::encode_create_volume(c).error() == BodyError::zero_id));
+    c = good;
+    c.capacity_sectors = 0;
+    BOOST_TEST((oar::encode_create_volume(c).error() == BodyError::bad_geometry));
+    c = good;
+    c.capacity_sectors = sample_sectors + 1;  // not whole 4 KiB blocks
+    BOOST_TEST((oar::encode_create_volume(c).error() == BodyError::bad_geometry));
+    c = good;
+    c.capacity_sectors = oar::max_capacity_sectors + 8;
+    BOOST_TEST((oar::encode_create_volume(c).error() == BodyError::bad_geometry));
+    c = good;
+    c.wrapped_key = {};
+    BOOST_TEST((oar::encode_create_volume(c).error() == BodyError::bad_key_length));
+    c.wrapped_key = too_long;
+    BOOST_TEST((oar::encode_create_volume(c).error() == BodyError::bad_key_length));
+}
+
+BOOST_AUTO_TEST_CASE(delete_and_rewrap_volume) {
+    const oar::DeleteVolume d{.volume_id = sample_volume};
+    auto body = oar::encode_delete_volume(d);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::delete_volume_size);
+    BOOST_TEST((oar::decode_delete_volume(*body).value() == d));
+    BOOST_TEST((oar::encode_delete_volume({.volume_id = 0}).error() == BodyError::zero_id));
+    BOOST_TEST((oar::decode_delete_volume(bytes_of(0, 0, 0, 0, 0, 0, 0, 0)).error() ==
+                BodyError::zero_id));
+    auto b = *body;
+    b.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_delete_volume(b).error() == BodyError::trailing_bytes));
+
+    const std::vector<std::byte> wrapped(wrapped_size, std::byte{wrapped_fill});
+    auto rw = oar::encode_rewrap_volume(
+        {.volume_id = sample_volume, .owner_vm = sample_vm, .wrapped_key = wrapped});
+    BOOST_REQUIRE(rw.has_value());
+    BOOST_TEST(rw->size() == oar::rewrap_volume_head_size + wrapped_size);
+    BOOST_TEST(std::to_integer<std::size_t>((*rw)[rewrap_key_len_offset]) == wrapped_size);
+    auto back = oar::decode_rewrap_volume(*rw);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST(back->volume_id == sample_volume);
+    BOOST_TEST(back->owner_vm == sample_vm);
+    BOOST_TEST(std::ranges::equal(back->wrapped_key, wrapped));
+    b = *rw;
+    b[rewrap_reserved_offset] = std::byte{1};
+    BOOST_TEST((oar::decode_rewrap_volume(b).error() == BodyError::reserved_not_zero));
+    b = *rw;
+    b.pop_back();
+    BOOST_TEST((oar::decode_rewrap_volume(b).error() == BodyError::bad_key_length));
+    BOOST_TEST((oar::encode_rewrap_volume(
+                    {.volume_id = sample_volume, .owner_vm = 0, .wrapped_key = wrapped})
+                    .error() == BodyError::zero_id));
+}
+
 BOOST_AUTO_TEST_CASE(map_chunk_bounds) {
     const std::vector<std::byte> data(mid_offset, std::byte{1});
     auto body = oar::encode_map_chunk({.total = small_total, .offset = 0, .chunk = data});
@@ -348,6 +453,8 @@ BOOST_AUTO_TEST_CASE(names) {
     BOOST_TEST(std::string_view{oar::to_string(oar::Role::gpu)} == "gpu");
     BOOST_TEST(std::string_view{oar::to_string(oar::HealthState::faulted)} == "faulted");
     BOOST_TEST(std::string_view{oar::to_string(BodyError::bad_chunk)} == "bad_chunk");
+    BOOST_TEST(std::string_view{oar::to_string(BodyError::bad_geometry)} == "bad_geometry");
+    BOOST_TEST(std::string_view{oar::to_string(BodyError::bad_key_length)} == "bad_key_length");
     BOOST_TEST(oar::role_serves(oar::Role::gpu, FunctionType::gpu_vf));
     BOOST_TEST(!oar::role_serves(oar::Role::net, FunctionType::blk_fn));
 }

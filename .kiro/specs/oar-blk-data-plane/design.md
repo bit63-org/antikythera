@@ -60,6 +60,50 @@
   `FileBackend::erase`, which overwrites the header, the file's only
   copy of the wrapped key, before unlinking.
 
+- **BlkRole** (`src/oar/blk/blk_role.*`) — the role's answer to helm's
+  sideband (`helm::OarHandler`): volume files `vol-<id>.akv` in one
+  directory, and a fixed set of functions, one per transport. A transport
+  lives as long as the role (L0 QEMU attaches at boot), so what it serves
+  changes: between attachments a placeholder (virtio-blk over an empty
+  backend, never keyed), during one the volume's own `VirtioBlkFunction`.
+  All of them have the same queues, hence the same PCI shape, which is
+  what lets the vfio-user binding retarget without the client noticing.
+  `prepare_function` opens the volume (owner checked against the header)
+  and calls `await_key`; `clean_function` drops the key and puts the
+  placeholder back; `delete_volume` closes a volume still open (a
+  destroyed VM's) before erasing it, and a missing file counts as
+  deleted so retries succeed; `rewrap_volume` refuses an open volume.
+- **ak-oar-blk** (`oar_blk_main.cpp`, `-DAK_VFIO_USER=ON`) — the harbor
+  process: one vfio-user socket per function, helm's sideband on a
+  listening SOCK_SEQPACKET socket (re-listening if helm goes away), core
+  dumps and ptrace off before anything is served.
+
+## Volume lifecycle with helm
+
+helm keeps the wrapped volume keys and the oar-blk role keeps the
+volumes; the sideband connects the two (helm-control-plane design,
+CommandRouter, for the full rules):
+
+| Command | Before relay (undone on failure) | After hull's ok |
+|---|---|---|
+| CREATE_VOLUME | create the key; `create_volume` with the wrapped key on the lowest blk slot | — |
+| ATTACH_VOLUME | reserve the function (on the volume's slot); `prepare_function` | unwrap, `deliver_key` |
+| DETACH_VOLUME | — | release; cleaning drops the key and closes the volume |
+| DELETE_VOLUME | — | destroy the key (crypto-erase), `delete_volume` |
+| REWRAP_VOLUME | — | rewrap in the KeyStore, `rewrap_volume` |
+
+The key follows hull's ok because hull answers once the VMM has opened the
+function, and opening a VFIO device resets it: a key delivered earlier
+would be wiped by that FLR. The guest may probe the disk in the gap, so
+the function holds its requests until the key comes. A delivery that
+fails is reported as a `device_lost` host fault (slot, volume ID) for the
+controller to detach. CREATE_VOLUME carries no block size, so volumes are
+created with 512-byte blocks; 4 KiB volumes need a body field.
+
+Open: helm keeps wrapped keys only in memory, so after a helm restart it
+must reload them from the media (`KeyStore::import_volume_key`); the
+sideband has no request to list volumes and their wrapped keys yet.
+
 ## Placement notes
 
 A storage board needs one PCIe controller in endpoint mode (backplane) and

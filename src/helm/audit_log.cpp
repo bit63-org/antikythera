@@ -37,12 +37,16 @@ constexpr std::string_view hex_chars = "0123456789abcdef";
 constexpr std::string_view hash_prefix = " h=";
 
 constexpr std::array event_names{
-    "command_received",     "command_refused",      "command_relayed",    "command_outcome",
-    "command_timed_out",    "late_response",        "vm_key_created",     "vm_key_destroyed",
-    "volume_key_created",   "volume_key_delivered", "volume_key_dropped", "volume_key_rewrapped",
-    "volume_key_destroyed",
+    "command_received",     "command_refused",
+    "command_relayed",      "command_outcome",
+    "command_timed_out",    "late_response",
+    "vm_key_created",       "vm_key_destroyed",
+    "volume_key_created",   "volume_key_delivered",
+    "volume_key_dropped",   "volume_key_rewrapped",
+    "volume_key_destroyed", "volume_key_delivery_failed",
 };
-static_assert(event_names.size() == static_cast<std::size_t>(AuditEvent::volume_key_destroyed) + 1,
+static_assert(event_names.size() ==
+                  static_cast<std::size_t>(AuditEvent::volume_key_delivery_failed) + 1,
               "event_names must list every AuditEvent");
 
 auto append_uint(std::string& out, std::uint64_t v, int base = decimal_base) -> void {

@@ -86,6 +86,23 @@ sudo harbor/oar_net_smoke.py /tmp/n.sock aknet0
 through the TAP, and that the guest cannot rewrite the MAC. Passing the
 function through to an L2 guest is the next harbor step.
 
+## oar-blk storage role
+
+`ak-oar-blk` (built with `-DAK_VFIO_USER=ON`) serves virtio-blk functions
+over vfio-user, one socket per `--function`, and takes helm's sideband on
+`--sideband` with the addresses from helm's `slot` directive:
+
+```bash
+build/src/ak-oar-blk --volumes /var/lib/antikythera/volumes \
+    --sideband /run/antikythera/slot2-sideband.sock \
+    --addr 0x12 --helm-addr 0x08 --eid 18 --helm-eid 8 \
+    --function /tmp/b0.sock --function /tmp/b1.sock
+```
+
+Volumes are files in `--volumes`, created, rewrapped and erased only on
+helm's request; between attachments each function is an empty disk with
+no key. Booting an L2 guest from a volume is oar-blk task 7.
+
 ## Layout
 
 | Path | Purpose |

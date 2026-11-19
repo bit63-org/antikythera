@@ -114,6 +114,15 @@ target_link_libraries(ak_oar_blk
   PUBLIC ak::common ak::oar_virtio OpenSSL::Crypto
   PRIVATE ak::warnings ak::hardening)
 
+# The storage role as helm drives it over the sideband: volume files and
+# one virtio-blk function per transport (oar-blk task 6). Kept apart from
+# ak_oar_blk so the data path does not depend on helm's library.
+add_library(ak_oar_blk_role oar/blk/blk_role.cpp)
+add_library(ak::oar_blk_role ALIAS ak_oar_blk_role)
+target_link_libraries(ak_oar_blk_role
+  PUBLIC ak::oar_blk ak::helm
+  PRIVATE ak::warnings ak::hardening)
+
 # vfio-user device servers, built against libvfio-user (the `vfio-user`
 # vcpkg feature, vcpkg-overlays/libvfio-user).
 #
@@ -199,6 +208,11 @@ if(LIBVFIO_USER_FOUND)
   target_link_libraries(ak-oar-net
     PRIVATE ak::vfu_virtio ak::oar_net ak::warnings ak::hardening)
   install(TARGETS ak-oar-net RUNTIME DESTINATION bin)
+
+  add_executable(ak-oar-blk oar/blk/oar_blk_main.cpp)
+  target_link_libraries(ak-oar-blk
+    PRIVATE ak::vfu_virtio ak::oar_blk_role ak::warnings ak::hardening)
+  install(TARGETS ak-oar-blk RUNTIME DESTINATION bin)
 elseif(_ak_vfio_user_required)
   message(FATAL_ERROR
     "libvfio-user not found, but it is required because ${_ak_vfio_user_reason}.\n"
@@ -212,7 +226,7 @@ else()
   if(AK_VFIO_USER STREQUAL "OFF")
     message(STATUS "AK_VFIO_USER=OFF: vfio-user device servers not built")
   else()
-    message(WARNING "libvfio-user not found: vfio-user device servers (ak-testdev, ak-oar-net) not built. "
+    message(WARNING "libvfio-user not found: vfio-user device servers (ak-testdev, ak-oar-net, ak-oar-blk) not built. "
                     "Install the `vfio-user` vcpkg feature to enable them, or pass "
                     "-DAK_VFIO_USER=OFF to silence this warning.")
   endif()

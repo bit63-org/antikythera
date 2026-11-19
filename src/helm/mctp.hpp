@@ -243,6 +243,9 @@ enum class VendorType : std::uint8_t {
     drop_key = 0x05,
     map_update = 0x06,
     health = 0x07,
+    create_volume = 0x08,
+    delete_volume = 0x09,
+    rewrap_volume = 0x0A,
 };
 
 struct VendorHeader {

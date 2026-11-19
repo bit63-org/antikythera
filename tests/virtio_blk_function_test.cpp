@@ -715,6 +715,57 @@ BOOST_AUTO_TEST_CASE(driver_reset_keeps_key, *boost::unit_test::timeout(unit_tim
     BOOST_TEST(rig.read(30, blk::sector_size).data == plain, boost::test_tools::per_element());
 }
 
+BOOST_AUTO_TEST_CASE(awaiting_the_key_holds_requests,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig;
+    const auto plain = pattern(16, blk::sector_size);
+
+    // The attach window: the VMM's open resets the function (FLR) after
+    // prepare, before the key; the wait survives it.
+    rig.fn().await_key();
+    BOOST_TEST(rig.fn().awaiting_key());
+    rig.fn().function_reset();
+    BOOST_TEST(rig.fn().awaiting_key());
+    BOOST_REQUIRE(rig.up());
+
+    // The guest probes: its requests stay in the ring, not failed.
+    const auto w = rig.post(static_cast<std::uint32_t>(RequestType::out), 16, plain);
+    rig.notify();
+    const auto r = rig.post(static_cast<std::uint32_t>(RequestType::in), 16, {}, blk::sector_size);
+    rig.notify();
+    BOOST_TEST(!rig.fn().pci().poll());
+    BOOST_TEST(!rig.result(w).completed);
+    BOOST_TEST(!rig.result(r).completed);
+    BOOST_TEST(rig.fn().counters().no_key == 0U);
+    BOOST_TEST(rig.backend().writes == 0U);
+
+    // The key arrives: the next poll serves both, in order.
+    rig.deliver_key();
+    BOOST_TEST(!rig.fn().awaiting_key());
+    static_cast<void>(rig.fn().pci().poll());
+    BOOST_TEST(rig.result(w).status == ok());
+    BOOST_TEST(rig.result(r).data == plain, boost::test_tools::per_element());
+}
+
+BOOST_AUTO_TEST_CASE(drop_key_ends_the_wait, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig;
+    rig.fn().await_key();
+    const auto id = rig.post(static_cast<std::uint32_t>(RequestType::in), 0, {}, blk::sector_size);
+    rig.notify();
+    BOOST_TEST(!rig.result(id).completed);
+    // helm gave up (cleaning): the held request now fails instead of hanging.
+    rig.fn().drop_key();
+    BOOST_TEST(!rig.fn().awaiting_key());
+    rig.notify();
+    BOOST_TEST(rig.result(id).status == ioerr());
+
+    // With a key already held, await_key() changes nothing.
+    rig.deliver_key();
+    rig.fn().await_key();
+    BOOST_TEST(!rig.fn().awaiting_key());
+    BOOST_TEST(rig.write(0, pattern(0, blk::sector_size)).status == ok());
+}
+
 BOOST_AUTO_TEST_CASE(missing_status_byte_needs_reset,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
     Rig rig;

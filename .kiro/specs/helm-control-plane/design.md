@@ -50,18 +50,27 @@ Built in `src/helm/command_router.*`. Decisions made in the implementation:
   `insufficient_resources` without consuming the sequence number.
 - Creative steps before relay, destructive steps after hull's ok.
   Reserving a function, preparing it on its role, creating a VM or volume
-  key and delivering a volume key happen before the slot goes to the
-  mailbox, each with a compensation. Releasing functions, destroying
-  keys (`DELETE_VOLUME`, `DESTROY_VM` without `persist_volumes`) and
-  `REWRAP_VOLUME` wait for hull's `ok`/`accepted`, which means hull has
-  verified the controller's signature: a forged or replayed envelope can
-  never crypto-erase anything.
+  key and storing a new volume (with its wrapped key) on the storage role
+  happen before the slot goes to the mailbox, each with a compensation.
+  Releasing functions, destroying keys (`DELETE_VOLUME`, `DESTROY_VM`
+  without `persist_volumes`) and erasing those volumes on the media, and
+  `REWRAP_VOLUME` (KeyStore, then the volume header) wait for hull's
+  `ok`/`accepted`, which means hull has verified the controller's
+  signature: a forged or replayed envelope can never crypto-erase
+  anything. A media step that fails after commit is counted
+  (`storage_failures`); it cannot be undone.
+- `ATTACH_VOLUME` delivers the volume key after hull's `ok`, not before
+  relay: hull answers once the VMM has opened the function, and that open
+  resets it (FLR), which wipes a key delivered earlier. The function holds
+  the guest's I/O until the key arrives. A failed delivery is audited
+  (`volume_key_delivery_failed`) and reported as a `device_lost` host
+  fault naming the slot and volume.
 - helm checks preconditions it owns before relaying (volume owner and
   attachment, function type and state, `REWRAP_VOLUME`'s `from_vm`) and
   answers a violation itself. Malformed slots are refused as `malformed`,
   `GPU_VF_CONFIG` as `unsupported`.
 - A failed attach (role refused, hull answered with an error, mailbox
-  write failed) drops a delivered key and moves the function
+  write failed) moves the function
   `assigned → cleaning` (pool event `attach_failed`): hull never handed
   it to the VM, but the role may hold the VM's configuration or key.
 - Timeouts report `timed_out` and do nothing else: reservations stay
@@ -173,6 +182,11 @@ signature included, so the role can check it itself. A frame (up to
 consecutive chunks (`total`, `offset`, bytes); offset 0 restarts a
 transfer, any gap or changed total aborts it, and the last chunk's answer
 is the result of applying the frame.
+
+`create_volume`, `delete_volume` and `rewrap_volume` are the storage
+role's half of the volume commands: the role keeps the wrapped key (opaque
+to it) in the volume's metadata and releases the space on delete. Other
+roles answer `unsupported` (OarHandler's defaults).
 
 `deliver_key` is the one place a plaintext volume key leaves helm.
 `OarLink` takes the `ScopedKey` by value, encodes it into exactly-sized

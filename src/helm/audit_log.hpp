@@ -64,6 +64,7 @@ enum class AuditEvent : std::uint8_t {
     volume_key_dropped,
     volume_key_rewrapped,  // vm = the new owner
     volume_key_destroyed,
+    volume_key_delivery_failed,  // ATTACH_VOLUME succeeded but the key did not reach the role
 };
 
 [[nodiscard]] auto to_string(AuditEvent e) noexcept -> const char*;

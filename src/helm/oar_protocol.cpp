@@ -17,6 +17,7 @@ constexpr std::uint16_t zero16 = 0;
 constexpr std::uint32_t zero32 = 0;
 constexpr std::byte mac_multicast_bit{0x01};
 constexpr std::byte mac_local_bit{0x02};
+constexpr std::uint32_t logical_block_4k = 4096;
 
 // Fixed-size bodies: reject both short and long input before reading.
 auto check_size(std::span<const std::byte> body, std::size_t want) noexcept
@@ -181,6 +182,41 @@ auto read_fn_volume(wire::Reader& r) noexcept -> std::expected<FnVolume, BodyErr
         return std::unexpected(BodyError::zero_id);
     }
     return FnVolume{.fn = *fn, .volume = *volume};
+}
+
+auto check_wrapped_key(std::span<const std::byte> key) noexcept -> std::expected<void, BodyError> {
+    if (key.empty() || key.size() > max_wrapped_volume_key) {
+        return std::unexpected(BodyError::bad_key_length);
+    }
+    return {};
+}
+
+auto check_create_volume(const CreateVolume& c) noexcept -> std::expected<void, BodyError> {
+    if (c.volume_id == 0 || c.owner_vm == 0) {
+        return std::unexpected(BodyError::zero_id);
+    }
+    if ((c.block_size != sector_size && c.block_size != logical_block_4k) ||
+        c.capacity_sectors == 0 || c.capacity_sectors > max_capacity_sectors ||
+        c.capacity_sectors % (c.block_size / sector_size) != 0) {
+        return std::unexpected(BodyError::bad_geometry);
+    }
+    return check_wrapped_key(c.wrapped_key);
+}
+
+auto check_rewrap_volume(const RewrapVolume& r) noexcept -> std::expected<void, BodyError> {
+    if (r.volume_id == 0 || r.owner_vm == 0) {
+        return std::unexpected(BodyError::zero_id);
+    }
+    return check_wrapped_key(r.wrapped_key);
+}
+
+// The wrapped key that ends a volume body: exactly `len` bytes must remain.
+auto read_wrapped_key(wire::Reader& r, std::uint16_t len) noexcept
+    -> std::expected<std::span<const std::byte>, BodyError> {
+    if (len == 0 || len > max_wrapped_volume_key || r.remaining() != len) {
+        return std::unexpected(BodyError::bad_key_length);
+    }
+    return r.rest();
 }
 
 }  // namespace
@@ -349,6 +385,120 @@ auto decode_drop_key(std::span<const std::byte> body) noexcept
         return std::unexpected(head.error());
     }
     return DropKey{.fn = head->fn, .volume_id = head->volume};
+}
+
+// ---- create_volume / delete_volume / rewrap_volume -------------------------
+
+auto encode_create_volume(const CreateVolume& c)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (auto ok = check_create_volume(c); !ok) {
+        return std::unexpected(ok.error());
+    }
+    std::vector<std::byte> out;
+    out.reserve(create_volume_head_size + c.wrapped_key.size());
+    wire::Writer w{out};
+    w.le64(c.volume_id);
+    w.le64(c.owner_vm);
+    w.le64(c.capacity_sectors);
+    w.le32(c.block_size);
+    w.le16(static_cast<std::uint16_t>(c.wrapped_key.size()));
+    w.le16(zero16);
+    w.bytes(c.wrapped_key);
+    return out;
+}
+
+auto decode_create_volume(std::span<const std::byte> body) noexcept
+    -> std::expected<CreateVolume, BodyError> {
+    if (body.size() < create_volume_head_size) {
+        return std::unexpected(BodyError::truncated);
+    }
+    wire::Reader r{body};
+    CreateVolume c;
+    c.volume_id = r.le64().value_or(0);
+    c.owner_vm = r.le64().value_or(0);
+    c.capacity_sectors = r.le64().value_or(0);
+    c.block_size = r.le32().value_or(0);
+    const auto key_len = r.le16().value_or(0);
+    if (r.le16().value_or(0) != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    auto key = read_wrapped_key(r, key_len);
+    if (!key) {
+        return std::unexpected(key.error());
+    }
+    c.wrapped_key = *key;
+    if (auto ok = check_create_volume(c); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return c;
+}
+
+auto encode_delete_volume(const DeleteVolume& d)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (d.volume_id == 0) {
+        return std::unexpected(BodyError::zero_id);
+    }
+    std::vector<std::byte> out;
+    out.reserve(delete_volume_size);
+    wire::Writer w{out};
+    w.le64(d.volume_id);
+    return out;
+}
+
+auto decode_delete_volume(std::span<const std::byte> body) noexcept
+    -> std::expected<DeleteVolume, BodyError> {
+    if (auto ok = check_size(body, delete_volume_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    wire::Reader r{body};
+    const auto volume = r.le64().value_or(0);
+    if (volume == 0) {
+        return std::unexpected(BodyError::zero_id);
+    }
+    return DeleteVolume{.volume_id = volume};
+}
+
+auto encode_rewrap_volume(const RewrapVolume& v)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (auto ok = check_rewrap_volume(v); !ok) {
+        return std::unexpected(ok.error());
+    }
+    std::vector<std::byte> out;
+    out.reserve(rewrap_volume_head_size + v.wrapped_key.size());
+    wire::Writer w{out};
+    w.le64(v.volume_id);
+    w.le64(v.owner_vm);
+    w.le16(static_cast<std::uint16_t>(v.wrapped_key.size()));
+    w.le16(zero16);
+    w.le32(zero32);
+    w.bytes(v.wrapped_key);
+    return out;
+}
+
+auto decode_rewrap_volume(std::span<const std::byte> body) noexcept
+    -> std::expected<RewrapVolume, BodyError> {
+    if (body.size() < rewrap_volume_head_size) {
+        return std::unexpected(BodyError::truncated);
+    }
+    wire::Reader r{body};
+    RewrapVolume v;
+    v.volume_id = r.le64().value_or(0);
+    v.owner_vm = r.le64().value_or(0);
+    const auto key_len = r.le16().value_or(0);
+    const auto reserved16 = r.le16().value_or(0);
+    const auto reserved32 = r.le32().value_or(0);
+    if (reserved16 != 0 || reserved32 != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    auto key = read_wrapped_key(r, key_len);
+    if (!key) {
+        return std::unexpected(key.error());
+    }
+    v.wrapped_key = *key;
+    if (auto ok = check_rewrap_volume(v); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return v;
 }
 
 // ---- map_update -----------------------------------------------------------
@@ -594,6 +744,10 @@ auto to_string(BodyError e) noexcept -> const char* {
             return "too_many_entries";
         case BodyError::bad_chunk:
             return "bad_chunk";
+        case BodyError::bad_geometry:
+            return "bad_geometry";
+        case BodyError::bad_key_length:
+            return "bad_key_length";
         case BodyError::status_with_body:
             return "status_with_body";
     }

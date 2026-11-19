@@ -73,6 +73,9 @@ auto status_code(mailbox::Status s) noexcept -> std::uint16_t {
     return static_cast<std::uint16_t>(s);
 }
 
+// 512-byte sectors in a CREATE_VOLUME size (1 GiB = 2^21 sectors).
+constexpr unsigned gib_sector_shift = 21;
+
 }  // namespace
 
 // ---- OarLinkPort -----------------------------------------------------------
@@ -94,6 +97,21 @@ auto OarLinkPort::deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey
 
 auto OarLinkPort::drop_key(const oar::DropKey& request) -> std::expected<void, LinkError> {
     return _link->drop_key(request);
+}
+
+auto OarLinkPort::create_volume(const oar::CreateVolume& request)
+    -> std::expected<void, LinkError> {
+    return _link->create_volume(request);
+}
+
+auto OarLinkPort::delete_volume(const oar::DeleteVolume& request)
+    -> std::expected<void, LinkError> {
+    return _link->delete_volume(request);
+}
+
+auto OarLinkPort::rewrap_volume(const oar::RewrapVolume& request)
+    -> std::expected<void, LinkError> {
+    return _link->rewrap_volume(request);
 }
 
 // ---- CommandRouter ---------------------------------------------------------
@@ -129,11 +147,21 @@ auto CommandRouter::port_for(std::uint8_t slot) -> OarPort* {
     return it == _ports.end() ? nullptr : it->second;
 }
 
+auto CommandRouter::storage_slot() const -> std::optional<std::uint8_t> {
+    for (const auto& [slot, role] : _roles) {
+        if (role == oar::Role::blk && _ports.contains(slot)) {
+            return slot;
+        }
+    }
+    return std::nullopt;
+}
+
 // ---- slots -----------------------------------------------------------------
 
 auto CommandRouter::add_slot(std::uint8_t slot, OarPort& port, const oar::Inventory& inventory)
     -> void {
     _ports[slot] = &port;
+    _roles[slot] = inventory.role;
     for (const auto& entry : inventory.functions) {
         const auto id = make_function_id(slot, entry.fn);
         // A function already known (the slot came back after a power
@@ -354,6 +382,26 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
                   .with_seq(seq)
                   .with_vm(c->owner_vm)
                   .with_volume(c->volume_id));
+        const auto slot = storage_slot();
+        if (!slot) {
+            return std::unexpected(Status::insufficient_resources);
+        }
+        const auto wrapped = _keys->find_volume_key(c->volume_id);
+        if (!wrapped) {
+            return std::unexpected(Status::internal_error);
+        }
+        auto stored = port_for(*slot)->create_volume(
+            {.volume_id = c->volume_id,
+             .owner_vm = c->owner_vm,
+             .capacity_sectors = std::uint64_t{c->size_gib} << gib_sector_shift,
+             .block_size = oar::sector_size,
+             .wrapped_key = wrapped->key.bytes()});
+        if (!stored) {
+            // Not marked for undo: a refused create (the volume exists on
+            // the media, say) must not be answered by erasing it.
+            return std::unexpected(link_status(stored.error()));
+        }
+        undo.stored_volume = StoredVolume{.volume = c->volume_id, .slot = *slot};
         return {};
     }
 
@@ -375,6 +423,11 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
         if (*owner != a->vm_id || _attached.contains(a->volume_id)) {
             return std::unexpected(Status::conflict);
         }
+        // Only the board that stores the volume can serve it.
+        if (const auto v = _volumes.find(a->volume_id);
+            v != _volumes.end() && v->second.slot != a->device.slot) {
+            return std::unexpected(Status::conflict);
+        }
         auto reserved = reserve(a->vm_id, a->device, undo);
         if (!reserved) {
             return std::unexpected(reserved.error());
@@ -387,23 +440,8 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
         if (!ok) {
             return std::unexpected(link_status(ok.error()));
         }
-        auto key = _keys->unwrap_volume_key(a->volume_id, a->vm_id);
-        if (!key) {
-            return std::unexpected(Status::internal_error);
-        }
-        // Marked before sending: a delivery that fails part way may still
-        // have reached the role, and dropping a key it lacks is harmless.
-        undo.key_delivered = true;
-        undo.key_volume = a->volume_id;
-        auto delivered = port->deliver_key(a->device.function, a->volume_id, std::move(*key));
-        if (!delivered) {
-            return std::unexpected(link_status(delivered.error()));
-        }
-        audit(AuditRecord::of(AuditEvent::volume_key_delivered)
-                  .with_seq(seq)
-                  .with_vm(a->vm_id)
-                  .with_volume(a->volume_id)
-                  .with_function(*reserved));
+        // The key goes on commit, after the VMM has opened (and reset) the
+        // function. Its cleaning, should the attach fail, closes the volume.
         return {};
     }
 
@@ -441,15 +479,11 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
 }
 
 auto CommandRouter::compensate(std::uint64_t seq, Undo& undo) -> void {
-    if (undo.key_delivered && undo.reserved) {
-        const auto id = *undo.reserved;
-        if (auto* port = port_for(slot_of(id))) {
-            (void)port->drop_key({.fn = function_number_of(id), .volume_id = undo.key_volume});
+    if (undo.stored_volume) {
+        auto* port = port_for(undo.stored_volume->slot);
+        if (port == nullptr || !port->delete_volume({.volume_id = undo.stored_volume->volume})) {
+            ++_stats.storage_failures;
         }
-        audit(AuditRecord::of(AuditEvent::volume_key_dropped)
-                  .with_seq(seq)
-                  .with_volume(undo.key_volume)
-                  .with_function(id));
     }
     if (undo.reserved && pool_event(*undo.reserved, PoolEvent::attach_failed)) {
         start_cleaning(*undo.reserved);
@@ -470,7 +504,7 @@ auto CommandRouter::compensate(std::uint64_t seq, Undo& undo) -> void {
     undo = Undo{};
 }
 
-auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body) -> void {
+auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body, const Undo& undo) -> void {
     if (const auto* c = std::get_if<mailbox::CreateVm>(&body)) {
         _vms[c->vm_id] = Vm{.vcpus = c->vcpus, .memory_mib = c->memory_mib};
     } else if (const auto* d = std::get_if<mailbox::DestroyVm>(&body)) {
@@ -488,6 +522,7 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body) -> void
                           .with_vm(d->vm_id)
                           .with_count(erased->size()));
                 for (const auto volume : *erased) {
+                    erase_volume(volume);
                     _volumes.erase(volume);
                 }
             }
@@ -498,7 +533,10 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body) -> void
             ++_stats.inconsistencies;
         }
     } else if (const auto* cv = std::get_if<mailbox::CreateVolume>(&body)) {
-        _volumes[cv->volume_id] = Volume{.owner = cv->owner_vm, .size_gib = cv->size_gib};
+        _volumes[cv->volume_id] =
+            Volume{.owner = cv->owner_vm,
+                   .size_gib = cv->size_gib,
+                   .slot = undo.stored_volume ? undo.stored_volume->slot : std::uint8_t{0}};
     } else if (const auto* dv = std::get_if<mailbox::DeleteVolume>(&body)) {
         if (_keys->destroy_volume_key(dv->volume_id)) {
             audit(AuditRecord::of(AuditEvent::volume_key_destroyed)
@@ -507,9 +545,11 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body) -> void
         } else {
             ++_stats.inconsistencies;
         }
+        erase_volume(dv->volume_id);
         _volumes.erase(dv->volume_id);
     } else if (const auto* av = std::get_if<mailbox::AttachVolume>(&body)) {
         _attached[av->volume_id] = function_id(av->device);
+        deliver_volume_key(seq, *av);
     } else if (const auto* xv = std::get_if<mailbox::DetachVolume>(&body)) {
         if (!release(function_id(xv->device), xv->vm_id)) {
             ++_stats.inconsistencies;
@@ -521,8 +561,17 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body) -> void
                       .with_seq(seq)
                       .with_vm(r->to_vm)
                       .with_volume(r->volume_id));
-            if (auto it = _volumes.find(r->volume_id); it != _volumes.end()) {
+            auto it = _volumes.find(r->volume_id);
+            if (it != _volumes.end()) {
                 it->second.owner = r->to_vm;
+            }
+            const auto wrapped = _keys->find_volume_key(r->volume_id);
+            auto* port = it == _volumes.end() ? nullptr : port_for(it->second.slot);
+            if (!wrapped || port == nullptr ||
+                !port->rewrap_volume({.volume_id = r->volume_id,
+                                      .owner_vm = r->to_vm,
+                                      .wrapped_key = wrapped->key.bytes()})) {
+                ++_stats.storage_failures;
             }
         } else {
             ++_stats.inconsistencies;
@@ -531,6 +580,39 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body) -> void
         _networks.try_emplace(cn->vni, 0);
     } else if (const auto* dn = std::get_if<mailbox::DeleteNetwork>(&body)) {
         _networks.erase(dn->vni);
+    }
+}
+
+auto CommandRouter::deliver_volume_key(std::uint64_t seq, const mailbox::AttachVolume& attach)
+    -> void {
+    const auto id = function_id(attach.device);
+    auto* port = port_for(attach.device.slot);
+    auto key = _keys->unwrap_volume_key(attach.volume_id, attach.vm_id);
+    bool delivered = false;
+    if (port != nullptr && key) {
+        delivered = port->deliver_key(attach.device.function, attach.volume_id, std::move(*key))
+                        .has_value();
+    }
+    const auto record = AuditRecord::of(delivered ? AuditEvent::volume_key_delivered
+                                                  : AuditEvent::volume_key_delivery_failed)
+                            .with_seq(seq)
+                            .with_vm(attach.vm_id)
+                            .with_volume(attach.volume_id)
+                            .with_function(id);
+    audit(record);
+    if (!delivered) {
+        ++_stats.key_delivery_failures;
+        _reports->report(proto::HostFaultReport{.code = proto::FaultCode::device_lost,
+                                                .slot = attach.device.slot,
+                                                .detail = attach.volume_id});
+    }
+}
+
+auto CommandRouter::erase_volume(VolumeId volume) -> void {
+    const auto it = _volumes.find(volume);
+    auto* port = it == _volumes.end() ? nullptr : port_for(it->second.slot);
+    if (port == nullptr || !port->delete_volume({.volume_id = volume})) {
+        ++_stats.storage_failures;
     }
 }
 
@@ -588,7 +670,7 @@ auto CommandRouter::on_response(const mailbox::Message& msg) -> void {
                   .with_command(command_code(rsp.command))
                   .with_status(status_code(rsp.status)));
         if (succeeded(rsp.status)) {
-            commit(done.seq, done.body);
+            commit(done.seq, done.body, done.undo);
         } else {
             compensate(done.seq, done.undo);
         }

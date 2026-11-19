@@ -23,14 +23,45 @@
 //      signature, hull does) and the body's preconditions are checked
 //      against helm's own state. Creative steps happen now, each with a
 //      compensation: reserve a function (DevicePool::assign), prepare it on
-//      its data-plane role, create a VM or volume key, unwrap and deliver a
-//      volume key. A refused precondition or failed step undoes the steps
-//      before it and reports the command without relaying it.
+//      its data-plane role, create a VM or volume key, store a new volume
+//      on the storage role. A refused precondition or failed step undoes
+//      the steps before it and reports the command without relaying it.
 //   4. Relay. Audit, then the slot goes to the mailbox unmodified.
 //   5. Commit or compensate. On ok or accepted, the command's destructive
 //      steps happen now, only after hull verified the controller's
-//      signature: release functions, destroy or rewrap keys. On any other
-//      status the prepare steps are undone.
+//      signature: release functions, destroy or rewrap keys, erase or
+//      rewrite volumes on the media. ATTACH_VOLUME delivers the volume key
+//      now too (below). On any other status the prepare steps are undone.
+//
+// Volumes (oar-blk Requirement 3). The storage role keeps each volume with
+// its wrapped key in the volume's metadata on the media:
+//
+//   CREATE_VOLUME  prepare: create the volume key, then create_volume on
+//                  the storage slot (the lowest connected blk slot) with
+//                  the wrapped key; compensate: delete_volume, destroy key.
+//   ATTACH_VOLUME  prepare: reserve the blk function (on the volume's
+//                  slot) and prepare_function, which opens the volume;
+//                  commit: unwrap and deliver the key. hull answers ok
+//                  once the VMM has opened the function, and opening a
+//                  VFIO device resets it (FLR), which wipes any key the
+//                  function held; a driver reset afterwards keeps the key.
+//                  So the key goes after the answer, and the function
+//                  holds the guest's I/O until it arrives. A delivery that
+//                  fails leaves the VM with a disk it cannot read: it is
+//                  audited and reported as a device_lost host fault naming
+//                  the slot and the volume, so the controller can detach.
+//   DETACH_VOLUME  commit: release the function; cleaning drops the key
+//                  and closes the volume.
+//   DELETE_VOLUME  commit: destroy the wrapped key (crypto-erase), then
+//                  delete_volume releases the space. DESTROY_VM without
+//                  persist_volumes does the same for each of its volumes.
+//   REWRAP_VOLUME  commit: rewrap in the KeyStore, then rewrap_volume
+//                  writes the new owner and wrapped key to the media.
+//
+// A media step that fails after commit (delete or rewrap) cannot be undone
+// either: it is counted in storage_failures. A failed delete leaves only
+// ciphertext whose key is gone; a failed rewrap leaves the old wrapped key
+// on the media, which matters once helm reloads keys from the media.
 //
 // Timeouts (Requirement 9.1). A command hull does not answer within
 // command_timeout is reported timed_out and nothing else happens: helm
@@ -123,6 +154,12 @@ public:
     virtual auto deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key)
         -> std::expected<void, LinkError> = 0;
     virtual auto drop_key(const oar::DropKey& request) -> std::expected<void, LinkError> = 0;
+    virtual auto create_volume(const oar::CreateVolume& request)
+        -> std::expected<void, LinkError> = 0;
+    virtual auto delete_volume(const oar::DeleteVolume& request)
+        -> std::expected<void, LinkError> = 0;
+    virtual auto rewrap_volume(const oar::RewrapVolume& request)
+        -> std::expected<void, LinkError> = 0;
 };
 
 class OarLinkPort final : public OarPort {
@@ -136,6 +173,9 @@ public:
     auto deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key)
         -> std::expected<void, LinkError> override;
     auto drop_key(const oar::DropKey& request) -> std::expected<void, LinkError> override;
+    auto create_volume(const oar::CreateVolume& request) -> std::expected<void, LinkError> override;
+    auto delete_volume(const oar::DeleteVolume& request) -> std::expected<void, LinkError> override;
+    auto rewrap_volume(const oar::RewrapVolume& request) -> std::expected<void, LinkError> override;
 
 private:
     OarLink* _link;
@@ -181,7 +221,9 @@ struct RouterStats {
     std::uint64_t duplicates{0};      // retries answered from history or ignored
     std::uint64_t stray_messages{0};  // undecodable, unexpected or late hull messages
     std::uint64_t audit_failures{0};
-    std::uint64_t inconsistencies{0};  // hull confirmed something helm's state disagrees with
+    std::uint64_t inconsistencies{0};        // hull confirmed something helm's state disagrees with
+    std::uint64_t key_delivery_failures{0};  // ATTACH_VOLUME succeeded, the key did not arrive
+    std::uint64_t storage_failures{0};       // a committed delete or rewrap failed on the media
 };
 
 class CommandRouter {
@@ -192,7 +234,8 @@ public:
     CommandRouter(RouterConfig config, DevicePool& pool, KeyStore& keys, HostPort& host,
                   ReportSink& reports, AuditLog& audit);
 
-    // Registers a data-plane role's sideband for `slot` and adds every
+    // Registers a data-plane role's sideband for `slot` (remembering its
+    // role, so volumes go to a storage slot) and adds every
     // function its inventory lists; each starts in `cleaning` and is
     // cleaned now (PowerSequencer calls this once the slot is link-ready).
     auto add_slot(std::uint8_t slot, OarPort& port, const oar::Inventory& inventory) -> void;
@@ -220,12 +263,16 @@ public:
 
 private:
     // What a command did before relay, so it can be undone.
+    struct StoredVolume {
+        VolumeId volume{0};
+        std::uint8_t slot{0};
+    };
+
     struct Undo {
         std::optional<FunctionId> reserved;  // assigned in the pool, maybe prepared
-        bool key_delivered{false};
-        VolumeId key_volume{0};
         std::optional<VmId> created_vm_key;
         std::optional<VolumeId> created_volume_key;
+        std::optional<StoredVolume> stored_volume;  // created on the storage role
     };
 
     struct InFlight {
@@ -243,6 +290,7 @@ private:
     struct Volume {
         VmId owner{0};
         std::uint32_t size_gib{0};
+        std::uint8_t slot{0};  // the storage slot holding it
     };
 
     using Outcome = proto::CommandOutcome;
@@ -255,7 +303,11 @@ private:
     auto reserve(VmId vm, const mailbox::DeviceRef& device, Undo& undo)
         -> std::expected<FunctionId, mailbox::Status>;
     auto compensate(std::uint64_t seq, Undo& undo) -> void;
-    auto commit(std::uint64_t seq, const mailbox::Body& body) -> void;
+    auto commit(std::uint64_t seq, const mailbox::Body& body, const Undo& undo) -> void;
+    auto deliver_volume_key(std::uint64_t seq, const mailbox::AttachVolume& attach) -> void;
+    // Releases a volume's space on its storage role (after crypto-erase).
+    auto erase_volume(VolumeId volume) -> void;
+    [[nodiscard]] auto storage_slot() const -> std::optional<std::uint8_t>;
     auto finish(std::uint64_t seq, mailbox::Type command, mailbox::Status status,
                 std::span<const std::byte> payload = {}) -> void;
     auto refuse(std::uint64_t seq, mailbox::Type command, mailbox::Status status) -> void;
@@ -282,6 +334,7 @@ private:
     AuditLog* _audit;
 
     std::map<std::uint8_t, OarPort*> _ports;
+    std::map<std::uint8_t, oar::Role> _roles;
     std::uint64_t _last_seq;
     std::deque<proto::Envelope> _queue;
     std::optional<InFlight> _in_flight;

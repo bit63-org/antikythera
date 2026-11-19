@@ -64,13 +64,16 @@ target_link_libraries(ak_tls
 
 # helm: control-plane mailbox protocol, device pool, MCTP sideband framing,
 # OarLink (sideband protocol and its transport bindings), key store, the
-# ControllerLink, the CommandRouter, the audit log and the PowerSequencer
-# (with harbor's process backplane).
+# ControllerLink, the CommandRouter, the audit log, the PowerSequencer
+# (with harbor's process backplane) and the daemon that wires them
+# (HelmDaemon, ak-helm's configuration).
 add_library(ak_helm
   helm/audit_log.cpp
   helm/command_router.cpp
   helm/controller_link.cpp
   helm/device_pool.cpp
+  helm/helm_config.cpp
+  helm/helm_daemon.cpp
   helm/key_store.cpp
   helm/mailbox.cpp
   helm/mctp.cpp
@@ -84,6 +87,12 @@ add_library(ak::helm ALIAS ak_helm)
 target_link_libraries(ak_helm
   PUBLIC ak::common ak::proto ak::tls
   PRIVATE OpenSSL::Crypto ak::warnings ak::hardening)
+
+# ak-helm: the helm daemon as harbor runs it (board processes, socket
+# sidebands, the ControllerLink).
+add_executable(ak-helm helm/helm_main.cpp)
+target_link_libraries(ak-helm PRIVATE ak::helm ak::warnings ak::hardening)
+install(TARGETS ak-helm RUNTIME DESTINATION bin)
 
 # hull: host-agent command authentication (Ed25519 signatures and sequence
 # numbers), the core / huge-page allocator, and the per-VMM jail and cgroup.

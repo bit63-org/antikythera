@@ -22,7 +22,7 @@ namespace helm = ak::helm;
 namespace mb = ak::helm::mailbox;
 namespace proto = ak::proto;
 using ak::test::unit_timeout_seconds;
-using helm::LinkError;
+using helm::SessionError;
 using proto::RecordType;
 
 namespace {
@@ -221,7 +221,7 @@ BOOST_FIXTURE_TEST_CASE(envelopes_and_updates_reach_the_sink_unmodified, Fixture
 BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
     struct Case {
         std::vector<std::byte> bytes;
-        LinkError want;
+        SessionError want;
     };
     auto bad_envelope = envelope_record(server, 10);
     bad_envelope[proto::record_header_size] = std::byte{0};  // envelope magic
@@ -229,14 +229,14 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
         proto::encode_report({.server_id = server, .report_seq = 1, .body = exited(1)});
     auto hello_payload = proto::encode_hello({.server_id = server, .boot_id = 1});
     const Case cases[] = {
-        {envelope_record(other_server, 10), LinkError::wrong_server},
-        {map_update_record(other_server), LinkError::wrong_server},
-        {bad_envelope, LinkError::bad_record},
-        {framed(RecordType::report, *report_payload), LinkError::wrong_direction},
-        {framed(RecordType::hello, *hello_payload), LinkError::wrong_direction},
-        {ack_record(99), LinkError::bad_ack},
-        {ack_record(1, other_server), LinkError::bad_ack},
-        {ak::test::bytes_of(0, 0, 0, 0, 9, 0, 0, 0), LinkError::bad_record},
+        {envelope_record(other_server, 10), SessionError::wrong_server},
+        {map_update_record(other_server), SessionError::wrong_server},
+        {bad_envelope, SessionError::bad_record},
+        {framed(RecordType::report, *report_payload), SessionError::wrong_direction},
+        {framed(RecordType::hello, *hello_payload), SessionError::wrong_direction},
+        {ack_record(99), SessionError::bad_ack},
+        {ack_record(1, other_server), SessionError::bad_ack},
+        {ak::test::bytes_of(0, 0, 0, 0, 9, 0, 0, 0), SessionError::bad_record},
     };
     for (const auto& c : cases) {
         Fixture f;
@@ -252,7 +252,7 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
 BOOST_FIXTURE_TEST_CASE(bytes_without_a_connection_are_refused, Fixture) {
     auto r = session.on_bytes(envelope_record(server, 1));
     BOOST_REQUIRE(!r.has_value());
-    BOOST_TEST((r.error() == LinkError::not_connected));
+    BOOST_TEST((r.error() == SessionError::not_connected));
     BOOST_TEST(sink.envelopes.empty());
 }
 
@@ -288,8 +288,9 @@ BOOST_FIXTURE_TEST_CASE(invalid_reports_are_dropped_not_sent, Fixture) {
 }
 
 BOOST_AUTO_TEST_CASE(errors_have_names) {
-    for (auto e : {LinkError::bad_record, LinkError::wrong_direction, LinkError::wrong_server,
-                   LinkError::bad_ack, LinkError::not_connected}) {
+    for (auto e :
+         {SessionError::bad_record, SessionError::wrong_direction, SessionError::wrong_server,
+          SessionError::bad_ack, SessionError::not_connected}) {
         BOOST_TEST(std::string_view{helm::to_string(e)} != "unknown");
     }
 }

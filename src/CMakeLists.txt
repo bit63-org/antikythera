@@ -144,6 +144,16 @@ target_link_libraries(ak_oar_blk
   PUBLIC ak::common ak::oar_virtio OpenSSL::Crypto
   PRIVATE ak::warnings ak::hardening)
 
+# The network role as helm drives it over the sideband: the VTEP's
+# MappingTable, VSwitch and Vtep, and one virtio-net function per
+# transport (oar-net tasks 9 and 11). Apart from ak_oar_net for the same
+# reason as ak_oar_blk_role.
+add_library(ak_oar_net_role oar/net/net_role.cpp)
+add_library(ak::oar_net_role ALIAS ak_oar_net_role)
+target_link_libraries(ak_oar_net_role
+  PUBLIC ak::oar_net ak::helm ak::proto
+  PRIVATE ak::warnings ak::hardening)
+
 # The storage role as helm drives it over the sideband: volume files and
 # one virtio-blk function per transport (oar-blk task 6). Kept apart from
 # ak_oar_blk so the data path does not depend on helm's library.
@@ -236,7 +246,7 @@ if(LIBVFIO_USER_FOUND)
 
   add_executable(ak-oar-net oar/net/oar_net_main.cpp)
   target_link_libraries(ak-oar-net
-    PRIVATE ak::vfu_virtio ak::oar_net ak::warnings ak::hardening)
+    PRIVATE ak::vfu_virtio ak::oar_net_role ak::hull ak::warnings ak::hardening)
   install(TARGETS ak-oar-net RUNTIME DESTINATION bin)
 
   add_executable(ak-oar-blk oar/blk/oar_blk_main.cpp)

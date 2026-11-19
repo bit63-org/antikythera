@@ -67,3 +67,12 @@ if(Python3_Interpreter_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/kernel_config_test.py -v)
   set_tests_properties(kernel_config_test PROPERTIES TIMEOUT 60)
 endif()
+
+# Kernel Geneve interop (oar-net task 4): the codec against the Linux geneve
+# driver in two network namespaces. Needs root, so an ordinary ctest run
+# reports it skipped (exit 77); CI runs the script under sudo.
+add_executable(geneve_interop_peer geneve_interop_peer.cpp)
+target_link_libraries(geneve_interop_peer PRIVATE ak::oar_net ak::warnings)
+add_test(NAME geneve_interop
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/geneve_interop.sh $<TARGET_FILE:geneve_interop_peer>)
+set_tests_properties(geneve_interop PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)

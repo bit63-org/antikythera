@@ -17,7 +17,9 @@
 //         underlay carries a source address owned by the NIC it came from
 //         (the sender on transmit, the Geneve source NIC on receive), never
 //         a link-local or unspecified one, and nothing but IPv4, IPv6 and
-//         ARP is ever forwarded.
+//         ARP is ever forwarded. vpc_one has a VPC gateway, so DHCP and the
+//         gateway's ARP/ND answers run too, and their replies (from the
+//         gateway's address) may only reach the asking NIC.
 
 #include <array>
 #include <chrono>
@@ -182,7 +184,8 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
     }
     std::array<Port, nic_count> ports{};
     for (std::size_t i = 0; i < nic_count; ++i) {
-        if (i != remote_index && !sw.attach(geneve::NicId{nic_ids.at(i)}, ports.at(i))) {
+        if (i != remote_index && !sw.attach(geneve::NicId{nic_ids.at(i)}, ports.at(i),
+                                            static_cast<std::uint16_t>(1500))) {
             std::abort();
         }
     }
@@ -191,6 +194,24 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
     if (!sw.set_neighbors({.vni = vpc_one,
                            .ipv4 = {{ip4_of(b_index), nic_b}, {ip4_of(remote_index), nic_c}},
                            .ipv6 = {{ip6_of(b_index), nic_b}, {ip6_of(remote_index), nic_c}}})) {
+        std::abort();
+    }
+    // vpc_one has a gateway (DHCP, gateway ARP/ND); vpc_two has none. The
+    // gateway's own address is nobody's, so a reply leaking to another NIC
+    // or the underlay fails forwarded_ok().
+    net::Ipv6Address prefix6 = ip6_of(0);
+    prefix6[ipv6_last] = std::byte{0};
+    if (!sw.set_vpc_config(
+            vpc_one, {.gateway_mac = {locally_administered, std::byte{0xaa}, std::byte{0},
+                                      std::byte{0}, std::byte{0}, std::byte{1}},
+                      .ipv4 = {.address = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}},
+                               .length = 24},
+                      .ipv4_gateway = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{254}},
+                      .ipv6_prefix = prefix6,
+                      .dns4 = {},
+                      .dns6 = {},
+                      .domain = "fuzz.internal",
+                      .lease_seconds = 60})) {
         std::abort();
     }
 

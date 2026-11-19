@@ -216,10 +216,21 @@
   before the inner IP check, so group meters and `rx_drop_group` keep
   their meaning. `fuzz_vswitch` checks that every forwarded frame is ARP
   or IP from the true sender's own address.
-- [ ] 17. `VpcConfig` per VNI (`set_vpc_config`, MTU taken at attach),
+- [x] 17. `VpcConfig` per VNI (`set_vpc_config`, MTU taken at attach),
   gateway ARP/ND answers, `tx_drop_no_route`, and the stateless DHCPv4
   server (`src/oar/net/dhcp4.*`), tests and fuzz. _Requirements: 12.1–12.3,
-  12.6_
+  12.6_ — `attach(nic, port, mtu)` defaults the MTU to 0, which leaves
+  option 26 out, so callers that do not pass one yet keep working. The
+  gateway answers ARP for its address and `169.254.169.254` (broadcast or
+  a unicast refresh to its MAC) and, with an IPv6 prefix, NS for its
+  link-local address and `fd00:ec2::254`. DHCPv4 client messages are
+  UDP 68→67 from `0.0.0.0` or to the broadcast or gateway address; a NAK
+  goes to `255.255.255.255`, other replies to `ciaddr`, broadcast on
+  request, else to `yiaddr`, always to the NIC's MAC and only its port.
+  Packet builders with full checksums (`packet::build_ipv4_udp`,
+  `build_ipv6_udp`, `build_icmpv6`, `build_ethernet`) serve the later
+  responders too. Fuzz: `fuzz_dhcp4`; `fuzz_vswitch` gives one VNI a
+  gateway and checks its replies reach only the asking NIC.
 - [ ] 18. Router advertisements (solicited, and periodic through
   `VSwitch::poll`) and the DHCPv6 server (`src/oar/net/dhcp6.*`), tests
   and fuzz. _Requirements: 12.4–12.6_

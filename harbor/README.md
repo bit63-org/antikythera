@@ -11,7 +11,7 @@ Prerequisites (one time):
 ```bash
 sudo apt-get install cloud-image-utils openssh-client ninja-build meson pkg-config \
     libglib2.0-dev libpixman-1-dev libslirp-dev python3-venv flex bison
-harbor/deps.sh            # pinned QEMU 10.2.4 + verified Ubuntu 24.04 image into harbor/.prefix
+harbor/deps.sh            # pinned QEMU 10.2.4, verified Ubuntu 24.04 image, Cloud Hypervisor into harbor/.prefix
 vcpkg install --x-feature=vfio-user
 cmake -B build -G Ninja -DAK_VFIO_USER=ON && cmake --build build   # builds build/src/ak-testdev
 harbor/check-host.sh
@@ -37,6 +37,45 @@ checks inside L1:
 It exits non-zero on any failure. On failure the logs stay in
 `harbor/.run/phase1/`: the board processes' `slot*.log`, L1's
 `console.log`, and the exact `qemu.cmdline`.
+
+## Phase 2: passthrough to an L2 guest
+
+Extra prerequisites: `harbor/deps.sh ch` (Cloud Hypervisor v54.0 static
+binaries, pinned by SHA-256) and `ak-guest-testdev`, which the normal build
+produces (`build/src/ak-guest-testdev`, a static PIE).
+
+```bash
+harbor/phase2.sh                 # 2 slots: slot 0 at boot, slot 1 hot-plugged
+harbor/phase2.sh --slots 3       # slots 0-1 at boot, slot 2 hot-plugged
+harbor/phase2.sh --keep          # leave L1 running (SSH on 127.0.0.1:2223)
+```
+
+Phase 2 boots L1 as phase 1 does (on SSH port 2223, so both can run on one
+host), binds every test device to `vfio-pci` in L1, and starts an L2 guest
+under Cloud Hypervisor with all but the last device. The L2 guest is L1's
+own kernel (decompressed to the ELF `vmlinux` Cloud Hypervisor boots) and a
+busybox initramfs built inside L1 by `l1/l2-image.sh`, so nothing more is
+downloaded. In the guest, `ak-guest-testdev` drives each device through
+vfio and checks:
+
+- MMIO: BAR0 magic, version, slot ID, scratch patterns
+- MSI-X: each of the 4 vectors arrives on its own eventfd and only there
+- DMA: the board process fills a guest buffer, writes exactly the length
+  asked, and rejects a zero length
+- reset: `VFIO_DEVICE_RESET` reaches the board process
+
+The L2 guest has no IOMMU of its own, so it uses vfio's no-IOMMU mode and
+gives the device guest-physical addresses; those still pass through L1's
+vIOMMU and QEMU's vfio-user client on the way to the board process. Then
+the last device is hot-plugged into the running guest (`ch-remote
+add-device`), checked the same way, and unplugged (`ch-remote
+remove-device`); the guest must see it arrive and leave, and L1 must have
+it back on `vfio-pci`. From L0, `phase2.sh` also checks that every board
+process logged the guest's reset and never refused a DMA mapping.
+
+On failure the logs stay in `harbor/.run/phase2/`: `l2-console.log` is the
+guest's serial console, next to phase 1's `slot*.log`, `console.log` and
+`qemu.cmdline`.
 
 ## Test controller
 
@@ -84,7 +123,7 @@ sudo harbor/oar_net_smoke.py /tmp/n.sock aknet0
 `oar_net_smoke.py` plays the vfio-user client and the guest driver itself
 (no QEMU), checking the PCI identity and capabilities, a frame each way
 through the TAP, and that the guest cannot rewrite the MAC. Passing the
-function through to an L2 guest is the next harbor step.
+function through to an L2 guest follows phase 2's path with `ak-testdev`.
 
 ## oar-blk storage role
 
@@ -113,5 +152,8 @@ no key. Booting an L2 guest from a volume is oar-blk task 7.
 | `l1/run.sh`, `l1/stop.sh` | start and stop one server (board processes, then QEMU) |
 | `l1/phase1-check.sh`, `l1/testdev_mmio.py` | the checks that run inside L1 |
 | `phase1.sh` | phase 1 end to end |
+| `l1/phase2-check.sh` | runs inside L1: vfio-pci binding, L2 boot, guest checks, hot-plug and unplug |
+| `l1/l2-image.sh`, `l1/l2-init.sh` | build the L2 guest inside L1 (kernel + busybox initramfs) and its `/init` |
+| `phase2.sh` | phase 2 end to end |
 | `oar_net_smoke.py` | drives a running `ak-oar-net` over vfio-user without QEMU (see below) |
 | `kernel/` | hull kernel fragments (strict `hull.config`, per-arch, `l1-debug.config`), resolver and checker; see [`kernel/README.md`](kernel/README.md) |

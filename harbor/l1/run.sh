@@ -70,7 +70,7 @@ users:
     shell: /bin/bash
     ssh_authorized_keys:
       - $(cat "${key}.pub")
-packages: [pciutils, python3]
+packages: [pciutils, python3, busybox-static, cpio, zstd]
 write_files:
   - path: /etc/default/grub.d/90-antikythera.cfg
     content: |

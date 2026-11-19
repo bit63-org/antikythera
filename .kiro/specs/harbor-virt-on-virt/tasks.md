@@ -1,6 +1,6 @@
 # Implementation Plan — harbor: the virt-on-virt prototype
 
-## Status: 4/10 tasks complete (task 2 written; `deps.sh qemu` not yet run end to end)
+## Status: 5/10 tasks complete (task 2 written; `deps.sh qemu` not yet run end to end)
 
 ## Tasks
 
@@ -30,8 +30,15 @@
   read/write, and in-L1 resets. The host-side reset check only counts
   slot-log lines written after the checks start, so the attach-time reset
   no longer satisfies it. _Requirements: 2.4, 5.1, 6.1_
-- [ ] 5. Phase 2: L2 passthrough, guest-side test program, hot-plug.
-  _Requirements: 5.2_
+- [x] 5. Phase 2: L2 passthrough, guest-side test program, hot-plug.
+  `phase2.sh` + `l1/phase2-check.sh`, `l1/l2-image.sh`/`l2-init.sh` (L2 is
+  L1's kernel with a busybox initramfs) and `ak-guest-testdev`
+  (`src/harbor/guest_testdev.cpp`, vfio in no-IOMMU mode). All checks pass
+  on tikhov with two slots (2026-11-19): MMIO, all four MSI-X vectors, DMA
+  fill with exact bounds, reset from L2, and hot-plug then unplug of the
+  second slot under Cloud Hypervisor v54.0. Fixed on the way: the 64-region
+  DMA cap in `ak-testdev` and `VirtioBinding`, and `ak-testdev`'s DMA by
+  vfio-user command. _Requirements: 5.2_
 - [ ] 6. Topology file format; combined vs split placement.
   _Requirements: 4.1_
 - [ ] 7. Multi-server network namespaces and the datacenter bridge.

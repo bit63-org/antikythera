@@ -39,6 +39,7 @@
 #include <vector>
 
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include "oar/vfu/libvfio_user.hpp"
@@ -55,7 +56,11 @@ constexpr std::uint32_t msix_table_offset = 0;
 constexpr std::uint32_t msix_pba_offset = 0x800;
 constexpr unsigned msix_offset_shift = 3;  // MSI-X table/PBA offsets are in 8-byte units
 constexpr std::uint32_t dma_max = 0x1000;
-constexpr std::size_t dma_max_regions = 64;
+// Behind L1's vIOMMU the client registers one DMA region per IOMMU
+// mapping, not one per RAM block: an L2 guest's 512 MiB arrives as 256
+// separate 2 MiB regions, or far more with 4 KiB pages. The cap only
+// guards against a runaway client.
+constexpr std::size_t dma_max_regions = 65536;
 constexpr std::uint32_t dma_ctrl_fill = 1;
 constexpr std::uint32_t dma_pattern_mask = 0xFF;
 constexpr std::uint8_t pcie_cap_version = 2;
@@ -151,10 +156,16 @@ auto Device::run_dma_fill(vfu_ctx_t* ctx) const -> DmaStatus {
     if (vfu_addr_to_sgl(ctx, iova, _dma_len, sg, 1, PROT_WRITE) != 1) {
         return DmaStatus::error;
     }
-    std::vector<std::byte> fill(_dma_len, static_cast<std::byte>(_dma_pattern & dma_pattern_mask));
-    if (vfu_sgl_write(ctx, sg, 1, fill.data(), sgl_flags_none) != 0) {
+    // Write through a local mapping of the client's memory, as a DMA engine
+    // would. vfu_sgl_write would instead send the data to the client as a
+    // command, which collides with the client's own pending BAR0 write (the
+    // DMA_CTRL write that started this fill) on a single socket.
+    iovec iov{};
+    if (vfu_sgl_get(ctx, sg, &iov, 1, sgl_flags_none) != 0) {
         return DmaStatus::error;
     }
+    std::memset(iov.iov_base, static_cast<int>(_dma_pattern & dma_pattern_mask), iov.iov_len);
+    vfu_sgl_put(ctx, sg, &iov, 1);
     return DmaStatus::done;
 }
 
@@ -258,6 +269,9 @@ auto reset_cb(vfu_ctx_t* ctx, vfu_reset_type_t type) -> int {
     return 0;
 }
 
+auto dma_register_cb(vfu_ctx_t* /*ctx*/, vfu_dma_info_t* /*info*/) -> void {}
+auto dma_unregister_cb(vfu_ctx_t* /*ctx*/, vfu_dma_info_t* /*info*/) -> void {}
+
 auto log_cb(vfu_ctx_t* ctx, int /*level*/, const char* msg) -> void {
     std::println(stderr, "ak-testdev[{}]: {}", device_of(ctx).slot(), msg);
 }
@@ -315,7 +329,10 @@ auto setup_device(vfu_ctx_t* ctx) -> void {
           "setup BAR2");
     check(vfu_setup_device_nr_irqs(ctx, VFU_DEV_MSIX_IRQ, msix_vectors), "setup MSI-X irqs");
     check(vfu_setup_device_reset_cb(ctx, reset_cb), "setup reset callback");
-    check(vfu_setup_device_dma(ctx, dma_max_regions, nullptr, nullptr), "setup DMA");
+    // vfu_sgl_get needs the unregister callback; there is no per-region
+    // state here to set up or tear down.
+    check(vfu_setup_device_dma(ctx, dma_max_regions, dma_register_cb, dma_unregister_cb),
+          "setup DMA");
     check(vfu_realize_ctx(ctx), "vfu_realize_ctx");
 }
 

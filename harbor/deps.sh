@@ -7,12 +7,14 @@
 #
 #   qemu   build QEMU ${QEMU_PIN_VERSION} (x86_64-softmmu, vfio-user client)
 #   image  download the Ubuntu 24.04 cloud image, verified against SHA256SUMS
-#   all    both (default)
+#   ch     download Cloud Hypervisor ${CH_PIN_VERSION} (static, pinned SHA-256)
+#          for L1 to run L2 guests with (phase 2 on)
+#   all    all three (default)
 #
 # A checksum mismatch is always fatal: a wrong binary or image is never
 # something to warn about and continue from.
 #
-# Usage: harbor/deps.sh [qemu|image|all]
+# Usage: harbor/deps.sh [qemu|image|ch|all]
 
 set -euo pipefail
 # shellcheck source=harbor/lib.sh
@@ -70,9 +72,29 @@ fetch_image() {
     log "verified ${L1_IMAGE_NAME}"
 }
 
+fetch_ch() {
+    mkdir -p "${CH_DIR}"
+    local name sum dest
+    for pair in "cloud-hypervisor-static:${CH_BIN_SHA256}:cloud-hypervisor" \
+                "ch-remote-static:${CH_REMOTE_SHA256}:ch-remote"; do
+        IFS=: read -r name sum dest <<<"${pair}"
+        if [[ ! -f "${CH_DIR}/${dest}" ]] ||
+            ! echo "${sum}  ${CH_DIR}/${dest}" | sha256sum -c - >/dev/null 2>&1; then
+            log "downloading ${name} ${CH_PIN_VERSION}"
+            curl --retry 3 -sSfL -o "${CH_DIR}/${dest}.part" "${CH_URL_BASE}/${name}"
+            mv "${CH_DIR}/${dest}.part" "${CH_DIR}/${dest}"
+        fi
+        echo "${sum}  ${CH_DIR}/${dest}" | sha256sum -c - >/dev/null ||
+            die "${name} does not match its pinned SHA-256; delete ${CH_DIR} and re-run"
+        chmod 0755 "${CH_DIR}/${dest}"
+    done
+    log "verified Cloud Hypervisor ${CH_PIN_VERSION} in ${CH_DIR}"
+}
+
 case "${what}" in
     qemu) fetch_qemu ;;
     image) fetch_image ;;
-    all) fetch_qemu; fetch_image ;;
-    *) die "usage: harbor/deps.sh [qemu|image|all]" ;;
+    ch) fetch_ch ;;
+    all) fetch_qemu; fetch_image; fetch_ch ;;
+    *) die "usage: harbor/deps.sh [qemu|image|ch|all]" ;;
 esac

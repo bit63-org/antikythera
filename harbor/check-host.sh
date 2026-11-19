@@ -98,6 +98,19 @@ else
     bad "ak-testdev not built: vcpkg install --x-feature=vfio-user, then build into ${AK_BUILD_DIR}"
 fi
 
+# Phase 2 on: L1 runs L2 guests with Cloud Hypervisor and the guest test
+# program. Phase 1 does not need them, so these only warn.
+if [[ -x "${CH_DIR}/cloud-hypervisor" && -x "${CH_DIR}/ch-remote" ]]; then
+    ok "Cloud Hypervisor ${CH_PIN_VERSION} (${CH_DIR})"
+else
+    warn "Cloud Hypervisor not downloaded; phase 2 needs it (run harbor/deps.sh ch)"
+fi
+if [[ -x "$(guest_testdev_bin)" ]]; then
+    ok "ak-guest-testdev built ($(guest_testdev_bin))"
+else
+    warn "ak-guest-testdev not built; phase 2 needs it (build into ${AK_BUILD_DIR})"
+fi
+
 mem_kib="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
 mem_gib=$((mem_kib / 1024 / 1024))
 cores="$(nproc)"

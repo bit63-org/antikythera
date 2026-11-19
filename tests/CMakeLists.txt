@@ -50,6 +50,7 @@ ak_add_test(virtio_blk_function_test SOURCES virtio_blk_function_test.cpp LIBS a
 ak_add_test(file_backend_test        SOURCES file_backend_test.cpp        LIBS ak::oar_blk)
 ak_add_test(net_role_test            SOURCES net_role_test.cpp            LIBS ak::oar_net_role ak::hull)
 ak_add_test(blk_role_test            SOURCES blk_role_test.cpp            LIBS ak::oar_blk_role)
+ak_add_test(image_manifest_test      SOURCES image_manifest_test.cpp      LIBS ak::oar_blk_image)
 ak_add_test(mailbox_test      SOURCES mailbox_test.cpp      LIBS ak::helm)
 ak_add_test(device_pool_test  SOURCES device_pool_test.cpp  LIBS ak::helm)
 ak_add_test(audit_log_test    SOURCES audit_log_test.cpp    LIBS ak::helm)

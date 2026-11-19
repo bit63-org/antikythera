@@ -150,8 +150,10 @@ The manifest is little-endian, decoded with `ak::wire` as untrusted input
 | 40 | 16 | image key ID (zero unless encrypted) |
 | 56 | 32 × count | SHA-256 of each chunk as stored; all zero bytes = a hole |
 
-The last chunk may be short. A hole is a chunk of zeros that is never
-fetched or cached, so sparse images stay cheap. The manifest is exactly
+The last chunk may be short. A hole is a chunk of plaintext zeros that
+is never stored, fetched or cached, so sparse images stay cheap; in an
+encrypted image too, which reveals which chunks are empty as a sparse
+file would. The manifest is exactly
 56 + 32 × count bytes; anything else is refused. For encrypted images the
 XTS data unit is the logical block and the tweak its block number, as
 for volumes, so the image is a valid ciphertext volume image under K_img.

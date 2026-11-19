@@ -164,6 +164,15 @@ target_link_libraries(ak_oar_net_role
   PUBLIC ak::oar_net ak::helm ak::proto
   PRIVATE ak::warnings ak::hardening)
 
+# oar-blk image volumes: a read-only base image in object storage under an
+# ephemeral overlay (.kiro/specs/oar-blk-data-plane/ Requirement 8).
+add_library(ak_oar_blk_image
+  oar/blk/image_manifest.cpp)
+add_library(ak::oar_blk_image ALIAS ak_oar_blk_image)
+target_link_libraries(ak_oar_blk_image
+  PUBLIC ak::oar_blk
+  PRIVATE ak::warnings ak::hardening)
+
 # The storage role as helm drives it over the sideband: volume files and
 # one virtio-blk function per transport (oar-blk task 6). Kept apart from
 # ak_oar_blk so the data path does not depend on helm's library.

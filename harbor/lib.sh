@@ -26,6 +26,15 @@ L1_IMAGE_URL_BASE="https://cloud-images.ubuntu.com/releases/noble/release"
 L1_IMAGE_NAME="ubuntu-24.04-server-cloudimg-amd64.img"
 L1_IMAGE="${PREFIX}/images/${L1_IMAGE_NAME}"
 
+# Cloud Hypervisor for L1 (phase 2 on): the upstream static release
+# binaries, checked against the SHA-256 digests GitHub publishes for the
+# release assets.
+CH_PIN_VERSION="v54.0"
+CH_URL_BASE="https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_PIN_VERSION}"
+CH_BIN_SHA256="4f4f98a3d661a40f3e5272627cc895a1b2e525f2f6bedf5f895f9cd21ba5c65b"  # cloud-hypervisor-static
+CH_REMOTE_SHA256="acd5be240d5c73373effbe818908fc03e313ec8486237904bff11d93b71b1c83"  # ch-remote-static
+CH_DIR="${PREFIX}/cloud-hypervisor-${CH_PIN_VERSION}"
+
 # vfio-user test device identity (src/oar/testdev/main.cpp).
 TESTDEV_VENDOR="1de5"
 TESTDEV_DEVICE="a001"
@@ -54,3 +63,4 @@ qemu_img_bin() {
 }
 
 testdev_bin() { printf '%s\n' "${AK_BUILD_DIR}/src/ak-testdev"; }
+guest_testdev_bin() { printf '%s\n' "${AK_BUILD_DIR}/src/ak-guest-testdev"; }

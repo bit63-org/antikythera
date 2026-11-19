@@ -125,6 +125,20 @@ dependencies. `harbor/check-host.sh` checks them all.
 - **OpenSSH client** to reach L1 during phases 1 to 5 (the strict hull
   image of phase 6 has no network stack).
 
+### Cloud Hypervisor (phase 2 on)
+- **Version**: **v54.0**, the upstream static release binaries
+  `cloud-hypervisor-static` (SHA-256
+  `4f4f98a3d661a40f3e5272627cc895a1b2e525f2f6bedf5f895f9cd21ba5c65b`) and
+  `ch-remote-static` (SHA-256
+  `acd5be240d5c73373effbe818908fc03e313ec8486237904bff11d93b71b1c83`), the
+  digests GitHub publishes for the release assets. `harbor/deps.sh ch`
+  downloads and verifies them into `harbor/.prefix/`; `phase2.sh` copies
+  them into L1, which runs the L2 guests with them. Static, so they need
+  nothing from L1's userspace.
+- **In L1**: the cloud-init seed installs `busybox-static`, `cpio` and
+  `zstd`, which `harbor/l1/l2-image.sh` uses to build the L2 initramfs
+  from L1's own kernel and modules.
+
 ### hull kernel source
 - **Status**: needed only to resolve or build the hull kernel
   (`harbor/kernel/build.sh`); not a build dependency of the C++ tree.

@@ -26,7 +26,11 @@ constexpr std::uint32_t msix_table_offset = 0;
 constexpr std::uint32_t msix_pba_offset = 0x800;
 constexpr unsigned msix_offset_shift = 3;         // table/PBA offsets are in 8-byte units
 constexpr unsigned msix_table_size_mask = 0x7FF;  // 11-bit field
-constexpr std::size_t dma_max_regions = 64;
+// Behind L1's vIOMMU the client registers one region per IOMMU mapping (an
+// L2 guest's RAM arrives as hundreds of 2 MiB regions), so 64 is far too
+// few; harbor phase 2 hit the limit with ak-testdev. The cap only guards
+// against a runaway client.
+constexpr std::size_t dma_max_regions = 65536;
 constexpr std::uint8_t pcie_cap_version = 2;
 // QEMU's choice for its own modern virtio devices; the spec asks for 0x40
 // or higher on non-transitional devices (virtio spec 4.1.2.1).

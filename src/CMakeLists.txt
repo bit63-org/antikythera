@@ -102,6 +102,23 @@ target_link_libraries(ak-test-controller
   PRIVATE ak::harbor_controller ak::warnings ak::hardening)
 install(TARGETS ak-test-controller RUNTIME DESTINATION bin)
 
+# harbor phase 2's guest program: drives an ak-testdev function through
+# vfio from inside the L2 guest. Linked statically (as a static PIE, so the
+# hardening flags still apply) because the L2 guest is a bare initramfs
+# with no shared libraries.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(ak-guest-testdev harbor/guest_testdev.cpp)
+  target_link_libraries(ak-guest-testdev PRIVATE ak::warnings ak::hardening)
+  # -static-pie goes in the link libraries, not target_link_options, so it
+  # comes after ak::hardening's -pie on the command line and wins. The
+  # sanitizer runtimes cannot be linked statically, so sanitizer builds
+  # (CI only compiles it there) stay dynamic.
+  if(NOT AK_SANITIZE)
+    target_link_libraries(ak-guest-testdev PRIVATE -static-pie)
+  endif()
+  install(TARGETS ak-guest-testdev RUNTIME DESTINATION bin)
+endif()
+
 # oar-blk: AES-256-XTS volume encryption, the locked key slot, the
 # virtio-blk request parser and the virtio-blk function on the shared
 # virtio core (storage data plane).

@@ -1,6 +1,6 @@
 # Implementation Plan — oar-net: the network data plane
 
-## Status: 6/11 tasks complete
+## Status: 7/11 tasks complete
 
 ## Tasks
 
@@ -35,7 +35,18 @@
   feature negotiation and the status machine). Fuzz: `fuzz_virtqueue`,
   `fuzz_virtio_pci`. Packed rings, the notify/ISR/device-config BAR
   handling and the transport binding come with VirtioNetFunction (task 6).
-- [ ] 6. VirtioNetFunction on vfio-user. _Requirements: 1_
+- [x] 6. VirtioNetFunction on vfio-user. _Requirements: 1_ —
+  `virtio::PciFunction` (`src/oar/virtio/function.*`) is the transport seam
+  every device shares: one BAR (common, ISR, device config, notify), queues
+  built at DRIVER_OK, DEVICE_NEEDS_RESET on ring errors, FLR.
+  `VirtioNetFunction` (`src/oar/net/virtio_net.*`): VERSION_1, MAC, MTU,
+  STATUS, EVENT_IDX, INDIRECT_DESC, one RX/TX pair; read-only device
+  config; TX copied once, offload headers, bad lengths and spoofed source
+  MACs dropped and counted, frames tagged with the function's NIC ID.
+  `ak::oar::vfu::VirtioBinding` serves a `PciFunction` over vfio-user and
+  `ak-oar-net` runs one NIC with an optional TAP backend until the VSwitch
+  (task 8). Fuzz: `fuzz_virtio_net`. Not yet: packed rings, the
+  `pci-epf` binding, a harbor run of `ak-oar-net` on tikhov.
 - [x] 7. MappingTable with atomic snapshots and `map_update` handling
   (`src/oar/net/mapping_table.*`), tests, fuzz target. Takes a decoded
   `MapUpdate`; the wire codec and signature check are controller task 2.

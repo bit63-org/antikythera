@@ -126,17 +126,17 @@ Requirement 7 and oar-net Requirement 10; the decision and its reasoning
 are in `docs/vpc-gap-analysis.md` ("Broadcast and multicast").
 
 ```
-GroupPolicy {                 // controller -> helm -> oar-net, signed
-  magic 'AKGP' u32, version u16 (1), reserved u16,
-  server_id u64, key_id u16, reserved u16, vni u32,
-  policy_version u64,         // per VNI, strictly increasing
-  mode u8 (0 drop, 1 multicast), reserved [3],
-  rate_frames u32, burst_frames u32,
-  rate_bytes u64, burst_bytes u64,
-  max_remote_vteps u32, max_groups_per_nic u16, reserved u16,
-  signature [64]              // Ed25519 over everything above
-}
-```
+GroupPolicy {                 // controller -> helm -> oar-net, signed;
+                              // src/proto/group_policy.hpp, 0x80 bytes LE
+  0x00 magic 'AKGP' u32, 0x04 version u16 (1), 0x06 key_id u16,
+  0x08 server_id u64, 0x10 vni u32,
+  0x14 mode u8 (0 drop, 1 multicast), 0x15 reserved [3],
+  0x18 policy_version u64,    // per VNI, starts at 1, strictly increasing
+  0x20 rate_frames u32, 0x24 burst_frames u32,
+  0x28 rate_bytes u64, 0x30 burst_bytes u64,
+  0x38 max_remote_vteps u32, 0x3C max_groups_per_nic u16, 0x3E reserved u16,
+  0x40 signature [64]         // Ed25519 over bytes 0x00-0x3F
+}```
 
 Like MapUpdate it is a full per-VNI snapshot carrying its own server and
 key IDs inside the signed bytes, so applying it is idempotent and a server
@@ -148,10 +148,12 @@ carries one entry per subnet. Phase 2 adds a `GroupMembers` frame (VNI,
 version, per-group VTEP lists) built from snooped joins.
 
 The `group_usage` report body is `count u16 | rsvd [6]` then `count`
-entries of 96 bytes, in strictly increasing `(nic_id, attachment)` order:
+(at most 1024) entries of 96 bytes, in strictly increasing `(slot, nic_id,
+attachment)` order. `slot` names the network role that holds the meter,
+because NIC IDs are unique only per role:
 
 ```
-nic_id u64 | vni u32 | flags u8 (bit 0: detached, final) | rsvd [3]
+nic_id u64 | vni u32 | flags u8 (bit 0: detached, final) | slot u8 | rsvd u16
 attachment u64          // per oar-net run; with boot_id and slot, unique
 frames u64 | bytes u64
 replicas_remote u64 | replica_bytes_remote u64   // billable

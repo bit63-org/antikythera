@@ -80,6 +80,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # nproc sees all 48 host CPUs inside a 4-CPU ARC runner pod; size
+      # every parallel step from the cgroup quota instead.
+      - name: CPU budget
+        run: |
+          jobs="$(.github/scripts/cpu-jobs.sh)"
+          echo "AK_JOBS=${jobs}" >> "$GITHUB_ENV"
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=${jobs}" >> "$GITHUB_ENV"
+          echo "nproc=$(nproc), using ${jobs} jobs"
+
       - name: Install toolchain
         run: |
           sudo apt-get update -qq
@@ -129,7 +138,7 @@ jobs:
             ${{ matrix.cmake_flags }}
 
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel "$AK_JOBS"
 
       - name: Test
         run: ctest --test-dir build --output-on-failure --parallel 4
@@ -156,6 +165,15 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+
+      # nproc sees all 48 host CPUs inside a 4-CPU ARC runner pod; size
+      # every parallel step from the cgroup quota instead.
+      - name: CPU budget
+        run: |
+          jobs="$(.github/scripts/cpu-jobs.sh)"
+          echo "AK_JOBS=${jobs}" >> "$GITHUB_ENV"
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=${jobs}" >> "$GITHUB_ENV"
+          echo "nproc=$(nproc), using ${jobs} jobs"
 
       - name: Install tools
         run: |
@@ -186,7 +204,7 @@ jobs:
             -DAK_VFIO_USER=OFF
           # Only translation units in compile_commands.json: files behind a
           # disabled option (the vfio-user servers) have no compile command.
-          run-clang-tidy-19 -p build-tidy -clang-tidy-binary clang-tidy-19 \
+          run-clang-tidy-19 -p build-tidy -clang-tidy-binary clang-tidy-19 -j "$AK_JOBS" \
             -quiet "$PWD/(src|tests|fuzz)/"
 
   kernel-config:
@@ -195,6 +213,15 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+
+      # nproc sees all 48 host CPUs inside a 4-CPU ARC runner pod; size
+      # every parallel step from the cgroup quota instead.
+      - name: CPU budget
+        run: |
+          jobs="$(.github/scripts/cpu-jobs.sh)"
+          echo "AK_JOBS=${jobs}" >> "$GITHUB_ENV"
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=${jobs}" >> "$GITHUB_ENV"
+          echo "nproc=$(nproc), using ${jobs} jobs"
 
       # Ubuntu's linux-source package: signed by the archive, and the same
       # tree a cloud thread can install, so local and CI results match.
@@ -208,7 +235,7 @@ jobs:
             -C "$RUNNER_TEMP/linux" --strip-components=1
 
       - name: hull (strict), resolve and build
-        run: harbor/kernel/build.sh --src "$RUNNER_TEMP/linux" --variant hull --build
+        run: harbor/kernel/build.sh --src "$RUNNER_TEMP/linux" --variant hull --build -j "$AK_JOBS"
 
       - name: l1-debug
         run: harbor/kernel/build.sh --src "$RUNNER_TEMP/linux" --variant l1-debug

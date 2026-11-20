@@ -41,6 +41,8 @@ ak_add_test(vswitch_test      SOURCES vswitch_test.cpp      LIBS ak::oar_net)
 ak_add_test(oam_test          SOURCES oam_test.cpp          LIBS ak::oar_net)
 ak_add_test(vtep_test         SOURCES vtep_test.cpp         LIBS ak::oar_net)
 ak_add_test(mtu_test          SOURCES mtu_test.cpp          LIBS ak::oar_net)
+ak_add_test(wireguard_test    SOURCES wireguard_test.cpp    LIBS ak::oar_net)
+ak_add_test(tunnel_test       SOURCES tunnel_test.cpp       LIBS ak::oar_net)
 ak_add_test(xts_cipher_test   SOURCES xts_cipher_test.cpp   LIBS ak::oar_blk)
 ak_add_test(key_slot_test     SOURCES key_slot_test.cpp     LIBS ak::oar_blk)
 ak_add_test(request_parser_test     SOURCES request_parser_test.cpp     LIBS ak::oar_blk)
@@ -87,6 +89,7 @@ ak_add_test(virtqueue_test    SOURCES virtqueue_test.cpp    LIBS ak::oar_virtio)
 ak_add_test(virtio_pci_test   SOURCES virtio_pci_test.cpp   LIBS ak::oar_virtio)
 ak_add_test(oar_protocol_test SOURCES oar_protocol_test.cpp LIBS ak::helm ak::proto)
 ak_add_test(oar_link_test     SOURCES oar_link_test.cpp     LIBS ak::helm)
+ak_add_test(tunnel_keys_test  SOURCES tunnel_keys_test.cpp  LIBS ak::helm ak::oar_net)
 ak_add_test(virtio_function_test SOURCES virtio_function_test.cpp LIBS ak::oar_virtio)
 ak_add_test(virtio_net_test   SOURCES virtio_net_test.cpp   LIBS ak::oar_net)
 
@@ -107,3 +110,11 @@ target_link_libraries(geneve_interop_peer PRIVATE ak::oar_net ak::warnings)
 add_test(NAME geneve_interop
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/geneve_interop.sh $<TARGET_FILE:geneve_interop_peer>)
 set_tests_properties(geneve_interop PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+# Kernel WireGuard interop (oar-net task 10): needs root, so it skips in an
+# ordinary ctest run; CI runs tests/wireguard_interop.sh under sudo.
+add_executable(wireguard_interop_peer wireguard_interop_peer.cpp)
+target_link_libraries(wireguard_interop_peer PRIVATE ak::oar_net ak::warnings)
+add_test(NAME wireguard_interop
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/wireguard_interop.sh $<TARGET_FILE:wireguard_interop_peer>)
+set_tests_properties(wireguard_interop PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)

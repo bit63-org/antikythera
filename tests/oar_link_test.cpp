@@ -474,6 +474,20 @@ BOOST_AUTO_TEST_CASE(roles_without_a_volume_store_answer_unsupported) {
     send_raw_request(*helm_b, mctp::VendorType::delete_volume, body, 0);
     serve_request(endpoint, role);
     BOOST_TEST((read_raw_status(*helm_b) == oar::Status::unsupported));
+    // Nor does it hold tunnel keys (only the network role does).
+    std::array<std::byte, oar::set_tunnel_peer_size> peer{};
+    peer.fill(std::byte{1});
+    send_raw_request(*helm_b, mctp::VendorType::set_tunnel_peer, peer, 2);
+    serve_request(endpoint, role);
+    BOOST_TEST((read_raw_status(*helm_b) == oar::Status::unsupported));
+    send_raw_request(*helm_b, mctp::VendorType::set_tunnel_key,
+                     std::span{peer}.first(oar::set_tunnel_key_size), 3);
+    serve_request(endpoint, role);
+    BOOST_TEST((read_raw_status(*helm_b) == oar::Status::unsupported));
+    send_raw_request(*helm_b, mctp::VendorType::remove_tunnel_peer,
+                     std::span{peer}.first(oar::remove_tunnel_peer_size), 4);
+    serve_request(endpoint, role);
+    BOOST_TEST((read_raw_status(*helm_b) == oar::Status::unsupported));
 
     // A malformed volume body never reaches the handler.
     FakeOar fake;

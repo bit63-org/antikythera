@@ -67,6 +67,22 @@ come from the same signed frame.
 Harbor and first release: WireGuard. Each VTEP's WireGuard peers are the
 other VTEPs in shared VNIs. Keys come from helm. Geneve UDP rides inside.
 
+The protocol runs inside oar-net (`src/oar/net/wireguard.*` messages and
+primitives over OpenSSL, `src/oar/net/tunnel.*` the state machine), not
+through a kernel `wg` device: the role needs no CAP_NET_ADMIN, keeps its
+keys in its own memory, and a forged packet is dropped before the Geneve
+decoder sees it (Requirement 5.3). `Tunnel` is a `DatagramSender` between
+the Vtep and the `UdpEndpoint`; `Tunnel::receive` returns only payloads
+that authenticated, tagged with the configured address of the peer they
+authenticated as, and that address (not the outer source) is what the
+Vtep and the VSwitch's ingress policy check. A transport message carries
+the Geneve UDP payload itself, unpadded; the handshake is WireGuard's and
+interoperates with Linux (`tests/wireguard_interop.sh`). Overhead on top
+of Geneve: 32 bytes (`wg::transport_overhead`). Keys arrive over the
+sideband: `set_tunnel_key` (the role's static private key) and
+`set_tunnel_peer` / `remove_tunnel_peer` (per peer VTEP: public key and
+pre-shared key).
+
 ## Data models
 
 - `NicBinding { vni, mac, owner_vtep }` (written).

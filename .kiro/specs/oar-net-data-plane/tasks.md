@@ -105,8 +105,37 @@
   helm has no channel yet to hand oar-net its map_updates and NIC
   attachments; that wiring comes with the harbor multi-server tests
   (task 11). Peer state changes are not yet carried to helm.
-- [ ] 10. WireGuard tunnel integration and key delivery from helm.
-  _Requirements: 5_
+- [x] 10. WireGuard tunnel integration and key delivery from helm.
+  _Requirements: 5_ — `Tunnel` (`src/oar/net/tunnel.*`) runs WireGuard
+  (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s) between the Vtep and the
+  `UdpEndpoint`, as a `DatagramSender` the Vtep sends through unchanged;
+  `pump(endpoint, tunnel, vtep, vswitch, ...)` authenticates every
+  datagram before Geneve decode. Messages, a strict parser, the primitives
+  (BLAKE2s, keyed BLAKE2s, HKDF, X25519, ChaCha20-Poly1305, TAI64N, all
+  OpenSSL 3.0) and the RFC 6479 replay window: `src/oar/net/wireguard.*`.
+  The Tunnel follows Linux's handshake, session rotation (current /
+  previous / unconfirmed next), rekey and reject timers, with endpoints
+  fixed by helm (no roaming), mac1 checked before any DH, initiation
+  replay and flood limits, and drops counted per reason. Simplifications
+  that do not change the wire: no packet queue (a send with no session
+  starts a handshake and is dropped; the Vtep's keepalives bring sessions
+  up), no cookie replies (mac2 sent as zero; a received cookie reply is
+  dropped), no passive keepalives. Transport payloads are Geneve, not IP,
+  so they are not padded. Key delivery: sideband `set_tunnel_key`,
+  `set_tunnel_peer` (VTEP, public key, PSK) and `remove_tunnel_peer`
+  (vendor types 0x0B-0x0D; `OarLink` methods wipe every buffer, the
+  `OarHandler` defaults answer unsupported). Tests: `wireguard_test`
+  (parser, RFC 7748/7693 vectors, AEAD, replay window), `tunnel_test`
+  (handshake both ways and crossed, PSK, forgeries, replays, timers, key
+  changes, two Vteps end to end over the Tunnel, UDP pump),
+  `tunnel_keys_test` (OarLink delivering keys to two roles that then talk),
+  `fuzz_wireguard`, and the kernel interop test
+  (`tests/wireguard_interop.sh`, CI under sudo: kernel-initiated and
+  Tunnel-initiated handshakes, data both ways). Not yet: nothing in helm
+  produces the keys (the controller has no message carrying VTEP public
+  keys, and helm does not generate the role's key pair); `ak-oar-net` is
+  not wired to the Tunnel (with the VSwitch and Vtep, task 11); cookie
+  replies under load; IPsec ESP (Requirement 5.1's alternative).
 - [ ] 11. MTU computation and advertisement; harbor multi-server tests.
   _Requirements: 6, 9.3_ — Done: `plan_mtu()` (`src/oar/net/mtu.*`)
   turns the underlay MTU and the tunnel's overhead into the guest MTU and

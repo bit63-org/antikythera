@@ -112,6 +112,13 @@ public:
     auto create_volume(const oar::CreateVolume& request) -> std::expected<void, LinkError>;
     auto delete_volume(const oar::DeleteVolume& request) -> std::expected<void, LinkError>;
     auto rewrap_volume(const oar::RewrapVolume& request) -> std::expected<void, LinkError>;
+    // The network role's WireGuard keys (oar-net Requirement 5.2). Every
+    // buffer that held a key is wiped once sent, success or not; the
+    // caller wipes its own copies.
+    auto set_tunnel_key(std::span<const std::byte, oar::tunnel_key_size> private_key)
+        -> std::expected<void, LinkError>;
+    auto set_tunnel_peer(const oar::SetTunnelPeer& request) -> std::expected<void, LinkError>;
+    auto remove_tunnel_peer(const oar::RemoveTunnelPeer& request) -> std::expected<void, LinkError>;
     // Sends one controller MapUpdate frame, in chunks. Fails without sending
     // if the frame is empty or larger than oar::max_map_frame. A failure part
     // way leaves the role's partial frame to be discarded by the next
@@ -168,6 +175,18 @@ public:
         return oar::Status::unsupported;
     }
     virtual auto rewrap_volume(const oar::RewrapVolume& /*request*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    // The WireGuard keys, which only the network role holds; every other
+    // role answers unsupported. The key spans are valid only during the
+    // call: copy them.
+    virtual auto set_tunnel_key(const oar::SetTunnelKey& /*request*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    virtual auto set_tunnel_peer(const oar::SetTunnelPeer& /*request*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    virtual auto remove_tunnel_peer(const oar::RemoveTunnelPeer& /*request*/) -> oar::Status {
         return oar::Status::unsupported;
     }
 };

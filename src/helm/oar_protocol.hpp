@@ -32,6 +32,18 @@
 //   delete_volume       0  volume_id u64
 //   rewrap_volume       0  volume_id u64 | 8  owner_vm u64 | 16 key_len u16
 //                       18 reserved u16 | 20 reserved u32 | 24 wrapped_key [key_len]
+//   set_tunnel_key      0  private_key [32]
+//   set_tunnel_peer     0  vtep [16] | 16 public_key [32] | 48 psk [32]
+//   remove_tunnel_peer  0  vtep [16]
+//
+// The tunnel requests deliver the network role's WireGuard keys (oar-net
+// Requirement 5.2): its own static X25519 private key, and for each peer
+// VTEP that peer's public key and the pre-shared key for the pair (all
+// zero for none, as in WireGuard). set_tunnel_peer adds the peer or
+// replaces its keys. Private and public keys and VTEP addresses are never
+// all zero. Only the network role implements them. The bodies carry
+// secrets, so both ends wipe every buffer that held one, as for
+// deliver_key.
 //
 // The volume requests are the storage role's half of CREATE_VOLUME,
 // DELETE_VOLUME and REWRAP_VOLUME (oar-blk Requirement 3): the role keeps
@@ -108,6 +120,10 @@ inline constexpr std::size_t map_chunk_head_size = 8;
 inline constexpr std::size_t create_volume_head_size = 32;
 inline constexpr std::size_t delete_volume_size = 8;
 inline constexpr std::size_t rewrap_volume_head_size = 24;
+inline constexpr std::size_t tunnel_key_size = 32;  // X25519 keys and the WireGuard PSK
+inline constexpr std::size_t set_tunnel_key_size = tunnel_key_size;
+inline constexpr std::size_t set_tunnel_peer_size = vtep_size + (2 * tunnel_key_size);
+inline constexpr std::size_t remove_tunnel_peer_size = vtep_size;
 // Room for a later wrapped-key format; helm's format 1 is 95 bytes. Equal
 // to oar-blk's max_wrapped_key_size (the field in its volume header).
 inline constexpr std::size_t max_wrapped_volume_key = 256;
@@ -178,6 +194,7 @@ enum class BodyError : std::uint8_t {
     status_with_body,   // a non-ok response carries bytes after its head
     bad_geometry,       // block size not 512/4096, or capacity zero, ragged or too large
     bad_key_length,     // wrapped key empty, too long, or not the length the body says
+    zero_key,           // a tunnel private or public key is all zero
 };
 
 [[nodiscard]] auto to_string(BodyError e) noexcept -> const char*;
@@ -256,6 +273,25 @@ struct RewrapVolume {
     std::span<const std::byte> wrapped_key;
 };
 
+// The network role's WireGuard keys. The key spans view into the caller's
+// buffers when encoding, into the message when decoding; the receiver
+// copies them during the call (OarEndpoint wipes the message after).
+struct SetTunnelKey {
+    std::span<const std::byte, tunnel_key_size> private_key;
+};
+
+struct SetTunnelPeer {
+    Vtep vtep{};
+    std::span<const std::byte, tunnel_key_size> public_key;
+    std::span<const std::byte, tunnel_key_size> psk;
+};
+
+struct RemoveTunnelPeer {
+    Vtep vtep{};
+
+    friend auto operator==(const RemoveTunnelPeer&, const RemoveTunnelPeer&) -> bool = default;
+};
+
 // One chunk of a MapUpdate frame. `chunk` views into the message.
 struct MapChunk {
     std::uint32_t total{0};
@@ -303,6 +339,22 @@ struct MapChunk {
     -> std::expected<std::vector<std::byte>, BodyError>;
 [[nodiscard]] auto decode_rewrap_volume(std::span<const std::byte> body) noexcept
     -> std::expected<RewrapVolume, BodyError>;
+
+// The returned buffers of the first two hold keys: the caller wipes them.
+[[nodiscard]] auto encode_set_tunnel_key(const SetTunnelKey& k)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_set_tunnel_key(std::span<const std::byte> body) noexcept
+    -> std::expected<SetTunnelKey, BodyError>;
+
+[[nodiscard]] auto encode_set_tunnel_peer(const SetTunnelPeer& p)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_set_tunnel_peer(std::span<const std::byte> body) noexcept
+    -> std::expected<SetTunnelPeer, BodyError>;
+
+[[nodiscard]] auto encode_remove_tunnel_peer(const RemoveTunnelPeer& r)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_remove_tunnel_peer(std::span<const std::byte> body) noexcept
+    -> std::expected<RemoveTunnelPeer, BodyError>;
 
 // function_inventory and health requests have empty bodies.
 [[nodiscard]] auto decode_empty(std::span<const std::byte> body) noexcept

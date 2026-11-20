@@ -58,6 +58,15 @@ auto decoders(std::span<const std::byte> body) -> void {
     if (auto r = oar::decode_rewrap_volume(body)) {
         same(body, oar::encode_rewrap_volume(*r));
     }
+    if (auto k = oar::decode_set_tunnel_key(body)) {
+        same(body, oar::encode_set_tunnel_key(*k));
+    }
+    if (auto p = oar::decode_set_tunnel_peer(body)) {
+        same(body, oar::encode_set_tunnel_peer(*p));
+    }
+    if (auto r = oar::decode_remove_tunnel_peer(body)) {
+        same(body, oar::encode_remove_tunnel_peer(*r));
+    }
     if (auto m = oar::decode_map_chunk(body)) {
         same(body, oar::encode_map_chunk(*m));
     }

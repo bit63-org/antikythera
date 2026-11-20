@@ -185,6 +185,32 @@ auto OarLink::rewrap_volume(const oar::RewrapVolume& request) -> std::expected<v
     return expect_empty(transact(mctp::VendorType::rewrap_volume, *body));
 }
 
+auto OarLink::set_tunnel_key(std::span<const std::byte, oar::tunnel_key_size> private_key)
+    -> std::expected<void, LinkError> {
+    auto body = oar::encode_set_tunnel_key({.private_key = private_key});
+    if (!body) {
+        return std::unexpected(bad_request());
+    }
+    return expect_empty(transact(mctp::VendorType::set_tunnel_key, *body, true));
+}
+
+auto OarLink::set_tunnel_peer(const oar::SetTunnelPeer& request) -> std::expected<void, LinkError> {
+    auto body = oar::encode_set_tunnel_peer(request);
+    if (!body) {
+        return std::unexpected(bad_request());
+    }
+    return expect_empty(transact(mctp::VendorType::set_tunnel_peer, *body, true));
+}
+
+auto OarLink::remove_tunnel_peer(const oar::RemoveTunnelPeer& request)
+    -> std::expected<void, LinkError> {
+    auto body = oar::encode_remove_tunnel_peer(request);
+    if (!body) {
+        return std::unexpected(bad_request());
+    }
+    return expect_empty(transact(mctp::VendorType::remove_tunnel_peer, *body));
+}
+
 auto OarLink::map_update(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
     if (frame.empty() || frame.size() > oar::max_map_frame) {
         return std::unexpected(bad_request());
@@ -431,6 +457,18 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
         case mctp::VendorType::rewrap_volume: {
             auto req = oar::decode_rewrap_volume(body);
             return status_only(req ? handler.rewrap_volume(*req) : oar::Status::bad_request);
+        }
+        case mctp::VendorType::set_tunnel_key: {
+            auto req = oar::decode_set_tunnel_key(body);
+            return status_only(req ? handler.set_tunnel_key(*req) : oar::Status::bad_request);
+        }
+        case mctp::VendorType::set_tunnel_peer: {
+            auto req = oar::decode_set_tunnel_peer(body);
+            return status_only(req ? handler.set_tunnel_peer(*req) : oar::Status::bad_request);
+        }
+        case mctp::VendorType::remove_tunnel_peer: {
+            auto req = oar::decode_remove_tunnel_peer(body);
+            return status_only(req ? handler.remove_tunnel_peer(*req) : oar::Status::bad_request);
         }
         case mctp::VendorType::map_update:
             return status_only(map_chunk(handler, body));

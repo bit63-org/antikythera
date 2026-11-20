@@ -246,6 +246,9 @@ enum class VendorType : std::uint8_t {
     create_volume = 0x08,
     delete_volume = 0x09,
     rewrap_volume = 0x0A,
+    set_tunnel_key = 0x0B,
+    set_tunnel_peer = 0x0C,
+    remove_tunnel_peer = 0x0D,
 };
 
 struct VendorHeader {

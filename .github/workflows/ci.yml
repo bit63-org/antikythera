@@ -73,7 +73,10 @@ jobs:
             cmake_flags: ""
           - compiler: clang-19
             cxx: clang++-19
-            packages: clang-19 libclang-rt-19-dev
+            # libstdc++-14-dev: clang uses the newest GCC's libstdc++ it
+            # finds, and the ARC runner image ships only GCC 13, whose
+            # libstdc++ has no <print>. Hosted images carry 14 already.
+            packages: clang-19 libclang-rt-19-dev libstdc++-14-dev
             cmake_flags: -DAK_SANITIZE=ON -DAK_FUZZ=ON
     steps:
       - uses: actions/checkout@v4
@@ -216,7 +219,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
-            clang-19 clang-tidy-19 cmake ninja-build libboost-test-dev libssl-dev shellcheck \
+            clang-19 clang-tidy-19 libstdc++-14-dev cmake ninja-build libboost-test-dev libssl-dev shellcheck \
             python3-venv
           # A venv, not pip --user: the ARC runner image's Python is
           # externally managed (PEP 668) and has no pip of its own.

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Clark Rawlins
+# SPDX-License-Identifier: Apache-2.0
+#
 # Print how many parallel jobs this runner should use.
 #
 # nproc reports every CPU the kernel lets us schedule on, which inside a

@@ -52,6 +52,7 @@ ak_add_test(net_role_test            SOURCES net_role_test.cpp            LIBS a
 ak_add_test(blk_role_test            SOURCES blk_role_test.cpp            LIBS ak::oar_blk_role)
 ak_add_test(image_manifest_test      SOURCES image_manifest_test.cpp      LIBS ak::oar_blk_image)
 ak_add_test(mailbox_test      SOURCES mailbox_test.cpp      LIBS ak::helm)
+ak_add_test(mailbox_device_test SOURCES mailbox_device_test.cpp LIBS ak::helm)
 ak_add_test(device_pool_test  SOURCES device_pool_test.cpp  LIBS ak::helm)
 ak_add_test(audit_log_test    SOURCES audit_log_test.cpp    LIBS ak::helm)
 ak_add_test(command_router_test SOURCES command_router_test.cpp LIBS ak::helm)
@@ -62,6 +63,8 @@ ak_add_test(mailbox_bodies_test SOURCES mailbox_bodies_test.cpp LIBS ak::helm)
 ak_add_test(mctp_test         SOURCES mctp_test.cpp         LIBS ak::helm)
 ak_add_test(signature_verifier_test SOURCES signature_verifier_test.cpp LIBS ak::hull)
 ak_add_test(command_auth_test       SOURCES command_auth_test.cpp       LIBS ak::hull)
+ak_add_test(mailbox_client_test     SOURCES mailbox_client_test.cpp     LIBS ak::hull)
+ak_add_test(vfio_mailbox_test       SOURCES vfio_mailbox_test.cpp       LIBS ak::hull)
 ak_add_test(cpu_topology_test       SOURCES cpu_topology_test.cpp       LIBS ak::hull)
 ak_add_test(resource_allocator_test SOURCES resource_allocator_test.cpp LIBS ak::hull)
 
@@ -129,3 +132,19 @@ set_tests_properties(wireguard_interop PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
 add_test(NAME ak_helm_check
          COMMAND $<TARGET_FILE:ak-helm> --check ${PROJECT_SOURCE_DIR}/harbor/helm.conf.example)
 set_tests_properties(ak_helm_check PROPERTIES TIMEOUT 30)
+
+# helm's mailbox function over vfio-user (helm task 8): the probe serves it
+# and harbor/mailbox_smoke.py drives it as a vfio-user client, no root or
+# QEMU needed. Only where libvfio-user is built (CI builds without it).
+if(AK_HAS_LIBVFIO_USER)
+  find_package(Python3 COMPONENTS Interpreter)
+  add_executable(mailbox_vfu_probe mailbox_vfu_probe.cpp)
+  target_link_libraries(mailbox_vfu_probe PRIVATE ak::helm_vfu ak::warnings)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME mailbox_vfu_smoke
+      COMMAND sh -c "sock=$(mktemp -u); \"$0\" \"$sock\" & probe=$!; if \"$1\" \"$2\" \"$sock\"; then wait $probe; else kill $probe; exit 1; fi"
+              $<TARGET_FILE:mailbox_vfu_probe> ${Python3_EXECUTABLE}
+              ${PROJECT_SOURCE_DIR}/harbor/mailbox_smoke.py)
+    set_tests_properties(mailbox_vfu_smoke PROPERTIES TIMEOUT 60)
+  endif()
+endif()

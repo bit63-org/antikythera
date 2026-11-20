@@ -179,4 +179,5 @@ no key. Booting an L2 guest from a volume is oar-blk task 7.
 | `phase2.sh` | phase 2 end to end |
 | `helm.conf.example` | sample `ak-helm` configuration (ctest parses it) |
 | `oar_net_smoke.py` | drives a running `ak-oar-net` over vfio-user without QEMU (see below) |
+| `mailbox_smoke.py` | drives helm's mailbox function (`tests/mailbox_vfu_probe`) over vfio-user; runs in ctest when libvfio-user is built |
 | `kernel/` | hull kernel fragments (strict `hull.config`, per-arch, `l1-debug.config`), resolver and checker; see [`kernel/README.md`](kernel/README.md) |

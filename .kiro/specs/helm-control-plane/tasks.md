@@ -1,6 +1,6 @@
 # Implementation Plan — helm: the control-plane role
 
-## Status: 10/12 tasks complete
+## Status: 11/12 tasks complete
 
 ## Tasks
 
@@ -27,7 +27,17 @@
   wrap/unwrap/rewrap/destroy (`src/helm/key_store.*`,
   `src/helm/secure_element.*`, `src/helm/scoped_key.*`), unit tests,
   wrapped-key fuzz target. _Requirements: 4_
-- [ ] 8. MailboxDevice as a vfio-user server (harbor). _Requirements: 1_
+- [x] 8. MailboxDevice as a vfio-user server (harbor). _Requirements: 1_
+  (`src/helm/mailbox_device.*`: the BAR0 register file, transport-free,
+  implementing `HostPort`. `post_command` writes the slot, bumps
+  `CMD_DOORBELL` and raises MSI-X vector 0 under one lock, and withdraws
+  the command if the interrupt cannot be raised; the host can write only
+  `RSP_SLOT`/`EVT_SLOT`, and a 32-bit doorbell write hands helm a copy of
+  that slot. `src/helm/mailbox_vfu_server.*` serves it over vfio-user
+  with one MSI-X vector, FLR and no DMA setup at all, so libvfio-user
+  ignores the client's DMA maps. `harbor/mailbox_smoke.py` drives it as a
+  vfio-user client in ctest where libvfio-user is built. Wiring it into
+  `ak-helm` in place of the detached host port waits for helm main.)
 - [x] 9. CommandRouter with compensation and timeouts. _Requirements: 3, 9_
   (`src/helm/command_router.*`: sequencing and retries, one command in
   the mailbox, creative steps before relay and destructive steps after

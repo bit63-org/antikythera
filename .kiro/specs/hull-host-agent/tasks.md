@@ -1,6 +1,6 @@
 # Implementation Plan — hull: the minimal host and its agent
 
-## Status: 5/11 tasks complete
+## Status: 6/11 tasks complete
 
 ## Tasks
 
@@ -20,8 +20,20 @@
   _Requirements: 5.2_
 - [ ] 3. Init binary: mounts, `vfio-pci` binding by allow-list, IOMMU group
   check. _Requirements: 3.1, 5.1, 5.2_
-- [ ] 4. MailboxClient over VFIO (BAR0 mmap, MSI-X eventfd, no DMA).
-  _Requirements: 3_
+- [x] 4. MailboxClient over VFIO (BAR0 mmap, MSI-X eventfd, no DMA).
+  _Requirements: 3_ — `src/hull/`: `MailboxClient` (doorbell check, one
+  copy of `CMD_SLOT` with 32-bit reads, `authenticate()`, body decode,
+  `CommandHandler`, exactly one response written in full before
+  `RSP_DOORBELL`; refusals answer `malformed`, `wrong_server`, `bad_signature`,
+  `stale_sequence` or `unsupported`, and only a slot naming no command
+  type goes unanswered; events through `send_event`). The doorbell
+  baseline is taken at `attach()`, so a command left in the slot from
+  before an agent restart is never re-run. `VfioMailbox` opens the group
+  in a type1 container with an empty IOMMU domain (no `MAP_DMA`), maps
+  BAR0 (pread/pwrite when it cannot be mapped), enables memory space and
+  bus mastering for the MSI-X write, and wires vector 0 to an eventfd.
+  Tested end to end against helm's `MailboxDevice`; fuzzed from slot
+  bytes. The real-VFIO path runs in harbor.
 - [x] 5. SignatureVerifier (OpenSSL Ed25519) and sequence tracking.
   _Requirements: 4_ — `src/hull/`: `SignatureVerifier`, `SequenceTracker`
   and `authenticate()` (decode, server ID, signature, sequence). The

@@ -1,9 +1,11 @@
 # Copyright (c) 2026 Clark Rawlins
 # SPDX-License-Identifier: Apache-2.0
 
-build/
-build-*/
-cmake-build-*/
+# Build trees, anchored to the repository root: an unanchored `build-*/`
+# also matched .kiro/specs/build-and-ci/ and kept that spec out of git.
+/build/
+/build-*/
+/cmake-build-*/
 vcpkg_installed/
 harbor/.prefix/
 harbor/.run/

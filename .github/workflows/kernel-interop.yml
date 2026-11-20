@@ -1,0 +1,85 @@
+# Copyright (c) 2026 Clark Rawlins
+# SPDX-License-Identifier: Apache-2.0
+#
+# Root-only tests that load host kernel modules (geneve, wireguard) and
+# place a jail in the root cgroup. An ARC runner pod has neither, so this
+# runs on a GitHub-hosted VM and rebuilds the GCC tree (about a minute)
+# instead of sharing ci.yml's self-hosted build.
+#
+# A workflow of its own, not a job in ci.yml: ci.yml's main-branch
+# concurrency group lets a run in progress finish, so while this job sat
+# in the saturated hosted queue every later main run of ci.yml waited
+# "pending" behind it. Not a required check. Superseded runs are
+# cancelled on main too, since only the newest result matters.
+
+name: kernel-interop
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-interop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_GENERATOR: Ninja
+
+jobs:
+  kernel-interop:
+    name: kernel-interop
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            g++-14 cmake ninja-build libboost-test-dev libssl-dev
+
+      - name: Build
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DAK_COMPILER_LAUNCHER=none \
+            -DAK_VFIO_USER=OFF
+          cmake --build build --parallel
+
+      # tests/geneve_interop.sh needs root for its network namespaces, so
+      # the ctest run above skips it; run it here under sudo. Azure kernels
+      # may ship geneve in linux-modules-extra.
+      - name: Kernel Geneve interop
+        run: |
+          sudo modprobe geneve || {
+            sudo apt-get install -y -qq --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe geneve
+          }
+          sudo tests/geneve_interop.sh build/tests/geneve_interop_peer
+
+      # tests/jail_test runs unprivileged in ctest above (mapping the
+      # runner's own IDs, or skipping where user namespaces are refused).
+      # Run it again as root for the production path: a reserved UID,
+      # setgroups, and the cgroup v2 placement case (AK_JAIL_TEST_CGROUP=1
+      # lets it enable cpuset and hugetlb at the runner's root cgroup, as
+      # hull's init will). The probe is copied
+      # out of the workspace because the jailed UID cannot enter $HOME.
+      - name: Jail as root
+        run: |
+          install -D -m 0755 build/tests/jail_probe /tmp/ak-jail-probe/jail_probe
+          sudo AK_JAIL_TEST_CGROUP=1 build/tests/jail_test --log_level=message -- /tmp/ak-jail-probe/jail_probe
+
+      # tests/wireguard_interop.sh also needs root: the Tunnel against
+      # a kernel wg device. The wireguard module ships in linux-modules.
+      - name: Kernel WireGuard interop
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends wireguard-tools
+          sudo modprobe wireguard
+          sudo tests/wireguard_interop.sh build/tests/wireguard_interop_peer

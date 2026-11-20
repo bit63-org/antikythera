@@ -96,7 +96,7 @@
   then the image volume path over S3; with `AK_S3_TEST_ENDPOINT` set it
   also seeds and reads an image on a real S3-compatible server (run
   against SeaweedFS's S3 gateway; any MinIO works the same way).
-- [ ] 12. `ak-image-pack`: raw image to manifest and data objects
+- [x] 12. `ak-image-pack`: raw image to manifest and data objects
   (optionally encrypted). _Requirements: 8.8_
 - [ ] 13. Image volumes through helm: CREATE_VOLUME image source,
   version-2 volume header, K_eph at attach, discard at detach.

@@ -52,6 +52,7 @@ ak_add_test(net_role_test            SOURCES net_role_test.cpp            LIBS a
 ak_add_test(blk_role_test            SOURCES blk_role_test.cpp            LIBS ak::oar_blk_role)
 ak_add_test(image_manifest_test      SOURCES image_manifest_test.cpp      LIBS ak::oar_blk_image)
 ak_add_test(image_volume_test        SOURCES image_volume_test.cpp        LIBS ak::oar_blk_image)
+ak_add_test(image_pack_test          SOURCES image_pack_test.cpp          LIBS ak::oar_blk_image)
 ak_add_test(sigv4_test               SOURCES sigv4_test.cpp               LIBS ak::oar_blk_s3)
 ak_add_test(http_response_test       SOURCES http_response_test.cpp       LIBS ak::oar_blk_s3)
 ak_add_test(s3_object_store_test     SOURCES s3_object_store_test.cpp     LIBS ak::oar_blk_s3)

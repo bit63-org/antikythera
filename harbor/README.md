@@ -20,10 +20,17 @@ harbor/check-host.sh
 Run:
 
 ```bash
-harbor/phase1.sh                       # 2 slots behind an emulated PCIe switch
-harbor/phase1.sh --topology rootports  # fallback: one root port per slot
-harbor/phase1.sh --keep                # leave L1 running to poke at it
+harbor/phase1.sh                    # 2 slots, one emulated root port each
+harbor/phase1.sh --topology switch  # slots behind an emulated PCIe switch (fails ACS, see below)
+harbor/phase1.sh --keep             # leave L1 running to poke at it
 ```
+
+**Topology.** The default gives each slot its own emulated root port.
+QEMU's emulated switch ports (`x3130-upstream`, `xio3130-downstream`) have
+no ACS capability. So with `--topology switch`, each device shares an
+IOMMU group with its downstream port, and the ACS and group checks fail.
+That is correct behaviour: it shows why the real backplane's switch must
+support ACS (`.kiro/specs/backplane-hardware/` Requirement 1.2).
 
 Phase 1 boots one L1 server with N `ak-testdev` board processes, then
 checks inside L1:

@@ -202,7 +202,11 @@ BOOST_AUTO_TEST_CASE(every_truncation_of_a_valid_packet_is_rejected,
         geneve::base_header_size + geneve::nic_pair_option_size + geneve::ethernet_header_size;
     for (std::size_t len = 0; len < min_valid; ++len) {
         std::vector<std::byte> cut(pkt.begin(), pkt.begin() + static_cast<std::ptrdiff_t>(len));
-        BOOST_TEST(!geneve::decode(cut).has_value(), "length " << len << " accepted");
+        // BOOST_CHECK_MESSAGE takes a plain bool. BOOST_TEST with a message
+        // routes through Boost's expression template, whose conversion to
+        // assertion_result GCC 15 rejects under -Werror=conversion.
+        const bool rejected = !geneve::decode(cut).has_value();
+        BOOST_CHECK_MESSAGE(rejected, "length " << len << " accepted");
     }
 }
 

@@ -21,15 +21,25 @@ L0 workstation (nested KVM)
 -cpu host -smp 4 -m 4G
 -object memory-backend-memfd,id=mem,size=4G,share=on
 -device intel-iommu,intremap=on,caching-mode=on,device-iotlb=off
--device pcie-root-port,id=rp0,chassis=1,slot=0
--device x3130-upstream,id=sw0,bus=rp0
--device xio3130-downstream,id=slot0,bus=sw0,chassis=2,slot=0
+-device pcie-root-port,id=slot0,chassis=2,slot=0
 -device '{"driver":"vfio-user-pci","bus":"slot0","socket":{"type":"unix","path":"…/slot0.sock"}}'
 ```
 
-Fallback `TOPOLOGY=rootports` puts each slot on its own `pcie-root-port`
-in case the emulated switch ports lack ACS and merge IOMMU groups. Which
-one works is the first thing phase 1 measures.
+**Topology: root ports by default (measured).** The first phase 1 run, on
+tikhov with QEMU 10.2.1, answered the open question:
+
+| Topology | Result |
+|---|---|
+| `rootports` (one `pcie-root-port` per slot) | all checks pass; each device alone in its IOMMU group; root ports expose ACS |
+| `switch` (`x3130-upstream` + `xio3130-downstream`) | 6 ACS failures; the upstream and downstream ports have no ACS capability, so each device shares a group with its downstream port |
+
+Everything else passed in both: IOMMU command line, DMAR unit, enumeration,
+ATS off, BAR0 MMIO, distinct slot IDs, scratch, and reset propagation
+(FLR and bus reset; the board process logged it).
+
+So harbor models "an ACS-capable switch port per slot" with root ports,
+which is the isolation property the real backplane's switch must provide.
+The switch topology stays available to show what an ACS-less switch does.
 
 L1 guest image for phases 1–5: the Ubuntu 24.04 server cloud image with
 its stock kernel, configured by a cloud-init seed that adds
@@ -72,5 +82,7 @@ L2 guest).
 
 1. Whether QEMU's vfio-user client works behind an emulated vIOMMU for
    nested passthrough to L2 (phase 1/2 answer this).
-2. ACS on emulated switch downstream ports (topology fallback above).
-3. Reset propagation from L1 through QEMU to the board process.
+2. ~~ACS on emulated switch downstream ports~~ — retired: QEMU's switch
+   ports have none; root ports are the default.
+3. ~~Reset propagation from L1 through QEMU to the board process~~ —
+   retired: FLR and bus reset both reach the board process.

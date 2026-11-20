@@ -42,9 +42,11 @@ designed, and so the same role code later runs on real boards unchanged.
 
 1. L1 SHALL be a q35 machine with `intel-iommu` (interrupt remapping,
    caching mode, no device IOTLB) and split irqchip.
-2. Each slot SHALL be a downstream port of an emulated PCIe switch (or, if
-   the emulated switch lacks ACS, a dedicated root port), with one board
-   process attached through `vfio-user-pci`.
+2. Each slot SHALL be an emulated PCIe port with ACS, by default a
+   dedicated root port, with one board process attached through
+   `vfio-user-pci`. An emulated-switch topology SHALL remain available. It
+   is expected to fail the isolation checks, because QEMU's switch ports
+   have no ACS.
 3. Guest RAM SHALL be a shared memfd backend, as vfio-user requires.
 4. Each slot's function SHALL land in its own IOMMU group in L1;
    `harbor/l1/phase1-check.sh` SHALL verify this, ATS disabled, and that a

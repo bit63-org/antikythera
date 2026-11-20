@@ -3,20 +3,26 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Starts one harbor "server": N board processes (ak-testdev for phase 1)
-# and an L1 QEMU VM whose slots are emulated PCIe switch downstream ports,
-# each with one vfio-user-pci device connected to a board process.
+# and an L1 QEMU VM with one emulated PCIe slot per board, each holding a
+# vfio-user-pci device connected to that board process.
 # (.kiro/specs/harbor-virt-on-virt/ Requirements 2 and 3.)
 #
 # Board processes start before QEMU: that ordering is harbor's stand-in for
 # helm's power sequencing (slots ready before the host leaves reset).
 #
-# Usage: harbor/l1/run.sh [--name srv1] [--slots N] [--topology switch|rootports]
+# Usage: harbor/l1/run.sh [--name srv1] [--slots N] [--topology rootports|switch]
 #                         [--mem 4G] [--cpus 4] [--ssh-port 2222]
 #
 # Topologies:
-#   switch     root port -> x3130 upstream -> one xio3130 downstream per slot
-#   rootports  one pcie-root-port per slot (fallback if the emulated switch
-#              ports lack ACS and merge IOMMU groups)
+#   rootports  one pcie-root-port per slot (default). QEMU's root ports
+#              expose ACS, so each slot gets its own IOMMU group, which is
+#              what the real backplane's ACS-capable switch provides.
+#   switch     root port -> x3130 upstream -> one xio3130 downstream per
+#              slot. Closer to the real wiring, but QEMU's x3130/xio3130
+#              ports have no ACS capability, so each device shares an IOMMU
+#              group with its downstream port and phase 1's ACS and group
+#              checks fail by design. Kept to show what an ACS-less switch
+#              does to isolation. (Measured on tikhov with QEMU 10.2.1.)
 
 set -euo pipefail
 # shellcheck source=harbor/lib.sh
@@ -24,7 +30,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 name="srv1"
 slots=2
-topology="switch"
+topology="rootports"
 mem="4G"
 cpus=4
 ssh_port=2222

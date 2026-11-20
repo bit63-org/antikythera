@@ -62,7 +62,7 @@ target_include_directories(ak_tls PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ak_tls
   PRIVATE OpenSSL::SSL OpenSSL::Crypto ak::warnings ak::hardening)
 
-# helm: control-plane mailbox protocol, device pool, MCTP sideband framing,
+# helm: control-plane mailbox protocol and register file, device pool, MCTP sideband framing,
 # OarLink (sideband protocol and its transport bindings), key store, the
 # ControllerLink, the CommandRouter, the audit log, the PowerSequencer
 # (with harbor's process backplane) and the daemon that wires them
@@ -76,6 +76,7 @@ add_library(ak_helm
   helm/helm_daemon.cpp
   helm/key_store.cpp
   helm/mailbox.cpp
+  helm/mailbox_device.cpp
   helm/mctp.cpp
   helm/oar_link.cpp
   helm/oar_protocol.cpp
@@ -95,14 +96,17 @@ target_link_libraries(ak-helm PRIVATE ak::helm ak::warnings ak::hardening)
 install(TARGETS ak-helm RUNTIME DESTINATION bin)
 
 # hull: host-agent command authentication (Ed25519 signatures and sequence
-# numbers), the core / huge-page allocator, and the per-VMM jail and cgroup.
+# numbers), the mailbox client and its VFIO mapping, the core / huge-page
+# allocator, and the per-VMM jail and cgroup.
 add_library(ak_hull
   hull/command_auth.cpp
   hull/cpu_topology.cpp
   hull/jail.cpp
+  hull/mailbox_client.cpp
   hull/resource_allocator.cpp
   hull/sequence_tracker.cpp
   hull/signature_verifier.cpp
+  hull/vfio_mailbox.cpp
   hull/vm_cgroup.cpp)
 add_library(ak::hull ALIAS ak_hull)
 target_link_libraries(ak_hull
@@ -252,6 +256,14 @@ if(LIBVFIO_USER_FOUND)
     PUBLIC ak::oar_virtio
     PRIVATE ak_libvfio_user ak::warnings ak::hardening)
   target_compile_options(ak_vfu_virtio PRIVATE -Wno-pedantic)
+
+  # helm's mailbox function served over vfio-user (helm task 8).
+  add_library(ak_helm_vfu helm/mailbox_vfu_server.cpp)
+  add_library(ak::helm_vfu ALIAS ak_helm_vfu)
+  target_link_libraries(ak_helm_vfu
+    PUBLIC ak::helm
+    PRIVATE ak_libvfio_user ak::warnings ak::hardening)
+  target_compile_options(ak_helm_vfu PRIVATE -Wno-pedantic)
 
   add_executable(ak-oar-net oar/net/oar_net_main.cpp)
   target_link_libraries(ak-oar-net

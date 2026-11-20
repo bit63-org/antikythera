@@ -12,7 +12,7 @@ Steering that applies to all of them is in `../steering/`.
 | [oar-blk-data-plane](oar-blk-data-plane/) | virtio-blk with transparent per-VM AES-XTS, crypto-erase, lazy S3 image volumes | 9/16 |
 | [oar-gpu-data-plane](oar-gpu-data-plane/) | GPUs: designed now, built after network and storage | designed |
 | [harbor-virt-on-virt](harbor-virt-on-virt/) | Nested-KVM prototype of the whole system | 4/10 |
-| [controller-interface](controller-interface/) | Signed commands, mappings, inventory; kythira EC2 mapping | 7/12 |
+| [controller-interface](controller-interface/) | Signed commands, mappings, inventory; kythira EC2 mapping | 9/12 |
 | [backplane-hardware](backplane-hardware/) | Physical PCIe backplane requirements | deferred |
 | [build-and-ci](build-and-ci/) | Toolchain, vcpkg, caching and CI, following kythira | 8/11 |
 

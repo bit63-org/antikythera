@@ -1,6 +1,6 @@
 # Implementation Plan — Controller interface and the kythira EC2 integration
 
-## Status: 7/12 tasks complete
+## Status: 9/12 tasks complete
 
 ## Tasks
 
@@ -39,15 +39,20 @@
   each owned by a NIC in the same frame; vectors regenerated; harbor's
   `map-update` takes `NIC,MAC,VTEP[,GUEST_IP ...]`. See design
   "Envelope".)
+- [x] 10. `GroupPolicy` codec in `src/proto/`, `group_policy` link record,
+  signing vectors, tests, fuzz; `ak-test-controller` can send it.
+  _Requirements: 7.3_ — Done: `src/proto/group_policy.hpp` (`AKGP`, 0x80
+  bytes, Ed25519 over the first 0x40), link record type 6 checked by the
+  ControllerSession (`ControllerSink::on_group_policy` gets the exact
+  frame), `ak-test-controller group-policy`, `fuzz_group_policy`.
+- [x] 11. `group_usage` report kind in `src/proto/report.hpp`, tests,
+  fuzz. _Requirements: 7.5_ — Done: kind 7, 96-byte entries with a
+  `slot` byte (NIC IDs are unique only per network role), strictly
+  ascending (slot, nic_id, attachment), at most 1024 per report.
 - [ ] 6. Draft the kythira `ec2-compatible-api` spec in the kythira
   repository, from Requirement 6. _Requirements: 6_
 - [ ] 7. End-to-end: AWS CLI `run-instances` against kythira, landing in a
   harbor server. _Requirements: 6.1_
-- [ ] 10. `GroupPolicy` codec in `src/proto/`, `group_policy` link record,
-  signing vectors, tests, fuzz; `ak-test-controller` can send it.
-  _Requirements: 7.3_
-- [ ] 11. `group_usage` report kind in `src/proto/report.hpp`, tests,
-  fuzz. _Requirements: 7.5_
 - [ ] 12. Controller policy state, admission checks and usage metering
   (kythira `ec2-compatible-api` spec and module). _Requirements: 7.2,
   7.4, 7.6–7.8_

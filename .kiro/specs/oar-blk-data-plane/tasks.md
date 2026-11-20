@@ -1,6 +1,6 @@
 # Implementation Plan — oar-blk: the storage data plane
 
-## Status: 9/16 tasks complete
+## Status: 12/16 tasks complete
 
 ## Tasks
 
@@ -98,7 +98,7 @@
   against SeaweedFS's S3 gateway; any MinIO works the same way).
 - [x] 12. `ak-image-pack`: raw image to manifest and data objects
   (optionally encrypted). _Requirements: 8.8_
-- [ ] 13. Image volumes through helm: CREATE_VOLUME image source,
+- [x] 13. Image volumes through helm: CREATE_VOLUME image source,
   version-2 volume header, K_eph at attach, discard at detach.
   _Requirements: 8.6, 8.7, 3_
 - [x] 14. Asynchronous miss completion in VirtioBlkFunction (done as

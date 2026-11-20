@@ -387,6 +387,87 @@ auto decode_drop_key(std::span<const std::byte> body) noexcept
     return DropKey{.fn = head->fn, .volume_id = head->volume};
 }
 
+// ---- set_tunnel_key / set_tunnel_peer / remove_tunnel_peer ----------------
+
+auto encode_set_tunnel_key(const SetTunnelKey& k)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (all_zero(k.private_key)) {
+        return std::unexpected(BodyError::zero_key);
+    }
+    std::vector<std::byte> out;
+    out.reserve(set_tunnel_key_size);  // no reallocation, no stray copy
+    wire::Writer w{out};
+    w.bytes(k.private_key);
+    return out;
+}
+
+auto decode_set_tunnel_key(std::span<const std::byte> body) noexcept
+    -> std::expected<SetTunnelKey, BodyError> {
+    if (auto ok = check_size(body, set_tunnel_key_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    if (all_zero(body)) {
+        return std::unexpected(BodyError::zero_key);
+    }
+    return SetTunnelKey{.private_key = body.first<tunnel_key_size>()};
+}
+
+auto encode_set_tunnel_peer(const SetTunnelPeer& p)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (all_zero(p.vtep)) {
+        return std::unexpected(BodyError::bad_vtep);
+    }
+    if (all_zero(p.public_key)) {
+        return std::unexpected(BodyError::zero_key);
+    }
+    std::vector<std::byte> out;
+    out.reserve(set_tunnel_peer_size);
+    wire::Writer w{out};
+    w.bytes(p.vtep);
+    w.bytes(p.public_key);
+    w.bytes(p.psk);
+    return out;
+}
+
+auto decode_set_tunnel_peer(std::span<const std::byte> body) noexcept
+    -> std::expected<SetTunnelPeer, BodyError> {
+    if (auto ok = check_size(body, set_tunnel_peer_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    SetTunnelPeer p{.vtep = {},
+                    .public_key = body.subspan(vtep_size).first<tunnel_key_size>(),
+                    .psk = body.subspan(vtep_size + tunnel_key_size).first<tunnel_key_size>()};
+    std::ranges::copy(body.first<vtep_size>(), p.vtep.begin());
+    if (all_zero(p.vtep)) {
+        return std::unexpected(BodyError::bad_vtep);
+    }
+    if (all_zero(p.public_key)) {
+        return std::unexpected(BodyError::zero_key);
+    }
+    return p;
+}
+
+auto encode_remove_tunnel_peer(const RemoveTunnelPeer& r)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (all_zero(r.vtep)) {
+        return std::unexpected(BodyError::bad_vtep);
+    }
+    return std::vector<std::byte>(r.vtep.begin(), r.vtep.end());
+}
+
+auto decode_remove_tunnel_peer(std::span<const std::byte> body) noexcept
+    -> std::expected<RemoveTunnelPeer, BodyError> {
+    if (auto ok = check_size(body, remove_tunnel_peer_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    RemoveTunnelPeer r;
+    std::ranges::copy(body, r.vtep.begin());
+    if (all_zero(r.vtep)) {
+        return std::unexpected(BodyError::bad_vtep);
+    }
+    return r;
+}
+
 // ---- create_volume / delete_volume / rewrap_volume -------------------------
 
 auto encode_create_volume(const CreateVolume& c)
@@ -748,6 +829,8 @@ auto to_string(BodyError e) noexcept -> const char* {
             return "bad_geometry";
         case BodyError::bad_key_length:
             return "bad_key_length";
+        case BodyError::zero_key:
+            return "zero_key";
         case BodyError::status_with_body:
             return "status_with_body";
     }

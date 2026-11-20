@@ -44,6 +44,7 @@
 
 #include "oar/net/geneve.hpp"
 #include "oar/net/virtio_net.hpp"
+#include "oar/net/wireguard.hpp"
 
 namespace ak::oar::net {
 
@@ -71,9 +72,8 @@ static_assert(encapsulation_overhead == 94);
 static_assert(max_underlay_mtu - encapsulation_overhead <= max_guest_mtu);
 
 // oar-net's WireGuard tunnel: message header (16) and Poly1305 tag (16),
-// inside the Vtep's own IPv6/UDP datagram. Mirrors wg::transport_overhead
-// (task 10) until both are on main.
-inline constexpr std::size_t wireguard_overhead = 32;
+// inside the Vtep's own IPv6/UDP datagram.
+inline constexpr std::size_t wireguard_overhead = wg::transport_overhead;
 // PSP transport mode over UDP: UDP (8), PSP header (16), virtualization
 // cookie (8) and ICV (16).
 inline constexpr std::size_t psp_overhead = udp_header_size + 16 + 8 + 16;

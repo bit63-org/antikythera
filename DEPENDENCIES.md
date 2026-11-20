@@ -32,14 +32,15 @@ build also works against system packages. See
 - **Status**: Required. `ak_tls` links `OpenSSL::SSL` for the mutually
   authenticated TLS 1.3 ControllerLink. `ak_hull` links `OpenSSL::Crypto`
   for command signature verification, `ak_helm` for the key store (AES-256-GCM
-  key wrapping, `RAND_bytes`, `OPENSSL_cleanse`) and `ak_oar_blk` for
-  AES-256-XTS volume encryption. CI uses
+  key wrapping, `RAND_bytes`, `OPENSSL_cleanse`), `ak_oar_blk` for
+  AES-256-XTS volume encryption and `ak_oar_net` for the WireGuard underlay
+  (X25519, ChaCha20-Poly1305, BLAKE2s). CI uses
   Ubuntu 24.04's OpenSSL 3.0 (`libssl-dev`), so 3.0 is the configure
   floor.
 - **Purpose**: TLS 1.3 with mutual authentication (controller link),
   Ed25519 command signatures, AES-256-GCM key wrapping in
-  the helm key store, AES-256-XTS for oar-blk, `OPENSSL_cleanse` for key
-  zeroization.
+  the helm key store, AES-256-XTS for oar-blk, WireGuard's primitives for
+  oar-net, `OPENSSL_cleanse` for key zeroization.
 - **Minimum version**: 3.6.5, taken from the `microsoft/vcpkg` git
   registry in `vcpkg-configuration.json` (the same pin kythira uses for
   its crash fixes), leaving every other port on the baseline.

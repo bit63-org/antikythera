@@ -330,6 +330,62 @@ BOOST_AUTO_TEST_CASE(delete_and_rewrap_volume) {
                     .error() == BodyError::zero_id));
 }
 
+BOOST_AUTO_TEST_CASE(tunnel_keys_round_trip_and_rejects) {
+    std::array<std::byte, oar::tunnel_key_size> priv{};
+    priv.fill(std::byte{key_fill});
+    auto body = oar::encode_set_tunnel_key({.private_key = priv});
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::set_tunnel_key_size);
+    BOOST_TEST(body->capacity() == oar::set_tunnel_key_size);  // no stray copies
+    auto key = oar::decode_set_tunnel_key(*body);
+    BOOST_REQUIRE(key.has_value());
+    BOOST_TEST(key->private_key.data() == body->data());  // a view, not a copy
+    const std::array<std::byte, oar::tunnel_key_size> zero{};
+    BOOST_TEST((oar::encode_set_tunnel_key({.private_key = zero}).error() == BodyError::zero_key));
+    BOOST_TEST((oar::decode_set_tunnel_key(zero).error() == BodyError::zero_key));
+    auto b = *body;
+    b.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_set_tunnel_key(b).error() == BodyError::trailing_bytes));
+
+    oar::Vtep vtep{};
+    vtep[0] = std::byte{0xfd};
+    vtep.back() = std::byte{2};
+    std::array<std::byte, oar::tunnel_key_size> pub{};
+    pub.fill(std::byte{0x42});
+    std::array<std::byte, oar::tunnel_key_size> psk{};  // none
+    auto peer = oar::encode_set_tunnel_peer({.vtep = vtep, .public_key = pub, .psk = psk});
+    BOOST_REQUIRE(peer.has_value());
+    BOOST_TEST(peer->size() == oar::set_tunnel_peer_size);
+    BOOST_TEST(peer->capacity() == oar::set_tunnel_peer_size);
+    BOOST_TEST(std::ranges::equal(std::span{*peer}.first(oar::vtep_size), vtep));
+    auto back = oar::decode_set_tunnel_peer(*peer);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST((back->vtep == vtep));
+    BOOST_TEST(std::ranges::equal(back->public_key, pub));
+    BOOST_TEST(std::ranges::equal(back->psk, psk));
+    BOOST_TEST((oar::encode_set_tunnel_peer({.vtep = {}, .public_key = pub, .psk = psk}).error() ==
+                BodyError::bad_vtep));
+    BOOST_TEST(
+        (oar::encode_set_tunnel_peer({.vtep = vtep, .public_key = zero, .psk = psk}).error() ==
+         BodyError::zero_key));
+    b = *peer;
+    std::ranges::fill(std::span{b}.subspan(oar::vtep_size, oar::tunnel_key_size), std::byte{0});
+    BOOST_TEST((oar::decode_set_tunnel_peer(b).error() == BodyError::zero_key));
+    b = *peer;
+    std::ranges::fill(std::span{b}.first(oar::vtep_size), std::byte{0});
+    BOOST_TEST((oar::decode_set_tunnel_peer(b).error() == BodyError::bad_vtep));
+    b.pop_back();
+    BOOST_TEST((oar::decode_set_tunnel_peer(b).error() == BodyError::truncated));
+
+    auto rm = oar::encode_remove_tunnel_peer({.vtep = vtep});
+    BOOST_REQUIRE(rm.has_value());
+    BOOST_TEST(
+        (oar::decode_remove_tunnel_peer(*rm).value() == oar::RemoveTunnelPeer{.vtep = vtep}));
+    BOOST_TEST((oar::encode_remove_tunnel_peer({}).error() == BodyError::bad_vtep));
+    BOOST_TEST((oar::decode_remove_tunnel_peer(std::span{zero}.first(oar::vtep_size)).error() ==
+                BodyError::bad_vtep));
+}
+
 BOOST_AUTO_TEST_CASE(map_chunk_bounds) {
     const std::vector<std::byte> data(mid_offset, std::byte{1});
     auto body = oar::encode_map_chunk({.total = small_total, .offset = 0, .chunk = data});

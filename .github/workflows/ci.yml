@@ -9,7 +9,8 @@
 #
 # Job names are the check names main's branch protection requires:
 #   build (gcc-14)     GCC 14 Debug build + ctest, and the kernel Geneve
-#                      interop test and the hull jail test under sudo
+#                      and WireGuard interop tests and the hull jail test
+#                      under sudo
 #   build (clang-19)   Clang 19 Debug + ASan/UBSan + libFuzzer build, ctest,
 #                      and a short smoke run of every fuzz target
 #   lint               clang-format, clang-tidy, shellcheck
@@ -104,6 +105,15 @@ jobs:
         run: |
           install -D -m 0755 build/tests/jail_probe /tmp/ak-jail-probe/jail_probe
           sudo AK_JAIL_TEST_CGROUP=1 build/tests/jail_test --log_level=message -- /tmp/ak-jail-probe/jail_probe
+
+      # tests/wireguard_interop.sh also needs root: the Tunnel against
+      # a kernel wg device. The wireguard module ships in linux-modules.
+      - name: Kernel WireGuard interop
+        if: matrix.compiler == 'gcc-14'
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends wireguard-tools
+          sudo modprobe wireguard
+          sudo tests/wireguard_interop.sh build/tests/wireguard_interop_peer
 
       - name: Fuzz smoke
         if: matrix.compiler == 'clang-19'

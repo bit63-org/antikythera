@@ -14,19 +14,21 @@ add_library(ak::proto ALIAS ak_proto)
 target_link_libraries(ak_proto INTERFACE ak::common)
 
 # oar-net: Geneve encapsulation, VTEP ingress policy and runtime, the
-# controller mapping table, the VSwitch and the virtio-net function
-# (network data plane).
+# WireGuard underlay, the controller mapping table, the VSwitch and the
+# virtio-net function (network data plane).
 add_library(ak_oar_net
   oar/net/geneve.cpp
   oar/net/mapping_table.cpp
   oar/net/mtu.cpp
   oar/net/neighbor.cpp
   oar/net/oam.cpp
+  oar/net/tunnel.cpp
   oar/net/udp_endpoint.cpp
   oar/net/virtio_net.cpp
   oar/net/vswitch.cpp
   oar/net/vtep.cpp
-  oar/net/vtep_policy.cpp)
+  oar/net/vtep_policy.cpp
+  oar/net/wireguard.cpp)
 add_library(ak::oar_net ALIAS ak_oar_net)
 target_link_libraries(ak_oar_net
   PUBLIC ak::common ak::oar_virtio
@@ -49,6 +51,8 @@ target_link_libraries(ak_oar_virtio
 # helm key store, and Ed25519 in hull (the only implementation here). CI
 # builds against Ubuntu 24.04's OpenSSL 3.0, so 3.0 is the configure floor.
 find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto SSL)
+# oar-net's WireGuard underlay: X25519, ChaCha20-Poly1305, BLAKE2s.
+target_link_libraries(ak_oar_net PRIVATE OpenSSL::Crypto)
 
 # ak_tls: mutually authenticated TLS 1.3 over TCP for the ControllerLink
 # (helm the client, the controller or harbor's test controller the server).

@@ -25,10 +25,12 @@
 // with fragmentation disabled, so its arrival shows the path between two
 // VTEPs carries full-size datagrams. A keepalive has no padding.
 //
-// Nothing here is authenticated: until the WireGuard tunnel (task 10) wraps
-// the underlay, anyone who can reach the VTEP's port can forge a keepalive.
-// The Vtep therefore accepts keepalives only from addresses that are peer
-// VTEPs in the current mappings, and liveness is advisory.
+// Nothing here is authenticated by itself. Over the WireGuard Tunnel
+// (tunnel.hpp, task 10) a keepalive reaches the Vtep only after it
+// authenticated as a peer, and with that peer's address; without the
+// Tunnel anyone who can reach the VTEP's port can forge one. Either way the
+// Vtep accepts keepalives only from addresses that are peer VTEPs in the
+// current mappings.
 
 #include <cstddef>
 #include <cstdint>

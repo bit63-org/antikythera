@@ -1,6 +1,6 @@
 # Implementation Plan — oar-net: the network data plane
 
-## Status: 11/14 tasks complete
+## Status: 16/22 tasks complete
 
 ## Tasks
 
@@ -225,11 +225,28 @@
   `build_ipv6_udp`, `build_icmpv6`, `build_ethernet`) serve the later
   responders too. Fuzz: `fuzz_dhcp4`; `fuzz_vswitch` gives one VNI a
   gateway and checks its replies reach only the asking NIC.
-- [ ] 18. Router advertisements (solicited, and periodic through
+- [x] 18. Router advertisements (solicited, and periodic through
   `VSwitch::poll`) and the DHCPv6 server (`src/oar/net/dhcp6.*`), tests
-  and fuzz. _Requirements: 12.4–12.6_
-- [ ] 19. Metadata intercept: `MetadataEndpoint`, per-NIC packet rate
-  limit, `inject_metadata` checks. _Requirements: 13.1–13.3_
+  and fuzz. _Requirements: 12.4–12.6_ — Only VNIs whose `VpcConfig` has
+  an IPv6 prefix get RAs. An RS with hop limit 255 is answered to its
+  source, or all-nodes from `::`; `poll()` sends each local attached NIC
+  one every `ra_interval` (200 s), unicast to its MAC. RAs carry M and O,
+  the /64 with L set and A clear, the NIC's MTU when known and RDNSS for
+  `dns6` with three intervals' lifetime. DHCPv6 is stateless: the server
+  DUID is DUID-LL from the gateway MAC; server-identifier rules follow
+  RFC 8415 16; Solicit/Request/Renew/Rebind get the NIC's in-prefix IPv6
+  addresses from the neighbor table (NoAddrsAvail when none, Rapid
+  Commit honoured), Confirm gets Success or NotOnLink, Release and
+  Decline get Success. Fuzz: `fuzz_dhcp6`.
+- [x] 19. Metadata intercept: `MetadataEndpoint`, per-NIC packet rate
+  limit, `inject_metadata` checks. _Requirements: 13.1–13.3_ — Packets
+  to `169.254.169.254` or `fd00:ec2::254` at the gateway MAC go to the
+  endpoint as IP packets keyed by source NIC, after the source check, at
+  most `metadata_rate_pps` (1024) with a burst of 256 per NIC. With no
+  endpoint they count as `metadata_no_endpoint`. `inject_metadata` only
+  delivers to a local attached NIC in a configured VNI, from the
+  metadata address, to an address that NIC owns. `fuzz_vswitch` checks
+  that the endpoint only hears a NIC from that NIC's own address.
 - [ ] 20. Signed `VpcConfig` frame (controller-interface, to be specced
   there) forwarded by helm over OarLink and applied by `NetRole`.
   _Requirements: 12.1_

@@ -19,7 +19,9 @@
 //         a link-local or unspecified one, and nothing but IPv4, IPv6 and
 //         ARP is ever forwarded. vpc_one has a VPC gateway, so DHCP and the
 //         gateway's ARP/ND answers run too, and their replies (from the
-//         gateway's address) may only reach the asking NIC.
+//         gateway's address) may only reach the asking NIC. Its metadata
+//         endpoint must only hear from the NIC a packet came from, with
+//         that NIC's own source address. poll() runs between records.
 
 #include <array>
 #include <chrono>
@@ -131,6 +133,20 @@ auto forwarded_ok(std::span<const std::byte> frame, std::size_t sender) -> bool 
     return p->family == pk::IpFamily::ipv4 ? p->src4 == ip4_of(sender) : p->src6 == ip6_of(sender);
 }
 
+// Requirement 13: the endpoint only ever hears from the NIC a packet came
+// from, and only from that NIC's own address.
+class Endpoint final : public net::MetadataEndpoint {
+public:
+    auto deliver(geneve::NicId nic, std::span<const std::byte> ip) -> void override {
+        calls.push_back({nic, {ip.begin(), ip.end()}});
+    }
+    struct Call {
+        geneve::NicId nic;
+        std::vector<std::byte> ip;
+    };
+    std::vector<Call> calls;
+};
+
 auto index_of(geneve::NicId id) -> std::size_t {
     for (std::size_t i = 0; i < nic_count; ++i) {
         if (nic_ids.at(i) == id.value) {
@@ -215,6 +231,9 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
         std::abort();
     }
 
+    Endpoint endpoint;
+    sw.set_metadata_endpoint(&endpoint);
+
     bool transmit = true;
     while (in.size() >= 2) {
         const std::size_t src = std::to_integer<std::size_t>(in[0]) % nic_count;
@@ -228,6 +247,7 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
             before.at(i) = ports.at(i).frames;
         }
         underlay.sent.clear();
+        endpoint.calls.clear();
 
         std::uint32_t vni = 0;
         if (transmit) {
@@ -242,6 +262,12 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
             for (std::size_t i = 0; i < nic_count; ++i) {
                 if (i != src && ports.at(i).frames != before.at(i) &&
                     !forwarded_ok(ports.at(i).last, src)) {
+                    std::abort();
+                }
+            }
+            for (const auto& c : endpoint.calls) {
+                const auto framed = pk::build_ethernet(net::MacAddress{}, net::MacAddress{}, c.ip);
+                if (c.nic.value != nic_ids.at(src) || !forwarded_ok(framed, src)) {
                     std::abort();
                 }
             }
@@ -281,7 +307,11 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
                 std::abort();
             }
         }
+        if (!transmit && !endpoint.calls.empty()) {
+            std::abort();  // received traffic never reaches the endpoint
+        }
         transmit = !transmit;
+        sw.poll();  // periodic RAs, outside the per-record delivery checks
     }
 
     // Meters are consistent: one remote VTEP, so at most one remote replica

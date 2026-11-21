@@ -13,7 +13,9 @@ the guest can influence which VPC a NIC belongs to.
 
 - How the controller allocates VPCs and NIC IDs (`controller-interface`).
 - Storage (`oar-blk-data-plane`).
-- Routing or gateways out of a VPC (future; no uplink by default).
+- Routing or gateways out of a VPC (future; no uplink by default). The
+  VPC gateway of Requirement 12 only answers configuration and metadata
+  traffic; it routes nothing yet.
 
 ## Glossary
 
@@ -52,7 +54,8 @@ another tenant's guest or a NIC board is compromised.
 
 1. A NIC's VPC, MAC and NIC ID SHALL come only from helm.
 2. Frames from a guest SHALL be forwarded only within the NIC's VPC.
-   Guest-supplied VLAN tags SHALL be treated as payload.
+   Guest-supplied VLAN tags SHALL never select a VPC (Requirement 11.1
+   drops tagged frames).
 3. A frame whose source MAC differs from the NIC's assigned MAC SHALL be
    dropped.
 4. An unassigned NIC SHALL be in the dead VPC, where it can reach nothing.
@@ -195,3 +198,118 @@ operator, I want no tenant able to turn replication into an amplifier.
 7. Policy changes SHALL apply atomically per VNI; a malformed or unsigned
    policy SHALL be rejected whole, leaving the previous one.
 
+### Requirement 11: IP awareness and source/destination check
+
+**User Story:** As a tenant, I want a guest that forges its IP source
+address, or sends to an address its target does not own, to be stopped
+outside both host and guest, as AWS's source/destination check does; as
+the operator, I want later IP features (subnets, security groups, DHCP)
+to share one hardened parser.
+
+#### Acceptance Criteria
+
+1. A VPC SHALL carry only IPv4, IPv6 and ARP. A guest frame with any
+   other EtherType, an 802.1Q or 802.1ad tag included, SHALL be dropped
+   and counted.
+2. Every IPv4 and IPv6 frame from a guest SHALL be parsed by one
+   bounds-checked parser (Ethernet, IPv4 with options, IPv6 with a bounded
+   walk of extension headers, then TCP, UDP, ICMP or ICMPv6 headers in
+   unfragmented packets and first fragments) that returns
+   `std::expected`. A frame that fails it SHALL be dropped and counted.
+3. An IP packet SHALL be forwarded only if its source address is one of
+   the sending NIC's guest addresses in the current mapping (MapUpdate
+   v2) for its family. A NIC with no address in a family SHALL send
+   nothing in that family.
+4. Sources that are not a guest address SHALL be accepted only for
+   traffic oar-net consumes itself: IPv4 `0.0.0.0` for DHCPv4 client
+   messages, and IPv6 unspecified or link-local (`fe80::/10`) sources for
+   neighbor discovery, router solicitations and DHCPv6 client messages.
+   Such a packet that no local responder consumes SHALL be dropped and
+   counted; link-local traffic is never forwarded between NICs.
+5. A unicast IP packet SHALL be forwarded only if its destination address
+   is one of the guest addresses of the NIC that owns its destination
+   MAC. A group-addressed frame admitted for replication (Requirement
+   10.2) SHALL carry an IP multicast destination.
+6. ARP from a guest SHALL carry a sender IP that is one of the NIC's IPv4
+   guest addresses or `0.0.0.0` (a probe). A neighbor advertisement SHALL
+   carry a target that is one of the NIC's IPv6 guest addresses.
+7. Guests SHALL NOT act as routers or address servers: router
+   advertisements, ICMPv6 redirects, and DHCPv4 or DHCPv6 messages sent
+   from a server port (UDP 67 or 547) SHALL be dropped and counted.
+8. A receiving VTEP SHALL apply 11.1, 11.3 and 11.5 to the inner frame of
+   every packet against its own mapping, so a compromised sending VTEP
+   cannot bypass them.
+9. Each drop cause SHALL have its own counter. Changing a VNI's addresses
+   SHALL take effect for the next frame.
+10. _(Future, with route tables.)_ A per-NIC opt-out of 11.3 and 11.5,
+    like AWS `SourceDestCheck=false`, carried as a signed per-NIC flag.
+
+### Requirement 12: Guest network configuration
+
+**User Story:** As a tenant, I want a stock EC2-style image to configure
+its network by DHCP and router advertisements, answered in the data plane
+from the controller's records, so that no guest can hand out addresses to
+another and nothing is flooded.
+
+#### Acceptance Criteria
+
+1. Each VNI MAY have a controller-signed `VpcConfig`, delivered through
+   helm and applied atomically: the gateway MAC (allocated from the
+   controller's MAC pool, so it never collides with a NIC), the IPv4
+   prefix and gateway address, an optional IPv6 /64 prefix, up to four
+   DNS servers per family, a domain name, and the DHCPv4 lease time. A
+   malformed config SHALL be rejected whole, leaving the previous one.
+2. With a `VpcConfig`, oar-net SHALL answer, for the requesting NIC only:
+   ARP for the gateway's IPv4 address and for `169.254.169.254`, and
+   neighbor solicitations for the gateway's link-local address
+   (`fe80::/64` with the EUI-64 interface ID of the gateway MAC) and for
+   `fd00:ec2::254`, all with the gateway MAC. Other IP packets addressed
+   to the gateway MAC SHALL be dropped and counted until routing exists.
+3. oar-net SHALL answer DHCPv4 (RFC 2131) from the mapping without lease
+   state: DISCOVER with OFFER, REQUEST with ACK when the requested address
+   is the NIC's DHCP address and NAK otherwise, INFORM with ACK. The NIC's
+   DHCP address is its lowest IPv4 guest address inside the VPC's IPv4
+   prefix. Replies carry the subnet mask, router (the gateway), DNS
+   servers, domain name, interface MTU, lease time, renewal and rebinding
+   times, and the gateway as server identifier. A message whose client
+   hardware address differs from the NIC's MAC SHALL be dropped.
+4. With an IPv6 prefix, oar-net SHALL answer router solicitations with a
+   router advertisement from the gateway's link-local address (managed and
+   other-config flags set, the /64 on-link but not autonomous, the
+   interface MTU, the gateway MAC as source link-layer address) and SHALL
+   send unsolicited ones to every attached NIC in the VNI periodically, so
+   a guest's default route never expires.
+5. oar-net SHALL answer DHCPv6 (RFC 8415): Solicit with Advertise, or
+   Reply when the client asks for rapid commit; Request, Renew and Rebind
+   with Reply; Confirm with Success or NotOnLink; Information-request with
+   Reply; Release and Decline with Reply. The first IA_NA gets every IPv6
+   guest address of the NIC inside the prefix. Replies carry the DNS
+   servers and domain search list, and a server DUID derived from the
+   gateway MAC; messages naming another server SHALL be ignored.
+6. Without a `VpcConfig` (or, for 12.4 and 12.5, without an IPv6 prefix)
+   these messages SHALL be dropped and counted, never flooded or
+   forwarded.
+
+### Requirement 13: Instance metadata intercept
+
+**User Story:** As a tenant, I want the standard metadata address to
+work from any guest, and as the operator, I want a guest to reach only
+its own metadata, whatever it puts in its packets.
+
+#### Acceptance Criteria
+
+1. IP packets from a guest to `169.254.169.254` or `fd00:ec2::254`,
+   addressed to the gateway MAC, SHALL never enter the fabric. They SHALL
+   be handed to a metadata endpoint together with the NIC ID of the
+   function they arrived on, which identifies the caller; nothing in the
+   packet can.
+2. Intercepted packets SHALL pass the source check (Requirement 11.3)
+   first and SHALL be limited per NIC by a packet rate with a bounded
+   burst; excess packets SHALL be dropped and counted.
+3. Packets the endpoint injects for a NIC SHALL be delivered to that NIC
+   only, and only when their source is the metadata address and their
+   destination is one of that NIC's guest addresses.
+4. The metadata service itself (HTTP, IMDSv2 session tokens, and the path
+   from the endpoint through helm to the controller's records) SHALL be
+   specified with it; until then a VNI without an endpoint drops these
+   packets and counts them.

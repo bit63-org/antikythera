@@ -74,6 +74,10 @@ enum class DecodeError : std::uint8_t {
     bad_peers_version,        // tunnel peer set version 0 (versions start at 1)
     bad_public_key,           // a tunnel public key is all zero
     duplicate_public_key,     // two tunnel peers share a public key
+    bad_header_crc,           // a hold frame header whose CRC32C does not match
+    bad_block_range,          // a block count or LBA range a hold opcode does not allow
+    bad_payload_size,         // a hold payload whose length does not fit its opcode
+    bad_hold_direction,       // a hold flag or status that does not fit the opcode's direction
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -164,6 +168,14 @@ enum class DecodeError : std::uint8_t {
             return "tunnel public key all zero";
         case DecodeError::duplicate_public_key:
             return "two tunnel peers share a public key";
+        case DecodeError::bad_header_crc:
+            return "hold header checksum mismatch";
+        case DecodeError::bad_block_range:
+            return "block range not allowed for the hold opcode";
+        case DecodeError::bad_payload_size:
+            return "hold payload length does not fit its opcode";
+        case DecodeError::bad_hold_direction:
+            return "hold flags or status do not fit the opcode";
     }
     return "unknown";
 }

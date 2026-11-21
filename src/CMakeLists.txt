@@ -22,6 +22,7 @@ add_library(ak_oar_net
   oar/net/mtu.cpp
   oar/net/neighbor.cpp
   oar/net/oam.cpp
+  oar/net/packet.cpp
   oar/net/tunnel.cpp
   oar/net/udp_endpoint.cpp
   oar/net/virtio_net.cpp

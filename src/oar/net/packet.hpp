@@ -39,6 +39,7 @@
 #include <expected>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include "oar/net/neighbor.hpp"
 #include "oar/net/vtep_policy.hpp"
@@ -117,6 +118,31 @@ struct ParsedPacket {
 
 // The frame's EtherType (bytes 12-13); 0 for frames shorter than that.
 [[nodiscard]] auto ethertype(std::span<const std::byte> frame) noexcept -> std::uint16_t;
+
+// Frames oar-net builds itself (DHCP and router replies, the metadata
+// path). Checksums are always filled: IPv4 header, UDP (mandatory for
+// IPv6, and some IPv4 DHCP clients check it too) and ICMPv6.
+inline constexpr std::uint8_t reply_hop_limit = 64;
+
+[[nodiscard]] auto build_ipv4_udp(const MacAddress& dst_mac, const MacAddress& src_mac,
+                                  const Ipv4Address& src, const Ipv4Address& dst,
+                                  std::uint16_t src_port, std::uint16_t dst_port,
+                                  std::span<const std::byte> payload) -> std::vector<std::byte>;
+
+[[nodiscard]] auto build_ipv6_udp(const MacAddress& dst_mac, const MacAddress& src_mac,
+                                  const Ipv6Address& src, const Ipv6Address& dst,
+                                  std::uint16_t src_port, std::uint16_t dst_port,
+                                  std::span<const std::byte> payload) -> std::vector<std::byte>;
+
+// An ICMPv6 message (type, code, then `body`) with its checksum filled.
+[[nodiscard]] auto build_icmpv6(const MacAddress& dst_mac, const MacAddress& src_mac,
+                                const Ipv6Address& src, const Ipv6Address& dst, std::uint8_t type,
+                                std::uint8_t code, std::span<const std::byte> body,
+                                std::uint8_t hop_limit) -> std::vector<std::byte>;
+
+// Wraps an IP packet (IPv4 or IPv6, by its version nibble) in Ethernet.
+[[nodiscard]] auto build_ethernet(const MacAddress& dst_mac, const MacAddress& src_mac,
+                                  std::span<const std::byte> ip_packet) -> std::vector<std::byte>;
 
 [[nodiscard]] auto is_ipv4_multicast(const Ipv4Address& a) noexcept -> bool;   // 224/4
 [[nodiscard]] auto is_ipv6_multicast(const Ipv6Address& a) noexcept -> bool;   // ff00::/8

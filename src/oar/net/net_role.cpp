@@ -170,7 +170,7 @@ auto NetRole::prepare_function(const oar::PrepareFunction& request) -> oar::Stat
     if (!s->function->reassign(identity)) {
         return oar::Status::failed;
     }
-    if (!_vswitch->attach(nic, *s->function)) {
+    if (!_vswitch->attach(nic, *s->function, _config.mtu.guest_mtu)) {
         static_cast<void>(
             s->function->reassign(placeholder_identity(request.fn, _config.mtu.guest_mtu)));
         return oar::Status::failed;

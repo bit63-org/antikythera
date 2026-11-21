@@ -1074,8 +1074,8 @@ BOOST_AUTO_TEST_CASE(destination_must_own_address,
 BOOST_AUTO_TEST_CASE(local_only_sources, *boost::unit_test::timeout(unit_timeout_seconds)) {
     const nb::Ipv4Address any{};
     const nb::Ipv4Address bcast{std::byte{255}, std::byte{255}, std::byte{255}, std::byte{255}};
-    // A DHCP client message from 0.0.0.0 is for a local responder; until
-    // one exists it is dropped, never flooded (Requirement 12.6).
+    // A DHCP client message from 0.0.0.0 is for the gateway; without a
+    // VpcConfig it is dropped and counted, never flooded (Requirement 12.6).
     send(nic_a, udp4(broadcast_mac(), mac_of(nic_a), any, bcast, dhcp4_client, dhcp4_server));
     // Link-local and unspecified IPv6 sources, unicast or multicast.
     send(nic_a, udp6(mac_of(nic_b), mac_of(nic_a), link_local(nic_a), link_local(nic_b)));
@@ -1085,7 +1085,8 @@ BOOST_AUTO_TEST_CASE(local_only_sources, *boost::unit_test::timeout(unit_timeout
     send(nic_a, udp6(all_nodes_mac(), mac_of(nic_a), link_local(nic_a), all_nodes(), dhcp6_client,
                      dhcp6_server));
     BOOST_TEST(nothing_delivered());
-    BOOST_TEST(sw.counters().tx_drop_local_only == 5);
+    BOOST_TEST(sw.counters().dhcp4_no_config == 1);
+    BOOST_TEST(sw.counters().tx_drop_local_only == 4);
     // 0.0.0.0 for anything but a DHCP client message is a forgery.
     send(nic_a, udp4(mac_of(nic_b), mac_of(nic_a), any, ip4(22)));
     BOOST_TEST(sw.counters().tx_drop_ip_spoofed == 1);
@@ -1178,6 +1179,301 @@ BOOST_AUTO_TEST_CASE(receiver_checks_inner_frame,
     BOOST_TEST(sw.receive(mcast_unicast_ip.packet, vtep(peer_tail)).has_value());
     BOOST_TEST(sw.counters().rx_drop_ip_dst == 2);
     BOOST_TEST(nothing_delivered());
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// Requirement 12.1-12.3 (task 17): the VPC gateway's ARP/ND answers and
+// the stateless DHCPv4 server.
+BOOST_FIXTURE_TEST_SUITE(gateway, Fixture)
+
+namespace {
+
+constexpr std::uint16_t dhcp_server = 67;
+constexpr std::uint16_t dhcp_client = 68;
+constexpr std::uint32_t xid = 0x1234'5678;
+constexpr std::uint16_t nic_mtu = 8874;
+constexpr std::uint32_t lease = 3600;
+constexpr std::uint8_t opt_requested_ip = 50;
+constexpr std::uint8_t opt_server_id = 54;
+constexpr std::size_t yiaddr_offset = 16;
+constexpr std::size_t udp_offset = ethernet_header_size + pk::ipv4_min_header_size;
+
+auto gw_mac() -> net::MacAddress {
+    return {std::byte{0x02}, std::byte{0xaa}, std::byte{0},
+            std::byte{0},    std::byte{0},    std::byte{0x01}};
+}
+
+auto gw_ip() -> nb::Ipv4Address {
+    return {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{1}};
+}
+
+auto config() -> net::VpcConfig {
+    net::Ipv6Address prefix{};
+    prefix[0] = ula_prefix;
+    prefix[1] = std::byte{0x10};
+    return {.gateway_mac = gw_mac(),
+            .ipv4 = {.address = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}},
+                     .length = 16},
+            .ipv4_gateway = gw_ip(),
+            .ipv6_prefix = prefix,
+            .dns4 = {{std::byte{10}, std::byte{0}, std::byte{0}, std::byte{2}}},
+            .dns6 = {},
+            .domain = "ec2.internal",
+            .lease_seconds = lease};
+}
+
+auto bcast_ip() -> nb::Ipv4Address {
+    return {std::byte{255}, std::byte{255}, std::byte{255}, std::byte{255}};
+}
+
+auto dhcp(NicId from, const net::MacAddress& dst_mac, const nb::Ipv4Address& src_ip,
+          const nb::Ipv4Address& dst_ip, const std::vector<std::byte>& bootp)
+    -> std::vector<std::byte> {
+    return fr::ipv4(dst_mac, mac_of(from), src_ip, dst_ip, pk::ipproto_udp,
+                    fr::udp(dhcp_client, dhcp_server, bootp));
+}
+
+auto discover(NicId from, std::uint16_t flags = 0) -> std::vector<std::byte> {
+    return dhcp(from, broadcast_mac(), nb::Ipv4Address{}, bcast_ip(),
+                fr::dhcp4_request(1, mac_of(from), xid, {}, flags));
+}
+
+auto request(NicId from, const nb::Ipv4Address& wanted, const nb::Ipv4Address& server = gw_ip())
+    -> std::vector<std::byte> {
+    return dhcp(from, broadcast_mac(), nb::Ipv4Address{}, bcast_ip(),
+                fr::dhcp4_request(3, mac_of(from), xid,
+                                  {{opt_requested_ip, {wanted.begin(), wanted.end()}},
+                                   {opt_server_id, {server.begin(), server.end()}}}));
+}
+
+auto option(const std::vector<std::byte>& frame, std::uint8_t code) -> std::vector<std::byte> {
+    for (auto& [c, v] : fr::dhcp4_options(std::span{frame}.subspan(udp_offset + 8))) {
+        if (c == code) {
+            return v;
+        }
+    }
+    return {};
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(config_validation, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    using net::VpcConfigError;
+    BOOST_TEST((sw.set_vpc_config(0, config()).error() == VpcConfigError::vni_out_of_range));
+    auto c = config();
+    c.gateway_mac[0] = std::byte{0x00};  // universally administered
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_gateway_mac));
+    c = config();
+    c.gateway_mac[0] = std::byte{0x03};  // group
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_gateway_mac));
+    c = config();
+    c.ipv4.length = 31;
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv4_prefix));
+    c = config();
+    c.ipv4.address[3] = std::byte{1};  // host bits
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv4_prefix));
+    c = config();
+    c.ipv4_gateway = {std::byte{10}, std::byte{1}, std::byte{0}, std::byte{0}};
+    c.ipv4.length = 24;  // 10.1.0.0 is outside 10.0.0.0/24
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv4_gateway));
+    c = config();
+    c.ipv4_gateway = {std::byte{10}, std::byte{0}, std::byte{255}, std::byte{255}};  // broadcast
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv4_gateway));
+    c = config();
+    (*c.ipv6_prefix)[ipv6_last] = std::byte{1};  // not a /64
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv6_prefix));
+    c = config();
+    c.dns4.resize(net::max_dns_servers + 1, gw_ip());
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::too_many_dns));
+    c = config();
+    c.dns4 = {bcast_ip()};
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_dns));
+    for (const char* bad : {"-a.b", "a..b", "a_b.c", "a.b-"}) {
+        c = config();
+        c.domain = bad;
+        BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_domain));
+    }
+    c = config();
+    c.domain = std::string(64, 'a');  // a label over 63 bytes
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_domain));
+    c = config();
+    c.lease_seconds = 59;
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_lease));
+
+    BOOST_TEST(sw.vpc_config(vpc) == nullptr);  // nothing applied so far
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, config()));
+    BOOST_TEST((*sw.vpc_config(vpc) == config()));
+    sw.clear_vpc_config(vpc);
+    BOOST_TEST(sw.vpc_config(vpc) == nullptr);
+}
+
+BOOST_AUTO_TEST_CASE(dhcp_without_config_dropped,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    send(nic_a, discover(nic_a));
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().dhcp4_no_config == 1);
+}
+
+BOOST_AUTO_TEST_CASE(discover_gets_offer, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(sw.detach(nic_a));
+    BOOST_REQUIRE(sw.attach(nic_a, port_a, nic_mtu));
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, config()));
+    send(nic_a, discover(nic_a, 0x8000));
+    BOOST_TEST(port_b.frames.empty());
+    BOOST_TEST(underlay.sent.empty());
+    BOOST_REQUIRE(port_a.frames.size() == 1);
+    const auto& f = port_a.frames[0];
+    BOOST_TEST(std::ranges::equal(std::span{f}.first(mac_size), mac_of(nic_a)));
+    BOOST_TEST(std::ranges::equal(std::span{f}.subspan(mac_size, mac_size), gw_mac()));
+    const auto p = pk::parse(f);
+    BOOST_REQUIRE(p.has_value());
+    BOOST_TEST((p->src4 == gw_ip()));
+    BOOST_TEST((p->dst4 == bcast_ip()));  // the client asked for broadcast
+    BOOST_TEST(p->l4->src_port == dhcp_server);
+    BOOST_TEST(p->l4->dst_port == dhcp_client);
+    BOOST_TEST(fr::ipv4_header_checksum(p->ip.first(pk::ipv4_min_header_size)) == 0);
+    BOOST_TEST(std::ranges::equal(p->payload.subspan(yiaddr_offset, 4), ip4(11)));
+    BOOST_TEST((option(f, 53) == std::vector<std::byte>{std::byte{2}}));  // OFFER
+    BOOST_TEST((option(f, 1) == std::vector<std::byte>{std::byte{255}, std::byte{255}, std::byte{0},
+                                                       std::byte{0}}));
+    BOOST_TEST(std::ranges::equal(option(f, 3), gw_ip()));
+    BOOST_TEST(std::ranges::equal(option(f, 54), gw_ip()));
+    BOOST_TEST((option(f, 26) == std::vector<std::byte>{std::byte{0x22}, std::byte{0xaa}}));
+    BOOST_TEST(option(f, 15).size() == std::string{"ec2.internal"}.size());
+    BOOST_TEST(sw.counters().dhcp4_replies == 1);
+
+    // Without the broadcast flag, the reply goes to the offered address.
+    send(nic_a, discover(nic_a));
+    BOOST_REQUIRE(port_a.frames.size() == 2);
+    BOOST_TEST((pk::parse(port_a.frames[1])->dst4 == ip4(11)));
+    // Attached without an MTU (b): no option 26.
+    send(nic_b, discover(nic_b));
+    BOOST_REQUIRE(port_b.frames.size() == 1);
+    BOOST_TEST(option(port_b.frames[0], 26).empty());
+}
+
+BOOST_AUTO_TEST_CASE(request_ack_nak_ignore, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, config()));
+    send(nic_a, request(nic_a, ip4(11)));
+    BOOST_REQUIRE(port_a.frames.size() == 1);
+    BOOST_TEST((option(port_a.frames[0], 53) == std::vector<std::byte>{std::byte{5}}));  // ACK
+    BOOST_TEST(option(port_a.frames[0], 51).size() == 4);
+
+    send(nic_a, request(nic_a, ip4(22)));  // b's address
+    BOOST_REQUIRE(port_a.frames.size() == 2);
+    BOOST_TEST((option(port_a.frames[1], 53) == std::vector<std::byte>{std::byte{6}}));  // NAK
+    BOOST_TEST((pk::parse(port_a.frames[1])->dst4 == bcast_ip()));
+
+    send(nic_a, request(nic_a, ip4(11), ip4(99)));  // chose another server
+    BOOST_TEST(port_a.frames.size() == 2);
+    BOOST_TEST(sw.counters().dhcp4_ignored == 1);
+}
+
+BOOST_AUTO_TEST_CASE(renew_and_inform_unicast, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, config()));
+    // RENEWING: unicast from the leased address to the server.
+    send(nic_a, dhcp(nic_a, gw_mac(), ip4(11), gw_ip(),
+                     fr::dhcp4_request(3, mac_of(nic_a), xid, {}, 0, ip4(11))));
+    BOOST_REQUIRE(port_a.frames.size() == 1);
+    BOOST_TEST((option(port_a.frames[0], 53) == std::vector<std::byte>{std::byte{5}}));
+    BOOST_TEST((pk::parse(port_a.frames[0])->dst4 == ip4(11)));
+    // INFORM: configuration only, no lease and no yiaddr.
+    send(nic_a, dhcp(nic_a, gw_mac(), ip4(11), gw_ip(),
+                     fr::dhcp4_request(8, mac_of(nic_a), xid, {}, 0, ip4(11))));
+    BOOST_REQUIRE(port_a.frames.size() == 2);
+    BOOST_TEST(option(port_a.frames[1], 51).empty());
+    BOOST_TEST(std::ranges::equal(pk::parse(port_a.frames[1])->payload.subspan(yiaddr_offset, 4),
+                                  nb::Ipv4Address{}));
+    // RELEASE is accepted silently.
+    send(nic_a, dhcp(nic_a, gw_mac(), ip4(11), gw_ip(),
+                     fr::dhcp4_request(7, mac_of(nic_a), xid, {}, 0, ip4(11))));
+    BOOST_TEST(port_a.frames.size() == 2);
+    BOOST_TEST(sw.counters().dhcp4_ignored == 1);
+    BOOST_TEST(underlay.sent.empty());
+}
+
+BOOST_AUTO_TEST_CASE(dhcp_checks, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, config()));
+    // chaddr is b's MAC.
+    send(nic_a, dhcp(nic_a, broadcast_mac(), nb::Ipv4Address{}, bcast_ip(),
+                     fr::dhcp4_request(1, mac_of(nic_b), xid)));
+    // Not a DHCP message at all.
+    send(nic_a, dhcp(nic_a, broadcast_mac(), nb::Ipv4Address{}, bcast_ip(),
+                     std::vector<std::byte>(20, std::byte{0})));
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().dhcp4_bad == 2);
+
+    // The lowest address inside the prefix wins; none inside means no answer.
+    net::NeighborUpdate u = Fixture::addresses(vpc, {nic_b, nic_c, nic_d, nic_e});
+    u.ipv4.push_back({ip4(11), nic_a});
+    u.ipv4.push_back({ip4(3), nic_a});
+    u.ipv4.push_back({{std::byte{9}, std::byte{0}, std::byte{0}, std::byte{1}}, nic_a});
+    BOOST_REQUIRE(sw.set_neighbors(u));
+    send(nic_a, discover(nic_a));
+    BOOST_REQUIRE(port_a.frames.size() == 1);
+    BOOST_TEST(
+        std::ranges::equal(pk::parse(port_a.frames[0])->payload.subspan(yiaddr_offset, 4), ip4(3)));
+    auto c = config();
+    c.ipv4 = {.address = {std::byte{192}, std::byte{168}, std::byte{0}, std::byte{0}},
+              .length = 16};
+    c.ipv4_gateway = {std::byte{192}, std::byte{168}, std::byte{0}, std::byte{1}};
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
+    send(nic_a, discover(nic_a));
+    BOOST_TEST(port_a.frames.size() == 1);
+    BOOST_TEST(sw.counters().dhcp4_no_address == 1);
+}
+
+BOOST_AUTO_TEST_CASE(answers_arp_for_gateway, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    send(nic_a, arp_request(nic_a, ip4(11), gw_ip()));
+    BOOST_TEST(nothing_delivered());  // no config: unanswered, and never flooded
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, config()));
+    send(nic_a, arp_request(nic_a, ip4(11), gw_ip()));
+    send(nic_a, arp_request(nic_a, ip4(11), net::metadata_ipv4));
+    auto unicast = arp_request(nic_a, ip4(11), gw_ip());  // a NUD refresh
+    std::ranges::copy(gw_mac(), unicast.begin());
+    send(nic_a, unicast);
+    BOOST_REQUIRE(port_a.frames.size() == 3);
+    for (const auto& f : port_a.frames) {
+        const auto reply = nb::parse_arp(f);
+        BOOST_REQUIRE(reply.has_value());
+        BOOST_TEST((reply->sender_mac == gw_mac()));
+    }
+    BOOST_TEST(port_b.frames.empty());
+    BOOST_TEST(underlay.sent.empty());
+}
+
+BOOST_AUTO_TEST_CASE(answers_nd_for_gateway, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto gw_ll = net::gateway_link_local(gw_mac());
+    BOOST_TEST(std::to_integer<int>(gw_ll[8]) == 0x00);  // 02 with the U/L bit flipped
+    BOOST_TEST(std::to_integer<int>(gw_ll[11]) == 0xff);
+    BOOST_TEST(std::to_integer<int>(gw_ll[12]) == 0xfe);
+    auto c = config();
+    c.ipv6_prefix.reset();
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
+    send(nic_a, neighbor_solicitation(nic_a, link_local(nic_a), gw_ll));
+    BOOST_TEST(nothing_delivered());  // no IPv6 prefix: no IPv6 gateway
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, config()));
+    send(nic_a, neighbor_solicitation(nic_a, link_local(nic_a), gw_ll));
+    send(nic_a, neighbor_solicitation(nic_a, ip6(11), net::metadata_ipv6));
+    BOOST_REQUIRE(port_a.frames.size() == 2);
+    for (const auto& f : port_a.frames) {
+        BOOST_TEST(std::ranges::equal(std::span{f}.subspan(mac_size, mac_size), gw_mac()));
+    }
+    // R is set for the gateway (a router), clear for the metadata address.
+    constexpr std::size_t na_flags = ethernet_header_size + nb::ipv6_header_size + 4;
+    BOOST_TEST(std::to_integer<int>(port_a.frames[0][na_flags]) == 0xe0);
+    BOOST_TEST(std::to_integer<int>(port_a.frames[1][na_flags]) == 0x60);
+    BOOST_TEST(sw.counters().nd_replies == 2);
+}
+
+BOOST_AUTO_TEST_CASE(gateway_routes_nothing_yet, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, config()));
+    const nb::Ipv4Address outside{std::byte{8}, std::byte{8}, std::byte{8}, std::byte{8}};
+    send(nic_a, udp4(gw_mac(), mac_of(nic_a), ip4(11), outside));
+    send(nic_a, udp4(gw_mac(), mac_of(nic_a), ip4(11), ip4(22)));
+    BOOST_TEST(nothing_delivered());
+    BOOST_TEST(sw.counters().tx_drop_no_route == 2);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -48,7 +48,9 @@
 //                        (ok, accepted, bad_signature, stale_sequence, wrong_server, ...)
 //   wait KIND            wait for a report of KIND (inventory, command_outcome,
 //                        pool_state, vm_exited, map_applied, host_fault,
-//                        group_usage)
+//                        group_usage, replica_status, volume_fault,
+//                        attachment_status, demotion_confirmed, op_outcome,
+//                        snapshot_progress)
 //
 // The RFC 8032 test keys are for harbor only; a real host image never
 // compiles them in.

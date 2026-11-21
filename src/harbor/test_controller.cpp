@@ -306,6 +306,12 @@ constexpr std::array kind_names{
     std::pair{"map_applied", proto::ReportKind::map_applied},
     std::pair{"host_fault", proto::ReportKind::host_fault},
     std::pair{"group_usage", proto::ReportKind::group_usage},
+    std::pair{"replica_status", proto::ReportKind::replica_status},
+    std::pair{"volume_fault", proto::ReportKind::volume_fault},
+    std::pair{"attachment_status", proto::ReportKind::attachment_status},
+    std::pair{"demotion_confirmed", proto::ReportKind::demotion_confirmed},
+    std::pair{"op_outcome", proto::ReportKind::op_outcome},
+    std::pair{"snapshot_progress", proto::ReportKind::snapshot_progress},
 };
 
 template<typename T, std::size_t N>
@@ -665,9 +671,36 @@ auto to_string(const proto::Report& report) -> std::string {
                        << " frames=" << e.frames << " replicas_remote=" << e.replicas_remote
                        << " replica_bytes_remote=" << e.replica_bytes_remote << "]";
                 }
-            } else {
+            } else if constexpr (std::is_same_v<T, proto::HostFaultReport>) {
                 os << " code=" << static_cast<int>(b.code) << " slot=" << int{b.slot}
                    << " detail=0x" << std::hex << b.detail << std::dec;
+            } else if constexpr (std::is_same_v<T, proto::ReplicaStatus>) {
+                os << " entries=" << b.entries.size();
+                for (const auto& e : b.entries) {
+                    os << " [volume=" << e.volume_id << " epoch=" << e.epoch
+                       << " role=" << static_cast<int>(e.role)
+                       << " state=" << static_cast<int>(e.state) << " seq=" << e.last_seq
+                       << " commit=" << e.commit_seq << "]";
+                }
+            } else if constexpr (std::is_same_v<T, proto::VolumeFault>) {
+                os << " volume=" << b.volume_id << " epoch=" << b.epoch
+                   << " fault=" << static_cast<int>(b.kind) << " suspect=" << b.suspect;
+            } else if constexpr (std::is_same_v<T, proto::AttachmentStatus>) {
+                os << " attachment=" << b.attachment_id << " volume=" << b.volume_id
+                   << " generation=" << b.generation << " state=" << static_cast<int>(b.state)
+                   << " in_flight=" << b.in_flight;
+            } else if constexpr (std::is_same_v<T, proto::DemotionConfirmed>) {
+                os << " volume=" << b.volume_id << " epoch=" << b.epoch
+                   << " last_seq=" << b.last_seq;
+            } else if constexpr (std::is_same_v<T, proto::OpOutcome>) {
+                os << " volume=" << b.volume_id << " op=" << b.op_id
+                   << " kind=" << static_cast<int>(b.kind)
+                   << " status=" << static_cast<int>(b.status) << " detail=" << b.detail;
+            } else {
+                static_assert(std::is_same_v<T, proto::SnapshotProgress>);
+                os << " volume=" << b.volume_id << " cut=" << b.cut_id
+                   << " state=" << static_cast<int>(b.state) << " chunks=" << b.chunks_done << "/"
+                   << b.chunks_total;
             }
         },
         report.body);

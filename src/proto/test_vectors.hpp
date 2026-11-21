@@ -85,4 +85,47 @@ inline constexpr std::string_view map0_signature =
     "da5b98d1fd9b4e0923f8a7452c722df82d2bb10dc19de1bd4de6f5203be17976c070c3fb029da4b75be5a130"
     "ec6ede28d0b8b1293c7611e94f49088651987d04";
 
+// Vector 4: a ReplicaConfig (format v1) for server 7, signed with key 1
+// (key_id 1): volume 0x100 at epoch 9, lineage 0x1EE, 2^18 blocks of 4096
+// bytes, flags multi_attach, QoS 3000 IOPS / 125 MiB/s (burst 16000 /
+// 1000), lease 4000 ms, resync window 900 s, no source;
+//   members  0x21 primary   fd00::21 port 7300 replica_gen 1
+//            0x22 secondary fd00::22 port 7300 replica_gen 1
+//   attachments 0xA1 on server 7 generation 2 rw
+//               0xA2 on server 8 generation 1 rw
+inline constexpr std::uint64_t rcfg4_server_id = 7;
+inline constexpr std::uint16_t rcfg4_key_id = 1;
+inline constexpr std::uint64_t rcfg4_volume_id = 0x100;
+inline constexpr std::uint64_t rcfg4_epoch = 9;
+inline constexpr std::string_view rcfg4 =
+    "414b5243464700000100010002020000070000000000000000010000000000000900000000000000ee010000"
+    "0000000000000400000000000010000001000000b80b00007d000000803e0000e8030000a00f000084030000"
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    "000000002100000000000000fd000000000000000000000000000021841c0100010000002200000000000000"
+    "fd000000000000000000000000000022841c020001000000a100000000000000070000000000000002000000"
+    "01000000a20000000000000008000000000000000100000001000000059e3fd0723e3754a1c7a8b8a0c7db12"
+    "36956a9c4c6ca3e116680db6db78258980c609423e73c08f7e7c2166eaac5b51ab6b22512e30c45a3dfc53f6"
+    "d2713a0d";
+inline constexpr std::string_view rcfg4_signature =
+    "059e3fd0723e3754a1c7a8b8a0c7db1236956a9c4c6ca3e116680db6db78258980c609423e73c08f7e7c2166"
+    "eaac5b51ab6b22512e30c45a3dfc53f6d2713a0d";
+
+// Vector 5: a VolumeOp (format v1) for server 0x22, signed with key 2
+// (key_id 2): snapshot_commit of cut 0xC07 with server 0x22 as uploader,
+// volume 0x100, epoch 9, op_id 0x0B.
+inline constexpr std::uint64_t vop5_server_id = 0x22;
+inline constexpr std::uint16_t vop5_key_id = 2;
+inline constexpr std::uint64_t vop5_volume_id = 0x100;
+inline constexpr std::uint64_t vop5_epoch = 9;
+inline constexpr std::uint64_t vop5_op_id = 0x0B;
+inline constexpr std::uint64_t vop5_cut_id = 0xC07;
+inline constexpr std::string_view vop5 =
+    "414b564f010002002200000000000000000100000000000009000000000000000b0000000000000002000000"
+    "00000000070c0000000000002200000000000000000000000000000000000000000000000000000000000000"
+    "000000000000000020cb5073f3685e09b14ab126d8e2a9901ad23310e03c5dd751b7819d629a0a14094074ca"
+    "9cd484d6e506f1650ccfc942a1c72d55992f059f6b5eb9dccfc6dd0d";
+inline constexpr std::string_view vop5_signature =
+    "20cb5073f3685e09b14ab126d8e2a9901ad23310e03c5dd751b7819d629a0a14094074ca9cd484d6e506f165"
+    "0ccfc942a1c72d55992f059f6b5eb9dccfc6dd0d";
+
 }  // namespace ak::proto::vectors

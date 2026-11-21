@@ -3,13 +3,16 @@
 
 // .kiro/specs/controller-interface/ Requirement 3 and design "Inventory and
 // status reports": the report codec, its canonical form, its strict decode,
-// and agreement of its enums with helm's.
+// and agreement of its enums with helm's. Also the network volume reports
+// of .kiro/specs/block-volume-service/ design "Reports" (Requirement 13.4).
 
 #define BOOST_TEST_MODULE proto_report_test
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -148,6 +151,117 @@ auto sample_usage() -> proto::GroupUsage {
     return {.entries = {usage_entry(1, 0x11, 3), detached, usage_entry(2, 0x11, 1)}};
 }
 
+auto replica_entry(std::uint8_t slot, std::uint64_t volume, std::uint32_t gen)
+    -> proto::ReplicaStatusEntry {
+    return {.volume_id = volume,
+            .epoch = 9,
+            .replica_gen = gen,
+            .slot = slot,
+            .role = proto::ReplicaRole::primary,
+            .state = proto::ReplicaState::in_sync,
+            .last_seq = 1000,
+            .commit_seq = 998,
+            .synced_bytes = 1 << 20,
+            .total_bytes = 1 << 30,
+            .hydrated_bytes = 1 << 30,
+            .lease_remaining_ms = 3500,
+            .checksum_errors = 2,
+            .checksum_repairs = 2,
+            .reads = 11,
+            .writes = 12,
+            .read_bytes = 13,
+            .write_bytes = 14,
+            .throttled_us = 15};
+}
+
+auto sample_replicas() -> proto::ReplicaStatus {
+    auto joining = replica_entry(1, 0x200, 1);
+    joining.role = proto::ReplicaRole::joining;
+    joining.state = proto::ReplicaState::joining;
+    joining.lease_remaining_ms = 0;
+    return {.entries = {replica_entry(1, 0x100, 3), replica_entry(1, 0x100, 4), joining,
+                        replica_entry(2, 0x100, 1)}};
+}
+
+auto manifest(std::uint8_t tag) -> proto::ManifestName {
+    proto::ManifestName m{};
+    m[0] = std::byte{tag};
+    m[proto::manifest_name_size - 1] = std::byte{tag};
+    return m;
+}
+
+auto sample_fault() -> proto::VolumeFault {
+    return {.volume_id = 0x100,
+            .epoch = 9,
+            .suspect = 0x55,
+            .kind = proto::VolumeFaultKind::member_timeout,
+            .reporter = proto::FaultReporter::hold,
+            .slot = 3};
+}
+
+auto sample_attachment() -> proto::AttachmentStatus {
+    return {.attachment_id = 0xA77,
+            .volume_id = 0x100,
+            .generation = 2,
+            .state = proto::AttachmentState::eject_requested,
+            .slot = 4,
+            .in_flight = 6};
+}
+
+auto sample_outcome() -> proto::OpOutcome {
+    return {.volume_id = 0x100,
+            .op_id = 0x0B,
+            .epoch = 9,
+            .detail = 1000,
+            .kind = proto::VolumeOpKind::snapshot_prepare,
+            .status = proto::OpStatus::ok,
+            .slot = 3};
+}
+
+auto sample_progress() -> proto::SnapshotProgress {
+    return {.volume_id = 0x100,
+            .cut_id = 0xC07,
+            .chunks_done = 1024,
+            .chunks_total = 1024,
+            .bytes_uploaded = 1 << 20,
+            .state = proto::SnapshotState::completed,
+            .slot = 3,
+            .manifest_name = manifest(0xAB)};
+}
+
+auto volume_bodies() -> std::vector<proto::ReportBody> {
+    return {
+        sample_replicas(),
+        proto::ReplicaStatus{},
+        sample_fault(),
+        proto::VolumeFault{.volume_id = 1,
+                           .epoch = 1,
+                           .suspect = 0,
+                           .kind = proto::VolumeFaultKind::media_error,
+                           .reporter = proto::FaultReporter::initiator,
+                           .slot = 0},
+        sample_attachment(),
+        proto::DemotionConfirmed{.volume_id = 0x100, .epoch = 10, .last_seq = 1000, .slot = 3},
+        sample_outcome(),
+        proto::OpOutcome{.volume_id = 0x100,
+                         .op_id = 0x0C,
+                         .epoch = 9,
+                         .detail = 0,
+                         .kind = proto::VolumeOpKind::delete_replica,
+                         .status = proto::OpStatus::unsupported,
+                         .slot = 0},
+        sample_progress(),
+        proto::SnapshotProgress{.volume_id = 0x100,
+                                .cut_id = 0xC07,
+                                .chunks_done = 3,
+                                .chunks_total = 10,
+                                .bytes_uploaded = 0,
+                                .state = proto::SnapshotState::uploading,
+                                .slot = 3,
+                                .manifest_name = {}},
+    };
+}
+
 auto all_bodies() -> std::vector<proto::ReportBody> {
     return {
         sample_inventory(),
@@ -174,6 +288,12 @@ auto all_bodies() -> std::vector<proto::ReportBody> {
         sample_usage(),
         proto::GroupUsage{},
     };
+}
+
+auto every_body() -> std::vector<proto::ReportBody> {
+    auto all = all_bodies();
+    std::ranges::move(volume_bodies(), std::back_inserter(all));
+    return all;
 }
 
 }  // namespace
@@ -212,7 +332,7 @@ BOOST_AUTO_TEST_CASE(enums_match_helm_and_the_mailbox) {
 }
 
 BOOST_AUTO_TEST_CASE(every_kind_round_trips) {
-    for (const auto& b : all_bodies()) {
+    for (const auto& b : every_body()) {
         const auto r = make_report(b);
         const auto bytes = encoded(r);
         auto back = proto::decode_report(bytes);
@@ -246,7 +366,7 @@ BOOST_AUTO_TEST_CASE(inventory_size_follows_its_counts) {
 }
 
 BOOST_AUTO_TEST_CASE(every_short_length_is_truncated) {
-    for (const auto& body_variant : all_bodies()) {
+    for (const auto& body_variant : every_body()) {
         const auto b = encoded(make_report(body_variant));
         for (std::size_t n = 0; n < b.size(); ++n) {
             auto r = proto::decode_report(std::span{b}.first(n));
@@ -285,7 +405,7 @@ BOOST_AUTO_TEST_CASE(header_rules) {
     b = good;
     set_le16(b, off_kind, 0);
     BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
-    set_le16(b, off_kind, 8);
+    set_le16(b, off_kind, 14);
     BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
     b = good;
     b[off_reserved + 3] = std::byte{1};
@@ -496,12 +616,205 @@ BOOST_AUTO_TEST_CASE(group_usage_rules_are_enforced_both_ways) {
 }
 
 BOOST_AUTO_TEST_CASE(errors_have_names) {
-    for (auto e : {DecodeError::bad_report_seq, DecodeError::bad_boot_id, DecodeError::bad_id,
-                   DecodeError::unknown_value, DecodeError::bad_capacity,
-                   DecodeError::not_ascending, DecodeError::bad_owner, DecodeError::bad_record_type,
-                   DecodeError::record_too_large, DecodeError::server_id_mismatch}) {
+    for (auto e :
+         {DecodeError::bad_report_seq, DecodeError::bad_boot_id, DecodeError::bad_id,
+          DecodeError::unknown_value, DecodeError::bad_capacity, DecodeError::not_ascending,
+          DecodeError::bad_owner, DecodeError::bad_record_type, DecodeError::record_too_large,
+          DecodeError::server_id_mismatch, DecodeError::bad_epoch, DecodeError::bad_source}) {
         BOOST_TEST(std::string_view{proto::to_string(e)} != "unknown");
     }
+}
+
+BOOST_AUTO_TEST_CASE(volume_kinds_are_numbered_by_the_spec) {
+    // The variant order is the wire numbering: pin both.
+    const std::pair<proto::ReportBody, std::uint16_t> cases[] = {
+        {sample_replicas(), 8},    {sample_fault(), 9},
+        {sample_attachment(), 10}, {proto::DemotionConfirmed{.volume_id = 1, .epoch = 1}, 11},
+        {sample_outcome(), 12},    {sample_progress(), 13},
+    };
+    for (const auto& [b, kind] : cases) {
+        BOOST_TEST(static_cast<std::uint16_t>(proto::report_kind(b)) == kind);
+        const auto bytes = encoded(make_report(b));
+        BOOST_TEST(std::to_integer<int>(bytes[off_kind]) == kind);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(volume_event_layouts) {
+    auto b = encoded(make_report(sample_fault()));
+    BOOST_TEST(b.size() == body + proto::volume_fault_size);
+    BOOST_TEST(le64_at(b, body) == 0x100U);               // volume_id
+    BOOST_TEST(le64_at(b, body + 8) == 9U);               // epoch
+    BOOST_TEST(le64_at(b, body + 16) == 0x55U);           // suspect
+    BOOST_TEST(std::to_integer<int>(b[body + 24]) == 1);  // member_timeout
+    BOOST_TEST(std::to_integer<int>(b[body + 25]) == 1);  // hold
+    BOOST_TEST(std::to_integer<int>(b[body + 26]) == 3);  // slot
+
+    b = encoded(make_report(sample_attachment()));
+    BOOST_TEST(b.size() == body + proto::attachment_status_size);
+    BOOST_TEST(le64_at(b, body) == 0xA77U);
+    BOOST_TEST(std::to_integer<int>(b[body + 16]) == 2);  // generation
+    BOOST_TEST(std::to_integer<int>(b[body + 20]) == 2);  // eject_requested
+    BOOST_TEST(std::to_integer<int>(b[body + 24]) == 6);  // in_flight
+
+    b = encoded(make_report(sample_outcome()));
+    BOOST_TEST(b.size() == body + proto::op_outcome_size);
+    BOOST_TEST(le64_at(b, body + 24) == 1000U);           // detail
+    BOOST_TEST(std::to_integer<int>(b[body + 32]) == 1);  // snapshot_prepare
+
+    b = encoded(make_report(sample_progress()));
+    BOOST_TEST(b.size() == body + proto::snapshot_progress_size);
+    BOOST_TEST(std::to_integer<int>(b[body + 40]) == 3);     // completed
+    BOOST_TEST(std::to_integer<int>(b[body + 48]) == 0xAB);  // manifest_name
+
+    b = encoded(make_report(sample_replicas()));
+    BOOST_TEST(b.size() ==
+               body + proto::replica_status_fixed_size + (4 * proto::replica_status_entry_size));
+    const std::size_t first = body + proto::replica_status_fixed_size;
+    BOOST_TEST(std::to_integer<int>(b[body]) == 4);          // count
+    BOOST_TEST(le64_at(b, first) == 0x100U);                 // volume_id
+    BOOST_TEST(std::to_integer<int>(b[first + 0x10]) == 3);  // replica_gen
+    BOOST_TEST(std::to_integer<int>(b[first + 0x15]) == 1);  // role primary
+    BOOST_TEST(le64_at(b, first + 0x20) == 998U);            // commit_seq
+    BOOST_TEST(le64_at(b, first + 0x78) == 15U);             // throttled_us
+    static_assert(proto::max_replica_status_size < proto::max_report_size);
+}
+
+BOOST_AUTO_TEST_CASE(volume_event_rules_are_enforced_both_ways) {
+    using B = proto::ReportBody;
+    auto fault = sample_fault();
+    auto no_suspect = fault;
+    no_suspect.suspect = 0;
+    auto primary_no_suspect = no_suspect;
+    primary_no_suspect.kind = proto::VolumeFaultKind::primary_timeout;
+    auto fault_epoch = fault;
+    fault_epoch.epoch = 0;
+    auto fault_kind = fault;
+    fault_kind.kind = static_cast<proto::VolumeFaultKind>(7);
+    auto fault_reporter = fault;
+    fault_reporter.reporter = static_cast<proto::FaultReporter>(0);
+    auto att_gen = sample_attachment();
+    att_gen.generation = 0;
+    auto att_state = sample_attachment();
+    att_state.state = static_cast<proto::AttachmentState>(6);
+    auto out_kind = sample_outcome();
+    out_kind.kind = static_cast<proto::VolumeOpKind>(8);
+    auto out_status = sample_outcome();
+    out_status.status = static_cast<proto::OpStatus>(8);
+    auto out_op = sample_outcome();
+    out_op.op_id = 0;
+    auto prog_chunks = sample_progress();
+    prog_chunks.chunks_done = prog_chunks.chunks_total + 1;
+    auto prog_unnamed = sample_progress();
+    prog_unnamed.manifest_name = {};
+    auto prog_named_early = sample_progress();
+    prog_named_early.state = proto::SnapshotState::uploading;
+    auto prog_cut = sample_progress();
+    prog_cut.cut_id = 0;
+
+    const std::pair<B, DecodeError> cases[] = {
+        {no_suspect, DecodeError::bad_server_id},
+        {primary_no_suspect, DecodeError::bad_server_id},
+        {fault_epoch, DecodeError::bad_epoch},
+        {fault_kind, DecodeError::unknown_value},
+        {fault_reporter, DecodeError::unknown_value},
+        {att_gen, DecodeError::bad_id},
+        {att_state, DecodeError::unknown_value},
+        {proto::DemotionConfirmed{.volume_id = 0, .epoch = 1}, DecodeError::bad_id},
+        {proto::DemotionConfirmed{.volume_id = 1, .epoch = 0}, DecodeError::bad_epoch},
+        {out_kind, DecodeError::unknown_value},
+        {out_status, DecodeError::unknown_value},
+        {out_op, DecodeError::bad_id},
+        {prog_chunks, DecodeError::bad_capacity},
+        {prog_unnamed, DecodeError::bad_source},
+        {prog_named_early, DecodeError::bad_source},
+        {prog_cut, DecodeError::bad_id},
+    };
+    for (const auto& [b, want] : cases) {
+        BOOST_TEST((encode_error(make_report(b)) == want));
+    }
+
+    // Reserved bytes of each fixed body, and a body relabelled with the
+    // wrong kind (same length, different layout).
+    const std::pair<B, std::size_t> reserved[] = {
+        {sample_fault(), 27},
+        {sample_fault(), 31},
+        {sample_attachment(), 22},
+        {sample_attachment(), 28},
+        {proto::DemotionConfirmed{.volume_id = 1, .epoch = 1}, 25},
+        {sample_outcome(), 35},
+        {sample_progress(), 42},
+    };
+    for (const auto& [rb, off] : reserved) {
+        auto b = encoded(make_report(rb));
+        b[body + off] = std::byte{1};
+        BOOST_TEST((decode_error(b) == DecodeError::reserved_not_zero), "offset " << off);
+    }
+    auto b = encoded(make_report(sample_fault()));
+    b[body + 24] = std::byte{9};  // unknown fault kind
+    BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
+    b = encoded(make_report(sample_fault()));
+    set_le16(b, off_kind, static_cast<std::uint16_t>(proto::ReportKind::demotion_confirmed));
+    BOOST_TEST((decode_error(b) == DecodeError::reserved_not_zero));
+}
+
+BOOST_AUTO_TEST_CASE(replica_status_rules_are_enforced_both_ways) {
+    struct Case {
+        void (*mutate)(proto::ReplicaStatus&);
+        DecodeError want;
+    };
+    const Case cases[] = {
+        {[](proto::ReplicaStatus& s) { s.entries[0].volume_id = 0; }, DecodeError::bad_id},
+        {[](proto::ReplicaStatus& s) { s.entries[0].replica_gen = 0; }, DecodeError::bad_id},
+        {[](proto::ReplicaStatus& s) { s.entries[0].epoch = 0; }, DecodeError::bad_epoch},
+        {[](proto::ReplicaStatus& s) { s.entries[0].role = static_cast<proto::ReplicaRole>(5); },
+         DecodeError::unknown_value},
+        {[](proto::ReplicaStatus& s) { s.entries[0].state = static_cast<proto::ReplicaState>(0); },
+         DecodeError::unknown_value},
+        {[](proto::ReplicaStatus& s) { s.entries[0].commit_seq = s.entries[0].last_seq + 1; },
+         DecodeError::bad_capacity},
+        {[](proto::ReplicaStatus& s) { s.entries[0].synced_bytes = s.entries[0].total_bytes + 1; },
+         DecodeError::bad_capacity},
+        {[](proto::ReplicaStatus& s) {
+             s.entries[0].hydrated_bytes = s.entries[0].total_bytes + 1;
+         },
+         DecodeError::bad_capacity},
+        {[](proto::ReplicaStatus& s) { std::swap(s.entries[0], s.entries[1]); },
+         DecodeError::not_ascending},
+        {[](proto::ReplicaStatus& s) { s.entries[1] = s.entries[0]; }, DecodeError::not_ascending},
+        {[](proto::ReplicaStatus& s) {
+             s.entries.clear();
+             for (std::uint64_t v = 1; v <= proto::max_replica_status_entries + 1; ++v) {
+                 s.entries.push_back(replica_entry(0, v, 1));
+             }
+         },
+         DecodeError::too_many_entries},
+    };
+    for (const auto& c : cases) {
+        auto s = sample_replicas();
+        c.mutate(s);
+        BOOST_TEST((encode_error(make_report(s)) == c.want));
+    }
+
+    const std::size_t first = body + proto::replica_status_fixed_size;
+    const auto good = encoded(make_report(sample_replicas()));
+    for (const std::size_t off : {body + 2, body + 7, first + 0x17, first + 0x44, first + 0x47}) {
+        auto b = good;
+        b[off] = std::byte{1};
+        BOOST_TEST((decode_error(b) == DecodeError::reserved_not_zero), "offset " << off);
+    }
+    auto b = good;
+    set_le16(b, body, 0xFFFF);  // hostile count, checked before allocating
+    BOOST_TEST((decode_error(b) == DecodeError::too_many_entries));
+    b = good;
+    set_le16(b, body, 5);
+    BOOST_TEST((decode_error(b) == DecodeError::truncated));
+    b = good;
+    set_le16(b, body, 3);
+    BOOST_TEST((decode_error(b) == DecodeError::trailing_bytes));
+    // Decode re-checks the rules: commit_seq above last_seq.
+    b = good;
+    b[first + 0x27] = std::byte{0xFF};
+    BOOST_TEST((decode_error(b) == DecodeError::bad_capacity));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

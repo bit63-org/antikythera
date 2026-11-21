@@ -1,8 +1,9 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-// .kiro/specs/controller-interface/ Requirements 1.1 and 5.2: the signing
-// test vectors in src/proto/test_vectors.hpp. For each vector this checks
+// .kiro/specs/controller-interface/ Requirements 1.1 and 5.2 and
+// .kiro/specs/block-volume-service/ Requirement 13.4: the signing test
+// vectors in src/proto/test_vectors.hpp. For each vector this checks
 // that encoding the listed fields and signing with the listed RFC 8032 key
 // reproduces the bytes exactly, that the frame decodes back to the fields,
 // and that the signature verifies under hull's verifier.
@@ -21,7 +22,9 @@
 #include "hull/signature_verifier.hpp"
 #include "proto/envelope.hpp"
 #include "proto/map_update.hpp"
+#include "proto/replica_config.hpp"
 #include "proto/test_vectors.hpp"
+#include "proto/volume_op.hpp"
 #include "test_support.hpp"
 
 namespace mb = ak::helm::mailbox;
@@ -40,6 +43,7 @@ constexpr std::uint64_t map2_nic_b = 0x11;
 constexpr std::size_t last = 15;
 constexpr std::uint8_t guest_net = 10;
 constexpr std::uint8_t guest_ula_second = 0x12;
+constexpr std::uint16_t rcfg4_port = 7300;
 
 auto verifier() -> ak::hull::SignatureVerifier {
     const std::array keys{ak::test::controller_key(vec::envelope1_key_id, vec::key1_public),
@@ -100,6 +104,43 @@ auto check_map_vector(std::string_view frame_hex, std::string_view sig_hex,
     // The key ID is signed: the same bytes under the other key fail.
     const proto::KeyId other = m->key_id == vec::map2_key_id ? vec::map0_key_id : vec::map2_key_id;
     BOOST_TEST(!v.verify(proto::map_update_signed_bytes(want), sig, other).has_value());
+}
+
+// Checks a signed frame vector: encoding `frame` and signing it with
+// `signer` reproduces the bytes, decoding gives the fields back, and the
+// signature verifies under its key_id and fails under the other one.
+template<typename Frame, typename Encode, typename Decode, typename Signed, typename SetSig>
+auto check_signed_vector(std::string_view frame_hex, std::string_view sig_hex, const Frame& fields,
+                         const TestSigner& signer, Encode encode, Decode decode,
+                         Signed signed_bytes, SetSig set_signature) -> void {
+    const auto want = from_hex(frame_hex);
+    auto frame = encode(fields);
+    BOOST_REQUIRE(frame.has_value());
+    set_signature(*frame, signer.sign(signed_bytes(*frame)));
+    BOOST_TEST(*frame == want);
+    BOOST_TEST(
+        std::ranges::equal(std::span{want}.last(proto::ed25519_signature_size), from_hex(sig_hex)));
+
+    auto got = decode(want);
+    BOOST_REQUIRE(got.has_value());
+    auto expect = fields;
+    std::ranges::copy(from_hex(sig_hex), expect.signature.begin());
+    BOOST_TEST((*got == expect));
+
+    const auto v = verifier();
+    const auto sig = std::span<const std::byte, proto::ed25519_signature_size>{got->signature};
+    BOOST_TEST(v.verify(signed_bytes(want), sig, got->key_id).has_value());
+    const proto::KeyId other =
+        got->key_id == vec::envelope1_key_id ? vec::map0_key_id : vec::envelope1_key_id;
+    BOOST_TEST(!v.verify(signed_bytes(want), sig, other).has_value());
+}
+
+auto rcfg4_member(std::uint64_t server, proto::ReplicaRole role) -> proto::ReplicaMember {
+    proto::ReplicaMember m{
+        .server_id = server, .endpoint = {}, .port = rcfg4_port, .role = role, .replica_gen = 1};
+    m.endpoint[0] = std::byte{ula_prefix};
+    m.endpoint[last] = std::byte{static_cast<std::uint8_t>(server)};
+    return m;
 }
 
 }  // namespace
@@ -174,6 +215,58 @@ BOOST_AUTO_TEST_CASE(map0_reproduces_and_verifies) {
                       .ipv6 = {},
                       .signature = {}},
                      TestSigner{vec::key2_secret});
+}
+
+BOOST_AUTO_TEST_CASE(rcfg4_reproduces_and_verifies) {
+    const proto::ReplicaConfig fields{
+        .key_id = vec::rcfg4_key_id,
+        .server_id = vec::rcfg4_server_id,
+        .volume_id = vec::rcfg4_volume_id,
+        .epoch = vec::rcfg4_epoch,
+        .lineage_id = 0x1EE,
+        .capacity_blocks = 1U << 18,
+        .block_size = proto::block_size_4096,
+        .flags = proto::replica_flags::multi_attach,
+        .qos = {.iops = 3000, .mib_per_s = 125, .burst_iops = 16000, .burst_mib = 1000},
+        .lease_ms = 4000,
+        .resync_window_s = 900,
+        .source = {},
+        .members = {rcfg4_member(0x21, proto::ReplicaRole::primary),
+                    rcfg4_member(0x22, proto::ReplicaRole::secondary)},
+        .attachments = {{.attachment_id = 0xA1,
+                         .server_id = 7,
+                         .generation = 2,
+                         .mode = proto::AttachMode::rw},
+                        {.attachment_id = 0xA2,
+                         .server_id = 8,
+                         .generation = 1,
+                         .mode = proto::AttachMode::rw}},
+        .signature = {}};
+    check_signed_vector(
+        vec::rcfg4, vec::rcfg4_signature, fields, TestSigner{vec::key1_secret},
+        [](const proto::ReplicaConfig& c) { return proto::encode_replica_config(c); },
+        [](std::span<const std::byte> b) { return proto::decode_replica_config(b); },
+        [](std::span<const std::byte> b) { return proto::replica_config_signed_bytes(b); },
+        [](std::span<std::byte> b, const auto& sig) {
+            proto::set_replica_config_signature(b, sig);
+        });
+}
+
+BOOST_AUTO_TEST_CASE(vop5_reproduces_and_verifies) {
+    const proto::VolumeOp fields{
+        .key_id = vec::vop5_key_id,
+        .server_id = vec::vop5_server_id,
+        .volume_id = vec::vop5_volume_id,
+        .epoch = vec::vop5_epoch,
+        .op_id = vec::vop5_op_id,
+        .args = proto::SnapshotCommit{.cut_id = vec::vop5_cut_id, .uploader = vec::vop5_server_id},
+        .signature = {}};
+    check_signed_vector(
+        vec::vop5, vec::vop5_signature, fields, TestSigner{vec::key2_secret},
+        [](const proto::VolumeOp& op) { return proto::encode_volume_op(op); },
+        [](std::span<const std::byte> b) { return proto::decode_volume_op(b); },
+        [](std::span<const std::byte> b) { return proto::volume_op_signed_bytes(b); },
+        [](std::span<std::byte> b, const auto& sig) { proto::set_volume_op_signature(b, sig); });
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -37,6 +37,7 @@ struct RecordingSink final : helm::ControllerSink {
     std::vector<proto::Envelope> envelopes;
     std::vector<std::pair<proto::MapUpdate, std::vector<std::byte>>> updates;
     std::vector<std::pair<proto::GroupPolicy, std::vector<std::byte>>> policies;
+    std::vector<std::pair<proto::TunnelPeers, std::vector<std::byte>>> peer_sets;
 
     auto on_envelope(const proto::Envelope& e) -> void override { envelopes.push_back(e); }
     auto on_map_update(const proto::MapUpdate& u, std::span<const std::byte> frame)
@@ -47,6 +48,18 @@ struct RecordingSink final : helm::ControllerSink {
         -> void override {
         policies.emplace_back(p, std::vector<std::byte>{frame.begin(), frame.end()});
     }
+    auto on_tunnel_peers(const proto::TunnelPeers& t, std::span<const std::byte> frame)
+        -> void override {
+        peer_sets.emplace_back(t, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
+};
+
+// A sink that keeps ControllerSink's default for tunnel peer sets.
+struct DefaultSink final : helm::ControllerSink {
+    int envelopes = 0;
+    auto on_envelope(const proto::Envelope& /*e*/) -> void override { ++envelopes; }
+    auto on_map_update(const proto::MapUpdate& /*u*/, std::span<const std::byte> /*frame*/)
+        -> void override {}
 };
 
 struct Fixture {
@@ -126,6 +139,24 @@ auto group_policy_record(std::uint64_t to) -> std::vector<std::byte> {
     auto b = proto::encode_group_policy(p);
     BOOST_REQUIRE(b.has_value());
     return framed(RecordType::group_policy, *b);
+}
+
+auto tunnel_peers_record(std::uint64_t to) -> std::vector<std::byte> {
+    proto::TunnelPeers t{
+        .server_id = to,
+        .key_id = key,
+        .vtep = {},
+        .peers_version = 4,
+        .peers = {{.vtep = {}, .mode = proto::TunnelMode::wireguard, .spi = 0, .key = {}}},
+        .signature = {}};
+    t.vtep[0] = std::byte{0xFD};
+    t.vtep[15] = std::byte{1};
+    t.peers[0].vtep = t.vtep;
+    t.peers[0].vtep[15] = std::byte{2};
+    t.peers[0].key.fill(std::byte{0x42});
+    auto b = proto::encode_tunnel_peers(t);
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::tunnel_peers, *b);
 }
 
 auto ack_record(std::uint64_t seq, std::uint64_t to = server) -> std::vector<std::byte> {
@@ -220,6 +251,8 @@ BOOST_FIXTURE_TEST_CASE(envelopes_and_updates_reach_the_sink_unmodified, Fixture
     auto stream = envelope_record(server, 10);
     const auto upd = map_update_record(server);
     stream.insert(stream.end(), upd.begin(), upd.end());
+    const auto peers = tunnel_peers_record(server);
+    stream.insert(stream.end(), peers.begin(), peers.end());
     // Byte at a time: reassembly is the decoder's job.
     for (const auto b : stream) {
         BOOST_REQUIRE(session.on_bytes(std::span{&b, 1}).has_value());
@@ -233,6 +266,26 @@ BOOST_FIXTURE_TEST_CASE(envelopes_and_updates_reach_the_sink_unmodified, Fixture
     BOOST_TEST(sink.updates[0].first.vni == 5U);
     BOOST_TEST(std::ranges::equal(sink.updates[0].second,
                                   std::span{upd}.subspan(proto::record_header_size)));
+    BOOST_REQUIRE(sink.peer_sets.size() == 1U);
+    BOOST_TEST(sink.peer_sets[0].first.peers_version == 4U);
+    BOOST_TEST(sink.peer_sets[0].first.peers.size() == 1U);
+    BOOST_TEST(std::ranges::equal(sink.peer_sets[0].second,
+                                  std::span{peers}.subspan(proto::record_header_size)));
+}
+
+BOOST_AUTO_TEST_CASE(tunnel_peers_default_to_dropped) {
+    DefaultSink sink;
+    helm::ControllerSession session{server, boot,
+                                    [] {
+                                        proto::Inventory inv;
+                                        inv.boot_id = 1;
+                                        return inv;
+                                    },
+                                    sink};
+    session.on_connected();
+    BOOST_TEST(session.on_bytes(tunnel_peers_record(server)).has_value());
+    BOOST_TEST(session.on_bytes(envelope_record(server, 10)).has_value());
+    BOOST_TEST(sink.envelopes == 1);
 }
 
 BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
@@ -242,6 +295,8 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
     };
     auto bad_envelope = envelope_record(server, 10);
     bad_envelope[proto::record_header_size] = std::byte{0};  // envelope magic
+    auto bad_peers = tunnel_peers_record(server);
+    bad_peers[proto::record_header_size] = std::byte{0};  // TunnelPeers magic
     auto report_payload =
         proto::encode_report({.server_id = server, .report_seq = 1, .body = exited(1)});
     auto hello_payload = proto::encode_hello({.server_id = server, .boot_id = 1});
@@ -251,8 +306,10 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
         {envelope_record(other_server, 10), SessionError::wrong_server},
         {map_update_record(other_server), SessionError::wrong_server},
         {group_policy_record(other_server), SessionError::wrong_server},
+        {tunnel_peers_record(other_server), SessionError::wrong_server},
         {bad_policy, SessionError::bad_record},
         {bad_envelope, SessionError::bad_record},
+        {bad_peers, SessionError::bad_record},
         {framed(RecordType::report, *report_payload), SessionError::wrong_direction},
         {framed(RecordType::hello, *hello_payload), SessionError::wrong_direction},
         {ack_record(99), SessionError::bad_ack},

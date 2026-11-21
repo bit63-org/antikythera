@@ -137,11 +137,17 @@
   `tunnel_keys_test` (OarLink delivering keys to two roles that then talk),
   `fuzz_wireguard`, and the kernel interop test
   (`tests/wireguard_interop.sh`, CI under sudo: kernel-initiated and
-  Tunnel-initiated handshakes, data both ways). Not yet: nothing in helm
-  produces the keys (the controller has no message carrying VTEP public
-  keys, and helm does not generate the role's key pair); `NetRole`/`ak-oar-net`
-  are not wired to the Tunnel yet (task 11); cookie
-  replies under load; IPsec ESP (Requirement 5.1's alternative).
+  Tunnel-initiated handshakes, data both ways). Keys from the controller
+  (controller-interface task 10): helm's `TunnelKeyring` generates each
+  VTEP's key pair and reports the public key; the controller's signed
+  `TunnelPeers` frame reaches the role over the sideband (`tunnel_peers`,
+  vendor type 0x0E, chunked), where `TunnelPeerSet`
+  (`src/oar/net/tunnel_peers.*`) verifies it and installs the peers;
+  `tunnel_peers_test`, `tunnel_keyring_test`, the signed end-to-end case
+  in `tunnel_keys_test`, and `fuzz_tunnel_peers`. Not yet: `NetRole`/`ak-oar-net`
+  are not wired to the Tunnel or a TunnelPeerSet (task 11), nor helm's
+  daemon to the keyring (after helm main);
+  cookie replies under load; IPsec ESP (Requirement 5.1's alternative).
 - [ ] 11. MTU computation and advertisement; harbor multi-server tests.
   _Requirements: 6, 9.3_ — Done: `plan_mtu()` (`src/oar/net/mtu.*`)
   turns the underlay MTU and the tunnel's overhead into the guest MTU and

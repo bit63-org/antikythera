@@ -139,6 +139,20 @@ auto Signer::group_policy(const proto::GroupPolicy& policy) const
     return *frame;
 }
 
+auto Signer::tunnel_peers(const proto::TunnelPeers& peers) const
+    -> std::optional<std::vector<std::byte>> {
+    auto frame = proto::encode_tunnel_peers(peers);
+    if (!frame) {
+        return std::nullopt;
+    }
+    const auto sig = sign(proto::tunnel_peers_signed_bytes(*frame));
+    if (!sig) {
+        return std::nullopt;
+    }
+    proto::set_tunnel_peers_signature(*frame, *sig);
+    return *frame;
+}
+
 // ---- Script ---------------------------------------------------------------
 
 namespace {
@@ -279,6 +293,32 @@ auto add_map_entry(std::string_view s, SendMapUpdate& m) -> std::expected<void, 
         }
     }
     return {};
+}
+
+auto tunnel_peer(std::string_view s) -> std::expected<proto::TunnelPeer, std::string> {
+    const auto c = s.find(',');
+    if (c == std::string_view::npos) {
+        return std::unexpected("tunnel peer must be VTEP,KEY");
+    }
+    auto v = vtep(s.substr(0, c));
+    if (!v) {
+        return std::unexpected(v.error());
+    }
+    const auto hex = s.substr(c + 1);
+    proto::TunnelPeer p{.vtep = *v, .mode = proto::TunnelMode::wireguard, .spi = 0, .key = {}};
+    if (hex.size() != 2 * p.key.size()) {
+        return std::unexpected("tunnel peer key must be 64 hex digits");
+    }
+    for (std::size_t i = 0; i < p.key.size(); ++i) {
+        std::uint8_t b = 0;
+        const char* first = hex.data() + (2 * i);
+        const auto [end, ec] = std::from_chars(first, first + 2, b, 16);
+        if (ec != std::errc{} || end != first + 2) {
+            return std::unexpected("tunnel peer key must be 64 hex digits");
+        }
+        p.key[i] = std::byte{b};
+    }
+    return p;
 }
 
 constexpr std::array status_names{
@@ -619,6 +659,29 @@ auto parse_line(std::string_view line) -> std::expected<std::optional<Action>, s
         }
         return std::optional<Action>{g};
     }
+    if (verb == "tunnel-peers") {
+        if (args.size() < 2) {
+            return std::unexpected("tunnel-peers: want VTEP VERSION [PEER_VTEP,KEY ...]");
+        }
+        auto v = vtep(args[0]);
+        auto version = number<std::uint64_t>(args[1], "peer set version");
+        if (!v) {
+            return std::unexpected(v.error());
+        }
+        if (!version) {
+            return std::unexpected(version.error());
+        }
+        SendTunnelPeers t{.vtep = *v, .peers_version = *version, .peers = {}};
+        for (const auto p : args.subspan(2)) {
+            auto peer = tunnel_peer(p);
+            if (!peer) {
+                return std::unexpected(peer.error());
+            }
+            t.peers.push_back(*peer);
+        }
+        std::ranges::sort(t.peers, {}, &proto::TunnelPeer::vtep);
+        return std::optional<Action>{std::move(t)};
+    }
     auto body = command(verb, args);
     if (!body) {
         return std::unexpected(body.error());
@@ -762,6 +825,7 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::map_update:
         case proto::RecordType::group_policy:
         case proto::RecordType::report_ack:
+        case proto::RecordType::tunnel_peers:
             break;
     }
     return std::unexpected("helm sent a controller-only record");
@@ -882,6 +946,18 @@ auto TestController::run(const Action& action) -> std::expected<void, std::strin
                     return std::unexpected("could not encode or sign the group policy");
                 }
                 return send(proto::RecordType::group_policy, *frame);
+            } else if constexpr (std::is_same_v<T, SendTunnelPeers>) {
+                const proto::TunnelPeers t{.server_id = _options.server_id,
+                                           .key_id = _options.key_id,
+                                           .vtep = a.vtep,
+                                           .peers_version = a.peers_version,
+                                           .peers = a.peers,
+                                           .signature = {}};
+                auto frame = _signer.tunnel_peers(t);
+                if (!frame) {
+                    return std::unexpected("could not encode or sign the tunnel peer set");
+                }
+                return send(proto::RecordType::tunnel_peers, *frame);
             } else if constexpr (std::is_same_v<T, ExpectOutcome>) {
                 if (_last_command_seq == 0) {
                     return std::unexpected("expect: no command sent yet");

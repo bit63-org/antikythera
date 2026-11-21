@@ -95,7 +95,7 @@ helm reports to the controller with `Report` frames
 
 | Kind | Body | Requirement |
 |---|---|---|
-| `inventory` | full snapshot: boot ID, last command sequence hull accepted, cores and 1 GiB pages (total, free), health, VTEPs, every function with type/state/owner, VMs, local volumes, networks with applied mapping version | 3.1, placement inputs |
+| `inventory` | full snapshot: boot ID, last command sequence hull accepted, cores and 1 GiB pages (total, free), health, VTEPs with their tunnel public keys, every function with type/state/owner, VMs, local volumes, networks with applied mapping version | 3.1, placement inputs |
 | `command_outcome` | hull's response: command sequence and type, status, optional payload | 3.2 |
 | `pool_state` | one device-pool transition (function, from, to, VM) | 3.2 |
 | `vm_exited` | a VM exit hull did not cause | 3.2 |
@@ -119,6 +119,11 @@ encoding is canonical and the largest report is under 128 KiB. A function
 names an owner VM exactly when it is `assigned` or `releasing`. Enum values
 are helm's (`FunctionType`, `FunctionState`) and the mailbox's (`Status`,
 `ExitReason`, `FaultCode`), pinned by `tests/proto_report_test.cpp`.
+
+Report format 2 made each inventory VTEP entry 56 bytes: the address, the
+VTEP's supported tunnel modes (a bit set: WireGuard, PSP), seven reserved
+bytes, and its WireGuard public key (all zero until helm has a key pair
+for it; see "TunnelPeers"). Format 1 frames are refused.
 
 ## Multicast policy and usage
 
@@ -170,12 +175,71 @@ VNI was never opted in, though drops are still reported for visibility.
 Enablement hours come from the controller's own record of when each
 subnet's policy was in force.
 
+## TunnelPeers
+
+oar-net carries VTEP-to-VTEP traffic inside WireGuard (oar-net
+Requirement 5), and WireGuard needs each peer's public key. The keys are
+distributed through the controller (Requirement 8):
+
+1. helm generates an X25519 key pair for each VTEP when its network role
+   attaches (`src/helm/tunnel_keyring.*`), hands the private key to that
+   role (`set_tunnel_key`), and reports the public key in the inventory.
+   Key pairs live as long as the helm process; nothing secret is
+   persisted, and a new helm boot reports new keys.
+2. The controller keeps every VTEP's public key and, for each VTEP, the set
+   of VTEPs it shares a VNI with. Whenever that set or a key in it changes
+   (a NIC attach that adds a VTEP to a VPC, a helm reboot), it sends the
+   VTEP a `TunnelPeers` frame (`src/proto/tunnel_peers.hpp`):
+
+   ```
+   0x00 magic 'AKTP' u32 | 0x04 version u16 (1) | 0x06 key_id u16
+   0x08 server_id u64 | 0x10 vtep [16] | 0x20 peers_version u64
+   0x28 peer_count u16 | 0x2A reserved [6]
+   0x30 peers: peer_count x { vtep [16] | mode u8 | reserved [3] | spi u32 | key [32] },
+        VTEPs ascending
+   then Ed25519 signature [64] over every byte before it
+   ```
+
+   It is a full snapshot at `peers_version` (per server and VTEP, from 1),
+   like a MapUpdate: idempotent, and a role that missed versions catches up
+   from the newest alone. `key_id`, `server_id` and the target VTEP are
+   signed, so a set cannot be replayed elsewhere. No peer is the target
+   VTEP, no key is zero, no two WireGuard peers share a key, and at most
+   2048 peers fit (112 KiB). Pre-shared keys are not distributed: peers
+   installed this way have none.
+
+   Each peer names its tunnel mode (Requirement 8.5). For `wireguard`,
+   `key` is the peer's X25519 public key and `spi` is 0. `psp` is room for
+   a later move to PSP NIC offload: `spi` would be the peer's receive SPI
+   and `key` the AES-256-GCM key derived for this sender. The controller
+   picks a mode per pair from what both VTEPs advertise, so a fleet moves
+   to PSP one pair at a time and falls back to WireGuard where either end
+   lacks it; a pair would switch with PSP keys pushed while WireGuard stays
+   up, then a new peer set flipping its mode. The guest MTU is already
+   budgeted for the larger PSP overhead (oar-net Requirement 6.3), so that
+   switch never changes a guest's MTU. Nothing implements PSP today: VTEPs
+   advertise only WireGuard, and a role refuses a peer set with a PSP peer.
+   PSP keys are secrets, so the frames carrying them will need wiping
+   wherever they are held.
+3. helm checks the frame's shape and server (ControllerSession), keeps the
+   newest frame per VTEP, and forwards it unmodified over the sideband
+   (`tunnel_peers`, chunked like `map_update`). It re-sends the key and the
+   newest frame whenever the role restarts. It verifies nothing; a frame
+   with the same version but other bytes replaces the one held, so a
+   refused frame never shadows the real one.
+4. The role (`src/oar/net/tunnel_peers.*`, `TunnelPeerSet`) decodes the
+   frame, checks it names its server and VTEP, verifies the signature with
+   the controller keys it also uses for MapUpdates, ignores a re-delivery
+   of the version it applied, refuses an older one, and replaces the peers
+   it installed from earlier frames with the frame's. Unchanged peers keep
+   their WireGuard sessions.
+
 ## Link framing
 
 The mTLS stream carries records (`src/proto/link.hpp`): `length u32 | type
 u16 | reserved u16 | payload`. Controller to helm: `envelope`, `map_update`, `group_policy`,
 `report_ack` (`server_id u64 | report_seq u64`, acknowledging every report
-up to that sequence). Helm to controller: `hello` (`server_id u64 | boot_id
+up to that sequence), `tunnel_peers` (type 7, a TunnelPeers frame). Helm to controller: `hello` (`server_id u64 | boot_id
 u64`, the first record on every connection) and `report`. Report sequence
 numbers restart when helm reboots, so the controller keys them by the
 connection's boot ID and drops any `(boot_id, report_seq)` it has already
@@ -205,9 +269,10 @@ everything up to it. Unacknowledged reports are capped at 4096; past that
 the oldest are dropped and counted, and the next inventory restates the
 state they described.
 
-helm checks each envelope and MapUpdate strictly and that it names this
-server, then passes it on unmodified (the slot to the mailbox, the exact
-MapUpdate bytes to whoever verifies them). It verifies no signatures. Any
+helm checks each envelope, MapUpdate and TunnelPeers frame strictly and
+that it names this server, then passes it on unmodified (the slot to the
+mailbox, the exact MapUpdate and TunnelPeers bytes to the network roles
+that verify them). It verifies no signatures. Any
 protocol violation (malformed record, a record type only helm sends, a
 frame for another server, an ack for a report never sent) closes the
 connection; helm reconnects with capped exponential backoff (1 s to 60 s,

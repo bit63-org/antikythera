@@ -159,7 +159,16 @@ file would. The manifest is exactly
 XTS data unit is the logical block and the tweak its block number, as
 for volumes, so the image is a valid ciphertext volume image under K_img.
 
-`ak-image-pack` (later task) turns a raw disk image into the two objects.
+`ak-image-pack` (`image_pack.*`, task 12) turns a raw disk image into the
+two objects in a local directory, `DIR/<name>/{manifest,data}`, and
+prints the name. It reads one chunk at a time; a chunk of zeros becomes a
+hole and is not written, so the data object is sparse. With `--key-file`
+(64 raw key bytes) and `--key-id` it encrypts every stored chunk under
+K_img exactly as the backend decrypts it. Packing is deterministic, and
+the output is renamed into place only once it is complete and synced. It
+never talks to the object store: publishing is an upload of that
+directory with the publisher's own write credentials, so the storage
+role's credentials can stay read-only (8.9).
 
 ### Components
 

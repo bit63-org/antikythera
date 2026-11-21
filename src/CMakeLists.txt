@@ -174,6 +174,7 @@ add_library(ak_oar_blk_image
   oar/blk/chunk_cache.cpp
   oar/blk/fetcher.cpp
   oar/blk/image_manifest.cpp
+  oar/blk/image_pack.cpp
   oar/blk/lazy_image_backend.cpp
   oar/blk/object_store.cpp
   oar/blk/overlay.cpp)
@@ -182,6 +183,13 @@ find_package(Threads REQUIRED)
 target_link_libraries(ak_oar_blk_image
   PUBLIC ak::oar_blk Threads::Threads
   PRIVATE ak::warnings ak::hardening)
+
+# Packs a raw disk image into an image volume's manifest and data objects
+# (oar-blk task 12).
+add_executable(ak-image-pack oar/blk/image_pack_main.cpp)
+target_link_libraries(ak-image-pack
+  PRIVATE ak::oar_blk_image OpenSSL::Crypto ak::warnings ak::hardening)
+install(TARGETS ak-image-pack RUNTIME DESTINATION bin)
 
 # The S3 client behind image volumes: HTTP/1.1 range GETs over TCP or TLS
 # with Signature V4 (oar-blk task 11).

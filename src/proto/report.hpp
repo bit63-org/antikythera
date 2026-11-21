@@ -57,6 +57,36 @@
 //       replicas_local u64 | replica_bytes_local u64
 //       drop_policy u64 | drop_rate u64 | drop_fanout u64
 //
+// Network volume reports (.kiro/specs/block-volume-service/ design
+// "Reports"), from a hold role or oar-blk (the initiator) through helm.
+// `slot` is the reporting role's data-plane slot.
+//   replica_status  -- a snapshot of replicas a hold role keeps
+//     count u16 | rsvd [6]
+//     entries  count x 128, strictly increasing (slot, volume_id, replica_gen):
+//       volume_id u64 | epoch u64 (applied)
+//       replica_gen u32 | slot u8 | role u8 | state u8 | rsvd u8
+//       last_seq u64 | commit_seq u64 (<= last_seq)
+//       synced_bytes u64 | total_bytes u64 | hydrated_bytes u64 (both <= total)
+//       lease_remaining_ms u32 (0 unless primary) | rsvd u32
+//       checksum_errors u64 | checksum_repairs u64
+//       reads u64 | writes u64 | read_bytes u64 | write_bytes u64 | throttled_us u64
+//   volume_fault  -- what a role saw go wrong with a volume
+//     volume_id u64 | epoch u64 | suspect u64 (server ID; 0 = none)
+//     kind u8 | reporter u8 | slot u8 | rsvd [5]
+//   attachment_status  -- an initiator attachment's state change
+//     attachment_id u64 | volume_id u64 | generation u32 | state u8 | slot u8
+//     rsvd u16 | in_flight u32 | rsvd u32
+//   demotion_confirmed  -- a leaving primary drained and stopped serving
+//     volume_id u64 | epoch u64 | last_seq u64 | slot u8 | rsvd [7]
+//   op_outcome  -- a hold role finished (or refused) a VolumeOp
+//     volume_id u64 | op_id u64 | epoch u64 | detail u64
+//     kind u8 (VolumeOpKind) | status u8 | slot u8 | rsvd [5]
+//     detail: the cut sequence for snapshot_prepare, else 0
+//   snapshot_progress  -- an uploader's progress on one cut
+//     volume_id u64 | cut_id u64 | chunks_done u64 | chunks_total u64
+//     bytes_uploaded u64 | state u8 | slot u8 | rsvd [6]
+//     manifest_name [32] (non-zero exactly when completed)
+//
 // group_usage entries are in strictly increasing (slot, nic_id, attachment)
 // order, at most max_group_usage_entries per report. Counters are
 // cumulative for one attachment: the controller bills the difference
@@ -88,6 +118,8 @@
 #include "common/wire.hpp"
 #include "proto/codec.hpp"
 #include "proto/map_update.hpp"
+#include "proto/replica_config.hpp"
+#include "proto/volume_op.hpp"
 
 namespace ak::proto {
 
@@ -124,8 +156,20 @@ inline constexpr std::size_t max_group_usage_size =
     group_usage_fixed_size + (max_group_usage_entries * group_usage_entry_size);
 inline constexpr std::uint8_t group_usage_detached = 0x01;
 
+inline constexpr std::size_t replica_status_fixed_size = 8;
+inline constexpr std::size_t replica_status_entry_size = 128;
+inline constexpr std::size_t max_replica_status_entries = 512;  // more replicas: several reports
+inline constexpr std::size_t max_replica_status_size =
+    replica_status_fixed_size + (max_replica_status_entries * replica_status_entry_size);
+inline constexpr std::size_t volume_fault_size = 32;
+inline constexpr std::size_t attachment_status_size = 32;
+inline constexpr std::size_t demotion_confirmed_size = 32;
+inline constexpr std::size_t op_outcome_size = 40;
+inline constexpr std::size_t snapshot_progress_size = 80;
+
 inline constexpr std::size_t max_report_size =
-    report_header_size + std::max(max_inventory_size, max_group_usage_size);
+    report_header_size +
+    std::max({max_inventory_size, max_group_usage_size, max_replica_status_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class ReportKind : std::uint16_t {
@@ -136,6 +180,58 @@ enum class ReportKind : std::uint16_t {
     map_applied = 5,
     host_fault = 6,
     group_usage = 7,
+    replica_status = 8,
+    volume_fault = 9,
+    attachment_status = 10,
+    demotion_confirmed = 11,
+    op_outcome = 12,
+    snapshot_progress = 13,
+};
+
+enum class ReplicaState : std::uint8_t {
+    in_sync = 1,
+    joining = 2,  // being rebuilt
+    stale = 3,    // missed writes; waits for resync or rebuild
+};
+
+enum class VolumeFaultKind : std::uint8_t {
+    member_timeout = 1,   // a member did not acknowledge REPL_WRITE; suspect is that member
+    primary_timeout = 2,  // the primary did not answer; suspect is the primary
+    stale_epoch = 3,      // a peer or initiator spoke an epoch older than the reporter's
+    checksum_unrepairable = 4,
+    media_error = 5,
+    lease_lost = 6,  // the primary's lease ran out before an acknowledgement came back
+};
+
+enum class FaultReporter : std::uint8_t {
+    hold = 1,
+    initiator = 2,  // oar-blk's NetworkVolumeBackend
+};
+
+enum class AttachmentState : std::uint8_t {
+    attached = 1,
+    eject_requested = 2,  // cooperative detach asked the guest to let go
+    released = 3,         // the guest let go; hull may hot-unplug
+    fenced = 4,           // the primary refused this generation
+    busy = 5,             // the guest did not let go within the detach timeout
+};
+
+enum class OpStatus : std::uint8_t {
+    ok = 0,
+    stale_epoch = 1,
+    unknown_volume = 2,
+    unknown_cut = 3,
+    io_error = 4,
+    no_space = 5,
+    timed_out = 6,
+    unsupported = 7,
+};
+
+enum class SnapshotState : std::uint8_t {
+    frozen = 1,
+    uploading = 2,
+    completed = 3,
+    failed = 4,
 };
 
 enum class Health : std::uint8_t {
@@ -303,8 +399,88 @@ struct GroupUsage {
     friend auto operator==(const GroupUsage&, const GroupUsage&) -> bool = default;
 };
 
+struct ReplicaStatusEntry {
+    std::uint64_t volume_id{0};
+    std::uint64_t epoch{0};
+    std::uint32_t replica_gen{0};
+    std::uint8_t slot{0};
+    ReplicaRole role{ReplicaRole::secondary};
+    ReplicaState state{ReplicaState::in_sync};
+    std::uint64_t last_seq{0};
+    std::uint64_t commit_seq{0};
+    std::uint64_t synced_bytes{0};
+    std::uint64_t total_bytes{0};
+    std::uint64_t hydrated_bytes{0};
+    std::uint32_t lease_remaining_ms{0};
+    std::uint64_t checksum_errors{0};
+    std::uint64_t checksum_repairs{0};
+    std::uint64_t reads{0};
+    std::uint64_t writes{0};
+    std::uint64_t read_bytes{0};
+    std::uint64_t write_bytes{0};
+    std::uint64_t throttled_us{0};
+    friend auto operator==(const ReplicaStatusEntry&, const ReplicaStatusEntry&) -> bool = default;
+};
+
+struct ReplicaStatus {
+    std::vector<ReplicaStatusEntry> entries;
+    friend auto operator==(const ReplicaStatus&, const ReplicaStatus&) -> bool = default;
+};
+
+struct VolumeFault {
+    std::uint64_t volume_id{0};
+    std::uint64_t epoch{0};
+    std::uint64_t suspect{0};  // server ID; required for the two timeouts
+    VolumeFaultKind kind{VolumeFaultKind::member_timeout};
+    FaultReporter reporter{FaultReporter::hold};
+    std::uint8_t slot{0};
+    friend auto operator==(const VolumeFault&, const VolumeFault&) -> bool = default;
+};
+
+struct AttachmentStatus {
+    std::uint64_t attachment_id{0};
+    std::uint64_t volume_id{0};
+    std::uint32_t generation{0};
+    AttachmentState state{AttachmentState::attached};
+    std::uint8_t slot{0};
+    std::uint32_t in_flight{0};
+    friend auto operator==(const AttachmentStatus&, const AttachmentStatus&) -> bool = default;
+};
+
+struct DemotionConfirmed {
+    std::uint64_t volume_id{0};
+    std::uint64_t epoch{0};
+    std::uint64_t last_seq{0};
+    std::uint8_t slot{0};
+    friend auto operator==(const DemotionConfirmed&, const DemotionConfirmed&) -> bool = default;
+};
+
+struct OpOutcome {
+    std::uint64_t volume_id{0};
+    std::uint64_t op_id{0};
+    std::uint64_t epoch{0};
+    std::uint64_t detail{0};
+    VolumeOpKind kind{VolumeOpKind::snapshot_prepare};
+    OpStatus status{OpStatus::ok};
+    std::uint8_t slot{0};
+    friend auto operator==(const OpOutcome&, const OpOutcome&) -> bool = default;
+};
+
+struct SnapshotProgress {
+    std::uint64_t volume_id{0};
+    std::uint64_t cut_id{0};
+    std::uint64_t chunks_done{0};
+    std::uint64_t chunks_total{0};
+    std::uint64_t bytes_uploaded{0};
+    SnapshotState state{SnapshotState::frozen};
+    std::uint8_t slot{0};
+    ManifestName manifest_name{};  // set exactly when completed
+    friend auto operator==(const SnapshotProgress&, const SnapshotProgress&) -> bool = default;
+};
+
 using ReportBody = std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport,
-                                MapApplied, HostFaultReport, GroupUsage>;
+                                MapApplied, HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault,
+                                AttachmentStatus, DemotionConfirmed, OpOutcome, SnapshotProgress>;
 
 struct Report {
     std::uint64_t server_id{0};
@@ -313,28 +489,12 @@ struct Report {
     friend auto operator==(const Report&, const Report&) -> bool = default;
 };
 
+// The variant's alternatives are in ReportKind order, starting at 1.
 [[nodiscard]] inline auto report_kind(const ReportBody& body) noexcept -> ReportKind {
-    return std::visit(
-        []<typename T>(const T&) {
-            if constexpr (std::is_same_v<T, Inventory>) {
-                return ReportKind::inventory;
-            } else if constexpr (std::is_same_v<T, CommandOutcome>) {
-                return ReportKind::command_outcome;
-            } else if constexpr (std::is_same_v<T, PoolStateChange>) {
-                return ReportKind::pool_state;
-            } else if constexpr (std::is_same_v<T, VmExitedReport>) {
-                return ReportKind::vm_exited;
-            } else if constexpr (std::is_same_v<T, MapApplied>) {
-                return ReportKind::map_applied;
-            } else if constexpr (std::is_same_v<T, HostFaultReport>) {
-                return ReportKind::host_fault;
-            } else {
-                static_assert(std::is_same_v<T, GroupUsage>);
-                return ReportKind::group_usage;
-            }
-        },
-        body);
+    return static_cast<ReportKind>(body.index() + 1);
 }
+static_assert(std::variant_size_v<ReportBody> ==
+              static_cast<std::size_t>(ReportKind::snapshot_progress));
 
 namespace detail {
 
@@ -355,6 +515,24 @@ namespace detail {
 }
 [[nodiscard]] constexpr auto known(FaultCode c) noexcept -> bool {
     return c >= FaultCode::iommu_fault && c <= FaultCode::resources_exhausted;
+}
+[[nodiscard]] constexpr auto known(ReplicaState s) noexcept -> bool {
+    return s >= ReplicaState::in_sync && s <= ReplicaState::stale;
+}
+[[nodiscard]] constexpr auto known(VolumeFaultKind k) noexcept -> bool {
+    return k >= VolumeFaultKind::member_timeout && k <= VolumeFaultKind::lease_lost;
+}
+[[nodiscard]] constexpr auto known(FaultReporter r) noexcept -> bool {
+    return r == FaultReporter::hold || r == FaultReporter::initiator;
+}
+[[nodiscard]] constexpr auto known(AttachmentState s) noexcept -> bool {
+    return s >= AttachmentState::attached && s <= AttachmentState::busy;
+}
+[[nodiscard]] constexpr auto known(OpStatus s) noexcept -> bool {
+    return s <= OpStatus::unsupported;
+}
+[[nodiscard]] constexpr auto known(SnapshotState s) noexcept -> bool {
+    return s >= SnapshotState::frozen && s <= SnapshotState::failed;
 }
 [[nodiscard]] constexpr auto has_owner(FunctionState s) noexcept -> bool {
     return s == FunctionState::assigned || s == FunctionState::releasing;
@@ -509,6 +687,108 @@ namespace detail {
             return key(a) >= key(b);
         }) != u.entries.end()) {
         return std::unexpected(DecodeError::not_ascending);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const ReplicaStatus& s) noexcept
+    -> std::expected<void, DecodeError> {
+    if (s.entries.size() > max_replica_status_entries) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    for (const auto& e : s.entries) {
+        if (!known(e.role) || !known(e.state)) {
+            return std::unexpected(DecodeError::unknown_value);
+        }
+        if (e.volume_id == 0 || e.replica_gen == 0) {
+            return std::unexpected(DecodeError::bad_id);
+        }
+        if (e.epoch == 0) {
+            return std::unexpected(DecodeError::bad_epoch);
+        }
+        if (e.commit_seq > e.last_seq || e.synced_bytes > e.total_bytes ||
+            e.hydrated_bytes > e.total_bytes) {
+            return std::unexpected(DecodeError::bad_capacity);
+        }
+    }
+    const auto key = [](const ReplicaStatusEntry& e) {
+        return std::tuple{e.slot, e.volume_id, e.replica_gen};
+    };
+    if (std::ranges::adjacent_find(s.entries, [&](const auto& a, const auto& b) {
+            return key(a) >= key(b);
+        }) != s.entries.end()) {
+        return std::unexpected(DecodeError::not_ascending);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const VolumeFault& f) noexcept
+    -> std::expected<void, DecodeError> {
+    if (!known(f.kind) || !known(f.reporter)) {
+        return std::unexpected(DecodeError::unknown_value);
+    }
+    if (f.volume_id == 0) {
+        return std::unexpected(DecodeError::bad_id);
+    }
+    if (f.epoch == 0) {
+        return std::unexpected(DecodeError::bad_epoch);
+    }
+    if (f.suspect == 0 &&
+        (f.kind == VolumeFaultKind::member_timeout || f.kind == VolumeFaultKind::primary_timeout)) {
+        return std::unexpected(DecodeError::bad_server_id);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const AttachmentStatus& a) noexcept
+    -> std::expected<void, DecodeError> {
+    if (!known(a.state)) {
+        return std::unexpected(DecodeError::unknown_value);
+    }
+    if (a.attachment_id == 0 || a.volume_id == 0 || a.generation == 0) {
+        return std::unexpected(DecodeError::bad_id);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const DemotionConfirmed& d) noexcept
+    -> std::expected<void, DecodeError> {
+    if (d.volume_id == 0) {
+        return std::unexpected(DecodeError::bad_id);
+    }
+    if (d.epoch == 0) {
+        return std::unexpected(DecodeError::bad_epoch);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const OpOutcome& o) noexcept
+    -> std::expected<void, DecodeError> {
+    if (!known(o.kind) || !known(o.status)) {
+        return std::unexpected(DecodeError::unknown_value);
+    }
+    if (o.volume_id == 0 || o.op_id == 0) {
+        return std::unexpected(DecodeError::bad_id);
+    }
+    if (o.epoch == 0) {
+        return std::unexpected(DecodeError::bad_epoch);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const SnapshotProgress& p) noexcept
+    -> std::expected<void, DecodeError> {
+    if (!known(p.state)) {
+        return std::unexpected(DecodeError::unknown_value);
+    }
+    if (p.volume_id == 0 || p.cut_id == 0) {
+        return std::unexpected(DecodeError::bad_id);
+    }
+    if (p.chunks_done > p.chunks_total) {
+        return std::unexpected(DecodeError::bad_capacity);
+    }
+    if (all_zero(p.manifest_name) == (p.state == SnapshotState::completed)) {
+        return std::unexpected(DecodeError::bad_source);
     }
     return {};
 }
@@ -828,6 +1108,218 @@ inline auto write_group_usage(wire::Writer& w, const GroupUsage& u) -> void {
     }
 }
 
+[[nodiscard]] inline auto decode_replica_status(std::span<const std::byte> body)
+    -> std::expected<ReplicaStatus, DecodeError> {
+    BodyReader in{.r = wire::Reader{body}};
+    const std::size_t count = in.le16();
+    bool zero = in.zeros(replica_status_fixed_size - 2);
+    if (!in.ok) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (count > max_replica_status_entries) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    const std::size_t want = replica_status_fixed_size + (count * replica_status_entry_size);
+    if (body.size() < want) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (body.size() > want) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    ReplicaStatus s;
+    s.entries.resize(count);
+    for (auto& e : s.entries) {
+        e.volume_id = in.le64();
+        e.epoch = in.le64();
+        e.replica_gen = in.le32();
+        e.slot = in.u8();
+        e.role = static_cast<ReplicaRole>(in.u8());
+        e.state = static_cast<ReplicaState>(in.u8());
+        zero = in.zeros(1) && zero;
+        e.last_seq = in.le64();
+        e.commit_seq = in.le64();
+        e.synced_bytes = in.le64();
+        e.total_bytes = in.le64();
+        e.hydrated_bytes = in.le64();
+        e.lease_remaining_ms = in.le32();
+        zero = in.zeros(4) && zero;
+        e.checksum_errors = in.le64();
+        e.checksum_repairs = in.le64();
+        e.reads = in.le64();
+        e.writes = in.le64();
+        e.read_bytes = in.le64();
+        e.write_bytes = in.le64();
+        e.throttled_us = in.le64();
+    }
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (auto ok = check_body(s); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return s;
+}
+
+inline auto write_replica_status(wire::Writer& w, const ReplicaStatus& s) -> void {
+    w.le16(static_cast<std::uint16_t>(s.entries.size()));
+    w.le16(0);
+    w.le32(0);
+    for (const auto& e : s.entries) {
+        w.le64(e.volume_id);
+        w.le64(e.epoch);
+        w.le32(e.replica_gen);
+        w.u8(e.slot);
+        w.u8(static_cast<std::uint8_t>(e.role));
+        w.u8(static_cast<std::uint8_t>(e.state));
+        w.u8(0);
+        w.le64(e.last_seq);
+        w.le64(e.commit_seq);
+        w.le64(e.synced_bytes);
+        w.le64(e.total_bytes);
+        w.le64(e.hydrated_bytes);
+        w.le32(e.lease_remaining_ms);
+        w.le32(0);
+        w.le64(e.checksum_errors);
+        w.le64(e.checksum_repairs);
+        w.le64(e.reads);
+        w.le64(e.writes);
+        w.le64(e.read_bytes);
+        w.le64(e.write_bytes);
+        w.le64(e.throttled_us);
+    }
+}
+
+template<typename T> inline constexpr std::size_t volume_event_size = 0;
+template<> inline constexpr std::size_t volume_event_size<VolumeFault> = volume_fault_size;
+template<>
+inline constexpr std::size_t volume_event_size<AttachmentStatus> = attachment_status_size;
+template<>
+inline constexpr std::size_t volume_event_size<DemotionConfirmed> = demotion_confirmed_size;
+template<> inline constexpr std::size_t volume_event_size<OpOutcome> = op_outcome_size;
+template<>
+inline constexpr std::size_t volume_event_size<SnapshotProgress> = snapshot_progress_size;
+
+// Decodes one of the fixed-size network volume event bodies.
+template<typename T>
+[[nodiscard]] auto decode_volume_event(std::span<const std::byte> body)
+    -> std::expected<T, DecodeError> {
+    if (body.size() < volume_event_size<T>) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (body.size() > volume_event_size<T>) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    BodyReader in{.r = wire::Reader{body}};
+    T out{};
+    bool zero = true;
+    if constexpr (std::is_same_v<T, VolumeFault>) {
+        out.volume_id = in.le64();
+        out.epoch = in.le64();
+        out.suspect = in.le64();
+        out.kind = static_cast<VolumeFaultKind>(in.u8());
+        out.reporter = static_cast<FaultReporter>(in.u8());
+        out.slot = in.u8();
+        zero = in.zeros(5);
+    } else if constexpr (std::is_same_v<T, AttachmentStatus>) {
+        out.attachment_id = in.le64();
+        out.volume_id = in.le64();
+        out.generation = in.le32();
+        out.state = static_cast<AttachmentState>(in.u8());
+        out.slot = in.u8();
+        zero = in.zeros(2);
+        out.in_flight = in.le32();
+        zero = in.zeros(4) && zero;
+    } else if constexpr (std::is_same_v<T, DemotionConfirmed>) {
+        out.volume_id = in.le64();
+        out.epoch = in.le64();
+        out.last_seq = in.le64();
+        out.slot = in.u8();
+        zero = in.zeros(7);
+    } else if constexpr (std::is_same_v<T, OpOutcome>) {
+        out.volume_id = in.le64();
+        out.op_id = in.le64();
+        out.epoch = in.le64();
+        out.detail = in.le64();
+        out.kind = static_cast<VolumeOpKind>(in.u8());
+        out.status = static_cast<OpStatus>(in.u8());
+        out.slot = in.u8();
+        zero = in.zeros(5);
+    } else {
+        static_assert(std::is_same_v<T, SnapshotProgress>);
+        out.volume_id = in.le64();
+        out.cut_id = in.le64();
+        out.chunks_done = in.le64();
+        out.chunks_total = in.le64();
+        out.bytes_uploaded = in.le64();
+        out.state = static_cast<SnapshotState>(in.u8());
+        out.slot = in.u8();
+        zero = in.zeros(6);
+        in.bytes(out.manifest_name);
+    }
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (auto ok = check_body(out); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return out;
+}
+
+inline auto write_volume_event(wire::Writer& w, const VolumeFault& b) -> void {
+    w.le64(b.volume_id);
+    w.le64(b.epoch);
+    w.le64(b.suspect);
+    w.u8(static_cast<std::uint8_t>(b.kind));
+    w.u8(static_cast<std::uint8_t>(b.reporter));
+    w.u8(b.slot);
+    w.bytes(std::array<std::byte, 5>{});
+}
+
+inline auto write_volume_event(wire::Writer& w, const AttachmentStatus& b) -> void {
+    w.le64(b.attachment_id);
+    w.le64(b.volume_id);
+    w.le32(b.generation);
+    w.u8(static_cast<std::uint8_t>(b.state));
+    w.u8(b.slot);
+    w.le16(0);
+    w.le32(b.in_flight);
+    w.le32(0);
+}
+
+inline auto write_volume_event(wire::Writer& w, const DemotionConfirmed& b) -> void {
+    w.le64(b.volume_id);
+    w.le64(b.epoch);
+    w.le64(b.last_seq);
+    w.u8(b.slot);
+    w.bytes(std::array<std::byte, 7>{});
+}
+
+inline auto write_volume_event(wire::Writer& w, const OpOutcome& b) -> void {
+    w.le64(b.volume_id);
+    w.le64(b.op_id);
+    w.le64(b.epoch);
+    w.le64(b.detail);
+    w.u8(static_cast<std::uint8_t>(b.kind));
+    w.u8(static_cast<std::uint8_t>(b.status));
+    w.u8(b.slot);
+    w.bytes(std::array<std::byte, 5>{});
+}
+
+inline auto write_volume_event(wire::Writer& w, const SnapshotProgress& b) -> void {
+    w.le64(b.volume_id);
+    w.le64(b.cut_id);
+    w.le64(b.chunks_done);
+    w.le64(b.chunks_total);
+    w.le64(b.bytes_uploaded);
+    w.u8(static_cast<std::uint8_t>(b.state));
+    w.u8(b.slot);
+    w.bytes(std::array<std::byte, 6>{});
+    w.bytes(b.manifest_name);
+}
+
 inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
     std::visit(
         [&w]<typename T>(const T& b) {
@@ -861,7 +1353,12 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
                 w.le64(b.map_version);
             } else if constexpr (std::is_same_v<T, GroupUsage>) {
                 write_group_usage(w, b);
+            } else if constexpr (std::is_same_v<T, ReplicaStatus>) {
+                write_replica_status(w, b);
+            } else if constexpr (volume_event_size<T> != 0) {
+                write_volume_event(w, b);
             } else {
+                static_assert(std::is_same_v<T, HostFaultReport>);
                 w.le16(static_cast<std::uint16_t>(b.code));
                 w.u8(b.slot);
                 w.u8(0);
@@ -934,6 +1431,18 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
             return wrap(detail::decode_fixed<HostFaultReport>(body));
         case ReportKind::group_usage:
             return wrap(detail::decode_group_usage(body));
+        case ReportKind::replica_status:
+            return wrap(detail::decode_replica_status(body));
+        case ReportKind::volume_fault:
+            return wrap(detail::decode_volume_event<VolumeFault>(body));
+        case ReportKind::attachment_status:
+            return wrap(detail::decode_volume_event<AttachmentStatus>(body));
+        case ReportKind::demotion_confirmed:
+            return wrap(detail::decode_volume_event<DemotionConfirmed>(body));
+        case ReportKind::op_outcome:
+            return wrap(detail::decode_volume_event<OpOutcome>(body));
+        case ReportKind::snapshot_progress:
+            return wrap(detail::decode_volume_event<SnapshotProgress>(body));
     }
     return std::unexpected(DecodeError::unknown_value);
 }

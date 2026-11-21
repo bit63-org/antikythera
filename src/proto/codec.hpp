@@ -62,6 +62,15 @@ enum class DecodeError : std::uint8_t {
     server_id_mismatch,       // envelope server_id differs from the slot header's server_id
     bad_policy_version,       // group policy version 0 (versions start at 1)
     bad_group_limits,         // group policy limits that do not fit its mode or bounds
+    bad_epoch,                // volume epoch 0 (epochs start at 1)
+    bad_block_size,           // a volume block size other than 512 or 4096
+    bad_member,               // a replica member with no endpoint, port or replica_gen
+    bad_roles,                // replica roles break the one-primary rule
+    too_many_members,         // no members, or more than max_replica_members
+    too_many_attachments,     // more than max_volume_attachments
+    bad_attachment_mode,      // more than one read-write attachment without multi_attach
+    bad_qos,                  // a QoS limit of 0, or a burst below its baseline
+    bad_source,               // a volume source whose fields do not fit its kind
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -128,6 +137,24 @@ enum class DecodeError : std::uint8_t {
             return "group policy version 0";
         case DecodeError::bad_group_limits:
             return "group policy limits do not fit its mode";
+        case DecodeError::bad_epoch:
+            return "volume epoch 0";
+        case DecodeError::bad_block_size:
+            return "block size not 512 or 4096";
+        case DecodeError::bad_member:
+            return "replica member without endpoint, port or replica generation";
+        case DecodeError::bad_roles:
+            return "replica roles break the one-primary rule";
+        case DecodeError::too_many_members:
+            return "no replica members, or too many";
+        case DecodeError::too_many_attachments:
+            return "too many volume attachments";
+        case DecodeError::bad_attachment_mode:
+            return "several read-write attachments without multi-attach";
+        case DecodeError::bad_qos:
+            return "QoS limit 0 or burst below baseline";
+        case DecodeError::bad_source:
+            return "volume source fields do not fit its kind";
     }
     return "unknown";
 }

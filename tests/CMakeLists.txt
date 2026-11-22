@@ -103,6 +103,13 @@ ak_add_test(hold_master_test      SOURCES hold_master_test.cpp      LIBS ak::hol
 ak_add_test(hold_store_test       SOURCES hold_store_test.cpp       LIBS ak::hold_store)
 ak_add_test(hold_server_test      SOURCES hold_server_test.cpp      LIBS ak::hold_server)
 ak_add_test(hold_replication_test SOURCES hold_replication_test.cpp LIBS ak::hold_server)
+# The simulation (block-volume-service task 9): a short seed sweep in every
+# run, and a long one under `ctest -C Nightly -L nightly`.
+ak_add_test(hold_sim_test SOURCES hold_sim_test.cpp
+            LIBS ak::hold_server ak::hold_master ak::oar_blk_volume
+            ARGS --run_test=!long_sweep)
+add_test(NAME hold_sim_nightly COMMAND hold_sim_test --run_test=long_sweep CONFIGURATIONS Nightly)
+set_tests_properties(hold_sim_nightly PROPERTIES LABELS nightly TIMEOUT 7200)
 ak_add_test(hold_node_test        SOURCES hold_node_test.cpp        LIBS ak::hold_server OpenSSL::Crypto)
 ak_add_test(initiator_test        SOURCES initiator_test.cpp        LIBS ak::oar_blk_volume ak::hold_server)
 ak_add_test(network_volume_test   SOURCES network_volume_test.cpp   LIBS ak::oar_blk_volume ak::hold_server OpenSSL::Crypto)

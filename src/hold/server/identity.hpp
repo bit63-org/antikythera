@@ -58,8 +58,9 @@ enum class IdentityError : std::uint8_t {
         return std::unexpected(IdentityError::malformed);
     }
     std::uint64_t id = 0;
-    const auto* end = digits.data() + digits.size();
-    const auto [ptr, ec] = std::from_chars(digits.data(), end, id);
+    const char* first = &digits.front();
+    const char* end = first + digits.size();
+    const auto [ptr, ec] = std::from_chars(first, end, id);
     if (ec != std::errc{} || ptr != end) {
         return std::unexpected(IdentityError::malformed);
     }

@@ -3,7 +3,8 @@
 
 #pragma once
 
-// A storage role's identity on the storage network
+// A storage role's identity on the storage network, shared by hold and
+// oar-blk's initiator
 // (.kiro/specs/block-volume-service/ design "hold wire protocol",
 // Requirement 13.2): the certificate the controller's CA issues at
 // enrollment carries the server's ID as a URI subjectAltName,
@@ -22,7 +23,7 @@
 #include <string>
 #include <string_view>
 
-namespace ak::hold {
+namespace ak::proto {
 
 inline constexpr std::string_view server_uri_prefix = "urn:antikythera:server:";
 
@@ -90,4 +91,4 @@ enum class IdentityError : std::uint8_t {
     return found;
 }
 
-}  // namespace ak::hold
+}  // namespace ak::proto

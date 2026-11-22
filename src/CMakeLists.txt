@@ -225,6 +225,17 @@ target_link_libraries(ak_oar_blk_image
   PUBLIC ak::oar_blk Threads::Threads
   PRIVATE ak::warnings ak::hardening)
 
+# oar-blk network volumes (.kiro/specs/block-volume-service/ task 7): the
+# initiator's protocol core and the backend that carries it over TLS to
+# the volume's primary hold.
+add_library(ak_oar_blk_volume
+  oar/blk/initiator.cpp
+  oar/blk/network_volume_backend.cpp)
+add_library(ak::oar_blk_volume ALIAS ak_oar_blk_volume)
+target_link_libraries(ak_oar_blk_volume
+  PUBLIC ak::oar_blk ak::proto ak::tls Threads::Threads
+  PRIVATE ak::warnings ak::hardening)
+
 # Packs a raw disk image into an image volume's manifest and data objects
 # (oar-blk task 12).
 add_executable(ak-image-pack oar/blk/image_pack_main.cpp)

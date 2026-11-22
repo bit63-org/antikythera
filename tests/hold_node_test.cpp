@@ -20,7 +20,7 @@
 #include <utility>
 #include <vector>
 
-#include "hold/server/identity.hpp"
+#include "proto/server_identity.hpp"
 #include "hold/server/node.hpp"
 #include "hold/store/file_layer.hpp"
 #include "proto/hold_wire.hpp"
@@ -103,7 +103,7 @@ public:
         _thread.join();
     }
 
-    static auto uri(std::uint64_t id) -> std::string { return "URI:" + ak::hold::server_uri(id); }
+    static auto uri(std::uint64_t id) -> std::string { return "URI:" + ak::proto::server_uri(id); }
 
     // A client presenting a certificate with these subjectAltNames.
     auto connect(const std::string& san) -> std::optional<tls::Stream> {

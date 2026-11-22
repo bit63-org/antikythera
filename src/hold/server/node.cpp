@@ -12,7 +12,7 @@
 #include <array>
 #include <utility>
 
-#include "hold/server/identity.hpp"
+#include "proto/server_identity.hpp"
 
 namespace ak::hold {
 
@@ -28,30 +28,6 @@ auto mark_storage_class(int fd) -> void {
 }
 
 }  // namespace
-
-// ---- FrameAssembler ----------------------------------------------------------
-
-auto FrameAssembler::feed(std::span<const std::byte> bytes) -> void {
-    _buf.insert(_buf.end(), bytes.begin(), bytes.end());
-}
-
-auto FrameAssembler::next()
-    -> std::expected<std::optional<std::vector<std::byte>>, proto::DecodeError> {
-    if (_buf.size() < proto::hold_header_size) {
-        return std::nullopt;
-    }
-    const auto header = proto::decode_hold_header(std::span{_buf}.first(proto::hold_header_size));
-    if (!header) {
-        return std::unexpected(header.error());
-    }
-    const std::size_t total = proto::hold_header_size + header->payload_len;
-    if (_buf.size() < total) {
-        return std::nullopt;
-    }
-    std::vector<std::byte> frame{_buf.begin(), _buf.begin() + static_cast<std::ptrdiff_t>(total)};
-    _buf.erase(_buf.begin(), _buf.begin() + static_cast<std::ptrdiff_t>(total));
-    return frame;
-}
 
 // ---- Node --------------------------------------------------------------------
 
@@ -120,7 +96,7 @@ auto Node::accept() -> void {
         return;
     }
     const auto uris = stream->peer_uris();
-    const auto peer = server_id_of(uris);
+    const auto peer = proto::server_id_of(uris);
     if (!peer) {
         stream->close();
         return;

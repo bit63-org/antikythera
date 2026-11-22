@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -32,6 +33,7 @@
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/wire.hpp"
@@ -221,14 +223,20 @@ public:
         return _requests.size() - 1;
     }
 
+    // By the status byte, since requests may complete out of order.
     [[nodiscard]] auto completed(std::size_t id) const -> bool {
-        return id < _driver.used_idx(queue0);
+        return _ram->get<std::byte>(_requests.at(id).status) != status_canary;
     }
     [[nodiscard]] auto status(std::size_t id) const -> Status {
         return static_cast<Status>(_ram->get<std::byte>(_requests.at(id).status));
     }
     [[nodiscard]] auto data(std::size_t id) const -> std::vector<std::byte> {
         return _ram->bytes(_requests.at(id).data, _requests.at(id).len);
+    }
+    // Runs the role until request `id` completes or about five seconds pass.
+    auto wait(std::size_t id) -> bool {
+        settle(id);
+        return completed(id);
     }
 
     auto write(std::uint64_t sector, std::span<const std::byte> d) -> Status {
@@ -280,17 +288,30 @@ private:
     std::vector<Request> _requests;
 };
 
-// An object store in memory, for image volumes.
+// An object store in memory, for image volumes. While held, range reads
+// (chunk fetches) wait for release(); whole-object reads (manifests) don't.
 class MemoryStore final : public blk::ObjectStore {
 public:
     auto put(const std::string& key, std::vector<std::byte> bytes) -> void {
         const std::scoped_lock lock{_mutex};
         _objects[key] = std::move(bytes);
     }
+    auto hold() -> void {
+        const std::scoped_lock lock{_mutex};
+        _held = true;
+    }
+    auto release() -> void {
+        {
+            const std::scoped_lock lock{_mutex};
+            _held = false;
+        }
+        _released.notify_all();
+    }
     auto get_range(std::string_view key, std::uint64_t offset, std::span<std::byte> out,
                    Clock::time_point /*deadline*/)
         -> std::expected<void, blk::FetchError> override {
-        const std::scoped_lock lock{_mutex};
+        std::unique_lock lock{_mutex};
+        _released.wait(lock, [this] { return !_held; });
         const auto it = _objects.find(std::string{key});
         if (it == _objects.end() || offset > it->second.size() ||
             out.size() > it->second.size() - offset) {
@@ -315,6 +336,8 @@ public:
 
 private:
     std::mutex _mutex;
+    std::condition_variable _released;
+    bool _held{false};
     std::map<std::string, std::vector<std::byte>> _objects;
 };
 
@@ -359,6 +382,7 @@ struct Rig {
                                        .overlay_dir = {},
                                        .overlay_limit_bytes = 0,
                                        .max_readahead_chunks = 8,
+                                       .image_max_in_flight = 4,
                                        .manifest_deadline = std::chrono::milliseconds{1000},
                                        .clock = {}},
                                       {&t0, &t1});
@@ -778,6 +802,51 @@ BOOST_AUTO_TEST_CASE(image_volume_serves_the_image_and_forgets_writes) {
     Guest g3{rig.ram1, *rig.t1.served(), rig.role.get()};
     BOOST_REQUIRE(g3.up());
     BOOST_TEST(g3.read(3) == sector_of(raw, 3), boost::test_tools::per_element());
+}
+
+BOOST_AUTO_TEST_CASE(image_volume_serves_writes_and_flushes_behind_a_miss) {
+    Rig rig{true};
+    const auto raw = image_raw();
+    const auto name = rig.publish(raw);
+    BOOST_REQUIRE(rig.create_image(vol_one, vm_one, name) == oar::Status::ok);
+    BOOST_REQUIRE(rig.prepare(fn0, vm_one, vol_one) == oar::Status::ok);
+    rig.t0.flr();
+    BOOST_REQUIRE(rig.deliver(fn0, vol_one) == oar::Status::ok);
+    Guest g{rig.ram0, *rig.t0.served(), rig.role.get()};
+    BOOST_REQUIRE(g.up());
+
+    // The read misses and waits for a fetch the store holds back; the
+    // write and flush queued behind it complete anyway.
+    rig.store.hold();
+    const auto read = g.post(RequestType::in, 3, {}, blk::sector_size);
+    const std::vector<std::byte> mine(blk::sector_size, std::byte{0xEE});
+    const auto write = g.post(RequestType::out, far_sector, mine);
+    const auto flush = g.post(RequestType::flush, 0);
+    BOOST_TEST(!g.completed(read));
+    BOOST_REQUIRE(g.completed(write));
+    BOOST_REQUIRE(g.completed(flush));
+    BOOST_TEST((g.status(write) == Status::ok));
+    BOOST_TEST((g.status(flush) == Status::ok));
+
+    rig.store.release();
+    BOOST_REQUIRE(g.wait(read));
+    BOOST_TEST((g.status(read) == Status::ok));
+    BOOST_TEST(g.data(read) == sector_of(raw, 3), boost::test_tools::per_element());
+    BOOST_TEST(g.read(far_sector) == mine, boost::test_tools::per_element());
+}
+
+BOOST_AUTO_TEST_CASE(image_in_flight_must_fit_the_queue) {
+    TempDir dir;
+    GuestRam ram;
+    FakeTransport t{ram};
+    for (const std::uint16_t n : {std::uint16_t{0}, std::uint16_t{ak::test::test_queue_size + 1}}) {
+        blk::RoleConfig c;
+        c.volume_dir = dir.path;
+        c.queue_size = ak::test::test_queue_size;
+        c.image_max_in_flight = n;
+        const bool created = blk::BlkRole::create(std::move(c), {&t}).has_value();
+        BOOST_TEST(!created);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(image_volume_refuses_a_missing_or_wrong_image) {

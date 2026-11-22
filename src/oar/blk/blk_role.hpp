@@ -114,6 +114,12 @@ struct RoleConfig {
     std::filesystem::path overlay_dir;     // empty: volume_dir
     std::uint64_t overlay_limit_bytes{0};  // per volume; 0: up to its capacity
     std::uint32_t max_readahead_chunks{8};
+    // Requests each queue of an image volume keeps in its backend at once
+    // (BlkParams::max_in_flight, each with a max_transfer_bytes bounce
+    // buffer), so a read waiting for a chunk does not hold up the reads
+    // the cache can answer, or the writes and flushes, behind it. 1 to
+    // queue_size. Disk volumes keep 1: their backend completes in the call.
+    std::uint16_t image_max_in_flight{8};
     std::chrono::milliseconds manifest_deadline{10000};
     // Empty: steady_clock::now (health's uptime).
     std::function<Clock::time_point()> clock;
@@ -177,8 +183,8 @@ private:
 
     [[nodiscard]] auto slot(helm::oar::FunctionNumber fn) -> Slot*;
     [[nodiscard]] auto slot_of_volume(std::uint64_t volume) -> Slot*;
-    [[nodiscard]] auto params(const VolumeGeometry& geometry, std::string_view serial) const
-        -> BlkParams;
+    [[nodiscard]] auto params(const VolumeGeometry& geometry, std::string_view serial,
+                              std::uint16_t max_in_flight = 1) const -> BlkParams;
     // Wipes the key, closes the volume and puts the placeholder back.
     auto close(Slot& s) -> bool;
     // The backend for an image volume, ready for its key.

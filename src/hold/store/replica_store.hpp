@@ -131,6 +131,14 @@ public:
     [[nodiscard]] auto hydrate(std::uint64_t lba, std::span<const std::byte> data,
                                std::span<const std::uint32_t> crcs)
         -> std::expected<std::uint64_t, StoreError>;
+    // Replaces one block a read found bad with a good copy from another
+    // replica (checksum repair, Requirement 5.4): data, sync, checksum,
+    // sync. No intent: a crash in between leaves a block that is still
+    // bad, or already good, and the next read repairs it again. A
+    // never-written copy (zeros with CRC 0) is accepted on a volume
+    // without a source.
+    [[nodiscard]] auto repair(std::uint64_t lba, std::span<const std::byte> block,
+                              std::uint32_t crc) -> std::expected<void, StoreError>;
     [[nodiscard]] auto unhydrated(std::uint64_t lba) -> std::expected<bool, StoreError>;
     [[nodiscard]] auto chunk_state(std::uint64_t chunk) -> std::expected<ChunkState, StoreError>;
     // Chunks written since the last clear_changed (a snapshot freeze).

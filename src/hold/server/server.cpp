@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "common/crc32c.hpp"
+
 namespace ak::hold {
 
 namespace {
@@ -43,6 +45,19 @@ auto status_of(store::StoreError e) noexcept -> HoldStatus {
         default:
             return HoldStatus::io_error;
     }
+}
+
+auto all_zero(std::span<const std::byte> b) noexcept -> bool {
+    return std::ranges::all_of(b, [](std::byte x) { return x == std::byte{0}; });
+}
+
+auto overlaps(const proto::HoldHeader& a, const proto::HoldHeader& b) noexcept -> bool {
+    return a.lba < b.lba + b.blocks && b.lba < a.lba + a.blocks;
+}
+
+// Members whose REPL_ACK a write waits for, and that can repair a read.
+auto in_sync(proto::ReplicaRole r) noexcept -> bool {
+    return r == proto::ReplicaRole::secondary || r == proto::ReplicaRole::leaving;
 }
 
 auto crc_bytes(std::span<const std::uint32_t> crcs) -> std::vector<std::byte> {
@@ -135,15 +150,26 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
     // Build the new state aside, so a refused config changes nothing.
     Volume next;
     if (found != _volumes.end()) {
-        next.store = std::move(found->second.store);
-        next.queue = std::move(found->second.queue);
-        next.limiter = found->second.limiter;
+        auto& old = found->second;
+        next.store = std::move(old.store);
+        next.queue = std::move(old.queue);
+        next.parked = std::move(old.parked);
+        next.limiter = old.limiter;
+        next.links = std::move(old.links);
+        next.replicating = std::move(old.replicating);
+        next.repairs = std::move(old.repairs);
+        next.next_request = old.next_request;
     }
     next.config = c;
     const auto restore = [&] {
         if (found != _volumes.end()) {
-            found->second.store = std::move(next.store);
-            found->second.queue = std::move(next.queue);
+            auto& old = found->second;
+            old.store = std::move(next.store);
+            old.queue = std::move(next.queue);
+            old.parked = std::move(next.parked);
+            old.links = std::move(next.links);
+            old.replicating = std::move(next.replicating);
+            old.repairs = std::move(next.repairs);
         }
     };
     if (const auto* me = find_member(c, _config.server_id); me != nullptr) {
@@ -168,13 +194,24 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
     if (next.store && single_replica_primary(next)) {
         next.store->set_commit(next.store->last_seq());
     }
-    _volumes.insert_or_assign(c.volume_id, std::move(next));
+    auto& v = _volumes.insert_or_assign(c.volume_id, std::move(next)).first->second;
+    if (is_primary(v)) {
+        sync_links(v, now);  // members added, removed or moved
+        advance(v);          // a removed member no longer holds writes up
+    } else {
+        abandon(v);
+    }
     return {};
 }
 
 auto HoldServer::single_replica_primary(const Volume& v) const -> bool {
     const auto* p = proto::primary_member(v.config);
     return v.config.members.size() == 1 && p != nullptr && p->server_id == _config.server_id;
+}
+
+auto HoldServer::is_primary(const Volume& v) const -> bool {
+    const auto* p = proto::primary_member(v.config);
+    return v.store && p != nullptr && p->server_id == _config.server_id;
 }
 
 auto HoldServer::epoch(std::uint64_t volume_id) const -> std::optional<std::uint64_t> {
@@ -195,6 +232,11 @@ auto HoldServer::queued(std::uint64_t volume_id) const -> std::size_t {
     return it == _volumes.end() ? 0 : it->second.queue.size();
 }
 
+auto HoldServer::replicating(std::uint64_t volume_id) const -> std::size_t {
+    const auto it = _volumes.find(volume_id);
+    return it == _volumes.end() ? 0 : it->second.replicating.size();
+}
+
 // ---- sessions --------------------------------------------------------------
 
 auto HoldServer::open_session(std::uint64_t peer_server_id) -> SessionId {
@@ -207,7 +249,53 @@ auto HoldServer::close_session(SessionId id) -> void {
     _sessions.erase(id);
     for (auto& [vid, v] : _volumes) {
         std::erase_if(v.queue, [id](const Request& r) { return r.session == id; });
+        std::erase_if(v.parked, [id](const Request& r) { return r.session == id; });
+        for (auto& [sid, l] : v.links) {
+            if (l.session != id) {
+                continue;
+            }
+            l.state = Link::State::down;
+            l.session = 0;
+            l.backoff = true;
+            for (auto it = v.repairs.begin(); it != v.repairs.end();) {
+                if (it->second.member == sid) {
+                    auto rep = std::move(it->second);
+                    it = v.repairs.erase(it);
+                    finish_repair(v, rep, nullptr);
+                } else {
+                    ++it;
+                }
+            }
+        }
     }
+}
+
+auto HoldServer::connected(SessionId id, Clock::time_point now) -> void {
+    static_cast<void>(now);
+    const auto sit = _sessions.find(id);
+    if (sit == _sessions.end() || !sit->second.outbound) {
+        return;
+    }
+    const auto vit = _volumes.find(sit->second.volume_id);
+    if (vit == _volumes.end()) {
+        return;
+    }
+    Volume& v = vit->second;
+    const auto lit = v.links.find(sit->second.peer);
+    const auto* me = find_member(v.config, _config.server_id);
+    if (lit == v.links.end() || lit->second.session != id || me == nullptr) {
+        return;
+    }
+    lit->second.state = Link::State::hello;
+    proto::HoldHeader h;
+    h.opcode = HoldOpcode::hello;
+    h.request_id = v.next_request++;
+    h.volume_id = v.config.volume_id;
+    h.epoch = v.config.epoch;
+    send_link(v, lit->second,
+              {.header = h,
+               .payload = proto::HoldHello{.role = proto::HoldPeerRole::peer,
+                                           .replica_gen = me->replica_gen}});
 }
 
 auto HoldServer::check(const Session& s, const proto::HoldHeader& h) const -> Verdict {
@@ -236,6 +324,21 @@ auto HoldServer::check(const Session& s, const proto::HoldHeader& h) const -> Ve
         if (find_member(c, _config.server_id) == nullptr) {
             return {.status = HoldStatus::unknown_volume};
         }
+        if (h.opcode == HoldOpcode::hello || h.opcode == HoldOpcode::ping) {
+            return {};
+        }
+        // Replication and repair reads come from this epoch's primary only.
+        const auto* primary = proto::primary_member(c);
+        if (primary == nullptr || primary->server_id != s.peer ||
+            primary->server_id == _config.server_id) {
+            return {.status = HoldStatus::not_primary};
+        }
+        if (!v.store) {
+            return {.status = HoldStatus::io_error};
+        }
+        if (proto::is_block_opcode(h.opcode) && h.lba + h.blocks > c.capacity_blocks) {
+            return {.status = HoldStatus::range};
+        }
         return {};
     }
     const auto* att = find_attachment(c, s.attachment_id);
@@ -255,13 +358,8 @@ auto HoldServer::check(const Session& s, const proto::HoldHeader& h) const -> Ve
     if (proto::is_block_opcode(h.opcode) && h.lba + h.blocks > c.capacity_blocks) {
         return {.status = HoldStatus::range};
     }
-    if (h.opcode == HoldOpcode::write) {
-        if (att->mode == proto::AttachMode::ro) {
-            return {.status = HoldStatus::read_only};
-        }
-        if (!single_replica_primary(v)) {
-            return {.status = HoldStatus::io_suspended};  // until replication (task 8)
-        }
+    if (h.opcode == HoldOpcode::write && att->mode == proto::AttachMode::ro) {
+        return {.status = HoldStatus::read_only};
     }
     return {};
 }
@@ -309,10 +407,16 @@ auto HoldServer::hello(SessionId id, Session& s, const proto::HoldFrame& f) -> v
 }
 
 auto HoldServer::on_frame(SessionId id, const proto::HoldFrame& f, Clock::time_point now) -> void {
-    static_cast<void>(now);
     const auto sit = _sessions.find(id);
-    if (sit == _sessions.end() || proto::is_response(f.header)) {
-        return;  // this role sends no requests yet (replication is task 8)
+    if (sit == _sessions.end()) {
+        return;
+    }
+    if (sit->second.outbound) {
+        on_link_frame(sit->second, id, f, now);
+        return;
+    }
+    if (proto::is_response(f.header)) {
+        return;  // nothing is asked of a peer over an inbound session
     }
     ++_stats.requests;
     Session& s = sit->second;
@@ -323,7 +427,11 @@ auto HoldServer::on_frame(SessionId id, const proto::HoldFrame& f, Clock::time_p
     }
     const auto verdict = check(s, h);
     if (verdict.status != HoldStatus::ok) {
-        refuse(id, h, verdict);
+        if (const auto* w = std::get_if<proto::ReplWrite>(&f.payload); w != nullptr) {
+            respond(id, h, verdict.status, proto::ReplAck{.seq = w->seq});
+        } else {
+            refuse(id, h, verdict);
+        }
         return;
     }
     Volume& v = _volumes.at(h.volume_id);
@@ -332,10 +440,15 @@ auto HoldServer::on_frame(SessionId id, const proto::HoldFrame& f, Clock::time_p
         .session = id, .header = h, .data = {}, .crcs = {}, .block_size = v.config.block_size};
     switch (h.opcode) {
         case HoldOpcode::ping:
+            if (const auto* p = std::get_if<proto::HoldPing>(&f.payload);
+                p != nullptr && !initiator && v.store) {
+                v.store->set_commit(p->commit_seq);  // the primary's commit point
+            }
             respond(id, h, HoldStatus::ok,
                     proto::HoldPing{.commit_seq = v.store ? v.store->commit_seq() : 0});
             return;
-        case HoldOpcode::read:
+        case HoldOpcode::read:  // from a peer: the primary repairing a block
+            break;
         case HoldOpcode::flush:
             if (!initiator) {
                 respond(id, h, HoldStatus::bad_request);
@@ -362,9 +475,25 @@ auto HoldServer::on_frame(SessionId id, const proto::HoldFrame& f, Clock::time_p
         }
         case HoldOpcode::repl_write: {
             const auto* w = std::get_if<proto::ReplWrite>(&f.payload);
-            respond(id, h, HoldStatus::bad_request,
-                    proto::ReplAck{.seq = w != nullptr ? w->seq : 0});
-            return;
+            if (initiator || w == nullptr || w->op != proto::ReplOp::write || w->seq == 0 ||
+                w->data.block_size != v.config.block_size) {
+                respond(id, h, HoldStatus::bad_request,
+                        proto::ReplAck{.seq = w != nullptr ? w->seq : 0});
+                return;
+            }
+            if (proto::first_bad_block(w->data) != h.blocks) {
+                ++_stats.checksum;
+                respond(id, h, HoldStatus::checksum, proto::ReplAck{.seq = w->seq});
+                return;
+            }
+            r.data.assign(w->data.data.begin(), w->data.data.end());
+            r.crcs.resize(h.blocks);
+            for (std::size_t i = 0; i < h.blocks; ++i) {
+                r.crcs[i] = proto::block_crc(w->data, i);
+            }
+            r.seq = w->seq;
+            r.commit_seq = w->commit_seq;
+            break;
         }
         default:  // write_zeroes, discard and the replication opcodes come later
             respond(id, h, HoldStatus::bad_request);
@@ -391,6 +520,12 @@ auto HoldServer::run(Clock::time_point now) -> void {
     }
     std::ranges::rotate(order, order.begin() + static_cast<std::ptrdiff_t>(_rr % order.size()));
     ++_rr;
+    for (auto* v : order) {
+        v->held = false;
+        if (is_primary(*v)) {
+            sync_links(*v, now);
+        }
+    }
     for (;;) {
         std::size_t progress = 0;
         for (auto* v : order) {
@@ -420,12 +555,17 @@ auto HoldServer::serve(Volume& v, std::size_t budget, Clock::time_point now) -> 
             continue;
         }
         if (const auto verdict = check(sit->second, r.header); verdict.status != HoldStatus::ok) {
-            refuse(r.session, r.header, verdict);
+            if (r.header.opcode == HoldOpcode::repl_write) {
+                respond(r.session, r.header, verdict.status, proto::ReplAck{.seq = r.seq});
+            } else {
+                refuse(r.session, r.header, verdict);
+            }
             v.queue.pop_front();
             ++served;
             continue;
         }
-        const bool plain = is_plain_write(r.header);
+        const bool repl = r.header.opcode == HoldOpcode::repl_write;
+        const bool plain = is_plain_write(r.header) || repl;
         const std::uint64_t bytes = r.header.opcode == HoldOpcode::flush
                                         ? 0
                                         : std::uint64_t{r.header.blocks} * r.block_size;
@@ -433,7 +573,19 @@ auto HoldServer::serve(Volume& v, std::size_t budget, Clock::time_point now) -> 
             batch_bytes + bytes > _config.max_batch_bytes) {
             flush_batch();  // order: what came before runs first
         }
-        if (bytes != 0 && !v.limiter.admit(bytes, now)) {
+        if (r.header.opcode == HoldOpcode::read && held_back(v, r)) {
+            v.parked.push_back(std::move(r));  // later requests go on without it
+            v.queue.pop_front();
+            continue;
+        }
+        if (held_back(v, r) || (plain && !repl && !v.links.empty() &&
+                                v.replicating.size() + batch.size() >= _config.max_replicating)) {
+            flush_batch();
+            v.held = true;  // until a member answers
+            break;
+        }
+        // The primary already shaped what it replicates.
+        if (bytes != 0 && !repl && !v.limiter.admit(bytes, now)) {
             break;
         }
         Request taken = std::move(r);
@@ -451,6 +603,10 @@ auto HoldServer::serve(Volume& v, std::size_t budget, Clock::time_point now) -> 
 }
 
 auto HoldServer::commit(Volume& v, std::vector<Request>& batch) -> void {
+    if (batch.front().header.opcode == HoldOpcode::repl_write) {
+        commit_replicas(v, batch);
+        return;
+    }
     std::vector<store::ReplicaStore::Write> writes;
     writes.reserve(batch.size());
     std::uint64_t seq = v.store->last_seq();
@@ -459,9 +615,27 @@ auto HoldServer::commit(Volume& v, std::vector<Request>& batch) -> void {
     }
     auto status = HoldStatus::ok;
     if (auto res = v.store->write(writes); res) {
-        v.store->set_commit(seq);
         ++_stats.batches;
         _stats.writes += batch.size();
+        if (!v.links.empty()) {
+            // Answered once every member holds them (advance).
+            const std::uint64_t first = seq - batch.size() + 1;
+            for (std::size_t i = 0; i < batch.size(); ++i) {
+                v.replicating.push_back({.request = std::move(batch[i]), .seq = first + i});
+            }
+            for (auto& [id, l] : v.links) {
+                if (l.state == Link::State::open) {
+                    for (auto it = v.replicating.end() - static_cast<std::ptrdiff_t>(batch.size());
+                         it != v.replicating.end(); ++it) {
+                        send_repl(v, l, *it);
+                    }
+                }
+            }
+            batch.clear();
+            advance(v);
+            return;
+        }
+        v.store->set_commit(seq);
     } else {
         status = status_of(res.error());
         if (res.error() == store::StoreError::io) {
@@ -494,6 +668,10 @@ auto HoldServer::execute(Volume& v, Request& r) -> void {
             }
             if (!bad->empty()) {
                 _stats.checksum += bad->size();
+                if (start_repair(v, r, *bad)) {
+                    return;
+                }
+                _stats.unrepairable += bad->size();
                 respond(r.session, r.header, HoldStatus::io_error);
                 return;
             }
@@ -525,13 +703,336 @@ auto HoldServer::execute(Volume& v, Request& r) -> void {
 
 auto HoldServer::next_wake(Clock::time_point now) const -> std::optional<Clock::time_point> {
     std::optional<Clock::time_point> wake;
+    const auto at = [&](Clock::time_point t) { wake = wake ? std::min(*wake, t) : t; };
     for (const auto& [id, v] : _volumes) {
-        if (!v.queue.empty()) {
-            const auto at = now + v.limiter.wait();
-            wake = wake ? std::min(*wake, at) : at;
+        if (!v.queue.empty() && !v.held) {
+            at(now + v.limiter.wait());
+        }
+        for (const auto& [sid, l] : v.links) {
+            if (l.state == Link::State::down) {
+                at(l.backoff ? now : std::max(now, l.redial_at));
+            }
         }
     }
     return wake;
+}
+
+// ---- replication -----------------------------------------------------------
+
+auto HoldServer::held_back(const Volume& v, const Request& r) const -> bool {
+    const auto& h = r.header;
+    if (h.opcode == HoldOpcode::read) {
+        // Not before an overlapping write is answered: it might still be
+        // rolled back.
+        return std::ranges::any_of(
+            v.replicating, [&](const Replicating& w) { return overlaps(w.request.header, h); });
+    }
+    if (h.opcode == HoldOpcode::write) {
+        // Not under a repair, which would write the older copy back over it.
+        return std::ranges::any_of(
+            v.repairs, [&](const auto& kv) { return overlaps(kv.second.request.header, h); });
+    }
+    return false;
+}
+
+auto HoldServer::sync_links(Volume& v, Clock::time_point now) -> void {
+    const auto& c = v.config;
+    if (!is_primary(v)) {
+        abandon(v);
+        return;
+    }
+    for (auto it = v.links.begin(); it != v.links.end();) {
+        const auto* m = find_member(c, it->first);
+        if (m == nullptr || m->replica_gen != it->second.member.replica_gen ||
+            m->endpoint != it->second.member.endpoint || m->port != it->second.member.port) {
+            drop_link(v, it->second, now);
+            it = v.links.erase(it);
+        } else {
+            it->second.member.role = m->role;
+            ++it;
+        }
+    }
+    for (const auto& m : c.members) {
+        if (m.server_id == _config.server_id) {
+            continue;
+        }
+        auto [it, added] = v.links.try_emplace(m.server_id, Link{.member = m});
+        Link& l = it->second;
+        if (l.backoff) {
+            l.backoff = false;
+            l.redial_at = now + _config.redial_backoff;
+        }
+        if (l.state != Link::State::down || now < l.redial_at) {
+            continue;
+        }
+        const SessionId id = _next_session++;
+        _sessions.emplace(id, Session{.peer = m.server_id,
+                                      .open = false,
+                                      .role = proto::HoldPeerRole::peer,
+                                      .volume_id = c.volume_id,
+                                      .attachment_id = 0,
+                                      .generation = m.replica_gen,
+                                      .outbound = true});
+        l.session = id;
+        l.state = Link::State::dialing;
+        _sink->dial(id, m.server_id, m.endpoint, m.port);
+    }
+}
+
+auto HoldServer::drop_link(Volume& v, Link& l, Clock::time_point now) -> void {
+    if (l.session != 0) {
+        const SessionId id = l.session;
+        _sessions.erase(id);
+        l.session = 0;
+        _sink->hang_up(id);
+    }
+    l.state = Link::State::down;
+    l.backoff = false;
+    l.redial_at = now + _config.redial_backoff;
+    for (auto it = v.repairs.begin(); it != v.repairs.end();) {
+        if (it->second.member == l.member.server_id) {
+            auto rep = std::move(it->second);
+            it = v.repairs.erase(it);
+            finish_repair(v, rep, nullptr);
+        } else {
+            ++it;
+        }
+    }
+}
+
+auto HoldServer::send_link(Volume& v, Link& l, proto::HoldFrame f) -> void {
+    static_cast<void>(v);
+    if (auto frame = proto::encode_hold_frame(f); frame && l.session != 0) {
+        _sink->send(l.session, std::move(*frame));
+    }
+}
+
+auto HoldServer::send_repl(Volume& v, Link& l, const Replicating& w) -> void {
+    const auto& r = w.request;
+    proto::HoldHeader h;
+    h.opcode = HoldOpcode::repl_write;
+    h.request_id = w.seq;
+    h.volume_id = v.config.volume_id;
+    h.epoch = v.config.epoch;
+    h.lba = r.header.lba;
+    h.blocks = r.header.blocks;
+    const auto crcs = crc_bytes(r.crcs);
+    send_link(v, l,
+              {.header = h,
+               .payload = proto::ReplWrite{
+                   .seq = w.seq,
+                   .commit_seq = std::min(v.store->commit_seq(), w.seq - 1),
+                   .op = proto::ReplOp::write,
+                   .data = {.block_size = r.block_size, .crcs = crcs, .data = r.data}}});
+}
+
+auto HoldServer::on_link_frame(Session& s, SessionId id, const proto::HoldFrame& f,
+                               Clock::time_point now) -> void {
+    if (!proto::is_response(f.header)) {
+        return;
+    }
+    const auto vit = _volumes.find(s.volume_id);
+    if (vit == _volumes.end()) {
+        return;
+    }
+    Volume& v = vit->second;
+    const auto lit = v.links.find(s.peer);
+    if (lit == v.links.end() || lit->second.session != id) {
+        return;
+    }
+    Link& l = lit->second;
+    const bool ok = f.header.status == HoldStatus::ok;
+    switch (f.header.opcode) {
+        case HoldOpcode::hello_ok:
+            if (!ok || l.state != Link::State::hello) {
+                drop_link(v, l, now);  // the member is at another epoch: retry later
+                return;
+            }
+            s.open = true;
+            l.state = Link::State::open;
+            for (const auto& w : v.replicating) {
+                if (w.seq > l.acked) {
+                    send_repl(v, l, w);  // in order, what it may not have
+                }
+            }
+            return;
+        case HoldOpcode::repl_ack: {
+            const auto* ack = std::get_if<proto::ReplAck>(&f.payload);
+            if (!ok || ack == nullptr || l.state != Link::State::open) {
+                drop_link(v, l, now);  // resent on the next session
+                return;
+            }
+            l.acked = std::max(l.acked, ack->seq);
+            advance(v);
+            return;
+        }
+        case HoldOpcode::read: {
+            const auto rit = v.repairs.find(f.header.request_id);
+            if (rit != v.repairs.end() && rit->second.member == l.member.server_id) {
+                auto rep = std::move(rit->second);
+                v.repairs.erase(rit);
+                finish_repair(v, rep, &f);
+            }
+            return;
+        }
+        default:
+            drop_link(v, l, now);
+            return;
+    }
+}
+
+auto HoldServer::advance(Volume& v) -> void {
+    std::uint64_t done = 0;
+    while (!v.replicating.empty()) {
+        auto& w = v.replicating.front();
+        const bool everywhere =
+            std::ranges::all_of(v.links, [&](const auto& kv) { return kv.second.acked >= w.seq; });
+        if (!everywhere) {
+            break;
+        }
+        respond(w.request.session, w.request.header, HoldStatus::ok);
+        ++_stats.replicated;
+        done = w.seq;
+        v.replicating.pop_front();
+    }
+    if (done != 0) {
+        if (v.store) {
+            v.store->set_commit(done);
+        }
+        unpark(v);
+    }
+}
+
+auto HoldServer::unpark(Volume& v) -> void {
+    // Back to the front, in order; run() parks any still held back.
+    v.queue.insert(v.queue.begin(), std::make_move_iterator(v.parked.begin()),
+                   std::make_move_iterator(v.parked.end()));
+    v.parked.clear();
+}
+
+auto HoldServer::abandon(Volume& v) -> void {
+    // No longer the primary: the initiators resend to the one that is.
+    for (auto& w : v.replicating) {
+        refuse(w.request.session, w.request.header,
+               {.status = HoldStatus::not_primary, .redirect = true});
+    }
+    v.replicating.clear();
+    for (auto& [id, rep] : v.repairs) {
+        respond(rep.request.session, rep.request.header, HoldStatus::io_error);
+    }
+    v.repairs.clear();
+    unpark(v);  // the fencing checks refuse them
+    for (auto& [id, l] : v.links) {
+        if (l.session != 0) {
+            _sessions.erase(l.session);
+            _sink->hang_up(l.session);
+        }
+    }
+    v.links.clear();
+}
+
+auto HoldServer::commit_replicas(Volume& v, std::vector<Request>& batch) -> void {
+    std::uint64_t commit = 0;
+    for (const auto& r : batch) {
+        commit = std::max(commit, r.commit_seq);
+    }
+    v.store->set_commit(commit);
+    const auto* me = find_member(v.config, _config.server_id);
+    const bool joining = me != nullptr && me->role == proto::ReplicaRole::joining;
+    std::vector<HoldStatus> status(batch.size(), HoldStatus::ok);
+    std::vector<store::ReplicaStore::Write> writes;
+    std::vector<std::size_t> written;
+    std::uint64_t last = v.store->last_seq();
+    for (std::size_t i = 0; i < batch.size(); ++i) {
+        const auto& r = batch[i];
+        if (r.seq <= last) {
+            continue;  // already durable here: a resend
+        }
+        if (!joining && r.seq != last + 1) {
+            status[i] = HoldStatus::bad_request;  // a gap: writes this replica never saw
+            continue;
+        }
+        writes.push_back({.seq = r.seq, .lba = r.header.lba, .data = r.data, .crcs = r.crcs});
+        written.push_back(i);
+        last = r.seq;
+    }
+    if (!writes.empty()) {
+        if (auto res = v.store->write(writes); res) {
+            ++_stats.batches;
+            _stats.writes += writes.size();
+        } else {
+            for (const auto i : written) {
+                status[i] = status_of(res.error());
+            }
+            if (res.error() == store::StoreError::io) {
+                ++_stats.io_errors;
+                v.store.reset();
+            }
+        }
+    }
+    for (std::size_t i = 0; i < batch.size(); ++i) {
+        respond(batch[i].session, batch[i].header, status[i], proto::ReplAck{.seq = batch[i].seq});
+    }
+    batch.clear();
+}
+
+auto HoldServer::start_repair(Volume& v, Request& r, std::vector<std::uint64_t> bad) -> bool {
+    if (!is_primary(v)) {
+        return false;
+    }
+    const auto it = std::ranges::find_if(v.links, [](const auto& kv) {
+        return kv.second.state == Link::State::open && in_sync(kv.second.member.role);
+    });
+    if (it == v.links.end()) {
+        return false;
+    }
+    proto::HoldHeader h;
+    h.opcode = HoldOpcode::read;
+    h.request_id = v.next_request++;
+    h.volume_id = v.config.volume_id;
+    h.epoch = v.config.epoch;
+    h.lba = r.header.lba;
+    h.blocks = r.header.blocks;
+    v.repairs.emplace(h.request_id,
+                      Repair{.request = std::move(r), .bad = std::move(bad), .member = it->first});
+    send_link(v, it->second, {.header = h, .payload = {}});
+    return true;
+}
+
+auto HoldServer::finish_repair(Volume& v, Repair& rep, const proto::HoldFrame* f) -> void {
+    const auto& h = rep.request.header;
+    const std::uint32_t bs = rep.request.block_size;
+    const bool sourced = v.config.source.kind != proto::SourceKind::none;
+    const auto* d = f != nullptr && f->header.status == HoldStatus::ok
+                        ? std::get_if<proto::BlockData>(&f->payload)
+                        : nullptr;
+    bool good = d != nullptr && v.store && d->block_size == bs && f->header.blocks == h.blocks &&
+                d->data.size() == std::size_t{h.blocks} * bs;
+    for (std::size_t b = 0; good && b < h.blocks; ++b) {
+        const auto block = d->data.subspan(b * bs, bs);
+        const auto crc = proto::block_crc(*d, b);
+        good = crc32c::of(block) == crc || (crc == 0 && !sourced && all_zero(block));
+    }
+    for (std::size_t i = 0; good && i < rep.bad.size(); ++i) {
+        const auto b = rep.bad[i] - h.lba;
+        auto r = v.store->repair(rep.bad[i], d->data.subspan(b * bs, bs), proto::block_crc(*d, b));
+        if (!r) {
+            good = false;
+            if (r.error() == store::StoreError::io) {
+                ++_stats.io_errors;
+                v.store.reset();
+            }
+        }
+    }
+    unpark(v);  // writes held behind the repair go on
+    if (!good) {
+        _stats.unrepairable += rep.bad.size();
+        respond(rep.request.session, h, HoldStatus::io_error);
+        return;
+    }
+    _stats.repaired += rep.bad.size();
+    respond(rep.request.session, h, HoldStatus::ok,
+            proto::BlockData{.block_size = bs, .crcs = d->crcs, .data = d->data});
 }
 
 // ---- responses -------------------------------------------------------------
@@ -551,6 +1052,9 @@ auto HoldServer::respond(SessionId id, const proto::HoldHeader& req, HoldStatus 
             break;
         case HoldOpcode::repl_write:
             h.opcode = HoldOpcode::repl_ack;
+            if (std::holds_alternative<std::monostate>(payload)) {
+                payload = proto::ReplAck{.seq = req.request_id};  // the primary's seq
+            }
             break;
         default:
             break;
@@ -569,7 +1073,7 @@ auto HoldServer::respond(SessionId id, const proto::HoldHeader& req, HoldStatus 
 }
 
 auto HoldServer::refuse(SessionId id, const proto::HoldHeader& req, Verdict v) -> void {
-    if (!v.redirect) {
+    if (!v.redirect || req.opcode == HoldOpcode::repl_write) {
         respond(id, req, v.status);
         return;
     }

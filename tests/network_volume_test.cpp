@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <csignal>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -42,6 +43,13 @@ using namespace std::chrono_literals;
 using namespace ak::oar::blk;
 using Clock = std::chrono::steady_clock;
 using Bytes = std::vector<std::byte>;
+
+// A peer that hangs up must not kill the process: the roles' mains
+// ignore SIGPIPE, and so do these tests.
+struct IgnoreSigpipe {
+    IgnoreSigpipe() { static_cast<void>(std::signal(SIGPIPE, SIG_IGN)); }
+};
+const IgnoreSigpipe ignore_sigpipe;
 
 constexpr std::uint64_t hold_id = 1;
 constexpr std::uint64_t compute_id = 2;

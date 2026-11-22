@@ -494,6 +494,27 @@ auto ReplicaStore::hydrate(std::uint64_t lba, std::span<const std::byte> data,
     return fill.size();
 }
 
+auto ReplicaStore::repair(std::uint64_t lba, std::span<const std::byte> block, std::uint32_t crc)
+    -> std::expected<void, StoreError> {
+    const std::uint32_t bs = _meta.block_size;
+    if (!check_range(lba, block.size()) || block.size() != bs) {
+        return std::unexpected(StoreError::bad_request);
+    }
+    const bool unwritten =
+        crc == 0 && _meta.source.kind == proto::SourceKind::none && all_zero(block);
+    if (!unwritten && crc32c::of(block) != crc) {
+        return std::unexpected(StoreError::bad_crc);
+    }
+    if (!_data->pwrite(lba * bs, block) || !_data->sync()) {
+        return std::unexpected(StoreError::io);
+    }
+    const std::array<std::uint32_t, 1> crcs{crc};
+    if (auto r = write_checksums(lba, crcs); !r) {
+        return std::unexpected(r.error());
+    }
+    return sync_meta();
+}
+
 auto ReplicaStore::unhydrated(std::uint64_t lba) -> std::expected<bool, StoreError> {
     if (lba >= _meta.capacity_blocks) {
         return std::unexpected(StoreError::bad_request);

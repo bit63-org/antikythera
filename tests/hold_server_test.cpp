@@ -398,7 +398,8 @@ BOOST_AUTO_TEST_CASE(accepts_members_as_peers, *utf::timeout(ak::test::unit_time
                 HoldStatus::fenced));  // a retired replica_gen
     BOOST_TEST((rig.peer_hello(rig.server().open_session(5), 3, 2).header.status ==
                 HoldStatus::fenced));  // not a member
-    // A peer gets no initiator operations, and replication is not here yet.
+    // A peer names no attachment, and replicates only from the primary,
+    // which this is.
     const auto p = rig.server().open_session(4);
     rig.peer_hello(p, 3, 2);
     BOOST_TEST((rig.read(p, 0, 1, 2) == HoldStatus::bad_request));
@@ -414,7 +415,7 @@ BOOST_AUTO_TEST_CASE(accepts_members_as_peers, *utf::timeout(ak::test::unit_time
                               .data = {.block_size = bs, .crcs = crcs, .data = data}});
     const auto ack = rig.sink().last();
     BOOST_TEST((ack.header.opcode == HoldOpcode::repl_ack));
-    BOOST_TEST((ack.header.status == HoldStatus::bad_request));
+    BOOST_TEST((ack.header.status == HoldStatus::not_primary));
     BOOST_TEST(std::get<proto::ReplAck>(ack.payload).seq == 9U);
 }
 
@@ -627,17 +628,6 @@ BOOST_AUTO_TEST_CASE(suspends_io, *utf::timeout(ak::test::unit_timeout_seconds))
     rig.apply(c);
     BOOST_TEST((rig.read(s, 0, 1, 2) == HoldStatus::io_suspended));
     BOOST_TEST((rig.write(s, 0, blocks_of(1, 1), 2) == HoldStatus::io_suspended));
-}
-
-BOOST_AUTO_TEST_CASE(refuses_writes_it_cannot_replicate,
-                     *utf::timeout(ak::test::unit_timeout_seconds)) {
-    Rig rig;
-    auto c = config(1);
-    c.members.push_back(member(4, proto::ReplicaRole::secondary));
-    rig.apply(c);
-    const auto s = rig.session();
-    BOOST_TEST((rig.write(s, 0, blocks_of(1, 1)) == HoldStatus::io_suspended));
-    BOOST_TEST((rig.read(s, 0, 1) == HoldStatus::ok));
 }
 
 BOOST_AUTO_TEST_CASE(redirects_after_a_handover, *utf::timeout(ak::test::unit_timeout_seconds)) {

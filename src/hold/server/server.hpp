@@ -40,13 +40,35 @@
 // READ, WRITE (and WRITE with the hydrate flag: fill only blocks still
 // unhydrated) and FLUSH (a barrier: an acknowledged write is already
 // durable) run in order per volume. Consecutive writes are group-committed
-// as one ReplicaStore batch. A read that finds a block whose checksum
-// does not match fails with io_error (a single replica has no copy to
-// repair from; task 8 adds repair). PING is answered at once.
+// as one ReplicaStore batch. PING is answered at once.
 //
-// Single replica only (task 6): a primary with other members refuses
-// writes with io_suspended until replication (task 8) exists, and the
-// lease (task 10) does not yet gate reads.
+// Replication (task 8, design "Write and read paths"). A primary with
+// other members opens one session to each (SessionSink::dial, then
+// connected(); HELLO as a peer naming its own replica_gen) and assigns
+// every write the next seq. After the local group commit, each write goes
+// to every member as REPL_WRITE(seq, commit_seq) on that member's ordered
+// stream, and the initiator is answered once every member has sent
+// REPL_ACK; commit_seq, the highest seq answered, then moves (Requirements
+// 1.5, 1.6). Joining members are awaited too until rebuild (task 11) gives
+// them a stream of their own. A member applies REPL_WRITEs in seq order
+// from the primary of its own epoch only (a deposed primary gets
+// stale_epoch, Requirement 6.2), acknowledges a seq it already holds
+// without writing it again, and refuses a gap unless it is joining. A
+// lost member session is redialled after redial_backoff and everything it
+// has not acknowledged is sent again in order. Members are awaited until
+// the controller removes them at a new epoch (reporting is task 10).
+//
+// The primary holds back a read that overlaps a write not yet answered,
+// so a read never returns data that might still be rolled back, and stops
+// taking writes while max_replicating are unanswered. A read that finds a
+// block whose checksum does not match is repaired (Requirement 5.4): the
+// primary reads the range from an in-sync member over its peer session,
+// writes the good blocks back (ReplicaStore::repair) and answers with
+// them; writes that overlap a repair wait for it. With no member to ask,
+// or no good copy there, the read fails with io_error.
+//
+// Single replica (task 6): a lone primary commits locally and answers at
+// once. The lease (task 10) does not yet gate reads.
 //
 // QoS (Requirement 10.2): each volume's requests wait in its queue until
 // its limiter (qos.hpp) admits them; run() serves the volumes round-robin,
@@ -87,6 +109,19 @@ public:
 
     // One encoded frame for the session's peer.
     virtual auto send(SessionId session, std::vector<std::byte> frame) -> void = 0;
+    // Replication: open `session` to another hold role at endpoint:port,
+    // whose certificate must name `server_id`. The node answers with
+    // HoldServer::connected() or close_session(). A sink without outbound
+    // connections ignores it (and replicated writes then wait).
+    virtual auto dial(SessionId session, std::uint64_t server_id,
+                      const proto::StorageEndpoint& endpoint, std::uint16_t port) -> void {
+        static_cast<void>(session);
+        static_cast<void>(server_id);
+        static_cast<void>(endpoint);
+        static_cast<void>(port);
+    }
+    // Ends a session (either direction); the node then calls close_session().
+    virtual auto hang_up(SessionId session) -> void { static_cast<void>(session); }
 };
 
 struct ServerConfig {
@@ -97,6 +132,8 @@ struct ServerConfig {
     std::size_t quantum{32};                       // requests per volume per pass
     std::size_t max_batch_writes{64};              // writes per group commit
     std::size_t max_batch_bytes{8 * 1024 * 1024};  // bytes per group commit
+    std::size_t max_replicating{1024};             // writes awaiting members per volume
+    std::chrono::milliseconds redial_backoff{250};
 };
 
 enum class ConfigError : std::uint8_t {
@@ -114,8 +151,11 @@ struct ServerStats {
     std::uint64_t throttled{0};
     std::uint64_t checksum{0};  // blocks read whose data did not match
     std::uint64_t io_errors{0};
-    std::uint64_t batches{0};  // group commits
-    std::uint64_t writes{0};   // writes in them
+    std::uint64_t batches{0};       // group commits
+    std::uint64_t writes{0};        // writes in them
+    std::uint64_t replicated{0};    // writes every member acknowledged
+    std::uint64_t repaired{0};      // blocks rewritten from a member's copy
+    std::uint64_t unrepairable{0};  // bad blocks with no good copy to be had
 };
 
 class HoldServer {
@@ -127,20 +167,26 @@ public:
 
     // A session from the server the peer's certificate names.
     [[nodiscard]] auto open_session(std::uint64_t peer_server_id) -> SessionId;
-    // Its queued requests are dropped.
+    // A session dialled for replication is up (the certificate named the
+    // server asked for).
+    auto connected(SessionId id, Clock::time_point now) -> void;
+    // Its queued requests are dropped; a dialled one is redialled later.
     auto close_session(SessionId id) -> void;
     // A frame decoded from the session (block data is copied).
     auto on_frame(SessionId id, const proto::HoldFrame& frame, Clock::time_point now) -> void;
 
-    // Serves queued requests the limits allow.
+    // Serves queued requests the limits allow, and dials members.
     auto run(Clock::time_point now) -> void;
-    // When run() next has work: now, a later time (a limiter), or never.
+    // When run() next has work: now, a later time (a limiter or a redial),
+    // or never.
     [[nodiscard]] auto next_wake(Clock::time_point now) const -> std::optional<Clock::time_point>;
 
     [[nodiscard]] auto stats() const noexcept -> const ServerStats& { return _stats; }
     [[nodiscard]] auto epoch(std::uint64_t volume_id) const -> std::optional<std::uint64_t>;
     [[nodiscard]] auto replica(std::uint64_t volume_id) -> store::ReplicaStore*;
     [[nodiscard]] auto queued(std::uint64_t volume_id) const -> std::size_t;
+    // Writes committed here and still awaiting a member's REPL_ACK.
+    [[nodiscard]] auto replicating(std::uint64_t volume_id) const -> std::size_t;
 
 private:
     struct Session {
@@ -150,6 +196,7 @@ private:
         std::uint64_t volume_id{0};
         std::uint64_t attachment_id{0};
         std::uint32_t generation{0};  // the attachment's, or the peer's replica_gen
+        bool outbound{false};         // dialled by this server to a member
     };
     struct Request {
         SessionId session{0};
@@ -157,12 +204,46 @@ private:
         std::vector<std::byte> data;
         std::vector<std::uint32_t> crcs;
         std::uint32_t block_size{0};
+        std::uint64_t seq{0};         // REPL_WRITE
+        std::uint64_t commit_seq{0};  // REPL_WRITE
+    };
+    // The primary's session to one member.
+    struct Link {
+        enum class State : std::uint8_t {
+            down,
+            dialing,
+            hello,
+            open
+        };
+        proto::ReplicaMember member;
+        State state{State::down};
+        SessionId session{0};
+        Clock::time_point redial_at{};
+        std::uint64_t acked{0};  // every seq up to here is durable there
+        bool backoff{false};     // lost: redial_at is set by the next run()
+    };
+    // A write committed here, awaiting the members.
+    struct Replicating {
+        Request request;
+        std::uint64_t seq{0};
+    };
+    // A read waiting for a member's copy of its bad blocks.
+    struct Repair {
+        Request request;
+        std::vector<std::uint64_t> bad;  // LBAs
+        std::uint64_t member{0};         // server asked
     };
     struct Volume {
         proto::ReplicaConfig config;
         std::unique_ptr<store::ReplicaStore> store;
         VolumeLimiter limiter;
         std::deque<Request> queue;
+        std::deque<Request> parked;               // reads held back behind writes or repairs
+        std::map<std::uint64_t, Link> links;      // primary: by member server ID
+        std::deque<Replicating> replicating;      // by seq
+        std::map<std::uint64_t, Repair> repairs;  // by request ID to the member
+        std::uint64_t next_request{1};
+        bool held{false};  // serving waits for a member, not for time
     };
     // The outcome of the fencing checks.
     struct Verdict {
@@ -176,6 +257,20 @@ private:
     [[nodiscard]] auto check_hello(const Session& s, const proto::HoldHeader& h,
                                    const proto::HoldHello& hello) const -> Verdict;
     [[nodiscard]] auto single_replica_primary(const Volume& v) const -> bool;
+    [[nodiscard]] auto is_primary(const Volume& v) const -> bool;
+    [[nodiscard]] auto held_back(const Volume& v, const Request& r) const -> bool;
+    auto sync_links(Volume& v, Clock::time_point now) -> void;
+    auto drop_link(Volume& v, Link& l, Clock::time_point now) -> void;
+    auto send_link(Volume& v, Link& l, proto::HoldFrame f) -> void;
+    auto send_repl(Volume& v, Link& l, const Replicating& w) -> void;
+    auto on_link_frame(Session& s, SessionId id, const proto::HoldFrame& f, Clock::time_point now)
+        -> void;
+    auto advance(Volume& v) -> void;
+    auto unpark(Volume& v) -> void;
+    auto abandon(Volume& v) -> void;
+    auto start_repair(Volume& v, Request& r, std::vector<std::uint64_t> bad) -> bool;
+    auto finish_repair(Volume& v, Repair& rep, const proto::HoldFrame* f) -> void;
+    auto commit_replicas(Volume& v, std::vector<Request>& batch) -> void;
     auto hello(SessionId id, Session& s, const proto::HoldFrame& f) -> void;
     auto serve(Volume& v, std::size_t budget, Clock::time_point now) -> std::size_t;
     auto commit(Volume& v, std::vector<Request>& batch) -> void;

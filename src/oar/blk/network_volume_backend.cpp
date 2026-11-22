@@ -3,12 +3,9 @@
 
 #include "oar/blk/network_volume_backend.hpp"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
-#include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -24,6 +21,7 @@
 
 #include "proto/hold_stream.hpp"
 #include "proto/server_identity.hpp"
+#include "proto/storage_net.hpp"
 
 namespace ak::oar::blk {
 
@@ -32,8 +30,6 @@ namespace {
 using Clock = InitiatorCore::Clock;
 using Bytes = std::vector<std::byte>;
 
-// DSCP AF41 in the TOS / traffic class byte: storage I/O (design "Priority").
-constexpr int storage_io_tos = 34 << 2;
 constexpr std::size_t read_chunk = 64 * 1024;
 
 auto close_fd(int fd) noexcept -> void {
@@ -51,24 +47,6 @@ auto drain(int fd) noexcept -> void {
     std::uint64_t n = 0;
     while (::read(fd, &n, sizeof n) == static_cast<ssize_t>(sizeof n)) {
     }
-}
-
-// The route's address as text: dotted quad for an IPv4-mapped address.
-auto address_text(const proto::StorageEndpoint& a) -> std::string {
-    const bool mapped =
-        std::all_of(a.begin(), a.begin() + 10, [](std::byte b) { return b == std::byte{0}; }) &&
-        a[10] == std::byte{0xFF} && a[11] == std::byte{0xFF};
-    std::array<char, INET6_ADDRSTRLEN> text{};
-    const char* r = mapped ? ::inet_ntop(AF_INET, a.data() + 12, text.data(), text.size())
-                           : ::inet_ntop(AF_INET6, a.data(), text.data(), text.size());
-    return r != nullptr ? std::string{text.data()} : std::string{};
-}
-
-auto set_storage_tos(int fd) noexcept -> void {
-    const int tos = storage_io_tos;
-    // Whichever family the socket is; the other call fails harmlessly.
-    static_cast<void>(::setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof tos));
-    static_cast<void>(::setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof tos));
 }
 
 }  // namespace
@@ -140,7 +118,7 @@ struct NetworkVolumeBackend::Shared {
 };
 
 auto NetworkVolumeBackend::Shared::open(const HoldTarget& t) -> std::optional<tls::Stream> {
-    const auto host = address_text(t.endpoint);
+    const auto host = proto::endpoint_text(t.endpoint);
     if (host.empty()) {
         return std::nullopt;
     }
@@ -162,7 +140,7 @@ auto NetworkVolumeBackend::Shared::open(const HoldTarget& t) -> std::optional<tl
         s->close();
         return std::nullopt;
     }
-    set_storage_tos(s->fd());
+    proto::set_storage_class(s->fd());
     return std::move(*s);
 }
 

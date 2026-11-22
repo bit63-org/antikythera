@@ -23,6 +23,9 @@
 //
 // Until set_route() delivers the first ReplicaConfig, requests are held
 // (Requirement 2.2, the route's side of VirtioBlkFunction::await_key).
+// The process must ignore SIGPIPE, as the roles' mains do: a hold that
+// hangs up mid-write would otherwise end it.
+//
 // Faults the core reports (primary timeout, fenced, checksum) wait in
 // take_faults() for helm's report path.
 

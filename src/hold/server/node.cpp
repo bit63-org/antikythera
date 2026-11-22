@@ -3,9 +3,8 @@
 
 #include "hold/server/node.hpp"
 
-#include <netinet/in.h>
 #include <poll.h>
-#include <sys/socket.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -21,22 +20,32 @@ namespace {
 constexpr std::size_t read_chunk = 64 * 1024;
 
 auto mark_storage_class(int fd) -> void {
-    const int tos = storage_io_tos;
-    // Whichever family the socket is; the other call fails harmlessly.
-    static_cast<void>(::setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof tos));
-    static_cast<void>(::setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof tos));
+    proto::set_storage_class(fd);
 }
 
 }  // namespace
 
 // ---- Node --------------------------------------------------------------------
 
-Node::Node(store::FileLayer& files, NodeConfig config, tls::Context ctx,
-           tls::Listener listener) noexcept
+Node::Dials::~Dials() {
+    if (wake >= 0) {
+        static_cast<void>(::close(wake));
+    }
+}
+
+Node::Node(store::FileLayer& files, NodeConfig config, tls::Context ctx, tls::Listener listener,
+           int dial_wake) noexcept
     : _config{std::move(config)},
       _ctx{std::move(ctx)},
       _listener{std::move(listener)},
-      _server{files, _config.server, *this} {}
+      _server{files, _config.server, *this},
+      _dials{dial_wake} {}
+
+Node::~Node() {
+    for (auto& [id, t] : _dialing) {
+        t.join();
+    }
+}
 
 auto Node::create(store::FileLayer& files, NodeConfig config)
     -> std::expected<std::unique_ptr<Node>, tls::Error> {
@@ -49,8 +58,12 @@ auto Node::create(store::FileLayer& files, NodeConfig config)
     if (!listener) {
         return std::unexpected(listener.error());
     }
+    const int wake = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (wake < 0) {
+        return std::unexpected(tls::Error::io);
+    }
     return std::unique_ptr<Node>{
-        new Node(files, std::move(config), std::move(*ctx), std::move(*listener))};
+        new Node(files, std::move(config), std::move(*ctx), std::move(*listener), wake)};
 }
 
 auto Node::run_once(Clock::duration max_wait) -> void {
@@ -62,6 +75,7 @@ auto Node::run_once(Clock::duration max_wait) -> void {
     std::vector<pollfd> fds;
     std::vector<SessionId> ids;
     fds.push_back({.fd = _listener.fd(), .events = POLLIN, .revents = 0});
+    fds.push_back({.fd = _dials.wake, .events = POLLIN, .revents = 0});
     for (auto& [id, c] : _conns) {
         if (c.stream.pending()) {
             wait = Clock::duration::zero();
@@ -74,12 +88,15 @@ auto Node::run_once(Clock::duration max_wait) -> void {
     now = Clock::now();
     for (std::size_t i = 0; i < ids.size(); ++i) {
         auto& c = _conns.at(ids[i]);
-        if (fds[i + 1].revents != 0 || c.stream.pending()) {
+        if (fds[i + 2].revents != 0 || c.stream.pending()) {
             read(c, now);
         }
     }
     if ((fds[0].revents & POLLIN) != 0) {
         accept();
+    }
+    if ((fds[1].revents & POLLIN) != 0) {
+        take_dials(now);
     }
     _server.run(Clock::now());
     reap();
@@ -147,6 +164,76 @@ auto Node::send(SessionId session, std::vector<std::byte> frame) -> void {
     }
     if (!it->second.stream.write_all(frame, Clock::now() + _config.write_timeout)) {
         it->second.dead = true;
+    }
+}
+
+auto Node::dial(SessionId session, std::uint64_t server_id, const proto::StorageEndpoint& endpoint,
+                std::uint16_t port) -> void {
+    auto config = _config.tls;
+    config.role = tls::Role::client;
+    config.peer_name = proto::endpoint_text(endpoint);  // the member's IP SAN
+    const auto deadline = Clock::now() + _config.handshake_timeout;
+    _dialing.emplace(
+        session, std::thread{[dials = &_dials, session, server_id, port, deadline,
+                              config = std::move(config)] {
+            Dialed d{.session = session, .server_id = server_id, .stream = std::nullopt};
+            if (auto ctx = tls::Context::create(config); ctx && !config.peer_name.empty()) {
+                if (auto s = tls::Stream::connect(*ctx, config.peer_name, port, deadline)) {
+                    d.stream = std::move(*s);
+                }
+            }
+            {
+                const std::scoped_lock lock{dials->mutex};
+                dials->done.push_back(std::move(d));
+            }
+            const std::uint64_t one = 1;
+            static_cast<void>(::write(dials->wake, &one, sizeof one));
+        }});
+}
+
+auto Node::hang_up(SessionId session) -> void {
+    if (const auto it = _conns.find(session); it != _conns.end()) {
+        it->second.dead = true;  // reap() closes it and tells the server
+    } else if (_dialing.contains(session)) {
+        _cancelled.push_back(session);
+    }
+}
+
+auto Node::take_dials(Clock::time_point now) -> void {
+    std::uint64_t n = 0;
+    static_cast<void>(::read(_dials.wake, &n, sizeof n));
+    std::vector<Dialed> done;
+    {
+        const std::scoped_lock lock{_dials.mutex};
+        done.swap(_dials.done);
+    }
+    for (auto& d : done) {
+        if (const auto t = _dialing.find(d.session); t != _dialing.end()) {
+            t->second.join();
+            _dialing.erase(t);
+        }
+        const bool cancelled = std::erase(_cancelled, d.session) != 0;
+        if (d.stream && !cancelled) {
+            const auto uris = d.stream->peer_uris();
+            const auto id = proto::server_id_of(uris);
+            if (!id || *id != d.server_id) {
+                d.stream->close();  // not the member the config names
+                d.stream.reset();
+            }
+        }
+        if (!d.stream || cancelled) {
+            if (d.stream) {
+                d.stream->close();
+            }
+            _server.close_session(d.session);
+            continue;
+        }
+        mark_storage_class(d.stream->fd());
+        _conns.emplace(
+            d.session,
+            Connection{
+                .stream = std::move(*d.stream), .session = d.session, .in = {}, .dead = false});
+        _server.connected(d.session, now);
     }
 }
 

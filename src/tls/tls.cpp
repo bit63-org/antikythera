@@ -363,6 +363,32 @@ auto Stream::pending() const noexcept -> bool {
     return _impl && _impl->ssl && SSL_pending(_impl->ssl.get()) > 0;
 }
 
+auto Stream::peer_uris() const -> std::vector<std::string> {
+    std::vector<std::string> out;
+    if (!_impl || !_impl->ssl) {
+        return out;
+    }
+    X509* cert = SSL_get0_peer_certificate(_impl->ssl.get());
+    if (cert == nullptr) {
+        return out;
+    }
+    auto* names =
+        static_cast<GENERAL_NAMES*>(X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr));
+    if (names == nullptr) {
+        return out;
+    }
+    for (int i = 0; i < sk_GENERAL_NAME_num(names); ++i) {
+        const GENERAL_NAME* n = sk_GENERAL_NAME_value(names, i);
+        if (n->type == GEN_URI) {
+            const ASN1_IA5STRING* uri = n->d.uniformResourceIdentifier;
+            out.emplace_back(reinterpret_cast<const char*>(ASN1_STRING_get0_data(uri)),
+                             static_cast<std::size_t>(ASN1_STRING_length(uri)));
+        }
+    }
+    GENERAL_NAMES_free(names);
+    return out;
+}
+
 auto Stream::read_some(std::span<std::byte> out) -> std::expected<std::size_t, Error> {
     if (!_impl || !_impl->ssl) {
         return std::unexpected(Error::closed);

@@ -141,6 +141,20 @@ target_link_libraries(ak_hold_store
   PUBLIC ak::proto ak::common
   PRIVATE OpenSSL::Crypto ak::warnings ak::hardening)
 
+# The hold role (.kiro/specs/block-volume-service/ task 6): request
+# handling, fencing and QoS (server), and the TLS node on the storage
+# segment; ak-hold runs it with a stub for helm's sideband.
+add_library(ak_hold_server
+  hold/server/node.cpp
+  hold/server/server.cpp)
+add_library(ak::hold_server ALIAS ak_hold_server)
+target_link_libraries(ak_hold_server
+  PUBLIC ak::hold_store ak::proto ak::tls
+  PRIVATE ak::warnings ak::hardening)
+add_executable(ak-hold hold/hold_main.cpp)
+target_link_libraries(ak-hold PRIVATE ak::hold_server ak::warnings ak::hardening)
+install(TARGETS ak-hold RUNTIME DESTINATION bin)
+
 # harbor's test controller: signs commands and mapping updates and drives
 # one helm over the ControllerLink, standing in for kythira's EC2 module
 # until it exists (.kiro/specs/controller-interface/ task 5).

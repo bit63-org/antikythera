@@ -11,6 +11,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <atomic>
+#include <csignal>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +38,13 @@ namespace utf = boost::unit_test;
 using namespace std::chrono_literals;
 using ak::hold::Clock;
 using Bytes = std::vector<std::byte>;
+
+// A peer that hangs up must not kill the process: the roles' mains
+// ignore SIGPIPE, and so do these tests.
+struct IgnoreSigpipe {
+    IgnoreSigpipe() { static_cast<void>(std::signal(SIGPIPE, SIG_IGN)); }
+};
+const IgnoreSigpipe ignore_sigpipe;
 
 constexpr std::uint64_t hold_id = 1;
 constexpr std::uint64_t compute_id = 2;
@@ -69,47 +77,56 @@ auto config() -> proto::ReplicaConfig {
     return c;
 }
 
-// A node on 127.0.0.1 running on its own thread.
+// A node on 127.0.0.1 running on its own thread, as server `id`.
 class Rig {
 public:
-    Rig() {
-        const auto pem = ca.issue("hold-1", "IP:127.0.0.1, " + uri(hold_id));
-        auto node = ak::hold::Node::create(
-            files, {.host = "127.0.0.1",
-                    .port = 0,
-                    .tls = {.role = tls::Role::server,
-                            .ca_pem = ca.cert_pem(),
-                            .cert_pem = pem.cert,
-                            .key_pem = pem.key,
-                            .peer_name = {}},
-                    .server = {.server_id = hold_id, .data_dir = "/srv/hold"},
-                    .handshake_timeout = 2000ms,
-                    .write_timeout = 2000ms});
+    Rig() : Rig(hold_id) { start(config()); }
+    explicit Rig(std::uint64_t id, ak::test::TestCa* shared_ca = nullptr)
+        : _ca{shared_ca != nullptr ? shared_ca : &ca} {
+        const auto pem = _ca->issue("hold", "IP:127.0.0.1, " + uri(id));
+        auto node =
+            ak::hold::Node::create(files, {.host = "127.0.0.1",
+                                           .port = 0,
+                                           .tls = {.role = tls::Role::server,
+                                                   .ca_pem = _ca->cert_pem(),
+                                                   .cert_pem = pem.cert,
+                                                   .key_pem = pem.key,
+                                                   .peer_name = {}},
+                                           .server = {.server_id = id, .data_dir = "/srv/hold"},
+                                           .handshake_timeout = 2000ms,
+                                           .write_timeout = 2000ms});
         BOOST_TEST_REQUIRE(node.has_value());
         _node = std::move(*node);
-        BOOST_TEST_REQUIRE(_node->server().apply_config(config(), Clock::now()).has_value());
+    }
+
+    // Applies the node's config and runs it on its thread.
+    auto start(const proto::ReplicaConfig& c) -> void {
+        BOOST_TEST_REQUIRE(_node->server().apply_config(c, Clock::now()).has_value());
         _thread = std::thread{[this] {
             while (!_stop.load()) {
                 _node->run_once(20ms);
             }
         }};
     }
+    auto stop() -> void {
+        _stop.store(true);
+        if (_thread.joinable()) {
+            _thread.join();
+        }
+    }
     Rig(const Rig&) = delete;
     auto operator=(const Rig&) -> Rig& = delete;
     Rig(Rig&&) = delete;
     auto operator=(Rig&&) -> Rig& = delete;
-    ~Rig() {
-        _stop.store(true);
-        _thread.join();
-    }
+    ~Rig() { stop(); }
 
     static auto uri(std::uint64_t id) -> std::string { return "URI:" + ak::proto::server_uri(id); }
 
     // A client presenting a certificate with these subjectAltNames.
     auto connect(const std::string& san) -> std::optional<tls::Stream> {
-        const auto pem = ca.issue("client", san);
+        const auto pem = _ca->issue("client", san);
         auto ctx = tls::Context::create({.role = tls::Role::client,
-                                         .ca_pem = ca.cert_pem(),
+                                         .ca_pem = _ca->cert_pem(),
                                          .cert_pem = pem.cert,
                                          .key_pem = pem.key,
                                          .peer_name = "127.0.0.1"});
@@ -128,6 +145,7 @@ public:
     ak::test::TestCa ca{"storage CA"};
 
 private:
+    ak::test::TestCa* _ca;
     ak::hold::store::MemFiles files;
     std::unique_ptr<ak::hold::Node> _node;
     std::vector<std::unique_ptr<tls::Context>> _contexts;
@@ -267,4 +285,53 @@ BOOST_AUTO_TEST_CASE(hangs_up_on_garbage, *utf::timeout(ak::test::unit_timeout_s
     BOOST_TEST_REQUIRE(s->write_all(junk, Clock::now() + 5s).has_value());
     ak::hold::FrameAssembler in;
     BOOST_TEST(!receive(*s, in).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(replicates_to_a_member_over_tls,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    ak::test::TestCa ca{"storage CA"};
+    Rig primary{hold_id, &ca};
+    Rig secondary{3, &ca};
+    auto c = config();
+    c.members[0].endpoint = {};
+    c.members[0].endpoint[10] = std::byte{0xFF};  // ::ffff:127.0.0.1
+    c.members[0].endpoint[11] = std::byte{0xFF};
+    c.members[0].endpoint[12] = std::byte{127};
+    c.members[0].endpoint[15] = std::byte{1};
+    c.members[0].port = primary.node().port();
+    auto m = c.members[0];
+    m.server_id = 3;
+    m.role = proto::ReplicaRole::secondary;
+    m.port = secondary.node().port();
+    c.members.push_back(m);
+    secondary.start([&] {
+        auto mine = c;
+        mine.server_id = 3;
+        return mine;
+    }());
+    primary.start(c);
+
+    auto s = primary.connect(Rig::uri(compute_id));
+    BOOST_TEST_REQUIRE(s.has_value());
+    ak::hold::FrameAssembler in;
+    BOOST_TEST((hello(*s, in) == proto::HoldStatus::ok));
+    const Bytes data(2 * bs, std::byte{0x3C});
+    const auto crcs = proto::block_crcs(data, bs);
+    auto w = header(proto::HoldOpcode::write, 2);
+    w.lba = 4;
+    w.blocks = 2;
+    BOOST_TEST_REQUIRE(send(*s, {.header = w, .payload = proto::BlockData{bs, crcs, data}}));
+    const auto reply = receive(*s, in);
+    BOOST_TEST_REQUIRE(reply.has_value());
+    BOOST_TEST((proto::decode_hold_frame(*reply)->header.status == proto::HoldStatus::ok));
+
+    // Answered only once the member had it.
+    secondary.stop();
+    auto* replica = secondary.node().server().replica(vol);
+    BOOST_TEST_REQUIRE(replica != nullptr);
+    Bytes out(2 * bs);
+    std::vector<std::uint32_t> got(2);
+    BOOST_TEST_REQUIRE(replica->read(4, out, got).has_value());
+    BOOST_TEST(out == data);
+    BOOST_TEST(replica->last_seq() == 1U);
 }

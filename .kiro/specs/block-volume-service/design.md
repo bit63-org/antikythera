@@ -211,7 +211,7 @@ rsvd u32, header_crc32c u32
 | Opcode | From → to | Meaning |
 |---|---|---|
 | `HELLO` / `HELLO_OK` | any | open a session for a volume; refuses stale epoch or unknown attachment |
-| `READ` | initiator → primary | read blocks; reply carries data + one CRC32C per block |
+| `READ` | initiator → primary; primary → member | read blocks; reply carries data + one CRC32C per block (from a member: checksum repair) |
 | `WRITE` | initiator → primary | write blocks with per-block CRC32C; flag `HYDRATE` = only fill unwritten blocks of an unhydrated chunk |
 | `WRITE_ZEROES`, `DISCARD` | initiator → primary | later virtio-blk features; zero / punch |
 | `FLUSH` | initiator → primary | barrier only: every completed write is already durable |
@@ -294,9 +294,10 @@ guest write ─► VirtioBlkFunction: encrypt (K_vol, tweak = LBA)
 - **Checksums.** The initiator computes CRC32C over each block's
   ciphertext, so a flipped bit anywhere between oar-blk and the media is
   caught. hold verifies on receipt and on every read; a mismatch on read
-  is repaired from another in-sync member (`SYNC_DATA` for that block)
-  and counted; if no member has a good copy the read fails with IOERR and
-  a `checksum_unrepairable` fault (Requirement 5.4).
+  is repaired from another in-sync member (the primary `READ`s the range
+  over its peer session and writes the good blocks back) and counted; if
+  no member has a good copy the read fails with IOERR and a
+  `checksum_unrepairable` fault (Requirement 5.4).
 
 ## Epochs, leases and fencing
 

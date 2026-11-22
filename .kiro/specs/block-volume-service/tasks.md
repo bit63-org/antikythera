@@ -53,7 +53,7 @@ repository. Prerequisites outside this spec: oar-blk task 14
 
 ### Phase C: fault tolerance
 
-- [ ] 8. Replication: `seq` ordering, `REPL_WRITE`/`REPL_ACK` to every
+- [x] 8. Replication: `seq` ordering, `REPL_WRITE`/`REPL_ACK` to every
   in-sync member, overlap ordering, `commit_seq`, intent trimming, read
   hold-back behind unacknowledged overlapping writes, checksum repair
   from a peer. _Requirements: 1.5-1.6, 4.2, 5.1, 5.4_ (cloud)

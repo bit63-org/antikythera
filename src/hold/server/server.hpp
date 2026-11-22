@@ -53,10 +53,11 @@
 // them a stream of their own. A member applies REPL_WRITEs in seq order
 // from the primary of its own epoch only (a deposed primary gets
 // stale_epoch, Requirement 6.2), acknowledges a seq it already holds
-// without writing it again, and refuses a gap unless it is joining. A
+// without writing it again, and refuses a gap unless it is joining or the
+// gap opens a session (a new primary's first write, see Promotion). A
 // lost member session is redialled after redial_backoff and everything it
 // has not acknowledged is sent again in order. Members are awaited until
-// the controller removes them at a new epoch (reporting is task 10).
+// the controller removes them at a new epoch (see Failover).
 //
 // The primary holds back a read that overlaps a write not yet answered,
 // so a read never returns data that might still be rolled back, and stops
@@ -68,7 +69,36 @@
 // or no good copy there, the read fails with io_error.
 //
 // Single replica (task 6): a lone primary commits locally and answers at
-// once. The lease (task 10) does not yet gate reads.
+// once.
+//
+// Failover (task 10, design "Epochs, leases and fencing" and "Failure
+// detection and failover"). take_reports() hands helm what goes up its
+// report path: a ReplicaStatus every status_interval (at most lease_ms / 4
+// apart while this server is a primary), which is also each primary's
+// lease request, and faults and demotions as they happen. grant_lease()
+// takes the controller's acknowledgement; the lease runs lease_ms from
+// when the first unanswered request was sent, and a primary serves reads
+// only while it holds one (writes are fenced by epochs instead). Faults:
+//   member_timeout   a member left a write unacknowledged, or a promotion's
+//                    INTENTS unanswered, for member_timeout
+//   primary_timeout  a member heard nothing from its primary (which pings
+//                    every ping_interval) for primary_timeout
+// each at most once per epoch and suspect. Applying a config that ends
+// this server's primary role reports demotion_confirmed.
+//
+// Promotion (Requirement 6.6). A server that becomes primary of a
+// replicated volume reconciles before it serves: it asks every member for
+// its uncommitted intent extents (INTENTS), and once all have answered it
+// writes its own copy of the union of theirs and its own to every member,
+// as ordinary replicated writes numbered above every seq any of them
+// holds (a member takes the jump on a session's first REPL_WRITE).
+// Writes no one acknowledged may thus be kept or lost, but every replica
+// ends up with the same copy. Its own blocks there are taken as they are,
+// with fresh checksums: a block a crash left half written belongs to a
+// write never acknowledged, which a disk may also leave torn at sectors.
+// The commit point it starts from is the highest any member reported in
+// HELLO_OK; commit_seq claims stay truthful, so a member's uncommitted
+// extents survive until every member holds the reconciled copy.
 //
 // QoS (Requirement 10.2): each volume's requests wait in its queue until
 // its limiter (qos.hpp) admits them; run() serves the volumes round-robin,
@@ -92,6 +122,7 @@
 #include "hold/store/replica_store.hpp"
 #include "proto/hold_wire.hpp"
 #include "proto/replica_config.hpp"
+#include "proto/report.hpp"
 
 namespace ak::hold {
 
@@ -134,6 +165,14 @@ struct ServerConfig {
     std::size_t max_batch_bytes{8 * 1024 * 1024};  // bytes per group commit
     std::size_t max_replicating{1024};             // writes awaiting members per volume
     std::chrono::milliseconds redial_backoff{250};
+    // Task 10. Without leases (no controller to grant them, as with
+    // ak-hold's --configs stand-in for helm) a primary serves reads
+    // regardless.
+    bool leases{true};
+    std::chrono::milliseconds member_timeout{2000};
+    std::chrono::milliseconds primary_timeout{2000};
+    std::chrono::milliseconds ping_interval{1000};
+    std::chrono::milliseconds status_interval{1000};
 };
 
 enum class ConfigError : std::uint8_t {
@@ -156,6 +195,7 @@ struct ServerStats {
     std::uint64_t replicated{0};    // writes every member acknowledged
     std::uint64_t repaired{0};      // blocks rewritten from a member's copy
     std::uint64_t unrepairable{0};  // bad blocks with no good copy to be had
+    std::uint64_t reconciled{0};    // extents rewritten by promotions
 };
 
 class HoldServer {
@@ -188,6 +228,15 @@ public:
     // Writes committed here and still awaiting a member's REPL_ACK.
     [[nodiscard]] auto replicating(std::uint64_t volume_id) const -> std::size_t;
 
+    // What goes up helm's report path now (see above).
+    [[nodiscard]] auto take_reports(Clock::time_point now) -> std::vector<proto::ReportBody>;
+    // The controller acknowledged this server's lease request for the
+    // volume at `epoch`.
+    auto grant_lease(std::uint64_t volume_id, std::uint64_t epoch, Clock::time_point now) -> void;
+    [[nodiscard]] auto has_lease(std::uint64_t volume_id, Clock::time_point now) const -> bool;
+    // A promotion is still collecting INTENTS.
+    [[nodiscard]] auto reconciling(std::uint64_t volume_id) const -> bool;
+
 private:
     struct Session {
         std::uint64_t peer{0};
@@ -197,9 +246,10 @@ private:
         std::uint64_t attachment_id{0};
         std::uint32_t generation{0};  // the attachment's, or the peer's replica_gen
         bool outbound{false};         // dialled by this server to a member
+        bool replicated{false};       // a REPL_WRITE was taken from it
     };
     struct Request {
-        SessionId session{0};
+        SessionId session{0};  // 0: the server's own (a reconcile write)
         proto::HoldHeader header;
         std::vector<std::byte> data;
         std::vector<std::uint32_t> crcs;
@@ -221,11 +271,23 @@ private:
         Clock::time_point redial_at{};
         std::uint64_t acked{0};  // every seq up to here is durable there
         bool backoff{false};     // lost: redial_at is set by the next run()
+        Clock::time_point next_ping{};
+        std::uint64_t commit_seen{0};    // the member's commit point in HELLO_OK
+        std::uint64_t intents_asked{0};  // reconcile: the INTENTS request ID
+        bool intents_answered{false};
     };
     // A write committed here, awaiting the members.
     struct Replicating {
         Request request;
         std::uint64_t seq{0};
+        Clock::time_point at{};  // committed here
+    };
+    // A promotion collecting its members' uncommitted extents.
+    struct Reconcile {
+        Clock::time_point started{};
+        std::vector<proto::HoldIntent> extents;
+        std::uint64_t base{0};    // the highest seq any replica holds
+        std::uint64_t commit{0};  // the highest commit point reported
     };
     // A read waiting for a member's copy of its bad blocks.
     struct Repair {
@@ -244,6 +306,15 @@ private:
         std::map<std::uint64_t, Repair> repairs;  // by request ID to the member
         std::uint64_t next_request{1};
         bool held{false};  // serving waits for a member, not for time
+        // Task 10.
+        std::uint64_t committed{0};  // primary: the highest seq every member holds
+        std::uint64_t seq_floor{0};  // primary: writes are numbered above this
+        std::optional<Reconcile> reconcile;
+        std::optional<Clock::time_point> lease_asked;  // the first status since a grant
+        Clock::time_point lease_until{};
+        Clock::time_point heard{};  // member: the primary's last frame
+        bool primary_reported{false};
+        std::vector<std::uint64_t> timeout_reported;  // members, this epoch
     };
     // The outcome of the fencing checks.
     struct Verdict {
@@ -258,7 +329,14 @@ private:
                                    const proto::HoldHello& hello) const -> Verdict;
     [[nodiscard]] auto single_replica_primary(const Volume& v) const -> bool;
     [[nodiscard]] auto is_primary(const Volume& v) const -> bool;
-    [[nodiscard]] auto held_back(const Volume& v, const Request& r) const -> bool;
+    [[nodiscard]] auto held_back(const Volume& v, const Request& r, Clock::time_point now) const
+        -> bool;
+    [[nodiscard]] auto lease_valid(const Volume& v, Clock::time_point now) const -> bool;
+    auto start_reconcile(Volume& v, Clock::time_point now) -> void;
+    auto ask_intents(Volume& v, Link& l) -> void;
+    auto finish_reconcile(Volume& v) -> void;
+    auto watch(Volume& v, Clock::time_point now) -> void;
+    auto report_timeout(Volume& v, proto::VolumeFaultKind kind, std::uint64_t suspect) -> void;
     auto sync_links(Volume& v, Clock::time_point now) -> void;
     auto drop_link(Volume& v, Link& l, Clock::time_point now) -> void;
     auto send_link(Volume& v, Link& l, proto::HoldFrame f) -> void;
@@ -288,6 +366,9 @@ private:
     SessionId _next_session{1};
     std::uint64_t _rr{0};  // the volume run() starts from
     ServerStats _stats;
+    std::vector<proto::ReportBody> _reports;
+    Clock::time_point _now{};  // the latest time a caller gave
+    std::optional<Clock::time_point> _next_status;
 };
 
 }  // namespace ak::hold

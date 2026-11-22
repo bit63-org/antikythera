@@ -128,7 +128,7 @@ public:
 // A storage server the initiator can reach.
 struct Server {
     explicit Server(std::uint64_t id)
-        : hold{files, {.server_id = id, .data_dir = "/srv/hold"}, sink} {}
+        : hold{files, {.server_id = id, .data_dir = "/srv/hold", .leases = false}, sink} {}
     ak::hold::store::MemFiles files;
     Sink sink;
     ak::hold::HoldServer hold;
@@ -503,8 +503,7 @@ BOOST_AUTO_TEST_CASE(follows_a_redirect, *utf::timeout(ak::test::unit_timeout_se
                                }(),
                                rig.now)
                            .has_value());
-    auto next = config(2, 3);
-    next.members.push_back(member(1, proto::ReplicaRole::secondary));
+    auto next = config(2, 3);  // server 1 is out (a lone new primary needs no reconcile)
     for (const std::uint64_t id : {std::uint64_t{1}, std::uint64_t{3}}) {
         auto c = next;
         c.server_id = id;
@@ -546,6 +545,35 @@ BOOST_AUTO_TEST_CASE(follows_a_redirect, *utf::timeout(ak::test::unit_timeout_se
     rig.run_for(1s);
     BOOST_TEST(r.ok());
     BOOST_TEST(rig.connects == before + 1);
+}
+
+// A request sent just before helm brought a newer epoch comes back
+// stale_epoch from a hold at that same epoch: resent, not a reason to wait
+// for yet another config.
+BOOST_AUTO_TEST_CASE(resends_what_an_older_epoch_sent,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Rig rig;
+    rig.apply(config(1));
+    const auto data = blocks_of(10, 1);
+    Done w;
+    rig.write(0, data, w);
+    BOOST_TEST_REQUIRE(w.ok());
+    rig.tamper = [&](Bytes& b) {
+        auto f = proto::decode_hold_frame(b);
+        if (f && f->header.opcode == HoldOpcode::read) {
+            auto h = f->header;
+            h.status = HoldStatus::stale_epoch;  // its epoch is the route's: 1
+            b = *proto::encode_hold_frame({.header = h, .payload = {}});
+            rig.tamper = nullptr;
+        }
+        return true;
+    };
+    Bytes out(bs);
+    Done r;
+    rig.read(0, out, r);
+    BOOST_TEST(r.ok());
+    BOOST_TEST((out == data));
+    BOOST_TEST(rig.core.session_open());
 }
 
 BOOST_AUTO_TEST_CASE(stops_when_fenced, *utf::timeout(ak::test::unit_timeout_seconds)) {

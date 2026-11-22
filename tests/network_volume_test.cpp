@@ -111,7 +111,7 @@ public:
                             .cert_pem = pem.cert,
                             .key_pem = pem.key,
                             .peer_name = {}},
-                    .server = {.server_id = hold_id, .data_dir = "/srv/hold"},
+                    .server = {.server_id = hold_id, .data_dir = "/srv/hold", .leases = false},
                     .handshake_timeout = 2000ms,
                     .write_timeout = 2000ms});
         BOOST_TEST_REQUIRE(node.has_value());

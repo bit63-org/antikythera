@@ -241,6 +241,7 @@ private:
     static auto fill(ServerConfig c) -> ServerConfig {
         c.server_id = me;
         c.data_dir = "/srv/hold";
+        c.leases = false;  // failover is hold_replication_test's
         return c;
     }
 
@@ -743,7 +744,8 @@ BOOST_AUTO_TEST_CASE(refuses_configs_it_cannot_apply,
 BOOST_AUTO_TEST_CASE(survives_a_restart, *utf::timeout(ak::test::unit_timeout_seconds)) {
     ak::hold::store::MemFiles files;
     Sink sink;
-    const ServerConfig cfg{.server_id = me, .data_dir = "/srv/hold"};
+    ServerConfig cfg{.server_id = me, .data_dir = "/srv/hold"};
+    cfg.leases = false;
     const auto d = blocks_of(3, 2);
     {
         HoldServer server{files, cfg, sink};

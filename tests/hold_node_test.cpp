@@ -84,17 +84,17 @@ public:
     explicit Rig(std::uint64_t id, ak::test::TestCa* shared_ca = nullptr)
         : _ca{shared_ca != nullptr ? shared_ca : &ca} {
         const auto pem = _ca->issue("hold", "IP:127.0.0.1, " + uri(id));
-        auto node =
-            ak::hold::Node::create(files, {.host = "127.0.0.1",
-                                           .port = 0,
-                                           .tls = {.role = tls::Role::server,
-                                                   .ca_pem = _ca->cert_pem(),
-                                                   .cert_pem = pem.cert,
-                                                   .key_pem = pem.key,
-                                                   .peer_name = {}},
-                                           .server = {.server_id = id, .data_dir = "/srv/hold"},
-                                           .handshake_timeout = 2000ms,
-                                           .write_timeout = 2000ms});
+        auto node = ak::hold::Node::create(
+            files, {.host = "127.0.0.1",
+                    .port = 0,
+                    .tls = {.role = tls::Role::server,
+                            .ca_pem = _ca->cert_pem(),
+                            .cert_pem = pem.cert,
+                            .key_pem = pem.key,
+                            .peer_name = {}},
+                    .server = {.server_id = id, .data_dir = "/srv/hold", .leases = false},
+                    .handshake_timeout = 2000ms,
+                    .write_timeout = 2000ms});
         BOOST_TEST_REQUIRE(node.has_value());
         _node = std::move(*node);
     }

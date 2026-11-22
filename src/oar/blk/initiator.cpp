@@ -349,7 +349,8 @@ auto InitiatorCore::on_frame(std::uint64_t session, const proto::HoldFrame& f,
             if (f.header.status == HoldStatus::ok) {
                 _state = State::open;
             } else if (f.header.status == HoldStatus::stale_epoch) {
-                _stale = true;
+                // Behind the hold only if its epoch is newer than the route.
+                _stale = f.header.epoch > _route->config.epoch;
                 drop_session(now);
             } else if (f.header.status == HoldStatus::fenced) {
                 fence();
@@ -440,8 +441,12 @@ auto InitiatorCore::on_reply(std::deque<Part>::iterator it, const proto::HoldFra
             }
             return;
         case HoldStatus::stale_epoch:
-            _stale = true;
-            drop_session(now);
+            if (f.header.epoch > _route->config.epoch) {
+                _stale = true;  // helm will bring the newer config
+                drop_session(now);
+            } else {
+                it->sent = false;  // sent before the route moved on: again, at its epoch
+            }
             return;
         case HoldStatus::fenced:
             fence();

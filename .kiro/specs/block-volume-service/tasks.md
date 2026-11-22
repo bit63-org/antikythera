@@ -57,7 +57,7 @@ repository. Prerequisites outside this spec: oar-blk task 14
   in-sync member, overlap ordering, `commit_seq`, intent trimming, read
   hold-back behind unacknowledged overlapping writes, checksum repair
   from a peer. _Requirements: 1.5-1.6, 4.2, 5.1, 5.4_ (cloud)
-- [ ] 9. Deterministic simulation harness (`tests/hold_sim_test.cpp`):
+- [x] 9. Deterministic simulation harness (`tests/hold_sim_test.cpp`):
   simulated clock, network and crashing disks around the real hold,
   initiator and master; per-block linearizability checker; seeded runs
   in ctest and a long nightly variant. _Requirements: 15.1_ (cloud)

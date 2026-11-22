@@ -626,7 +626,9 @@ public:
           _hydrate_tried(m.capacity_blocks),
           _epoch{m.epoch} {}
 
-    auto source_block(std::uint64_t b) const -> Bytes { return block_of(_source, _bs, b); }
+    [[nodiscard]] auto source_block(std::uint64_t b) const -> Bytes {
+        return block_of(_source, _bs, b);
+    }
 
     auto begin(const Op& op) -> void {
         _inflight.clear();

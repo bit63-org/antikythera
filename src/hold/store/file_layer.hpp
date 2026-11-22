@@ -71,7 +71,7 @@ public:
 class PosixFiles final : public FileLayer {
 public:
     auto make_dir(const std::filesystem::path& dir) -> FileResult override;
-    auto exists(const std::filesystem::path& p) const -> bool override;
+    [[nodiscard]] auto exists(const std::filesystem::path& p) const -> bool override;
     auto open(const std::filesystem::path& p, bool create)
         -> std::expected<std::unique_ptr<File>, int> override;
     auto remove_all(const std::filesystem::path& p) -> FileResult override;
@@ -91,7 +91,7 @@ public:
     explicit MemFiles(bool reflink = true) : _reflink{reflink} {}
 
     auto make_dir(const std::filesystem::path& dir) -> FileResult override;
-    auto exists(const std::filesystem::path& p) const -> bool override;
+    [[nodiscard]] auto exists(const std::filesystem::path& p) const -> bool override;
     auto open(const std::filesystem::path& p, bool create)
         -> std::expected<std::unique_ptr<File>, int> override;
     auto remove_all(const std::filesystem::path& p) -> FileResult override;

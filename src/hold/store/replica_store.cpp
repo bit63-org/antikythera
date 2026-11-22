@@ -432,7 +432,8 @@ auto ReplicaStore::read(std::uint64_t lba, std::span<std::byte> out, std::span<s
     for (std::size_t b = 0; b < crcs.size(); ++b) {
         crcs[b] = le32_at(stored, b);
         const auto block = out.subspan(b * bs, bs);
-        if (crc32c::of(block) != crcs[b] && !(crcs[b] == 0 && !sourced && all_zero(block))) {
+        const bool unwritten = crcs[b] == 0 && !sourced && all_zero(block);
+        if (crc32c::of(block) != crcs[b] && !unwritten) {
             bad.push_back(lba + b);
         }
     }

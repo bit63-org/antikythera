@@ -90,7 +90,7 @@ public:
         }
         return {};
     }
-    auto size() const -> std::expected<std::uint64_t, int> override {
+    [[nodiscard]] auto size() const -> std::expected<std::uint64_t, int> override {
         struct stat st{};
         if (::fstat(_fd.get(), &st) != 0) {
             return std::unexpected(errno);
@@ -170,7 +170,7 @@ public:
         _state->pending.push_back(std::move(p));
         return {};
     }
-    auto size() const -> std::expected<std::uint64_t, int> override {
+    [[nodiscard]] auto size() const -> std::expected<std::uint64_t, int> override {
         return _state->current.size();
     }
 
@@ -250,9 +250,12 @@ auto MemFiles::step() -> bool {
         return false;
     }
     ++_ops;
-    if (_fail_in != 0 && --_fail_in == 0) {
-        _failed = true;
-        return false;
+    if (_fail_in != 0) {
+        --_fail_in;
+        if (_fail_in == 0) {
+            _failed = true;
+            return false;
+        }
     }
     return true;
 }

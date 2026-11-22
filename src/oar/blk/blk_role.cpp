@@ -67,6 +67,9 @@ auto BlkRole::create(RoleConfig config, const std::vector<FunctionTransport*>& t
     if (transports.empty() || transports.size() > std::numeric_limits<oar::FunctionNumber>::max()) {
         return std::unexpected("need between 1 and 65535 functions");
     }
+    if (config.image_max_in_flight == 0 || config.image_max_in_flight > config.queue_size) {
+        return std::unexpected("image_max_in_flight must be between 1 and queue_size");
+    }
     if (!config.clock) {
         config.clock = [] { return RoleConfig::Clock::now(); };
     }
@@ -100,12 +103,14 @@ auto BlkRole::create(RoleConfig config, const std::vector<FunctionTransport*>& t
 
 BlkRole::~BlkRole() = default;
 
-auto BlkRole::params(const VolumeGeometry& geometry, std::string_view serial) const -> BlkParams {
+auto BlkRole::params(const VolumeGeometry& geometry, std::string_view serial,
+                     std::uint16_t max_in_flight) const -> BlkParams {
     return BlkParams{.geometry = geometry,
                      .num_queues = _config.num_queues,
                      .queue_size = _config.queue_size,
                      .budget = _config.budget,
-                     .serial = serial};
+                     .serial = serial,
+                     .max_in_flight = max_in_flight};
 }
 
 auto BlkRole::volume_path(std::uint64_t volume_id) const -> std::filesystem::path {
@@ -250,7 +255,10 @@ auto BlkRole::prepare_function(const oar::PrepareFunction& request) -> oar::Stat
                            .seg_max = _config.seg_max,
                            .max_transfer_bytes = _config.max_transfer_bytes};
     const std::string serial = volume_serial(cfg->volume_id);
-    auto f = VirtioBlkFunction::create(params(g, serial), s->transport->memory(),
+    // An image volume's misses park in the backend; let the rest of the
+    // ring go on past them.
+    const std::uint16_t in_flight = image != nullptr ? _config.image_max_in_flight : 1;
+    auto f = VirtioBlkFunction::create(params(g, serial, in_flight), s->transport->memory(),
                                        s->transport->interrupts(), std::move(backend));
     if (!f) {
         return oar::Status::failed;

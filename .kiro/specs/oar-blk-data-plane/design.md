@@ -224,15 +224,21 @@ role's credentials can stay read-only (8.9).
   `drop_key` for its K_eph copy (and K_img), counters (hits, misses,
   fetched bytes, readahead hits, overlay blocks).
 
-### Blocking on a miss
+### Misses do not block
 
-The role serves requests synchronously on one thread, so a demand miss
-blocks every function of the role until the chunk arrives or its deadline
-passes. Readahead keeps sequential boot reads mostly hitting, but a cold
-random read costs a round trip to the store. The fix is asynchronous
-completion in `VirtioBlkFunction`: park the request (as `await_key`
-already parks requests) and complete it when the fetcher calls back. That
-changes the function's request loop, so it is a separate task.
+The role serves every function on one thread, so a demand miss must not
+wait there for the store. `BlockBackend` is a submit and complete
+interface (block-volume-service task 3, which closed task 14):
+`LazyImageBackend::submit_read` completes at once when every chunk is
+resident or a hole, and otherwise parks the read, hands each missing
+chunk to `Fetcher::fetch_async`, and completes it from `poll()` when the
+last one lands; its `wake_fd()` wakes the role's event loop.
+`VirtioBlkFunction` holds the request in a slot meanwhile. An image
+volume's queues get `RoleConfig::image_max_in_flight` slots (default 8,
+each with its own bounce buffer), so the reads the cache can answer and
+the writes and flushes behind a miss complete without waiting for it;
+virtio-blk lets requests complete in any order. Disk volumes keep one
+slot, since their backend completes inside the call.
 
 ### Lifecycle with helm
 

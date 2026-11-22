@@ -320,6 +320,7 @@ auto main(int argc, char** argv) -> int {
                               .overlay_dir = {},
                               .overlay_limit_bytes = 0,
                               .max_readahead_chunks = defaults.max_readahead_chunks,
+                              .image_max_in_flight = defaults.image_max_in_flight,
                               .manifest_deadline = defaults.manifest_deadline,
                               .clock = {}},
                              raw);

@@ -24,7 +24,7 @@
 #include <vector>
 
 #include "common/crc32c.hpp"
-#include "hold/server/identity.hpp"
+#include "proto/server_identity.hpp"
 #include "hold/server/node.hpp"
 #include "hold/server/qos.hpp"
 #include "hold/server/server.hpp"
@@ -45,10 +45,12 @@ namespace ak::hold {
 auto operator<<(std::ostream& os, ConfigError e) -> std::ostream& {
     return os << to_string(e);
 }
+}  // namespace ak::hold
+namespace ak::proto {
 auto operator<<(std::ostream& os, IdentityError e) -> std::ostream& {
     return os << to_string(e);
 }
-}  // namespace ak::hold
+}  // namespace ak::proto
 
 namespace {
 
@@ -57,6 +59,10 @@ namespace utf = boost::unit_test;
 using namespace ak::hold;
 using proto::HoldOpcode;
 using proto::HoldStatus;
+using proto::IdentityError;
+using proto::parse_server_uri;
+using proto::server_id_of;
+using proto::server_uri;
 using Bytes = std::vector<std::byte>;
 using namespace std::chrono_literals;
 

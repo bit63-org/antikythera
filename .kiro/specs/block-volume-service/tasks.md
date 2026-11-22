@@ -45,7 +45,7 @@ repository. Prerequisites outside this spec: oar-blk task 14
   ReplicaConfig, epoch and generation fencing, READ/WRITE/FLUSH, `ro`
   enforcement, per-volume QoS and fair queueing; `ak-hold` binary with a
   helm sideband stub. _Requirements: 1.5, 4.3, 6.2, 6.4, 10.2, 13_ (cloud)
-- [ ] 7. `NetworkVolumeBackend` in oar-blk: session to the primary,
+- [x] 7. `NetworkVolumeBackend` in oar-blk: session to the primary,
   CRC32C on writes and reads, QoS token buckets, request queue with
   deadlines, retry and `REDIRECT` handling across epochs, `await_route`
   beside `await_key`; tests against an in-process hold. _Requirements:

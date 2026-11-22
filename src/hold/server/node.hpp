@@ -31,23 +31,12 @@
 
 #include "hold/server/server.hpp"
 #include "proto/codec.hpp"
+#include "proto/hold_stream.hpp"
 #include "tls/tls.hpp"
 
 namespace ak::hold {
 
-// Splits a byte stream into whole hold frames, checking each header as
-// soon as it is complete (so a bad length is refused before buffering).
-class FrameAssembler {
-public:
-    auto feed(std::span<const std::byte> bytes) -> void;
-    // The next whole frame, nothing yet, or a header that does not decode.
-    [[nodiscard]] auto next()
-        -> std::expected<std::optional<std::vector<std::byte>>, proto::DecodeError>;
-    [[nodiscard]] auto buffered() const noexcept -> std::size_t { return _buf.size(); }
-
-private:
-    std::vector<std::byte> _buf;
-};
+using proto::FrameAssembler;
 
 // DSCP AF41 in the TOS / traffic class byte: storage I/O (design "Priority").
 inline constexpr int storage_io_tos = 34 << 2;

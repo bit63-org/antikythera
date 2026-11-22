@@ -103,6 +103,8 @@ ak_add_test(hold_master_test      SOURCES hold_master_test.cpp      LIBS ak::hol
 ak_add_test(hold_store_test       SOURCES hold_store_test.cpp       LIBS ak::hold_store)
 ak_add_test(hold_server_test      SOURCES hold_server_test.cpp      LIBS ak::hold_server)
 ak_add_test(hold_node_test        SOURCES hold_node_test.cpp        LIBS ak::hold_server OpenSSL::Crypto)
+ak_add_test(initiator_test        SOURCES initiator_test.cpp        LIBS ak::oar_blk_volume ak::hold_server)
+ak_add_test(network_volume_test   SOURCES network_volume_test.cpp   LIBS ak::oar_blk_volume ak::hold_server OpenSSL::Crypto)
 ak_add_test(proto_hold_wire_test  SOURCES proto_hold_wire_test.cpp  LIBS ak::proto)
 ak_add_test(crc32c_test           SOURCES crc32c_test.cpp           LIBS ak::common)
 ak_add_test(proto_group_policy_test SOURCES proto_group_policy_test.cpp LIBS ak::proto ak::helm ak::hull)

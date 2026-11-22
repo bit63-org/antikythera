@@ -445,6 +445,55 @@ BOOST_AUTO_TEST_CASE(reopen_waits_for_the_commit_point,
     BOOST_TEST_REQUIRE(write_one(*s, 5001, 0, content(1, 512)).has_value());
 }
 
+BOOST_AUTO_TEST_CASE(rewrites_writes_still_in_the_ring,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    MemFiles files;
+    auto s = create(files, make_meta(64));
+    const auto a = content(1, 512, 2);
+    const auto b = content(2, 512, 1);
+    BOOST_TEST_REQUIRE(write_one(*s, 1, 4, a).has_value());
+    BOOST_TEST_REQUIRE(write_one(*s, 2, 8, b).has_value());
+    s->set_commit(1);
+    // A crash tore seq 2: its data and its checksum are both gone.
+    auto data = files.open(vdir / "data", false);
+    BOOST_TEST_REQUIRE((*data)->pwrite(8 * 512, Bytes(512)).has_value());
+    BOOST_TEST((read_blocks(*s, 8, 1)->bad == std::vector<std::uint64_t>{8}));
+
+    auto refused = [&](std::uint64_t seq, std::uint64_t lba, const Bytes& d) {
+        Batch batch{512};
+        batch.add(seq, lba, d);
+        return s->rewrite(batch.writes()).error();
+    };
+    BOOST_TEST(refused(1, 4, a) == StoreError::bad_seq);  // committed
+    BOOST_TEST(refused(3, 8, b) == StoreError::bad_seq);  // never written
+    BOOST_TEST(refused(2, 9, b) == StoreError::bad_seq);  // not where the ring says
+    BOOST_TEST(refused(2, 8, a) == StoreError::bad_seq);  // nor its length
+    BOOST_TEST(refused(2, 64, b) == StoreError::bad_request);
+    {
+        Batch batch{512};
+        batch.add(2, 8, b);
+        batch.crcs(0)[0] ^= 1U;
+        BOOST_TEST(s->rewrite(batch.writes()).error() == StoreError::bad_crc);
+    }
+    BOOST_TEST((read_blocks(*s, 8, 1)->bad == std::vector<std::uint64_t>{8}));
+
+    Batch again{512};
+    again.add(2, 8, b);
+    BOOST_TEST_REQUIRE(s->rewrite(again.writes()).has_value());
+    const auto r = read_blocks(*s, 8, 1);
+    BOOST_TEST(r->bad.empty());
+    BOOST_TEST((r->data == b));
+    // No new intent, and the seqs stand.
+    BOOST_TEST(s->last_seq() == 2U);
+    BOOST_TEST((s->intents() == std::vector<Intent>{{.seq = 2, .lba = 8, .blocks = 1}}));
+    // Durable: a crash now loses nothing.
+    s.reset();
+    files.crash(1);
+    s = reopen(files);
+    BOOST_TEST(read_blocks(*s, 8, 1)->bad.empty());
+    BOOST_TEST((read_blocks(*s, 8, 1)->data == b));
+}
+
 BOOST_AUTO_TEST_CASE(records_epochs_in_alternate_slots,
                      *utf::timeout(ak::test::unit_timeout_seconds)) {
     MemFiles files;

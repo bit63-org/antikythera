@@ -942,11 +942,20 @@ auto HoldServer::commit_replicas(Volume& v, std::vector<Request>& batch) -> void
     std::vector<HoldStatus> status(batch.size(), HoldStatus::ok);
     std::vector<store::ReplicaStore::Write> writes;
     std::vector<std::size_t> written;
+    std::vector<store::ReplicaStore::Write> again;
+    std::vector<std::size_t> rewritten;
     std::uint64_t last = v.store->last_seq();
     for (std::size_t i = 0; i < batch.size(); ++i) {
         const auto& r = batch[i];
         if (r.seq <= last) {
-            continue;  // already durable here: a resend
+            // A resend. Above the commit point it may be one a crash tore
+            // here (still in the ring): write it again; else it is durable.
+            if (r.seq > v.store->commit_seq() && r.seq <= v.store->last_seq()) {
+                again.push_back(
+                    {.seq = r.seq, .lba = r.header.lba, .data = r.data, .crcs = r.crcs});
+                rewritten.push_back(i);
+            }
+            continue;
         }
         if (!joining && r.seq != last + 1) {
             status[i] = HoldStatus::bad_request;  // a gap: writes this replica never saw
@@ -955,6 +964,21 @@ auto HoldServer::commit_replicas(Volume& v, std::vector<Request>& batch) -> void
         writes.push_back({.seq = r.seq, .lba = r.header.lba, .data = r.data, .crcs = r.crcs});
         written.push_back(i);
         last = r.seq;
+    }
+    if (!again.empty()) {
+        if (auto res = v.store->rewrite(again); !res) {
+            for (const auto i : rewritten) {
+                status[i] = status_of(res.error());
+            }
+            for (const auto i : written) {
+                status[i] = status_of(res.error());  // not after a failed rewrite
+            }
+            writes.clear();
+            if (res.error() == store::StoreError::io) {
+                ++_stats.io_errors;
+                v.store.reset();
+            }
+        }
     }
     if (!writes.empty()) {
         if (auto res = v.store->write(writes); res) {

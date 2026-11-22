@@ -119,6 +119,12 @@ public:
 
     // A group commit; durable when it returns.
     [[nodiscard]] auto write(std::span<const Write> batch) -> std::expected<void, StoreError>;
+    // Writes again what writes already in the ring and above the commit
+    // point hold (a member's resend after a crash, which may have torn
+    // them): data, sync, checksums, sync, with no new intents, so a crash
+    // here leaves them in the ring still. Each seq must be one of
+    // intents().
+    [[nodiscard]] auto rewrite(std::span<const Write> batch) -> std::expected<void, StoreError>;
     // Reads blocks [lba, lba + out/block_size) and their stored CRC32Cs;
     // returns the LBAs whose data does not match (empty: all good). On a
     // volume without a source, a block never written reads as zeros with a

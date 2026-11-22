@@ -96,6 +96,7 @@ ak_add_test(proto_report_test     SOURCES proto_report_test.cpp     LIBS ak::pro
 ak_add_test(proto_link_test       SOURCES proto_link_test.cpp       LIBS ak::proto)
 ak_add_test(proto_volume_test     SOURCES proto_volume_test.cpp     LIBS ak::proto)
 ak_add_test(hold_master_test      SOURCES hold_master_test.cpp      LIBS ak::hold_master)
+ak_add_test(hold_store_test       SOURCES hold_store_test.cpp       LIBS ak::hold_store)
 ak_add_test(proto_hold_wire_test  SOURCES proto_hold_wire_test.cpp  LIBS ak::proto)
 ak_add_test(crc32c_test           SOURCES crc32c_test.cpp           LIBS ak::common)
 ak_add_test(proto_group_policy_test SOURCES proto_group_policy_test.cpp LIBS ak::proto ak::helm ak::hull)

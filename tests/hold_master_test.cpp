@@ -505,6 +505,12 @@ BOOST_AUTO_TEST_CASE(a_confirmed_primary_failure_waits_out_the_lease,
     BOOST_TEST(rig.vol(10).failover);
     rig.status(p, 10, 7);  // asks again: no acknowledgement now
     BOOST_TEST(rig.t.leases.size() == granted);
+    // Nor does the suspect, come back, get to drop the members that
+    // reported it.
+    const auto epoch = rig.vol(10).epoch;
+    rig.fault(p, 10, proto::VolumeFaultKind::member_timeout, secs[0]);
+    BOOST_TEST(rig.vol(10).epoch == epoch);
+    BOOST_TEST(rig.with_role(10, ReplicaRole::secondary) == secs);
     rig.advance(lease_wait() - Time{1});
     BOOST_TEST(rig.primary(10) == p);  // its lease may still run
     rig.advance(Time{1});

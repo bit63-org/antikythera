@@ -1037,7 +1037,9 @@ auto Master::on_fault(std::uint64_t server, const proto::VolumeFault& f, Time no
     const Member* primary = primary_of(*v);
     switch (f.kind) {
         case proto::VolumeFaultKind::member_timeout:
-            if (primary != nullptr && primary->server_id == server && f.suspect != server) {
+            // Not from a primary being replaced: it may be the one cut off.
+            if (primary != nullptr && primary->server_id == server && f.suspect != server &&
+                !v->failover) {
                 drop_member(*v, f.suspect, now);
             }
             break;

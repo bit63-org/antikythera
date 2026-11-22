@@ -129,6 +129,7 @@ auto HoldServer::ensure_replica(Volume& v, const proto::ReplicaMember& me)
 
 auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point now)
     -> std::expected<void, ConfigError> {
+    _now = now;
     if (c.server_id != _config.server_id) {
         return std::unexpected(ConfigError::wrong_server);
     }
@@ -147,6 +148,8 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
             return std::unexpected(ConfigError::mismatch);
         }
     }
+    const bool was_primary = found != _volumes.end() && is_primary(found->second);
+    const std::uint64_t old_last = was_primary ? found->second.store->last_seq() : 0;
     // Build the new state aside, so a refused config changes nothing.
     Volume next;
     if (found != _volumes.end()) {
@@ -159,7 +162,13 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
         next.replicating = std::move(old.replicating);
         next.repairs = std::move(old.repairs);
         next.next_request = old.next_request;
+        next.committed = old.committed;
+        next.seq_floor = old.seq_floor;
+        next.reconcile = std::move(old.reconcile);
+        next.lease_asked = old.lease_asked;
+        next.lease_until = old.lease_until;
     }
+    next.heard = now;  // a new epoch: the primary gets primary_timeout to speak
     next.config = c;
     const auto restore = [&] {
         if (found != _volumes.end()) {
@@ -170,6 +179,7 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
             old.links = std::move(next.links);
             old.replicating = std::move(next.replicating);
             old.repairs = std::move(next.repairs);
+            old.reconcile = std::move(next.reconcile);
         }
     };
     if (const auto* me = find_member(c, _config.server_id); me != nullptr) {
@@ -196,10 +206,26 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
     }
     auto& v = _volumes.insert_or_assign(c.volume_id, std::move(next)).first->second;
     if (is_primary(v)) {
+        if (!was_primary) {
+            v.lease_asked.reset();
+            v.lease_until = {};
+            if (!single_replica_primary(v)) {
+                start_reconcile(v, now);
+            } else {
+                v.committed = v.store->last_seq();
+            }
+        }
         sync_links(v, now);  // members added, removed or moved
         advance(v);          // a removed member no longer holds writes up
+        if (v.reconcile) {
+            finish_reconcile(v);  // a removed member no longer owes INTENTS
+        }
     } else {
         abandon(v);
+        if (was_primary) {
+            _reports.emplace_back(proto::DemotionConfirmed{
+                .volume_id = c.volume_id, .epoch = c.epoch, .last_seq = old_last, .slot = 0});
+        }
     }
     return {};
 }
@@ -407,6 +433,7 @@ auto HoldServer::hello(SessionId id, Session& s, const proto::HoldFrame& f) -> v
 }
 
 auto HoldServer::on_frame(SessionId id, const proto::HoldFrame& f, Clock::time_point now) -> void {
+    _now = now;
     const auto sit = _sessions.find(id);
     if (sit == _sessions.end()) {
         return;
@@ -436,6 +463,10 @@ auto HoldServer::on_frame(SessionId id, const proto::HoldFrame& f, Clock::time_p
     }
     Volume& v = _volumes.at(h.volume_id);
     const bool initiator = s.role == proto::HoldPeerRole::initiator;
+    if (const auto* p = proto::primary_member(v.config);
+        !initiator && p != nullptr && p->server_id == s.peer) {
+        v.heard = now;
+    }
     Request r{
         .session = id, .header = h, .data = {}, .crcs = {}, .block_size = v.config.block_size};
     switch (h.opcode) {
@@ -449,6 +480,18 @@ auto HoldServer::on_frame(SessionId id, const proto::HoldFrame& f, Clock::time_p
             return;
         case HoldOpcode::read:  // from a peer: the primary repairing a block
             break;
+        case HoldOpcode::intents: {  // from a peer: a new primary reconciling
+            if (initiator || !v.store) {
+                respond(id, h, HoldStatus::bad_request);
+                return;
+            }
+            proto::HoldIntents out;
+            for (const auto& i : v.store->intents()) {
+                out.entries.push_back({.seq = i.seq, .lba = i.lba, .blocks = i.blocks});
+            }
+            respond(id, h, HoldStatus::ok, std::move(out));
+            return;
+        }
         case HoldOpcode::flush:
             if (!initiator) {
                 respond(id, h, HoldStatus::bad_request);
@@ -510,6 +553,7 @@ auto HoldServer::on_frame(SessionId id, const proto::HoldFrame& f, Clock::time_p
 // ---- serving ---------------------------------------------------------------
 
 auto HoldServer::run(Clock::time_point now) -> void {
+    _now = now;
     if (_volumes.empty()) {
         return;
     }
@@ -525,6 +569,7 @@ auto HoldServer::run(Clock::time_point now) -> void {
         if (is_primary(*v)) {
             sync_links(*v, now);
         }
+        watch(*v, now);
     }
     for (;;) {
         std::size_t progress = 0;
@@ -547,14 +592,23 @@ auto HoldServer::serve(Volume& v, std::size_t budget, Clock::time_point now) -> 
             batch_bytes = 0;
         }
     };
+    if (v.reconcile) {
+        v.held = !v.queue.empty();  // until every member has answered INTENTS
+        return 0;
+    }
     while (served < budget && !v.queue.empty()) {
         Request& r = v.queue.front();
         const auto sit = _sessions.find(r.session);
-        if (sit == _sessions.end()) {
+        if (r.session != 0 && sit == _sessions.end()) {
             v.queue.pop_front();
             continue;
         }
-        if (const auto verdict = check(sit->second, r.header); verdict.status != HoldStatus::ok) {
+        if (r.session == 0 && !is_primary(v)) {
+            v.queue.pop_front();  // a reconcile write of a role since lost
+            continue;
+        }
+        if (const auto verdict = r.session == 0 ? Verdict{} : check(sit->second, r.header);
+            verdict.status != HoldStatus::ok) {
             if (r.header.opcode == HoldOpcode::repl_write) {
                 respond(r.session, r.header, verdict.status, proto::ReplAck{.seq = r.seq});
             } else {
@@ -573,19 +627,21 @@ auto HoldServer::serve(Volume& v, std::size_t budget, Clock::time_point now) -> 
             batch_bytes + bytes > _config.max_batch_bytes) {
             flush_batch();  // order: what came before runs first
         }
-        if (r.header.opcode == HoldOpcode::read && held_back(v, r)) {
+        if (r.header.opcode == HoldOpcode::read && held_back(v, r, now)) {
             v.parked.push_back(std::move(r));  // later requests go on without it
             v.queue.pop_front();
             continue;
         }
-        if (held_back(v, r) || (plain && !repl && !v.links.empty() &&
-                                v.replicating.size() + batch.size() >= _config.max_replicating)) {
+        if (held_back(v, r, now) ||
+            (plain && !repl && !v.links.empty() &&
+             v.replicating.size() + batch.size() >= _config.max_replicating)) {
             flush_batch();
             v.held = true;  // until a member answers
             break;
         }
-        // The primary already shaped what it replicates.
-        if (bytes != 0 && !repl && !v.limiter.admit(bytes, now)) {
+        // The primary already shaped what it replicates, and its own
+        // reconcile writes are not the guest's.
+        if (bytes != 0 && !repl && r.session != 0 && !v.limiter.admit(bytes, now)) {
             break;
         }
         Request taken = std::move(r);
@@ -609,7 +665,7 @@ auto HoldServer::commit(Volume& v, std::vector<Request>& batch) -> void {
     }
     std::vector<store::ReplicaStore::Write> writes;
     writes.reserve(batch.size());
-    std::uint64_t seq = v.store->last_seq();
+    std::uint64_t seq = std::max(v.store->last_seq(), v.seq_floor);
     for (const auto& r : batch) {
         writes.push_back({.seq = ++seq, .lba = r.header.lba, .data = r.data, .crcs = r.crcs});
     }
@@ -621,7 +677,8 @@ auto HoldServer::commit(Volume& v, std::vector<Request>& batch) -> void {
             // Answered once every member holds them (advance).
             const std::uint64_t first = seq - batch.size() + 1;
             for (std::size_t i = 0; i < batch.size(); ++i) {
-                v.replicating.push_back({.request = std::move(batch[i]), .seq = first + i});
+                v.replicating.push_back(
+                    {.request = std::move(batch[i]), .seq = first + i, .at = _now});
             }
             for (auto& [id, l] : v.links) {
                 if (l.state == Link::State::open) {
@@ -636,6 +693,7 @@ auto HoldServer::commit(Volume& v, std::vector<Request>& batch) -> void {
             return;
         }
         v.store->set_commit(seq);
+        v.committed = seq;
     } else {
         status = status_of(res.error());
         if (res.error() == store::StoreError::io) {
@@ -711,21 +769,39 @@ auto HoldServer::next_wake(Clock::time_point now) const -> std::optional<Clock::
         for (const auto& [sid, l] : v.links) {
             if (l.state == Link::State::down) {
                 at(l.backoff ? now : std::max(now, l.redial_at));
+            } else if (l.state == Link::State::open) {
+                at(std::max(now, l.next_ping));
+            }
+            const bool reported = std::ranges::contains(v.timeout_reported, sid);
+            if (!reported && !v.replicating.empty() && l.acked < v.replicating.front().seq) {
+                at(std::max(now, v.replicating.front().at + _config.member_timeout));
+            }
+            if (!reported && v.reconcile && !l.intents_answered) {
+                at(std::max(now, v.reconcile->started + _config.member_timeout));
             }
         }
+        if (const auto* p = proto::primary_member(v.config);
+            p != nullptr && v.store && p->server_id != _config.server_id && !v.primary_reported) {
+            at(std::max(now, v.heard + _config.primary_timeout));
+        }
+    }
+    if (_next_status) {
+        at(std::max(now, *_next_status));  // the caller takes reports
     }
     return wake;
 }
 
 // ---- replication -----------------------------------------------------------
 
-auto HoldServer::held_back(const Volume& v, const Request& r) const -> bool {
+auto HoldServer::held_back(const Volume& v, const Request& r, Clock::time_point now) const -> bool {
     const auto& h = r.header;
     if (h.opcode == HoldOpcode::read) {
-        // Not before an overlapping write is answered: it might still be
-        // rolled back.
-        return std::ranges::any_of(
-            v.replicating, [&](const Replicating& w) { return overlaps(w.request.header, h); });
+        // Not without a lease (another primary may be serving), nor before
+        // an overlapping write is answered: it might still be rolled back.
+        return !lease_valid(v, now) ||
+               std::ranges::any_of(v.replicating, [&](const Replicating& w) {
+                   return overlaps(w.request.header, h);
+               });
     }
     if (h.opcode == HoldOpcode::write) {
         // Not under a repair, which would write the older copy back over it.
@@ -758,6 +834,15 @@ auto HoldServer::sync_links(Volume& v, Clock::time_point now) -> void {
         }
         auto [it, added] = v.links.try_emplace(m.server_id, Link{.member = m});
         Link& l = it->second;
+        if (l.state == Link::State::open && now >= l.next_ping) {
+            l.next_ping = now + _config.ping_interval;
+            proto::HoldHeader h;
+            h.opcode = HoldOpcode::ping;
+            h.request_id = v.next_request++;
+            h.volume_id = c.volume_id;
+            h.epoch = c.epoch;
+            send_link(v, l, {.header = h, .payload = proto::HoldPing{.commit_seq = v.committed}});
+        }
         if (l.backoff) {
             l.backoff = false;
             l.redial_at = now + _config.redial_backoff;
@@ -821,7 +906,7 @@ auto HoldServer::send_repl(Volume& v, Link& l, const Replicating& w) -> void {
               {.header = h,
                .payload = proto::ReplWrite{
                    .seq = w.seq,
-                   .commit_seq = std::min(v.store->commit_seq(), w.seq - 1),
+                   .commit_seq = std::min(v.committed, w.seq - 1),
                    .op = proto::ReplOp::write,
                    .data = {.block_size = r.block_size, .crcs = crcs, .data = r.data}}});
 }
@@ -850,6 +935,13 @@ auto HoldServer::on_link_frame(Session& s, SessionId id, const proto::HoldFrame&
             }
             s.open = true;
             l.state = Link::State::open;
+            l.next_ping = now + _config.ping_interval;
+            if (const auto* ok_ = std::get_if<proto::HoldHelloOk>(&f.payload)) {
+                l.commit_seen = ok_->commit_seq;
+            }
+            if (v.reconcile && !l.intents_answered) {
+                ask_intents(v, l);
+            }
             for (const auto& w : v.replicating) {
                 if (w.seq > l.acked) {
                     send_repl(v, l, w);  // in order, what it may not have
@@ -864,6 +956,25 @@ auto HoldServer::on_link_frame(Session& s, SessionId id, const proto::HoldFrame&
             }
             l.acked = std::max(l.acked, ack->seq);
             advance(v);
+            return;
+        }
+        case HoldOpcode::ping:
+            return;
+        case HoldOpcode::intents: {
+            const auto* in = std::get_if<proto::HoldIntents>(&f.payload);
+            if (!ok || in == nullptr || !v.reconcile || l.intents_answered ||
+                f.header.request_id != l.intents_asked) {
+                drop_link(v, l, now);  // asked again on the next session
+                return;
+            }
+            l.intents_answered = true;
+            auto& rec = *v.reconcile;
+            rec.commit = std::max(rec.commit, l.commit_seen);
+            for (const auto& i : in->entries) {
+                rec.base = std::max(rec.base, i.seq);
+                rec.extents.push_back(i);
+            }
+            finish_reconcile(v);
             return;
         }
         case HoldOpcode::read: {
@@ -896,6 +1007,7 @@ auto HoldServer::advance(Volume& v) -> void {
         v.replicating.pop_front();
     }
     if (done != 0) {
+        v.committed = done;
         if (v.store) {
             v.store->set_commit(done);
         }
@@ -917,6 +1029,9 @@ auto HoldServer::abandon(Volume& v) -> void {
                {.status = HoldStatus::not_primary, .redirect = true});
     }
     v.replicating.clear();
+    v.reconcile.reset();
+    v.lease_asked.reset();
+    v.lease_until = {};
     for (auto& [id, rep] : v.repairs) {
         respond(rep.request.session, rep.request.header, HoldStatus::io_error);
     }
@@ -957,9 +1072,18 @@ auto HoldServer::commit_replicas(Volume& v, std::vector<Request>& batch) -> void
             }
             continue;
         }
-        if (!joining && r.seq != last + 1) {
-            status[i] = HoldStatus::bad_request;  // a gap: writes this replica never saw
+        // A gap means writes this replica never saw, except on a session's
+        // first REPL_WRITE: a primary that has just taken the role numbers
+        // its writes above every seq any replica holds, and one that only
+        // reconnected resends from this replica's last acknowledgement.
+        const auto sit = _sessions.find(r.session);
+        const bool first = sit != _sessions.end() && !sit->second.replicated;
+        if (!joining && r.seq != last + 1 && !first) {
+            status[i] = HoldStatus::bad_request;
             continue;
+        }
+        if (sit != _sessions.end()) {
+            sit->second.replicated = true;
         }
         writes.push_back({.seq = r.seq, .lba = r.header.lba, .data = r.data, .crcs = r.crcs});
         written.push_back(i);
@@ -1059,10 +1183,234 @@ auto HoldServer::finish_repair(Volume& v, Repair& rep, const proto::HoldFrame* f
             proto::BlockData{.block_size = bs, .crcs = d->crcs, .data = d->data});
 }
 
+// ---- failover --------------------------------------------------------------
+
+auto HoldServer::lease_valid(const Volume& v, Clock::time_point now) const -> bool {
+    return !_config.leases || now < v.lease_until;
+}
+
+auto HoldServer::start_reconcile(Volume& v, Clock::time_point now) -> void {
+    Reconcile rec{.started = now,
+                  .extents = {},
+                  .base = v.store->last_seq(),
+                  .commit = v.store->commit_seq()};
+    for (const auto& i : v.store->intents()) {
+        rec.extents.push_back({.seq = i.seq, .lba = i.lba, .blocks = i.blocks});
+    }
+    v.reconcile = std::move(rec);
+    for (auto& [id, l] : v.links) {
+        l.intents_answered = false;
+        if (l.state == Link::State::open) {
+            ask_intents(v, l);
+        }
+    }
+}
+
+auto HoldServer::ask_intents(Volume& v, Link& l) -> void {
+    proto::HoldHeader h;
+    h.opcode = HoldOpcode::intents;
+    h.request_id = v.next_request++;
+    h.volume_id = v.config.volume_id;
+    h.epoch = v.config.epoch;
+    l.intents_asked = h.request_id;
+    send_link(v, l, {.header = h, .payload = {}});
+}
+
+auto HoldServer::finish_reconcile(Volume& v) -> void {
+    if (!v.reconcile || !v.store) {
+        return;
+    }
+    for (const auto& m : v.config.members) {
+        if (m.server_id == _config.server_id) {
+            continue;
+        }
+        const auto it = v.links.find(m.server_id);
+        if (it == v.links.end() || !it->second.intents_answered) {
+            return;
+        }
+    }
+    auto rec = std::move(*v.reconcile);
+    v.reconcile.reset();
+    v.store->set_commit(rec.commit);
+    v.committed = v.store->commit_seq();
+    v.seq_floor = std::max(v.seq_floor, rec.base);
+    // The union of the extents, merged and cut to what one write carries.
+    std::ranges::sort(rec.extents, {}, &proto::HoldIntent::lba);
+    const std::uint32_t bs = v.config.block_size;
+    const std::uint64_t most =
+        std::min<std::uint64_t>(proto::max_hold_blocks, proto::max_hold_data_bytes / bs);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;  // [first, end)
+    for (const auto& e : rec.extents) {
+        const std::uint64_t end = std::min(e.lba + e.blocks, v.config.capacity_blocks);
+        if (e.lba >= end) {
+            continue;
+        }
+        if (!spans.empty() && e.lba <= spans.back().second) {
+            spans.back().second = std::max(spans.back().second, end);
+        } else {
+            spans.emplace_back(e.lba, end);
+        }
+    }
+    std::vector<Request> writes;
+    for (const auto& [first, end] : spans) {
+        for (std::uint64_t lba = first; lba < end; lba += most) {
+            const auto blocks = static_cast<std::uint32_t>(std::min(most, end - lba));
+            Request r;
+            r.header.opcode = HoldOpcode::write;
+            r.header.volume_id = v.config.volume_id;
+            r.header.epoch = v.config.epoch;
+            r.header.lba = lba;
+            r.header.blocks = blocks;
+            r.block_size = bs;
+            r.data.resize(std::size_t{blocks} * bs);
+            r.crcs.resize(blocks);
+            if (auto bad = v.store->read(lba, r.data, r.crcs); !bad) {
+                ++_stats.io_errors;
+                v.store.reset();  // a failed replica is reopened by the next config
+                return;
+            }
+            for (std::size_t b = 0; b < blocks; ++b) {
+                r.crcs[b] = crc32c::of(std::span{r.data}.subspan(b * bs, bs));
+            }
+            writes.push_back(std::move(r));
+        }
+    }
+    _stats.reconciled += writes.size();
+    // Ahead of everything the initiators sent meanwhile.
+    v.queue.insert(v.queue.begin(), std::make_move_iterator(writes.begin()),
+                   std::make_move_iterator(writes.end()));
+}
+
+auto HoldServer::watch(Volume& v, Clock::time_point now) -> void {
+    if (is_primary(v)) {
+        for (const auto& [sid, l] : v.links) {
+            if (std::ranges::contains(v.timeout_reported, sid)) {
+                continue;
+            }
+            const bool write_late = !v.replicating.empty() && l.acked < v.replicating.front().seq &&
+                                    now - v.replicating.front().at >= _config.member_timeout;
+            const bool intents_late = v.reconcile && !l.intents_answered &&
+                                      now - v.reconcile->started >= _config.member_timeout;
+            if (write_late || intents_late) {
+                report_timeout(v, proto::VolumeFaultKind::member_timeout, sid);
+            }
+        }
+        return;
+    }
+    const auto* p = proto::primary_member(v.config);
+    if (p != nullptr && v.store && p->server_id != _config.server_id && !v.primary_reported &&
+        now - v.heard >= _config.primary_timeout) {
+        report_timeout(v, proto::VolumeFaultKind::primary_timeout, p->server_id);
+    }
+}
+
+auto HoldServer::report_timeout(Volume& v, proto::VolumeFaultKind kind, std::uint64_t suspect)
+    -> void {
+    if (kind == proto::VolumeFaultKind::member_timeout) {
+        v.timeout_reported.push_back(suspect);
+    } else {
+        v.primary_reported = true;
+    }
+    _reports.emplace_back(proto::VolumeFault{.volume_id = v.config.volume_id,
+                                             .epoch = v.config.epoch,
+                                             .suspect = suspect,
+                                             .kind = kind,
+                                             .reporter = proto::FaultReporter::hold,
+                                             .slot = 0});
+}
+
+auto HoldServer::take_reports(Clock::time_point now) -> std::vector<proto::ReportBody> {
+    std::vector<proto::ReportBody> out;
+    if (!_next_status || now >= *_next_status) {
+        auto interval = _config.status_interval;
+        proto::ReplicaStatus status;
+        for (auto& [id, v] : _volumes) {
+            const auto* me = find_member(v.config, _config.server_id);
+            if (me == nullptr || !v.store) {
+                continue;
+            }
+            const bool primary = is_primary(v);
+            if (primary) {
+                // This status is the lease request (design "Epochs, leases").
+                if (!v.lease_asked) {
+                    v.lease_asked = now;
+                }
+                interval = std::min(interval, std::chrono::milliseconds{v.config.lease_ms / 4});
+            }
+            const auto left =
+                primary && now < v.lease_until
+                    ? std::chrono::duration_cast<std::chrono::milliseconds>(v.lease_until - now)
+                    : std::chrono::milliseconds{0};
+            proto::ReplicaState state = proto::ReplicaState::in_sync;
+            if (me->role == proto::ReplicaRole::joining) {
+                state = proto::ReplicaState::joining;
+            }
+            status.entries.push_back(
+                {.volume_id = id,
+                 .epoch = v.config.epoch,
+                 .replica_gen = me->replica_gen,
+                 .slot = 0,
+                 .role = me->role,
+                 .state = state,
+                 .last_seq = v.store->last_seq(),
+                 .commit_seq = v.store->commit_seq(),
+                 .synced_bytes = 0,
+                 .total_bytes = 0,
+                 .hydrated_bytes = 0,
+                 .lease_remaining_ms = static_cast<std::uint32_t>(left.count()),
+                 .checksum_errors = 0,
+                 .checksum_repairs = 0,
+                 .reads = 0,
+                 .writes = 0,
+                 .read_bytes = 0,
+                 .write_bytes = 0,
+                 .throttled_us = 0});
+        }
+        out.emplace_back(std::move(status));
+        _next_status = now + std::max(interval, std::chrono::milliseconds{1});
+    }
+    for (auto& r : _reports) {
+        out.push_back(std::move(r));
+    }
+    _reports.clear();
+    return out;
+}
+
+auto HoldServer::grant_lease(std::uint64_t volume_id, std::uint64_t epoch, Clock::time_point now)
+    -> void {
+    _now = now;
+    const auto it = _volumes.find(volume_id);
+    if (it == _volumes.end()) {
+        return;
+    }
+    Volume& v = it->second;
+    if (epoch != v.config.epoch || !is_primary(v) || !v.lease_asked) {
+        return;  // not for this role, or not asked since the last grant
+    }
+    // From when it asked: the controller counts from when it answered.
+    v.lease_until =
+        std::max(v.lease_until, *v.lease_asked + std::chrono::milliseconds{v.config.lease_ms});
+    v.lease_asked.reset();
+    unpark(v);  // reads held for the lease
+}
+
+auto HoldServer::has_lease(std::uint64_t volume_id, Clock::time_point now) const -> bool {
+    const auto it = _volumes.find(volume_id);
+    return it != _volumes.end() && is_primary(it->second) && lease_valid(it->second, now);
+}
+
+auto HoldServer::reconciling(std::uint64_t volume_id) const -> bool {
+    const auto it = _volumes.find(volume_id);
+    return it != _volumes.end() && it->second.reconcile.has_value();
+}
+
 // ---- responses -------------------------------------------------------------
 
 auto HoldServer::respond(SessionId id, const proto::HoldHeader& req, HoldStatus status,
                          proto::HoldPayload payload) -> void {
+    if (id == 0) {
+        return;  // the server's own request
+    }
     proto::HoldHeader h = req;
     h.flags = proto::hold_flags::response;
     h.status = status;
@@ -1097,6 +1445,9 @@ auto HoldServer::respond(SessionId id, const proto::HoldHeader& req, HoldStatus 
 }
 
 auto HoldServer::refuse(SessionId id, const proto::HoldHeader& req, Verdict v) -> void {
+    if (id == 0) {
+        return;
+    }
     if (!v.redirect || req.opcode == HoldOpcode::repl_write) {
         respond(id, req, v.status);
         return;

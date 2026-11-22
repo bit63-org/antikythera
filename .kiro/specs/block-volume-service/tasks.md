@@ -61,7 +61,7 @@ repository. Prerequisites outside this spec: oar-blk task 14
   simulated clock, network and crashing disks around the real hold,
   initiator and master; per-block linearizability checker; seeded runs
   in ctest and a long nightly variant. _Requirements: 15.1_ (cloud)
-- [ ] 10. Failover: config application in hold, leases through helm's
+- [x] 10. Failover: config application in hold, leases through helm's
   report path, demotion, member-loss and primary-loss handling, intent
   reconcile on promotion, `io_suspended` and `EnableVolumeIO`; all
   exercised by the simulation. _Requirements: 6_ (cloud)

@@ -215,7 +215,9 @@ auto main(int argc, char** argv) -> int {
                 .cert_pem = *cert,
                 .key_pem = *key,
                 .peer_name = {}},
-        .server = {.server_id = opts->server_id, .data_dir = opts->data_dir},
+        // No helm sideband yet (configs come from --configs), so no
+        // controller grants leases: the primary serves reads without one.
+        .server = {.server_id = opts->server_id, .data_dir = opts->data_dir, .leases = false},
     };
     auto node = ak::hold::Node::create(files, std::move(config));
     if (!node) {

@@ -1,19 +1,24 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-// .kiro/specs/block-volume-service/ task 9: the deterministic simulation
-// (Requirement 15.1). The real master, three real hold servers over
-// crash-model files and the real initiator run on one simulated clock,
-// joined by a simulated network: each session is a pair of FIFO pipes
-// with random latency, and configs travel from the master with their own
-// delay. A seeded schedule crashes secondaries (power loss, then restart
-// from what survived) and cuts sessions while a guest workload of
-// overlapping reads and writes runs. Afterwards every operation must
-// have completed, every read must be linearizable per block, and every
-// replica must hold the same data.
+// .kiro/specs/block-volume-service/ tasks 9 and 10: the deterministic
+// simulation (Requirement 15.1). The real master, three real hold servers
+// over crash-model files and the real initiator run on one simulated
+// clock, joined by a simulated network: each session is a pair of FIFO
+// pipes with random latency, and configs, reports and lease grants travel
+// between the master and the holds with their own delay. A seeded
+// schedule crashes holds, the primary among them (power loss, then
+// restart from what survived), and cuts sessions while a guest workload
+// of overlapping reads and writes runs; the controller drops members that
+// stop acknowledging and replaces a primary that stops answering.
+// Afterwards every operation must have completed, every read must be
+// linearizable per block, and every in-sync replica must hold the same
+// data; throughout, at most one hold may hold a lease.
 //
-// The primary is never crashed yet: replacing it needs leases, reports
-// and intent reconcile (task 10), which will extend this harness.
+// Crashes come only while all three replicas are in sync: a dropped
+// member returns with resync (task 11), which will extend this harness.
+// Initiators' faults reach the controller by another path (not modelled):
+// the members' reports confirm a lost primary.
 //
 // AK_SIM_SEED=<n> reruns one seed; AK_SIM_SEEDS=<n> sets how many seeds
 // the run covers. ctest runs a short sweep; `ctest -C Nightly -L nightly`
@@ -90,6 +95,9 @@ struct Params {
     Clock::duration settle{90s};    // then everything must finish within this
     Clock::duration max_latency{2ms};
     bool faults{true};
+    // Also crash the primary at this point of the workload, down long
+    // enough that the controller replaces it.
+    std::optional<Clock::duration> crash_primary;
 };
 
 // One guest operation and what it saw.
@@ -212,7 +220,10 @@ public:
         schedule(latency(), Deliver{.server = c.server_id, .config = c});
     }
     auto send_op(const proto::VolumeOp& op) -> void override { static_cast<void>(op); }
-    auto grant_lease(std::uint64_t, std::uint64_t, std::uint64_t) -> void override {}
+    auto grant_lease(std::uint64_t server, std::uint64_t volume, std::uint64_t epoch)
+        -> void override {
+        schedule(latency(), Grant{.server = server, .volume = volume, .epoch = epoch});
+    }
     auto sweep_lineage(std::uint64_t, std::span<const proto::ManifestName>) -> void override {}
     auto destroy_lineage_key(std::uint64_t) -> void override {}
 
@@ -248,14 +259,19 @@ public:
     // ---- the run ----------------------------------------------------------
     auto run() -> void {
         const auto stop = t0 + _p.workload;
-        auto next_report = t0;
+        auto next_tick = t0;
         auto next_fault = t0 + 500ms;
+        bool crashed = false;
         auto next_op = t0;
         while (now < stop + _p.settle) {
             const bool working = now < stop;
-            if (now >= next_report) {
-                report();
-                next_report = now + 1s;
+            if (now >= next_tick) {
+                master.tick(mnow());
+                next_tick = now + 100ms;
+            }
+            if (working && _p.crash_primary && !crashed && now >= t0 + *_p.crash_primary) {
+                crash(_holds.at(primary()), 15s);
+                crashed = true;
             }
             if (working && _p.faults && now >= next_fault) {
                 fault();
@@ -275,11 +291,14 @@ public:
             }
             settle();
             // The next moment anything wants to happen.
-            auto wake = next_report;
+            auto wake = next_tick;
             if (working) {
                 wake = std::min(wake, next_op);
                 if (_p.faults) {
                     wake = std::min(wake, next_fault);
+                }
+                if (_p.crash_primary && !crashed) {
+                    wake = std::min(wake, t0 + *_p.crash_primary);
                 }
             }
             if (!_events.empty()) {
@@ -315,6 +334,9 @@ public:
 
     [[nodiscard]] auto ops() const -> std::size_t { return _ops.size(); }
     [[nodiscard]] auto crashes() const -> std::size_t { return _crashes; }
+    [[nodiscard]] auto primary_crashes() const -> std::size_t { return _primary_crashes; }
+    [[nodiscard]] auto primary_now() const -> std::uint64_t { return primary(); }
+    [[nodiscard]] auto epoch() const -> std::uint64_t { return master.volume(vol)->epoch; }
     [[nodiscard]] auto cuts() const -> std::size_t { return _cuts; }
 
     m::Master master;
@@ -337,7 +359,16 @@ private:
         std::uint64_t server{0};
         proto::ReplicaConfig config;
     };
-    using Event = std::variant<Frame, Dial, Closed, Deliver>;
+    struct Up {  // a report on its way through helm to the master
+        std::uint64_t server{0};
+        proto::ReportBody body;
+    };
+    struct Grant {  // a lease acknowledgement on its way down
+        std::uint64_t server{0};
+        std::uint64_t volume{0};
+        std::uint64_t epoch{0};
+    };
+    using Event = std::variant<Frame, Dial, Closed, Deliver, Up, Grant>;
 
     [[nodiscard]] auto mnow() const -> m::Time {
         return std::chrono::duration_cast<m::Time>(now.time_since_epoch());
@@ -404,11 +435,20 @@ private:
             }
             core.tick(now);
             moved = initiator_io() || moved;
+            int leases = 0;
             for (auto& [id, h] : _holds) {
                 if (h.up) {
                     h.server->run(now);
+                    for (auto& body : h.server->take_reports(now)) {
+                        schedule(latency(), Up{.server = id, .body = std::move(body)});
+                    }
+                    leases += h.server->has_lease(vol, now) ? 1 : 0;
                 }
             }
+            BOOST_TEST_REQUIRE(leases <= 1);  // never two primaries serving reads
+            // The controller learns of a lost primary from its members;
+            // initiators' reports take another path, not modelled here.
+            static_cast<void>(core.take_faults());
             if (!moved && (_events.empty() || _events.begin()->first.first > now)) {
                 return;
             }
@@ -449,6 +489,13 @@ private:
         } else if (auto* c = std::get_if<Closed>(&e)) {
             unlink(c->end);
             closed(c->end);
+        } else if (auto* up = std::get_if<Up>(&e)) {
+            master.on_report(
+                {.server_id = up->server, .report_seq = 0, .body = std::move(up->body)}, mnow());
+        } else if (auto* g = std::get_if<Grant>(&e)) {
+            if (auto& h = _holds.at(g->server); h.up) {
+                h.server->grant_lease(g->volume, g->epoch, now);
+            }
         } else if (auto* cfg = std::get_if<Deliver>(&e)) {
             if (cfg->server == compute) {
                 static_cast<void>(core.set_route(cfg->config, now));
@@ -514,37 +561,22 @@ private:
         return 0;
     }
 
+    // A crash is survivable only while every replica is in sync: a member
+    // the controller dropped comes back with resync (task 11).
+    [[nodiscard]] auto may_crash() const -> bool {
+        const auto* v = master.volume(vol);
+        return _restart.empty() && !v->failover && v->members.size() == 3 &&
+               std::ranges::all_of(v->members,
+                                   [](const auto& mem) {
+                                       return mem.role == proto::ReplicaRole::primary ||
+                                              mem.role == proto::ReplicaRole::secondary;
+                                   }) &&
+               std::ranges::all_of(_holds, [](const auto& kv) { return kv.second.up; });
+    }
+
     auto fault() -> void {
-        if (_rng() % 2 == 0) {
-            // Crash a secondary: its sessions drop, unsynced writes may be
-            // lost, and it comes back from what its files kept.
-            std::vector<std::uint64_t> candidates;
-            for (auto& [id, h] : _holds) {
-                if (h.up && id != primary()) {
-                    candidates.push_back(id);
-                }
-            }
-            if (candidates.empty()) {
-                return;
-            }
-            auto& h = _holds.at(candidates[_rng() % candidates.size()]);
-            std::vector<End> ends;
-            for (const auto& [e, other] : _peer) {
-                if (e.node == h.id && e.incarnation == h.incarnation) {
-                    ends.push_back(e);
-                }
-            }
-            for (const auto& e : ends) {
-                const auto other = _peer.at(e);
-                unlink(e);
-                schedule(latency() * 10, Closed{.end = other});  // the peer notices later
-            }
-            h.up = false;
-            h.server.reset();
-            h.sink.reset();
-            h.files.crash(_rng());
-            _restart[h.id] = now + std::chrono::milliseconds{300 + _rng() % 3000};
-            ++_crashes;
+        if (_rng() % 2 == 0 && may_crash()) {
+            crash(_holds.at(1 + (_rng() % 3)), std::chrono::milliseconds{300 + _rng() % 3000});
         } else if (!_peer.empty()) {
             // Cut one session.
             auto it = _peer.begin();
@@ -556,6 +588,31 @@ private:
             schedule(latency(), Closed{.end = b});
             ++_cuts;
         }
+    }
+
+    // Crash a hold, the primary too: its sessions drop, unsynced writes may
+    // be lost, and it comes back after `down` from what its files kept.
+    auto crash(Hold& h, Clock::duration down) -> void {
+        if (h.id == primary()) {
+            ++_primary_crashes;
+        }
+        std::vector<End> ends;
+        for (const auto& [e, other] : _peer) {
+            if (e.node == h.id && e.incarnation == h.incarnation) {
+                ends.push_back(e);
+            }
+        }
+        for (const auto& e : ends) {
+            const auto other = _peer.at(e);
+            unlink(e);
+            schedule(latency() * 10, Closed{.end = other});  // the peer notices later
+        }
+        h.up = false;
+        h.server.reset();
+        h.sink.reset();
+        h.files.crash(_rng());
+        _restart[h.id] = now + down;
+        ++_crashes;
     }
 
     auto heal() -> void {
@@ -570,34 +627,8 @@ private:
         }
         const auto p = primary();
         const auto& h = _holds.at(p);
-        return h.up && h.server->replicating(vol) == 0 && h.server->queued(vol) == 0;
-    }
-
-    // What helm would report for each running hold every second.
-    auto report() -> void {
-        for (auto& [id, h] : _holds) {
-            if (!h.up) {
-                continue;
-            }
-            proto::ReplicaStatus status;
-            if (const auto* r = h.server->replica(vol)) {
-                const auto& meta = r->meta();
-                status.entries.push_back({.volume_id = vol,
-                                          .epoch = meta.epoch,
-                                          .replica_gen = meta.replica_gen,
-                                          .slot = 0,
-                                          .role = meta.role,
-                                          .state = proto::ReplicaState::in_sync,
-                                          .last_seq = r->last_seq(),
-                                          .commit_seq = r->commit_seq(),
-                                          .synced_bytes = 0,
-                                          .total_bytes = 0,
-                                          .hydrated_bytes = 0,
-                                          .lease_remaining_ms = 0});
-            }
-            master.on_report({.server_id = id, .report_seq = 0, .body = status}, mnow());
-        }
-        master.tick(mnow());
+        return h.up && h.server->replicating(vol) == 0 && h.server->queued(vol) == 0 &&
+               !h.server->reconciling(vol);
     }
 
     // ---- the guest ----------------------------------------------------------
@@ -649,8 +680,8 @@ private:
             }
         }
         for (const auto& [id, op] : _ops) {
-            if (op.write) {
-                continue;
+            if (op.write || !op.result || !op.result->has_value()) {
+                continue;  // a failed read is check()'s
             }
             for (std::uint64_t b = op.lba; b < op.lba + op.n; ++b) {
                 const auto block = std::span{op.buf}.subspan((b - op.lba) * bs, bs);
@@ -673,11 +704,12 @@ private:
         }
     }
 
-    // Every replica holds what the primary does. A member's checksums may
-    // lag its data only inside extents its intent ring held when it
+    // Every in-sync replica holds what the primary does (one the
+    // controller dropped waits for resync, task 11). Checksums may lag the
+    // data only inside extents a replica's intent ring held when it
     // reopened after a crash (a crash can lose checksum updates the ring
-    // covers): resync on return (task 11) rewrites those. The primary's
-    // must all match.
+    // covers): a read repairs those from a member, and resync rewrites
+    // them.
     auto check_replicas() -> void {
         const auto p = primary();
         auto read_all = [&](std::uint64_t id) {
@@ -690,7 +722,6 @@ private:
             const auto& reopened = _holds.at(id).reopened;
             for (const auto lba : *bad) {
                 BOOST_TEST_INFO("bad block " << lba << " on " << id);
-                BOOST_TEST(id != p);
                 BOOST_TEST(std::ranges::any_of(reopened, [&](const auto& i) {
                     return i.lba <= lba && lba < i.lba + i.blocks;
                 }));
@@ -698,10 +729,10 @@ private:
             return out;
         };
         const auto expect = read_all(p);
-        for (auto& [id, h] : _holds) {
-            if (id != p) {
-                BOOST_TEST_INFO("replica on " << id);
-                BOOST_TEST((read_all(id) == expect));
+        for (const auto& mem : master.volume(vol)->members) {
+            if (mem.server_id != p && mem.role == proto::ReplicaRole::secondary) {
+                BOOST_TEST_INFO("replica on " << mem.server_id);
+                BOOST_TEST((read_all(mem.server_id) == expect));
             }
         }
     }
@@ -717,6 +748,7 @@ private:
     std::size_t _outstanding = 0;
     std::uint64_t _next_op{1};
     std::size_t _crashes{0};
+    std::size_t _primary_crashes{0};
     std::size_t _cuts{0};
 };
 
@@ -746,7 +778,9 @@ auto run_seeds(std::uint64_t first, std::uint64_t count, Params p) -> void {
             w.run();
             w.check();
             BOOST_TEST_MESSAGE("seed " << seed << ": " << w.ops() << " ops, " << w.crashes()
-                                       << " crashes, " << w.cuts() << " cuts");
+                                       << " crashes (" << w.primary_crashes()
+                                       << " of the primary), " << w.cuts() << " cuts, epoch "
+                                       << w.epoch());
         }
     }
 }
@@ -754,15 +788,34 @@ auto run_seeds(std::uint64_t first, std::uint64_t count, Params p) -> void {
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(runs_without_faults, *utf::timeout(ak::test::unit_timeout_seconds)) {
-    run_seeds(1, 1, {.workload = 5s, .settle = 30s, .max_latency = 2ms, .faults = false});
+    run_seeds(
+        1, 1,
+        {.workload = 5s, .settle = 30s, .max_latency = 2ms, .faults = false, .crash_primary = {}});
 }
 
-BOOST_AUTO_TEST_CASE(survives_secondary_crashes_and_cuts,
-                     *utf::timeout(ak::test::unit_timeout_seconds)) {
-    run_seeds(100, 4, {.workload = 5s, .settle = 60s, .max_latency = 2ms, .faults = true});
+BOOST_AUTO_TEST_CASE(survives_crashes_and_cuts, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    run_seeds(
+        100, 4,
+        {.workload = 5s, .settle = 60s, .max_latency = 2ms, .faults = true, .crash_primary = {}});
+}
+
+BOOST_AUTO_TEST_CASE(fails_over_a_lost_primary, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    // No other faults: a clean failover, then the old primary comes back
+    // outside the replica set (until resync, task 11).
+    World w{
+        7,
+        {.workload = 5s, .settle = 60s, .max_latency = 2ms, .faults = false, .crash_primary = 2s}};
+    const auto first = w.primary_now();
+    w.run();
+    w.check();
+    BOOST_TEST(w.primary_now() != first);
+    BOOST_TEST(w.primary_crashes() == 1U);
+    BOOST_TEST(w.epoch() >= 3U);
 }
 
 // The nightly sweep (ctest -C Nightly -L nightly): many more seeds.
 BOOST_AUTO_TEST_CASE(long_sweep, *utf::disabled()) {
-    run_seeds(10'000, 500, {.workload = 60s, .settle = 120s, .max_latency = 5ms, .faults = true});
+    run_seeds(
+        10'000, 500,
+        {.workload = 60s, .settle = 120s, .max_latency = 5ms, .faults = true, .crash_primary = {}});
 }

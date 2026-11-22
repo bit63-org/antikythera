@@ -17,9 +17,11 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "common/crc32c.hpp"
@@ -27,6 +29,7 @@
 #include "hold/store/file_layer.hpp"
 #include "proto/hold_wire.hpp"
 #include "proto/replica_config.hpp"
+#include "proto/report.hpp"
 #include "test_support.hpp"
 
 namespace ak::proto {
@@ -122,15 +125,23 @@ struct Server {
     ak::hold::store::MemFiles files;
     NetSink sink;
     HoldServer hold;
-    bool up{true};     // accepts connections
-    bool mute{false};  // frames to it are lost
+    bool up{true};       // accepts connections
+    bool mute{false};    // frames to it are lost
+    bool halted{false};  // never runs (with mute: hung)
 };
+
+// Failover is tested on its own: elsewhere a primary needs no lease.
+auto no_leases() -> ServerConfig {
+    ServerConfig c;
+    c.leases = false;
+    return c;
+}
 
 // Hold servers 1-3 and the sessions between them; the initiator's
 // session to server 1 is the test's own end.
 class Net {
 public:
-    explicit Net(ServerConfig cfg = {}) {
+    explicit Net(ServerConfig cfg = no_leases()) {
         for (std::uint64_t id = 1; id <= 3; ++id) {
             _servers[id] = std::make_unique<Server>(*this, id, cfg);
         }
@@ -190,9 +201,9 @@ public:
         step();
         return h.request_id;
     }
-    auto read(SessionId s, std::uint64_t lba, std::uint32_t blocks, std::uint64_t server_id = 1)
-        -> std::uint64_t {
-        auto h = header(HoldOpcode::read);
+    auto read(SessionId s, std::uint64_t lba, std::uint32_t blocks, std::uint64_t server_id = 1,
+              std::uint64_t epoch = 1) -> std::uint64_t {
+        auto h = header(HoldOpcode::read, epoch);
         h.lba = lba;
         h.blocks = blocks;
         hold(server_id).on_frame(s, {.header = h, .payload = {}}, now);
@@ -254,7 +265,9 @@ public:
         for (int guard = 0; guard < 10000; ++guard) {
             bool moved = false;
             for (auto& [id, s] : _servers) {
-                s->hold.run(now);
+                if (!s->halted) {
+                    s->hold.run(now);
+                }
             }
             while (!_dials.empty()) {
                 moved = true;
@@ -310,6 +323,9 @@ public:
         while (true) {
             std::optional<Clock::time_point> wake;
             for (auto& [id, s] : _servers) {
+                if (s->halted) {
+                    continue;
+                }
                 if (const auto w = s->hold.next_wake(now); w && *w > now) {
                     wake = wake ? std::min(*wake, *w) : *w;
                 }
@@ -431,9 +447,10 @@ BOOST_AUTO_TEST_CASE(replicates_writes_to_every_member,
 
 BOOST_AUTO_TEST_CASE(waits_for_every_member, *utf::timeout(ak::test::unit_timeout_seconds)) {
     Net net;
-    net.server(3).up = false;
     net.apply(config(1));
-    net.step();
+    net.step();  // the promotion's reconcile hears from every member
+    net.server(3).up = false;
+    net.cut(3);
     const auto s = net.initiator();
     const auto data = blocks_of(3, 2);
     const auto w = net.write(s, 0, data);
@@ -585,10 +602,12 @@ BOOST_AUTO_TEST_CASE(stops_taking_writes_it_cannot_replicate,
                      *utf::timeout(ak::test::unit_timeout_seconds)) {
     ServerConfig cfg;
     cfg.max_replicating = 2;
+    cfg.leases = false;
     Net net{cfg};
-    net.server(3).up = false;
     net.apply(config(1));
-    net.step();
+    net.step();  // the promotion's reconcile hears from every member
+    net.server(3).up = false;
+    net.cut(3);
     const auto s = net.initiator();
     for (std::uint64_t i = 0; i < 3; ++i) {
         net.write(s, i, blocks_of(i, 1));
@@ -652,9 +671,10 @@ BOOST_AUTO_TEST_CASE(fails_a_read_with_no_member_to_ask,
 
 BOOST_AUTO_TEST_CASE(follows_member_changes, *utf::timeout(ak::test::unit_timeout_seconds)) {
     Net net;
-    net.server(3).up = false;
     net.apply(config(1));
-    net.step();
+    net.step();  // the promotion's reconcile hears from every member
+    net.server(3).up = false;
+    net.cut(3);
     const auto s = net.initiator();
     const auto w = net.write(s, 0, blocks_of(11, 1));
     BOOST_TEST(!net.status(s, w).has_value());
@@ -669,4 +689,233 @@ BOOST_AUTO_TEST_CASE(follows_member_changes, *utf::timeout(ak::test::unit_timeou
     const auto s3 = net.initiator(1, 3);
     const auto w3 = net.write(s3, 1, blocks_of(12, 1), 1, 3);
     BOOST_TEST((net.status(s3, w3) == HoldStatus::ok));
+}
+
+// ---- failover (task 10) ----------------------------------------------------
+
+namespace {
+
+auto faults(const std::vector<proto::ReportBody>& reports) -> std::vector<proto::VolumeFault> {
+    std::vector<proto::VolumeFault> out;
+    for (const auto& r : reports) {
+        if (const auto* f = std::get_if<proto::VolumeFault>(&r)) {
+            out.push_back(*f);
+        }
+    }
+    return out;
+}
+
+auto status_of(const std::vector<proto::ReportBody>& reports)
+    -> std::optional<proto::ReplicaStatusEntry> {
+    for (const auto& r : reports) {
+        if (const auto* s = std::get_if<proto::ReplicaStatus>(&r); s != nullptr) {
+            for (const auto& e : s->entries) {
+                if (e.volume_id == vol) {
+                    return e;
+                }
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+// Server 1 hangs: it runs no more, and nothing reaches it.
+auto hang(Net& net, std::uint64_t id) -> void {
+    net.server(id).halted = true;
+    net.server(id).mute = true;
+    net.server(id).up = false;
+}
+
+// Epoch 2: server 2 primary, 3 its secondary; 1 is gone.
+auto promoted() -> proto::ReplicaConfig {
+    return config(
+        2, {member(2, proto::ReplicaRole::primary), member(3, proto::ReplicaRole::secondary)});
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(serves_reads_only_under_a_lease,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net{ServerConfig{}};
+    net.apply(config(1));
+    net.step();
+    const auto s = net.initiator();
+    const auto data = blocks_of(1, 2);
+    BOOST_TEST((net.status(s, net.write(s, 0, data)) == HoldStatus::ok));  // no lease needed
+    const auto r = net.read(s, 0, 2);
+    BOOST_TEST(!net.status(s, r).has_value());
+    net.hold(1).grant_lease(vol, 1, net.now);  // never asked for: ignored
+    net.step();
+    BOOST_TEST(!net.status(s, r).has_value());
+
+    // Its status is the lease request; a member's is only a status.
+    const auto asked = net.now;
+    const auto st = status_of(net.hold(1).take_reports(net.now));
+    BOOST_TEST_REQUIRE(st.has_value());
+    BOOST_TEST((st->role == proto::ReplicaRole::primary));
+    BOOST_TEST(st->epoch == 1U);
+    BOOST_TEST(st->last_seq == 1U);
+    BOOST_TEST(st->lease_remaining_ms == 0U);
+    const auto member_st = status_of(net.hold(2).take_reports(net.now));
+    BOOST_TEST_REQUIRE(member_st.has_value());
+    BOOST_TEST((member_st->role == proto::ReplicaRole::secondary));
+
+    net.run_for(1s);
+    net.hold(1).grant_lease(vol, 2, net.now);  // another epoch's
+    net.step();
+    BOOST_TEST(!net.status(s, r).has_value());
+    net.hold(1).grant_lease(vol, 1, net.now);
+    net.step();
+    BOOST_TEST(net.read_data(s, r) == data);
+    // It runs lease_ms from when it was asked for, not from the grant.
+    BOOST_TEST(net.hold(1).has_lease(vol, asked + 3999ms));
+    BOOST_TEST(!net.hold(1).has_lease(vol, asked + 4000ms));
+    BOOST_TEST(!net.hold(2).has_lease(vol, net.now));
+    net.run_for(3s);
+    const auto late = net.read(s, 0, 2);
+    BOOST_TEST(!net.status(s, late).has_value());
+    // The next request and grant renew it.
+    BOOST_TEST(status_of(net.hold(1).take_reports(net.now))->lease_remaining_ms == 0U);
+    net.hold(1).grant_lease(vol, 1, net.now);
+    net.step();
+    BOOST_TEST(net.read_data(s, late) == data);
+}
+
+BOOST_AUTO_TEST_CASE(reports_a_member_that_stops_acknowledging,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net;
+    net.apply(config(1));
+    net.step();
+    net.server(3).up = false;
+    net.cut(3);
+    const auto s = net.initiator();
+    const auto w = net.write(s, 0, blocks_of(2, 1));
+    net.run_for(1900ms);
+    BOOST_TEST(faults(net.hold(1).take_reports(net.now)).empty());
+    net.run_for(200ms);
+    const auto f = faults(net.hold(1).take_reports(net.now));
+    BOOST_TEST_REQUIRE(f.size() == 1U);
+    BOOST_TEST((f[0].kind == proto::VolumeFaultKind::member_timeout));
+    BOOST_TEST((f[0].reporter == proto::FaultReporter::hold));
+    BOOST_TEST(f[0].suspect == 3U);
+    BOOST_TEST(f[0].epoch == 1U);
+    net.run_for(5s);
+    BOOST_TEST(faults(net.hold(1).take_reports(net.now)).empty());  // once per epoch
+    BOOST_TEST(!net.status(s, w).has_value());
+    // The controller drops it: the write is answered.
+    net.apply(config(
+        2, {member(1, proto::ReplicaRole::primary), member(2, proto::ReplicaRole::secondary)}));
+    net.step();
+    BOOST_TEST((net.status(s, w) == HoldStatus::ok));
+}
+
+BOOST_AUTO_TEST_CASE(members_report_a_silent_primary,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net;
+    net.apply(config(1));
+    net.step();
+    net.run_for(5s);  // idle, but the primary pings
+    BOOST_TEST(faults(net.hold(2).take_reports(net.now)).empty());
+    hang(net, 1);
+    net.run_for(2500ms);
+    for (const std::uint64_t id : {std::uint64_t{2}, std::uint64_t{3}}) {
+        const auto f = faults(net.hold(id).take_reports(net.now));
+        BOOST_TEST_REQUIRE(f.size() == 1U);
+        BOOST_TEST((f[0].kind == proto::VolumeFaultKind::primary_timeout));
+        BOOST_TEST(f[0].suspect == 1U);
+    }
+    net.run_for(5s);
+    BOOST_TEST(faults(net.hold(2).take_reports(net.now)).empty());
+}
+
+BOOST_AUTO_TEST_CASE(confirms_its_demotion, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net;
+    net.apply(config(1));
+    net.step();
+    const auto s = net.initiator();
+    BOOST_TEST((net.status(s, net.write(s, 0, blocks_of(3, 1))) == HoldStatus::ok));
+    net.apply(
+        config(2, {member(1, proto::ReplicaRole::leaving), member(2, proto::ReplicaRole::primary),
+                   member(3, proto::ReplicaRole::secondary)}));
+    net.step();
+    const auto reports = net.hold(1).take_reports(net.now);
+    const auto it = std::ranges::find_if(
+        reports, [](const auto& r) { return std::holds_alternative<proto::DemotionConfirmed>(r); });
+    BOOST_TEST_REQUIRE((it != reports.end()));
+    const auto& d = std::get<proto::DemotionConfirmed>(*it);
+    BOOST_TEST(d.volume_id == vol);
+    BOOST_TEST(d.epoch == 2U);
+    BOOST_TEST(d.last_seq == 1U);
+    BOOST_TEST(!net.hold(1).has_lease(vol, net.now));
+}
+
+// A write only the old primary and server 2 hold when 1 hangs: the new
+// primary keeps it and gives it to 3.
+BOOST_AUTO_TEST_CASE(promotion_reconciles_from_the_new_primary,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net;
+    net.apply(config(1));
+    net.step();
+    const auto s = net.initiator();
+    const auto a = blocks_of(4, 1);
+    const auto b = blocks_of(5, 1);
+    BOOST_TEST((net.status(s, net.write(s, 0, a)) == HoldStatus::ok));
+    net.server(3).up = false;
+    net.cut(3);
+    const auto w = net.write(s, 0, b);
+    BOOST_TEST(!net.status(s, w).has_value());
+    BOOST_TEST(net.stored(2, 0, 1) == b);
+    BOOST_TEST(net.stored(3, 0, 1) == a);
+    hang(net, 1);
+    net.cut(1);
+
+    // Promoted while 3 is still away: nothing is served until it answers.
+    net.apply_to(2, promoted());
+    net.apply_to(3, promoted());
+    net.step();
+    BOOST_TEST(net.hold(2).reconciling(vol));
+    const auto s2 = net.initiator(2, 2);
+    const auto w2 = net.write(s2, 8, blocks_of(6, 1), 2, 2);
+    BOOST_TEST(!net.status(s2, w2).has_value());
+    net.run_for(2100ms);
+    const auto f = faults(net.hold(2).take_reports(net.now));
+    BOOST_TEST_REQUIRE(f.size() == 1U);
+    BOOST_TEST((f[0].kind == proto::VolumeFaultKind::member_timeout));
+    BOOST_TEST(f[0].suspect == 3U);
+
+    net.server(3).up = true;
+    net.run_for(1s);
+    BOOST_TEST(!net.hold(2).reconciling(vol));
+    BOOST_TEST(net.hold(2).stats().reconciled == 1U);
+    BOOST_TEST(net.stored(3, 0, 1) == b);
+    BOOST_TEST((net.status(s2, w2) == HoldStatus::ok));
+    BOOST_TEST(net.stored(3, 8, 1) == blocks_of(6, 1));
+    BOOST_TEST(net.read_data(s2, net.read(s2, 0, 1, 2, 2)) == b);
+    // Numbered above everything: seq 2 was the last either held.
+    BOOST_TEST(net.hold(3).replica(vol)->last_seq() == 4U);
+}
+
+// A write only the old primary and server 3 hold: the new primary's
+// older copy wins, so both replicas agree.
+BOOST_AUTO_TEST_CASE(promotion_overrides_what_only_a_member_holds,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net;
+    net.apply(config(1));
+    net.step();
+    const auto s = net.initiator();
+    const auto a = blocks_of(7, 2);
+    BOOST_TEST((net.status(s, net.write(s, 4, a)) == HoldStatus::ok));
+    net.server(2).up = false;
+    net.cut(2);
+    net.write(s, 5, blocks_of(8, 1));
+    BOOST_TEST(net.stored(3, 4, 2) != a);
+    hang(net, 1);
+    net.cut(1);
+    net.server(2).up = true;
+    net.apply_to(2, promoted());
+    net.apply_to(3, promoted());
+    net.step();
+    BOOST_TEST(!net.hold(2).reconciling(vol));
+    BOOST_TEST(net.stored(3, 4, 2) == a);
+    BOOST_TEST(net.stored(2, 4, 2) == a);
 }

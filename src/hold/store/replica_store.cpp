@@ -494,6 +494,43 @@ auto ReplicaStore::hydrate(std::uint64_t lba, std::span<const std::byte> data,
     return fill.size();
 }
 
+auto ReplicaStore::rewrite(std::span<const Write> batch) -> std::expected<void, StoreError> {
+    const std::uint32_t bs = _meta.block_size;
+    for (const auto& w : batch) {
+        if (!check_range(w.lba, w.data.size()) || w.crcs.size() != w.data.size() / bs) {
+            return std::unexpected(StoreError::bad_request);
+        }
+        if (w.seq <= _commit_seq || w.seq > _last_seq ||
+            std::ranges::none_of(_ring, [&](const Intent& i) {
+                return i.seq == w.seq && i.lba == w.lba && i.blocks == w.crcs.size();
+            })) {
+            return std::unexpected(StoreError::bad_seq);
+        }
+        for (std::size_t b = 0; b < w.crcs.size(); ++b) {
+            if (crc32c::of(w.data.subspan(b * bs, bs)) != w.crcs[b]) {
+                return std::unexpected(StoreError::bad_crc);
+            }
+        }
+    }
+    for (const auto& w : batch) {
+        if (!_data->pwrite(w.lba * bs, w.data)) {
+            return std::unexpected(StoreError::io);
+        }
+    }
+    if (!_data->sync()) {
+        return std::unexpected(StoreError::io);
+    }
+    for (const auto& w : batch) {
+        if (auto r = write_checksums(w.lba, w.crcs); !r) {
+            return r;
+        }
+        if (auto r = mark_written(w.lba, w.crcs.size()); !r) {
+            return r;
+        }
+    }
+    return sync_meta();
+}
+
 auto ReplicaStore::repair(std::uint64_t lba, std::span<const std::byte> block, std::uint32_t crc)
     -> std::expected<void, StoreError> {
     const std::uint32_t bs = _meta.block_size;

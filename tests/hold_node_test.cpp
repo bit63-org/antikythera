@@ -146,8 +146,8 @@ auto receive(tls::Stream& s, ak::hold::FrameAssembler& in) -> std::optional<Byte
     const auto deadline = Clock::now() + 5s;
     std::array<std::byte, 4096> buf{};
     while (Clock::now() < deadline) {
-        if (auto f = in.next(); f && *f) {
-            return std::move(**f);
+        if (auto f = in.next(); f && f->has_value()) {
+            return std::move(*f);
         }
         auto got = s.read_some(buf);
         if (!got) {

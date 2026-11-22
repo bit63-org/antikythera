@@ -362,7 +362,8 @@ auto HoldServer::on_frame(SessionId id, const proto::HoldFrame& f, Clock::time_p
         }
         case HoldOpcode::repl_write: {
             const auto* w = std::get_if<proto::ReplWrite>(&f.payload);
-            respond(id, h, HoldStatus::bad_request, proto::ReplAck{.seq = w ? w->seq : 0});
+            respond(id, h, HoldStatus::bad_request,
+                    proto::ReplAck{.seq = w != nullptr ? w->seq : 0});
             return;
         }
         default:  // write_zeroes, discard and the replication opcodes come later

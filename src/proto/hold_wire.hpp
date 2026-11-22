@@ -59,7 +59,9 @@
 // Block data is blocks x 4 bytes of CRC32C (one per block, over its
 // ciphertext) followed by blocks x block_size bytes; block_size (512 or
 // 4096) follows from payload_len, and the data is at most
-// max_hold_data_bytes. A response with a status other than ok has an
+// max_hold_data_bytes. A read returns a block never written as zeros with
+// a CRC of 0 (the CRC32C of a zero block is not 0), which the initiator
+// takes as an unwritten block. A response with a status other than ok has an
 // empty payload, except repl_ack and redirect, which always carry theirs.
 //
 // Block opcodes: read, write, write_zeroes, discard, repl_write,

@@ -12,23 +12,23 @@ repository. Prerequisites outside this spec: oar-blk task 14
 
 ### Phase A: contracts
 
-- [ ] 1. Protocol codecs in `src/proto/`: `ReplicaConfig`, `VolumeOp`,
+- [x] 1. Protocol codecs in `src/proto/`: `ReplicaConfig`, `VolumeOp`,
   `VolumeKey`, and the report additions (`replica_status`,
   `volume_fault`, `attachment_status`, `demotion_confirmed`,
   `op_outcome`, `snapshot_progress`); signing test vectors under the
   RFC 8032 keys like `MapUpdate`; fuzz targets. helm verification of
   `ReplicaConfig` reuses the `MapUpdate` path. _Requirements: 6.1-6.2,
   12.2, 13.4_ (cloud)
-- [ ] 2. hold wire protocol codec (`src/proto/hold_wire.*`): header,
+- [x] 2. hold wire protocol codec (`src/proto/hold_wire.*`): header,
   every opcode's payload, status codes, CRC32C helpers (portable table,
   SSE4.2 when available, no new dependency); `fuzz/fuzz_hold_wire.cpp`. _Requirements:
   13.4, 5.4_ (cloud)
-- [ ] 3. Asynchronous `BlockBackend`: submit/complete interface,
+- [x] 3. Asynchronous `BlockBackend`: submit/complete interface,
   `VirtioBlkFunction` parks requests and completes them from backend
   callbacks (subsumes oar-blk task 14); the existing file, image and
   overlay backends adapted; fuzzing of the function kept. _Requirements:
   1.1, 2.2_ (cloud)
-- [ ] 4. Controller reference model `src/hold/master/` (`ak_hold_master`):
+- [x] 4. Controller reference model `src/hold/master/` (`ak_hold_master`):
   volume records, placement across failure domains, epoch, lease and
   attachment-generation rules, failure handling, rebuild queue, moves,
   snapshot coordination and GC, over an abstract transport; unit tests
@@ -36,11 +36,11 @@ repository. Prerequisites outside this spec: oar-blk task 14
 
 ### Phase B: one replica, end to end
 
-- [ ] 5. `ReplicaStore`: replica directory, `meta` header codec (fuzzed),
+- [x] 5. `ReplicaStore`: replica directory, `meta` header codec (fuzzed),
   data file with reflink detection, per-block CRC32C, chunk state,
   changed-chunk bitmap, intent ring, group commit, crash-injection tests
   over an in-memory file layer. _Requirements: 1.5, 5.4_ (cloud)
-- [ ] 6. hold server, single replica: TLS 1.3 sessions with
+- [x] 6. hold server, single replica: TLS 1.3 sessions with
   `server_id`-bound certificates, `HELLO` authorization against the
   ReplicaConfig, epoch and generation fencing, READ/WRITE/FLUSH, `ro`
   enforcement, per-volume QoS and fair queueing; `ak-hold` binary with a

@@ -190,7 +190,8 @@ Additions to `src/proto/report.hpp`:
 
 TCP with TLS 1.3 (`src/tls`), mutually authenticated with per-role
 certificates the controller's CA issues at enrollment (the role creates
-its key; helm relays the CSR). The certificate binds the `server_id`,
+its key; helm relays the CSR). The certificate binds the `server_id`
+(a URI subjectAltName `urn:antikythera:server:<id>`, exactly one),
 which is what a hold role checks against the ReplicaConfig
 (Requirement 13.2); its packets carry the storage I/O class, or the
 background class for rebuild, hydration and scrub sessions. A session is opened per (volume, peer) with `HELLO`

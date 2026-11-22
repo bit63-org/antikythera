@@ -28,6 +28,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace ak::tls {
 
@@ -104,6 +105,10 @@ public:
     // TLS: check pending() before waiting on the socket.
     [[nodiscard]] auto fd() const noexcept -> int;
     [[nodiscard]] auto pending() const noexcept -> bool;
+
+    // The URI subjectAltNames of the peer's verified certificate, in
+    // certificate order (a storage role's identity is one of them).
+    [[nodiscard]] auto peer_uris() const -> std::vector<std::string>;
 
     // Reads what is available without waiting: 0 bytes means nothing yet.
     [[nodiscard]] auto read_some(std::span<std::byte> out) -> std::expected<std::size_t, Error>;

@@ -128,6 +128,18 @@ target_link_libraries(ak_hold_master
   PUBLIC ak::proto
   PRIVATE ak::warnings ak::hardening)
 
+# One hold replica on disk (.kiro/specs/block-volume-service/ task 5):
+# the data file, the meta header and per-block state, the intent ring and
+# group commit, over a file layer the tests replace with a crash model.
+add_library(ak_hold_store
+  hold/store/file_layer.cpp
+  hold/store/replica_meta.cpp
+  hold/store/replica_store.cpp)
+add_library(ak::hold_store ALIAS ak_hold_store)
+target_link_libraries(ak_hold_store
+  PUBLIC ak::proto ak::common
+  PRIVATE OpenSSL::Crypto ak::warnings ak::hardening)
+
 # harbor's test controller: signs commands and mapping updates and drives
 # one helm over the ControllerLink, standing in for kythira's EC2 module
 # until it exists (.kiro/specs/controller-interface/ task 5).

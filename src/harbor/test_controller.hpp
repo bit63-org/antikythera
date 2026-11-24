@@ -49,6 +49,12 @@
 //   group-policy VNI VERSION multicast RATE_FRAMES BURST_FRAMES RATE_BYTES BURST_BYTES
 //                MAX_REMOTE_VTEPS [MAX_GROUPS_PER_NIC]
 //                        the VPC's broadcast/multicast policy (oar-net Requirement 10)
+//   vpc-config VNI VERSION GATEWAY_MAC IPV4_PREFIX/LEN IPV4_GATEWAY [ipv6=PREFIX/64]
+//              [dns=ADDRESS ...] [domain=NAME] [lease=SECONDS] [route=PREFIX/LEN,NIC ...]
+//                        the VPC's gateway, DHCP and route configuration (oar-net
+//                        Requirement 12), e.g. vpc-config 100 1 02:00:00:00:ff:01
+//                        10.0.0.0/16 10.0.0.1 ipv6=fd10::/64 dns=10.0.0.2
+//                        domain=ec2.internal; lease defaults to 3600
 //   tunnel-peers VTEP VERSION [PEER_VTEP,KEY ...]
 //                        the WireGuard peers of this server's VTEP; KEY is the
 //                        peer's X25519 public key as 64 hex digits
@@ -84,6 +90,7 @@
 #include "proto/map_update.hpp"
 #include "proto/report.hpp"
 #include "proto/tunnel_peers.hpp"
+#include "proto/vpc_config.hpp"
 #include "tls/tls.hpp"
 
 namespace ak::harbor {
@@ -116,6 +123,9 @@ public:
     [[nodiscard]] auto group_policy(const proto::GroupPolicy& policy) const
         -> std::optional<std::vector<std::byte>>;
     [[nodiscard]] auto map_update(const proto::MapUpdate& update) const
+        -> std::optional<std::vector<std::byte>>;
+    // `config` encoded and signed (its signature field is ignored).
+    [[nodiscard]] auto vpc_config(const proto::VpcConfigFrame& config) const
         -> std::optional<std::vector<std::byte>>;
     // `peers` encoded and signed (its signature field is ignored).
     [[nodiscard]] auto tunnel_peers(const proto::TunnelPeers& peers) const
@@ -155,6 +165,11 @@ struct SendTunnelPeers {
     std::uint64_t peers_version{0};
     std::vector<proto::TunnelPeer> peers;
 };
+// Every field of the frame but the server and key, which the controller
+// fills in.
+struct SendVpcConfig {
+    proto::VpcConfigFrame config;
+};
 struct ExpectOutcome {
     proto::CommandStatus status{proto::CommandStatus::ok};
 };
@@ -163,7 +178,7 @@ struct WaitReport {
 };
 
 using Action = std::variant<SendCommand, SendMapUpdate, SendGroupPolicy, SendTunnelPeers,
-                            ExpectOutcome, WaitReport>;
+                            SendVpcConfig, ExpectOutcome, WaitReport>;
 
 // One script line: an action, nothing (blank or comment), or a message
 // saying what is wrong with it.

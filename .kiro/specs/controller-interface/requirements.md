@@ -272,3 +272,35 @@ tables.
     snapshot sharing across accounts, Recycle Bin and snapshot lock,
     Outposts, and the EBS direct APIs.
 
+### Requirement 10: VPC configuration
+
+**User Story:** As the operator, I want every server hosting a VPC to
+answer DHCP, router solicitations and the gateway's addresses from one
+record the controller signs, so that no guest can configure another and
+every server answers the same way (oar-net Requirement 12).
+
+#### Acceptance Criteria
+
+1. The controller SHALL keep one configuration per VPC (until subnets
+   exist; then per subnet): the gateway MAC, allocated from the MAC pool of
+   Requirement 4.2 so it never collides with a NIC; the IPv4 prefix and
+   gateway address; an optional IPv6 /64; up to four DNS servers per
+   family; a domain name; the DHCPv4 lease time; and the route table.
+2. Each route SHALL name a destination prefix (IPv4 or IPv6, a default
+   route allowed) and a target NIC in the same VPC. Routes to anything
+   other than a NIC (gateways, peering, endpoints) come with those
+   features and a new frame version.
+3. The controller SHALL deliver the configuration as a signed, versioned
+   `VpcConfig` frame, a full snapshot naming its target server and key, to
+   every server hosting a NIC in the VPC, before the first NIC there is
+   attached and again on every change.
+4. helm SHALL forward `VpcConfig` frames unmodified, keep the newest per
+   VPC, and resend it to a network role whose sideband reopens before any
+   NIC is prepared there; the network role SHALL verify the signature,
+   target and version and apply the configuration atomically, leaving
+   the previous one in place when a frame is refused.
+5. A route whose target NIC is not in the receiving server's current
+   mapping for the VPC SHALL match nothing there (its traffic is dropped
+   and counted) rather than refuse the whole frame, so mapping and
+   configuration updates need not arrive in a fixed order.
+

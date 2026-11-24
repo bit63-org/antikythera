@@ -175,6 +175,63 @@ VNI was never opted in, though drops are still reported for visibility.
 Enablement hours come from the controller's own record of when each
 subnet's policy was in force.
 
+## VpcConfig
+
+Requirement 10 and oar-net Requirements 11.10 and 12. One frame per VPC
+per server, like `GroupPolicy`; variable length because of the DNS lists,
+the domain and the routes.
+
+```
+VpcConfig {                   // controller -> helm -> oar-net, signed;
+                              // src/proto/vpc_config.hpp, LE
+  0x00 magic 'AKVC' u32, 0x04 version u16 (1), 0x06 key_id u16,
+  0x08 server_id u64, 0x10 vni u32,
+  0x14 flags u8 (bit 0: ipv6_prefix present), 0x15 ipv4_length u8 (8..30),
+  0x16 dns4_count u8 (<= 4), 0x17 dns6_count u8 (<= 4),
+  0x18 config_version u64,    // per VNI, starts at 1, strictly increasing
+  0x20 gateway_mac [6], 0x26 domain_size u8 (<= 253), 0x27 reserved u8,
+  0x28 ipv4_prefix [4], 0x2C ipv4_gateway [4],
+  0x30 ipv6_prefix [16]       // a /64; all zero without the flag
+  0x40 lease_seconds u32 (60 .. 2^31-1), 0x44 route_count u16 (<= 100),
+  0x46 reserved u16,
+  0x48 dns4 [4] x dns4_count, dns6 [16] x dns6_count,
+       routes x route_count { target_nic u64 | family u8 (4, 6)
+                              | length u8 | reserved [6] | prefix [16] },
+       domain [domain_size],
+       signature [64]         // Ed25519 over every byte before it
+}
+```
+
+The value rules are the VSwitch's (`VSwitch::set_vpc_config`): the
+gateway MAC is locally administered unicast; the IPv4 prefix has no host
+bits and the gateway is inside it but neither its network nor its
+broadcast address; the IPv6 prefix is a /64 that is not unspecified,
+link-local or multicast; DNS servers are unicast; the domain is RFC 1035
+preferred name syntax. Routes are strictly ascending by `(family, prefix,
+length)`, which makes the encoding canonical and rules out duplicates; a
+prefix has no bits past its length (an IPv4 prefix uses the first four
+bytes and leaves the rest zero), and a target is a real NIC ID (not 0 or
+the broadcast ID).
+
+Routes name NICs, not addresses or VTEPs. Only a NIC whose
+source/destination check is off (oar-net Requirement 11.10, a per-NIC flag
+in the mapping) can usefully receive traffic not addressed to it, and
+each receiver resolves the NIC through its own signed mapping, so a frame
+cannot point traffic at a server. A target missing from the receiver's
+mapping matches nothing there instead of refusing the frame (Requirement
+10.5): the controller sends `VpcConfig` and `MapUpdate` independently and
+they may arrive in either order. A network role that does not route yet
+refuses a frame with routes whole rather than half-apply it.
+
+The largest frame is 3,669 bytes (four DNS servers of each family, 100
+routes, a 253-byte domain), which fits one OarLink message, so helm
+forwards it like `GroupPolicy` without chunking. A VPC with more routes
+needs a new frame version (or subnets, whose route tables are smaller).
+The link record is type 14; type 13 is `image_key` (oar-blk task 15).
+Clearing a VPC's configuration is not a frame: a VPC keeps one from its
+first NIC's attach until it is deleted, and a server that no longer hosts
+the VPC drops it with the VNI's mapping.
+
 ## TunnelPeers
 
 oar-net carries VTEP-to-VTEP traffic inside WireGuard (oar-net
@@ -241,9 +298,10 @@ u16 | reserved u16 | payload`. Controller to helm: `envelope`, `map_update`, `gr
 `report_ack` (`server_id u64 | report_seq u64`, acknowledging every report
 up to that sequence), `tunnel_peers` (type 7, a TunnelPeers frame), and the
 block volume records `replica_config`, `volume_op`, `volume_key`, `lease_grant` and
-`role_certificate` (types 8 to 12, `.kiro/specs/block-volume-service/`), and
+`role_certificate` (types 8 to 12, `.kiro/specs/block-volume-service/`),
 `image_key` (type 13, an encrypted image's key for the image volume a
-CREATE_VOLUME is about to create, `.kiro/specs/oar-blk-data-plane/` task 15). Helm to controller: `hello` (`server_id u64 | boot_id
+CREATE_VOLUME is about to create, `.kiro/specs/oar-blk-data-plane/` task 15),
+and `vpc_config` (type 14, a VpcConfig frame). Helm to controller: `hello` (`server_id u64 | boot_id
 u64`, the first record on every connection) and `report`. Report sequence
 numbers restart when helm reboots, so the controller keys them by the
 connection's boot ID and drops any `(boot_id, report_seq)` it has already

@@ -157,6 +157,17 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
             _sink->on_group_policy(*policy, rec.payload);
             return {};
         }
+        case proto::RecordType::vpc_config: {
+            auto config = proto::decode_vpc_config(rec.payload);
+            if (!config) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (config->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_vpc_config(*config, rec.payload);
+            return {};
+        }
         case proto::RecordType::tunnel_peers: {
             auto peers = proto::decode_tunnel_peers(rec.payload);
             if (!peers) {

@@ -139,6 +139,20 @@ auto Signer::group_policy(const proto::GroupPolicy& policy) const
     return *frame;
 }
 
+auto Signer::vpc_config(const proto::VpcConfigFrame& config) const
+    -> std::optional<std::vector<std::byte>> {
+    auto frame = proto::encode_vpc_config(config);
+    if (!frame) {
+        return std::nullopt;
+    }
+    const auto sig = sign(proto::vpc_config_signed_bytes(*frame));
+    if (!sig) {
+        return std::nullopt;
+    }
+    proto::set_vpc_config_signature(*frame, *sig);
+    return *frame;
+}
+
 auto Signer::tunnel_peers(const proto::TunnelPeers& peers) const
     -> std::optional<std::vector<std::byte>> {
     auto frame = proto::encode_tunnel_peers(peers);
@@ -315,6 +329,139 @@ auto add_map_entry(std::string_view s, SendMapUpdate& m) -> std::expected<void, 
         }
     }
     return {};
+}
+
+// ADDRESS/LENGTH, IPv4 or IPv6.
+struct Prefix {
+    bool ipv6{false};
+    proto::Ipv6Address address{};  // IPv4 in the first four bytes
+    std::uint8_t length{0};
+};
+
+auto prefix(std::string_view s) -> std::expected<Prefix, std::string> {
+    const auto slash = s.find('/');
+    if (slash == std::string_view::npos) {
+        return std::unexpected("bad prefix " + std::string{s} + " (want ADDRESS/LENGTH)");
+    }
+    auto length = number<std::uint8_t>(s.substr(slash + 1), "prefix length");
+    if (!length) {
+        return std::unexpected(length.error());
+    }
+    const std::string text{s.substr(0, slash)};
+    Prefix out{.ipv6 = false, .address = {}, .length = *length};
+    if (inet_pton(AF_INET, text.c_str(), out.address.data()) == 1) {
+        return out;
+    }
+    if (inet_pton(AF_INET6, text.c_str(), out.address.data()) == 1) {
+        out.ipv6 = true;
+        return out;
+    }
+    return std::unexpected("bad prefix address " + text);
+}
+
+// vpc-config VNI VERSION GATEWAY_MAC IPV4_PREFIX/LEN IPV4_GATEWAY then
+// key=value options: ipv6=PREFIX/64, dns=ADDRESS (repeatable, either
+// family), domain=NAME, lease=SECONDS (default 3600) and
+// route=PREFIX/LEN,NIC (repeatable).
+auto vpc_config(std::span<const std::string_view> args)
+    -> std::expected<SendVpcConfig, std::string> {
+    constexpr std::uint32_t default_lease = 3600;
+    if (args.size() < 5) {
+        return std::unexpected(
+            "vpc-config: want VNI VERSION GATEWAY_MAC IPV4_PREFIX/LEN IPV4_GATEWAY "
+            "[ipv6=PREFIX/64] [dns=ADDRESS ...] [domain=NAME] [lease=SECONDS] "
+            "[route=PREFIX/LEN,NIC ...]");
+    }
+    auto vni = number<std::uint32_t>(args[0], "VNI");
+    auto version = number<std::uint64_t>(args[1], "config version");
+    auto gw_mac = mac(args[2]);
+    auto v4 = prefix(args[3]);
+    if (!vni) {
+        return std::unexpected(vni.error());
+    }
+    if (!version) {
+        return std::unexpected(version.error());
+    }
+    if (!gw_mac) {
+        return std::unexpected(gw_mac.error());
+    }
+    if (!v4 || v4->ipv6) {
+        return std::unexpected(v4 ? "vpc-config: the VPC prefix must be IPv4" : v4.error());
+    }
+    SendVpcConfig out{};
+    auto& c = out.config;
+    c.vni = *vni;
+    c.config_version = *version;
+    c.gateway_mac = *gw_mac;
+    std::copy_n(v4->address.begin(), c.ipv4_prefix.size(), c.ipv4_prefix.begin());
+    c.ipv4_length = v4->length;
+    c.lease_seconds = default_lease;
+    if (inet_pton(AF_INET, std::string{args[4]}.c_str(), c.ipv4_gateway.data()) != 1) {
+        return std::unexpected("bad gateway address " + std::string{args[4]});
+    }
+    for (const auto opt : args.subspan(5)) {
+        const auto eq = opt.find('=');
+        const auto key = opt.substr(0, eq);
+        const auto value = eq == std::string_view::npos ? std::string_view{} : opt.substr(eq + 1);
+        if (key == "ipv6") {
+            auto p = prefix(value);
+            if (!p || !p->ipv6 || p->length != 64) {
+                return std::unexpected("vpc-config: ipv6 wants an IPv6 /64");
+            }
+            c.has_ipv6 = true;
+            c.ipv6_prefix = p->address;
+        } else if (key == "dns") {
+            const std::string text{value};
+            proto::Ipv4Address a4{};
+            proto::Ipv6Address a6{};
+            if (inet_pton(AF_INET, text.c_str(), a4.data()) == 1) {
+                c.dns4.push_back(a4);
+            } else if (inet_pton(AF_INET6, text.c_str(), a6.data()) == 1) {
+                c.dns6.push_back(a6);
+            } else {
+                return std::unexpected("bad DNS server " + text);
+            }
+        } else if (key == "domain") {
+            c.domain = value;
+        } else if (key == "lease") {
+            auto lease = number<std::uint32_t>(value, "lease");
+            if (!lease) {
+                return std::unexpected(lease.error());
+            }
+            c.lease_seconds = *lease;
+        } else if (key == "route") {
+            const auto comma = value.find(',');
+            if (comma == std::string_view::npos) {
+                return std::unexpected("vpc-config: route wants PREFIX/LEN,NIC");
+            }
+            auto p = prefix(value.substr(0, comma));
+            auto nic = number<std::uint64_t>(value.substr(comma + 1), "route target NIC");
+            if (!p) {
+                return std::unexpected(p.error());
+            }
+            if (!nic) {
+                return std::unexpected(nic.error());
+            }
+            c.routes.push_back(
+                {.family = p->ipv6 ? proto::RouteFamily::ipv6 : proto::RouteFamily::ipv4,
+                 .length = p->length,
+                 .prefix = p->address,
+                 .target_nic = *nic});
+        } else {
+            return std::unexpected("vpc-config: unknown option " + std::string{opt});
+        }
+    }
+    // The frame's canonical order; duplicates are left for the encoder to
+    // refuse.
+    std::ranges::sort(c.routes, proto::detail::vpc_route_key_less);
+    // Check now with placeholder IDs, so a typo fails at parse time.
+    auto check = c;
+    check.server_id = 1;
+    check.key_id = 1;
+    if (auto ok = proto::encode_vpc_config(check); !ok) {
+        return std::unexpected(std::string{"vpc-config: "} + proto::to_string(ok.error()));
+    }
+    return out;
 }
 
 auto tunnel_peer(std::string_view s) -> std::expected<proto::TunnelPeer, std::string> {
@@ -697,6 +844,13 @@ auto parse_line(std::string_view line) -> std::expected<std::optional<Action>, s
         }
         return std::optional<Action>{g};
     }
+    if (verb == "vpc-config") {
+        auto c = vpc_config(args);
+        if (!c) {
+            return std::unexpected(c.error());
+        }
+        return std::optional<Action>{std::move(*c)};
+    }
     if (verb == "tunnel-peers") {
         if (args.size() < 2) {
             return std::unexpected("tunnel-peers: want VTEP VERSION [PEER_VTEP,KEY ...]");
@@ -902,6 +1056,7 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::lease_grant:
         case proto::RecordType::role_certificate:
         case proto::RecordType::image_key:
+        case proto::RecordType::vpc_config:
             break;
     }
     return std::unexpected("helm sent a controller-only record");
@@ -1022,6 +1177,15 @@ auto TestController::run(const Action& action) -> std::expected<void, std::strin
                     return std::unexpected("could not encode or sign the group policy");
                 }
                 return send(proto::RecordType::group_policy, *frame);
+            } else if constexpr (std::is_same_v<T, SendVpcConfig>) {
+                auto c = a.config;
+                c.server_id = _options.server_id;
+                c.key_id = _options.key_id;
+                auto frame = _signer.vpc_config(c);
+                if (!frame) {
+                    return std::unexpected("could not encode or sign the VPC config");
+                }
+                return send(proto::RecordType::vpc_config, *frame);
             } else if constexpr (std::is_same_v<T, SendTunnelPeers>) {
                 const proto::TunnelPeers t{.server_id = _options.server_id,
                                            .key_id = _options.key_id,

@@ -35,6 +35,7 @@
 //                                      in that slot, answering its
 //                                      cert_request report
 //   image_key     controller -> helm   an ImageKey (image_key.hpp)
+//   vpc_config    controller -> helm   a VpcConfig (vpc_config.hpp)
 //
 // The block volume records (.kiro/specs/block-volume-service/ task 12):
 // helm forwards replica_config, volume_op and lease_grant to its storage
@@ -89,6 +90,7 @@
 #include "proto/tunnel_peers.hpp"
 #include "proto/volume_key.hpp"
 #include "proto/volume_op.hpp"
+#include "proto/vpc_config.hpp"
 
 namespace ak::proto {
 
@@ -103,7 +105,7 @@ inline constexpr std::size_t max_record_payload =
     std::max({envelope_size, max_map_update_size, max_report_size, report_ack_size, hello_size,
               group_policy_size, max_tunnel_peers_size, max_replica_config_size, volume_op_size,
               volume_key_size, lease_grant_size, role_certificate_fixed_size + max_cert_chain_size,
-              image_key_size});
+              image_key_size, max_vpc_config_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class RecordType : std::uint16_t {
@@ -120,6 +122,7 @@ enum class RecordType : std::uint16_t {
     lease_grant = 11,
     role_certificate = 12,
     image_key = 13,
+    vpc_config = 14,
 };
 
 struct Record {
@@ -157,7 +160,7 @@ struct RoleCertificate {
 namespace detail {
 
 [[nodiscard]] constexpr auto known(RecordType t) noexcept -> bool {
-    return t >= RecordType::envelope && t <= RecordType::image_key;
+    return t >= RecordType::envelope && t <= RecordType::vpc_config;
 }
 
 }  // namespace detail

@@ -18,6 +18,7 @@
 #include "helm/mailbox.hpp"
 #include "proto/group_policy.hpp"
 #include "proto/link.hpp"
+#include "proto/group_members.hpp"
 #include "proto/vpc_config.hpp"
 #include "test_support.hpp"
 
@@ -46,6 +47,7 @@ struct RecordingSink final : helm::ControllerSink {
     std::vector<std::pair<proto::ImageKey, std::vector<std::byte>>> image_keys;
     std::vector<proto::LeaseGrant> grants;
     std::vector<std::pair<proto::VpcConfigFrame, std::vector<std::byte>>> vpc_configs;
+    std::vector<std::pair<proto::GroupMembers, std::vector<std::byte>>> members;
 
     auto on_envelope(const proto::Envelope& e) -> void override { envelopes.push_back(e); }
     auto on_map_update(const proto::MapUpdate& u, std::span<const std::byte> frame)
@@ -78,6 +80,10 @@ struct RecordingSink final : helm::ControllerSink {
     auto on_vpc_config(const proto::VpcConfigFrame& c, std::span<const std::byte> frame)
         -> void override {
         vpc_configs.emplace_back(c, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
+    auto on_group_members(const proto::GroupMembers& m, std::span<const std::byte> frame)
+        -> void override {
+        members.emplace_back(m, std::vector<std::byte>{frame.begin(), frame.end()});
     }
     std::vector<proto::RoleCertificate> certificates;
     auto on_role_certificate(const proto::RoleCertificate& c) -> void override {
@@ -252,6 +258,19 @@ auto vpc_config_record(std::uint64_t to) -> std::vector<std::byte> {
     auto b = proto::encode_vpc_config(c);
     BOOST_REQUIRE(b.has_value());
     return framed(RecordType::vpc_config, *b);
+}
+
+auto group_members_record(std::uint64_t to) -> std::vector<std::byte> {
+    proto::GroupMembers m{.server_id = to, .key_id = key, .vni = 5, .members_version = 4};
+    proto::MemberGroup g{.family = proto::RouteFamily::ipv4, .group = {}, .vteps = {{}}};
+    g.group[0] = std::byte{239};
+    g.group[3] = std::byte{1};
+    g.vteps[0][0] = std::byte{0xFD};
+    g.vteps[0][15] = std::byte{2};
+    m.groups.push_back(g);
+    auto b = proto::encode_group_members(m);
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::group_members, *b);
 }
 
 auto tunnel_peers_record(std::uint64_t to) -> std::vector<std::byte> {
@@ -554,6 +573,8 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
     bad_policy[proto::record_header_size] = std::byte{0};  // policy magic
     auto bad_vpc = vpc_config_record(server);
     bad_vpc[proto::record_header_size] = std::byte{0};  // VpcConfig magic
+    auto bad_members = group_members_record(server);
+    bad_members[proto::record_header_size] = std::byte{0};  // GroupMembers magic
     const Case cases[] = {
         {envelope_record(other_server, 10), SessionError::wrong_server},
         {map_update_record(other_server), SessionError::wrong_server},
@@ -562,6 +583,8 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
         {bad_policy, SessionError::bad_record},
         {vpc_config_record(other_server), SessionError::wrong_server},
         {bad_vpc, SessionError::bad_record},
+        {group_members_record(other_server), SessionError::wrong_server},
+        {bad_members, SessionError::bad_record},
         {bad_envelope, SessionError::bad_record},
         {bad_peers, SessionError::bad_record},
         {framed(RecordType::report, *report_payload), SessionError::wrong_direction},
@@ -580,7 +603,21 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
         BOOST_TEST(f.sink.updates.empty());
         BOOST_TEST(f.sink.policies.empty());
         BOOST_TEST(f.sink.vpc_configs.empty());
+        BOOST_TEST(f.sink.members.empty());
     }
+}
+
+// Requirement 7.9: a GroupMembers frame for this server reaches the sink as
+// its exact frame, for helm to forward unmodified.
+BOOST_FIXTURE_TEST_CASE(group_members_reach_the_sink_unmodified, Fixture) {
+    session.on_connected();
+    const auto rec = group_members_record(server);
+    BOOST_REQUIRE(session.on_bytes(rec).has_value());
+    BOOST_REQUIRE(sink.members.size() == 1U);
+    BOOST_TEST(sink.members[0].first.vni == 5U);
+    BOOST_TEST(sink.members[0].first.members_version == 4U);
+    BOOST_TEST(std::ranges::equal(sink.members[0].second,
+                                  std::span{rec}.subspan(proto::record_header_size)));
 }
 
 // Requirement 10.3: a VpcConfig for this server reaches the sink as its
@@ -608,6 +645,7 @@ BOOST_AUTO_TEST_CASE(a_sink_without_a_network_role_ignores_vpc_configs) {
                                     sink};
     session.on_connected();
     BOOST_TEST(session.on_bytes(vpc_config_record(server)).has_value());
+    BOOST_TEST(session.on_bytes(group_members_record(server)).has_value());
     BOOST_TEST(session.on_bytes(envelope_record(server, 10)).has_value());
     BOOST_TEST(sink.envelopes == 1);
 }

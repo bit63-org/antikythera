@@ -153,6 +153,20 @@ auto Signer::vpc_config(const proto::VpcConfigFrame& config) const
     return *frame;
 }
 
+auto Signer::group_members(const proto::GroupMembers& members) const
+    -> std::optional<std::vector<std::byte>> {
+    auto frame = proto::encode_group_members(members);
+    if (!frame) {
+        return std::nullopt;
+    }
+    const auto sig = sign(proto::group_members_signed_bytes(*frame));
+    if (!sig) {
+        return std::nullopt;
+    }
+    proto::set_group_members_signature(*frame, *sig);
+    return *frame;
+}
+
 auto Signer::tunnel_peers(const proto::TunnelPeers& peers) const
     -> std::optional<std::vector<std::byte>> {
     auto frame = proto::encode_tunnel_peers(peers);
@@ -469,6 +483,58 @@ auto vpc_config(std::span<const std::string_view> args)
     return out;
 }
 
+// group-members VNI VERSION then GROUP=VTEP[,VTEP ...] per group, sorted
+// into the frame's order here.
+auto group_members(std::span<const std::string_view> args)
+    -> std::expected<SendGroupMembers, std::string> {
+    if (args.size() < 2) {
+        return std::unexpected("group-members: want VNI VERSION [GROUP=VTEP[,VTEP ...] ...]");
+    }
+    auto vni = number<std::uint32_t>(args[0], "VNI");
+    auto version = number<std::uint64_t>(args[1], "members version");
+    if (!vni) {
+        return std::unexpected(vni.error());
+    }
+    if (!version) {
+        return std::unexpected(version.error());
+    }
+    SendGroupMembers out{};
+    out.members.vni = *vni;
+    out.members.members_version = *version;
+    for (const auto arg : args.subspan(2)) {
+        const auto eq = arg.find('=');
+        if (eq == std::string_view::npos) {
+            return std::unexpected("group-members: a group wants GROUP=VTEP[,VTEP ...]");
+        }
+        proto::MemberGroup g{};
+        const std::string text{arg.substr(0, eq)};
+        if (inet_pton(AF_INET, text.c_str(), g.group.data()) == 1) {
+            g.family = proto::RouteFamily::ipv4;
+        } else if (inet_pton(AF_INET6, text.c_str(), g.group.data()) == 1) {
+            g.family = proto::RouteFamily::ipv6;
+        } else {
+            return std::unexpected("bad group address " + text);
+        }
+        for (const auto v : split(arg.substr(eq + 1), ',')) {
+            auto addr = vtep(v);
+            if (!addr) {
+                return std::unexpected(addr.error());
+            }
+            g.vteps.push_back(*addr);
+        }
+        std::ranges::sort(g.vteps);
+        out.members.groups.push_back(std::move(g));
+    }
+    std::ranges::sort(out.members.groups, proto::detail::member_group_less);
+    auto check = out.members;
+    check.server_id = 1;
+    check.key_id = 1;
+    if (auto ok = proto::encode_group_members(check); !ok) {
+        return std::unexpected(std::string{"group-members: "} + proto::to_string(ok.error()));
+    }
+    return out;
+}
+
 auto tunnel_peer(std::string_view s) -> std::expected<proto::TunnelPeer, std::string> {
     const auto c = s.find(',');
     if (c == std::string_view::npos) {
@@ -529,6 +595,7 @@ constexpr std::array kind_names{
     std::pair{"snapshot_progress", proto::ReportKind::snapshot_progress},
     std::pair{"enrollment", proto::ReportKind::enrollment},
     std::pair{"cert_request", proto::ReportKind::cert_request},
+    std::pair{"group_membership", proto::ReportKind::group_membership},
 };
 
 template<typename T, std::size_t N>
@@ -849,6 +916,13 @@ auto parse_line(std::string_view line) -> std::expected<std::optional<Action>, s
         }
         return std::optional<Action>{g};
     }
+    if (verb == "group-members") {
+        auto m = group_members(args);
+        if (!m) {
+            return std::unexpected(m.error());
+        }
+        return std::optional<Action>{std::move(*m)};
+    }
     if (verb == "vpc-config") {
         auto c = vpc_config(args);
         if (!c) {
@@ -955,6 +1029,8 @@ auto to_string(const proto::Report& report) -> std::string {
             } else if constexpr (std::is_same_v<T, proto::CertRequest>) {
                 os << " slot=" << int{b.slot} << " role=" << static_cast<int>(b.role)
                    << " csr=" << b.csr.size();
+            } else if constexpr (std::is_same_v<T, proto::GroupMembership>) {
+                os << " slot=" << int{b.slot} << " joins=" << b.entries.size();
             } else {
                 static_assert(std::is_same_v<T, proto::SnapshotProgress>);
                 os << " volume=" << b.volume_id << " cut=" << b.cut_id
@@ -1062,6 +1138,7 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::role_certificate:
         case proto::RecordType::image_key:
         case proto::RecordType::vpc_config:
+        case proto::RecordType::group_members:
             break;
     }
     return std::unexpected("helm sent a controller-only record");
@@ -1191,6 +1268,15 @@ auto TestController::run(const Action& action) -> std::expected<void, std::strin
                     return std::unexpected("could not encode or sign the VPC config");
                 }
                 return send(proto::RecordType::vpc_config, *frame);
+            } else if constexpr (std::is_same_v<T, SendGroupMembers>) {
+                auto m = a.members;
+                m.server_id = _options.server_id;
+                m.key_id = _options.key_id;
+                auto frame = _signer.group_members(m);
+                if (!frame) {
+                    return std::unexpected("could not encode or sign the group members");
+                }
+                return send(proto::RecordType::group_members, *frame);
             } else if constexpr (std::is_same_v<T, SendTunnelPeers>) {
                 const proto::TunnelPeers t{.server_id = _options.server_id,
                                            .key_id = _options.key_id,

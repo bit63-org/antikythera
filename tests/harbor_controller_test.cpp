@@ -288,6 +288,35 @@ BOOST_AUTO_TEST_CASE(vpc_configs_parse_and_sort) {
                    .find("unknown option") != std::string::npos);
 }
 
+BOOST_AUTO_TEST_CASE(group_members_parse_and_sort) {
+    auto a = action(
+        "group-members 100 2 ff05::42=fd00::2 239.1.2.3=fd00::3,fd00::1 224.0.0.251=fd00::1");
+    BOOST_REQUIRE(std::holds_alternative<harbor::SendGroupMembers>(a));
+    const auto& m = std::get<harbor::SendGroupMembers>(a).members;
+    BOOST_TEST(m.vni == 100U);
+    BOOST_TEST(m.members_version == 2U);
+    BOOST_REQUIRE(m.groups.size() == 3U);
+    // The frame's order: IPv4 before IPv6, then by address; VTEPs sorted.
+    BOOST_TEST(std::to_integer<int>(m.groups[0].group[0]) == 224);
+    BOOST_TEST(std::to_integer<int>(m.groups[1].group[0]) == 239);
+    BOOST_TEST((m.groups[2].family == proto::RouteFamily::ipv6));
+    BOOST_REQUIRE(m.groups[1].vteps.size() == 2U);
+    BOOST_TEST(std::to_integer<int>(m.groups[1].vteps[0][15]) == 1);
+    // No groups at all: every group unknown again.
+    auto e = action("group-members 100 3");
+    BOOST_TEST(std::get<harbor::SendGroupMembers>(e).members.groups.empty());
+
+    BOOST_TEST(parse_error("group-members 100").find("want VNI") != std::string::npos);
+    BOOST_TEST(parse_error("group-members 100 1 239.1.2.3").find("GROUP=VTEP") !=
+               std::string::npos);
+    BOOST_TEST(parse_error("group-members 100 1 10.0.0.1=fd00::1").find("group-members") !=
+               std::string::npos);
+    BOOST_TEST(parse_error("group-members 100 1 239.1.2.3=nowhere").find("VTEP") !=
+               std::string::npos);
+    BOOST_TEST(parse_error("group-members 100 1 239.1.2.3=fd00::1 239.1.2.3=fd00::2")
+                   .find("group-members") != std::string::npos);
+}
+
 BOOST_AUTO_TEST_CASE(expectations_parse) {
     auto e = action("expect stale_sequence");
     BOOST_TEST((std::get<harbor::ExpectOutcome>(e).status == proto::CommandStatus::stale_sequence));

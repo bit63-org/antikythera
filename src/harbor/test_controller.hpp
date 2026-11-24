@@ -56,6 +56,10 @@
 //                        Requirement 12), e.g. vpc-config 100 1 02:00:00:00:ff:01
 //                        10.0.0.0/16 10.0.0.1 ipv6=fd10::/64 dns=10.0.0.2
 //                        domain=ec2.internal; lease defaults to 3600
+//   group-members VNI VERSION [GROUP=VTEP[,VTEP ...] ...]
+//                        a multicast VPC's per-group VTEP lists (oar-net
+//                        Requirement 10.5), e.g. group-members 100 2
+//                        239.1.2.3=fd00::1,fd00::2 ff05::42=fd00::2
 //   tunnel-peers VTEP VERSION [PEER_VTEP,KEY ...]
 //                        the WireGuard peers of this server's VTEP; KEY is the
 //                        peer's X25519 public key as 64 hex digits
@@ -91,6 +95,7 @@
 #include "proto/map_update.hpp"
 #include "proto/report.hpp"
 #include "proto/tunnel_peers.hpp"
+#include "proto/group_members.hpp"
 #include "proto/vpc_config.hpp"
 #include "tls/tls.hpp"
 
@@ -127,6 +132,9 @@ public:
         -> std::optional<std::vector<std::byte>>;
     // `config` encoded and signed (its signature field is ignored).
     [[nodiscard]] auto vpc_config(const proto::VpcConfigFrame& config) const
+        -> std::optional<std::vector<std::byte>>;
+    // `members` encoded and signed (its signature field is ignored).
+    [[nodiscard]] auto group_members(const proto::GroupMembers& members) const
         -> std::optional<std::vector<std::byte>>;
     // `peers` encoded and signed (its signature field is ignored).
     [[nodiscard]] auto tunnel_peers(const proto::TunnelPeers& peers) const
@@ -171,6 +179,10 @@ struct SendTunnelPeers {
 struct SendVpcConfig {
     proto::VpcConfigFrame config;
 };
+// Every field of the frame but the server and key.
+struct SendGroupMembers {
+    proto::GroupMembers members;
+};
 struct ExpectOutcome {
     proto::CommandStatus status{proto::CommandStatus::ok};
 };
@@ -179,7 +191,7 @@ struct WaitReport {
 };
 
 using Action = std::variant<SendCommand, SendMapUpdate, SendGroupPolicy, SendTunnelPeers,
-                            SendVpcConfig, ExpectOutcome, WaitReport>;
+                            SendVpcConfig, SendGroupMembers, ExpectOutcome, WaitReport>;
 
 // One script line: an action, nothing (blank or comment), or a message
 // saying what is wrong with it.

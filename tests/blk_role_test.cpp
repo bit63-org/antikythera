@@ -188,6 +188,13 @@ public:
     Guest(GuestRam& ram, vio::PciFunction& fn, blk::BlkRole* role = nullptr)
         : _ram{&ram}, _driver{ram, fn}, _role{role} {}
 
+    // The guest's driver lets go of the device (device_status = 0), as
+    // Linux does when the PCI device is removed.
+    auto release() -> bool {
+        return _driver.common_write(vio::common_cfg::device_status, ak::test::width8, 0)
+            .has_value();
+    }
+
     auto up() -> bool {
         namespace cc = vio::common_cfg;
         std::uint64_t f = 0;
@@ -510,6 +517,8 @@ struct Rig {
                    std::ranges::all_of(sig, [](std::byte b) { return b == good_sig; });
         };
     std::optional<ak::tls::Config> storage_tls;
+    // The role's clock, which tests move by hand.
+    blk::RoleConfig::Clock::time_point now{std::chrono::hours{1}};
     std::unique_ptr<blk::BlkRole> role;
 
     explicit Rig(bool images = false, std::optional<ak::tls::Config> tls = std::nullopt,
@@ -548,7 +557,7 @@ struct Rig {
                                        .verify_config = verify,
                                        .storage_tls = storage_tls,
                                        .initiator = {},
-                                       .clock = {}},
+                                       .clock = [this] { return now; }},
                                       {&t0, &t1});
         BOOST_REQUIRE(r);
         role = std::move(*r);
@@ -768,6 +777,46 @@ BOOST_AUTO_TEST_CASE(cleaning_closes_the_volume) {
     Guest g1{rig.ram1, *rig.t1.served()};
     BOOST_REQUIRE(g1.up());
     BOOST_TEST(g1.read(far_sector) == marker(), boost::test_tools::per_element());
+}
+
+// .kiro/specs/block-volume-service/ Requirement 3.3: helm asks for the
+// guest to let go, and the role says when it has.
+BOOST_AUTO_TEST_CASE(eject_waits_for_the_guest_to_let_go) {
+    Rig rig;
+    const auto ask = [&](oar::EjectOp op, oar::FunctionNumber fn = fn0) {
+        return rig.role->eject({.fn = fn, .op = op});
+    };
+    BOOST_REQUIRE(rig.create(vol_one, vm_one) == oar::Status::ok);
+    // Nothing attached: nothing to ask for.
+    BOOST_TEST((ask(oar::EjectOp::request).error() == oar::Status::busy));
+    BOOST_TEST((ask(oar::EjectOp::query).value() == oar::EjectState::none));
+    BOOST_TEST((ask(oar::EjectOp::query, 5).error() == oar::Status::unknown_function));
+
+    BOOST_REQUIRE(rig.prepare(fn0, vm_one, vol_one) == oar::Status::ok);
+    BOOST_REQUIRE(rig.deliver(fn0, vol_one) == oar::Status::ok);
+    Guest g{rig.ram0, *rig.t0.served()};
+    BOOST_REQUIRE(g.up());
+    BOOST_TEST((ask(oar::EjectOp::query).value() == oar::EjectState::none));
+    BOOST_TEST((ask(oar::EjectOp::request).value() == oar::EjectState::requested));
+    BOOST_TEST(rig.t0.served()->eject_requested());
+    // Still mounted, as far as the device can tell: it keeps serving.
+    rig.now += std::chrono::minutes{10};
+    BOOST_TEST((ask(oar::EjectOp::query).value() == oar::EjectState::requested));
+    BOOST_TEST((g.write(far_sector, marker()) == Status::ok));
+
+    // The guest withdraws the disk.
+    BOOST_REQUIRE(g.release());
+    BOOST_TEST((ask(oar::EjectOp::query).value() == oar::EjectState::requested));
+    rig.now += blk::release_quiet;
+    BOOST_TEST((ask(oar::EjectOp::query).value() == oar::EjectState::released));
+    BOOST_TEST((ask(oar::EjectOp::request).value() == oar::EjectState::released));  // idempotent
+
+    // Withdrawn, then cleaned: the placeholder carries no request.
+    BOOST_TEST((ask(oar::EjectOp::cancel).value() == oar::EjectState::none));
+    BOOST_TEST((ask(oar::EjectOp::request).value() == oar::EjectState::requested));
+    BOOST_TEST((rig.clean(fn0) == oar::Status::ok));
+    BOOST_TEST(!rig.t0.served()->eject_requested());
+    BOOST_TEST((ask(oar::EjectOp::query).value() == oar::EjectState::none));
 }
 
 BOOST_AUTO_TEST_CASE(rewrap_changes_the_owner_on_the_media) {

@@ -245,6 +245,22 @@ auto OarLink::cert_request() -> std::expected<CertRequest, LinkError> {
     return CertRequest{.role = answer->role, .csr = {answer->csr.begin(), answer->csr.end()}};
 }
 
+auto OarLink::eject(const oar::Eject& request) -> std::expected<oar::EjectState, LinkError> {
+    auto body = oar::encode_eject(request);
+    if (!body) {
+        return std::unexpected(bad_request());
+    }
+    auto response = transact(mctp::VendorType::eject, *body);
+    if (!response) {
+        return std::unexpected(response.error());
+    }
+    auto state = oar::decode_eject_answer(*response);
+    if (!state) {
+        return std::unexpected(LinkError{.code = LinkErrc::bad_response});
+    }
+    return *state;
+}
+
 auto OarLink::send_chunked(mctp::VendorType type, std::span<const std::byte> frame)
     -> std::expected<void, LinkError> {
     const auto total = static_cast<std::uint32_t>(frame.size());
@@ -619,6 +635,18 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
                                                                      : answer.error());
             }
             return with_body(oar::encode_cert_answer(*answer));
+        }
+        case mctp::VendorType::eject: {
+            auto req = oar::decode_eject(body);
+            if (!req) {
+                return status_only(oar::Status::bad_request);
+            }
+            auto state = handler.eject(*req);
+            if (!state) {
+                return status_only(state.error() == oar::Status::ok ? oar::Status::failed
+                                                                    : state.error());
+            }
+            return with_body(oar::encode_eject_answer(*state));
         }
         case mctp::VendorType::group_policy: {
             auto frame = oar::decode_group_policy_frame(body);

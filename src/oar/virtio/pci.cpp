@@ -54,7 +54,22 @@ auto to_string(AccessError e) noexcept -> const char* {
     return "unknown";
 }
 
-auto encode_capability(const PciCapability& cap, std::uint8_t next) -> std::vector<std::byte> {
+auto encode_capability(const PciCapability& cap, std::uint8_t next, std::uint32_t flags)
+    -> std::vector<std::byte> {
+    if (cap.type == CfgType::vendor) {
+        std::vector<std::byte> out;
+        wire::Writer w{out};
+        w.u8(pci_cap_id_vendor);
+        w.u8(next);
+        w.u8(static_cast<std::uint8_t>(vendor_data::size));
+        w.u8(static_cast<std::uint8_t>(cap.type));
+        w.le16(vendor_data::vendor_id);
+        w.u8(vendor_data::version);
+        w.u8(0);
+        w.bytes(vendor_data::magic);
+        w.le32(flags);
+        return out;
+    }
     const bool notify = cap.type == CfgType::notify;
     const std::size_t len = notify ? virtio_pci_notify_cap_size : virtio_pci_cap_size;
     std::vector<std::byte> out;

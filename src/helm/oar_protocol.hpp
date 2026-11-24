@@ -50,6 +50,7 @@
 //   hold_reports        0  ack u64 | 8  offset u32 | 12 reserved u32
 //   cert_request        (empty)
 //   role_certificate    0  total u32 | 4  offset u32 | 8  chunk (as map_update)
+//   eject               0  fn u16 | 2  op u8 (EjectOp) | 3  reserved u8
 //
 // The tunnel requests deliver the network role's WireGuard keys (oar-net
 // Requirement 5.2): its own static X25519 private key, and for each peer
@@ -120,6 +121,13 @@
 // its storage CA, its server ID and its own key before it uses or keeps
 // it, so neither body needs more than its framing checked here.
 //
+// Cooperative detach (block-volume-service task 13), to the storage role
+// (blk): eject asks the guest to release a function (request), withdraws
+// that (cancel) or only looks (query), and every answer says where the
+// function stands: no request, requested, or released (the driver reset
+// the device and left it alone long enough, with no request still in the
+// backend). request and cancel are idempotent.
+//
 // Responses (oar -> helm) start with a 2-byte head:
 //
 //   0  status u8 (Status) | 1  reserved u8
@@ -136,6 +144,7 @@
 //                       (total 0: nothing to report, and the rest zero and empty)
 //   cert_request        2  role u8 (Role: blk or hold) | 3  reserved u8 | 4  csr_len u16
 //                       6  csr [csr_len] (0..max_csr bytes)
+//   eject               2  state u8 (EjectState) | 3  reserved u8
 //   group_usage         2  total u16 | 4  count u16 | 6  reserved u32
 //                       10 count x 96 (the proto group_usage report entry, slot 0):
 //                          nic_id u64 | vni u32 | flags u8 | reserved [3] | attachment u64
@@ -246,6 +255,8 @@ inline constexpr std::size_t max_report_chunk =
 // Largest report a role may send (at least proto::max_report_size, pinned).
 inline constexpr std::size_t max_role_report = std::size_t{1} << 17U;
 inline constexpr std::size_t cert_answer_head_size = 4;
+inline constexpr std::size_t eject_request_size = 4;
+inline constexpr std::size_t eject_answer_size = 2;
 // Largest certificate request that fits one cert_request answer (below
 // proto::max_csr_size; a P-256 request is a few hundred bytes).
 inline constexpr std::size_t max_csr = max_body_size - response_head_size - cert_answer_head_size;
@@ -277,6 +288,20 @@ enum class HealthState : std::uint8_t {
     ok = 0,
     degraded = 1,
     faulted = 2,
+};
+
+// What an eject request does. Values are wire protocol.
+enum class EjectOp : std::uint8_t {
+    request = 1,
+    cancel = 2,
+    query = 3,
+};
+
+// Where a function stands in a cooperative detach. Values are wire protocol.
+enum class EjectState : std::uint8_t {
+    none = 0,       // no eject requested
+    requested = 1,  // requested; the guest still holds the device
+    released = 2,   // the guest let go
 };
 
 [[nodiscard]] auto to_string(Status s) noexcept -> const char*;
@@ -439,6 +464,13 @@ struct ReportChunk {
 struct CertAnswer {
     Role role{Role::blk};
     std::span<const std::byte> csr;
+};
+
+struct Eject {
+    FunctionNumber fn{0};
+    EjectOp op{EjectOp::query};
+
+    friend auto operator==(const Eject&, const Eject&) -> bool = default;
 };
 
 // One chunk of a MapUpdate frame. `chunk` views into the message.
@@ -674,6 +706,15 @@ struct ResponseView {
     -> std::expected<std::vector<std::byte>, BodyError>;
 [[nodiscard]] auto decode_report_chunk(std::span<const std::byte> body) noexcept
     -> std::expected<ReportChunk, BodyError>;
+
+// eject requests and answers.
+[[nodiscard]] auto encode_eject(const Eject& e) -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_eject(std::span<const std::byte> body) noexcept
+    -> std::expected<Eject, BodyError>;
+[[nodiscard]] auto encode_eject_answer(EjectState s)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_eject_answer(std::span<const std::byte> body) noexcept
+    -> std::expected<EjectState, BodyError>;
 
 // cert_request answer bodies.
 [[nodiscard]] auto encode_cert_answer(const CertAnswer& a)

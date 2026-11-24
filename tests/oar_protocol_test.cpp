@@ -749,6 +749,53 @@ BOOST_AUTO_TEST_CASE(cert_answer_round_trip_and_rules) {
     BOOST_TEST((oar::decode_cert_answer(bad).error() == oar::BodyError::bad_csr));
 }
 
+BOOST_AUTO_TEST_CASE(eject_round_trip_and_rules) {
+    auto b = oar::encode_eject({.fn = 0x0102, .op = oar::EjectOp::cancel});
+    BOOST_REQUIRE(b.has_value());
+    BOOST_TEST((*b == ak::test::bytes_of(0x02, 0x01, 2, 0)));
+    BOOST_TEST(
+        (oar::decode_eject(*b).value() == oar::Eject{.fn = 0x0102, .op = oar::EjectOp::cancel}));
+    for (const auto op : {oar::EjectOp::request, oar::EjectOp::query}) {
+        auto e = oar::encode_eject({.fn = 3, .op = op});
+        BOOST_REQUIRE(e.has_value());
+        BOOST_TEST((oar::decode_eject(*e).value().op == op));
+    }
+    BOOST_TEST((oar::encode_eject({.fn = 1, .op = static_cast<oar::EjectOp>(4)}).error() ==
+                oar::BodyError::unknown_enum));
+    BOOST_TEST((oar::decode_eject(std::span{*b}.first(3)).error() == oar::BodyError::truncated));
+    auto longer = *b;
+    longer.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_eject(longer).error() == oar::BodyError::trailing_bytes));
+    auto bad = *b;
+    bad[3] = std::byte{1};
+    BOOST_TEST((oar::decode_eject(bad).error() == oar::BodyError::reserved_not_zero));
+    for (const auto op : {0, 4}) {
+        bad = *b;
+        bad[2] = static_cast<std::byte>(op);
+        BOOST_TEST((oar::decode_eject(bad).error() == oar::BodyError::unknown_enum));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(eject_answer_round_trip_and_rules) {
+    for (const auto s :
+         {oar::EjectState::none, oar::EjectState::requested, oar::EjectState::released}) {
+        auto b = oar::encode_eject_answer(s);
+        BOOST_REQUIRE(b.has_value());
+        BOOST_TEST(b->size() == oar::eject_answer_size);
+        BOOST_TEST((oar::decode_eject_answer(*b).value() == s));
+    }
+    BOOST_TEST((oar::encode_eject_answer(static_cast<oar::EjectState>(3)).error() ==
+                oar::BodyError::unknown_enum));
+    BOOST_TEST((oar::decode_eject_answer(ak::test::bytes_of(3, 0)).error() ==
+                oar::BodyError::unknown_enum));
+    BOOST_TEST((oar::decode_eject_answer(ak::test::bytes_of(2, 1)).error() ==
+                oar::BodyError::reserved_not_zero));
+    BOOST_TEST(
+        (oar::decode_eject_answer(ak::test::bytes_of(2)).error() == oar::BodyError::truncated));
+    BOOST_TEST((oar::decode_eject_answer(ak::test::bytes_of(2, 0, 0)).error() ==
+                oar::BodyError::trailing_bytes));
+}
+
 BOOST_AUTO_TEST_CASE(report_queue_serves_and_acknowledges) {
     oar::ReportQueue q{2};
     BOOST_TEST(oar::encode_report_chunk(q.serve({}).value()).has_value());

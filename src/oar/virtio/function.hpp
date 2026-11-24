@@ -35,6 +35,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -122,6 +123,9 @@ struct PciFunctionParams {
     std::uint16_t num_queues{0};
     std::uint16_t max_queue_size{0};
     std::uint32_t device_config_size{0};  // <= bar_layout::device_max_length
+    // Presents the vendor-data capability (pci.hpp vendor_data), for a
+    // device the host may ask the guest to release (cooperative detach).
+    bool eject_capability{false};
 };
 
 enum class FunctionError : std::uint8_t {
@@ -149,7 +153,10 @@ public:
 
     [[nodiscard]] auto identity() const noexcept -> const PciIdentity& { return _params.identity; }
     // Vendor capabilities for config space, in order: common, notify, ISR,
-    // device. Encode each with encode_capability().
+    // device, and the vendor-data capability when the function has one.
+    // Encode each with encode_capability(); the vendor-data one changes
+    // (vendor_flags), so the transport places it writable by the device
+    // and rewrites it when the vendor listener says so.
     [[nodiscard]] auto capabilities() const -> std::vector<PciCapability>;
     // One vector per queue plus one for configuration changes.
     [[nodiscard]] auto msix_vectors() const noexcept -> std::uint16_t {
@@ -165,8 +172,16 @@ public:
         -> std::expected<void, AccessError>;
 
     // FLR or power-on: every register back to its reset value, queues and
-    // in-flight buffers gone (Requirement 1.3).
+    // in-flight buffers gone (Requirement 1.3). An eject request survives:
+    // only the host withdraws it.
     auto reset() -> void;
+    // Called with the new flags whenever the vendor-data capability's
+    // flags change; the transport rewrites its copy in config space.
+    // Empty: nobody is told.
+    auto set_vendor_listener(std::function<void(std::uint32_t)> listener) -> void {
+        _vendor_listener = std::move(listener);
+    }
+    [[nodiscard]] auto vendor_flags() const noexcept -> std::uint32_t { return _vendor_flags; }
     // The transport is about to remove guest memory it cannot describe:
     // live queues are dropped and a live driver sees DEVICE_NEEDS_RESET.
     auto memory_changing() -> void;
@@ -201,6 +216,20 @@ public:
     // the config interrupt (spec 4.1.4.3.1).
     auto config_changed() -> void;
 
+    // Cooperative detach (.kiro/specs/block-volume-service/ design "Detach
+    // blocked while mounted"): sets eject_requested in the vendor-data
+    // capability and raises the configuration-change interrupt, so a
+    // guest helper notices; cancel_eject() clears it. No effect without
+    // the capability.
+    auto request_eject() -> void;
+    auto cancel_eject() -> void;
+    [[nodiscard]] auto eject_requested() const noexcept -> bool {
+        return (_vendor_flags & vendor_data::flag_eject_requested) != 0;
+    }
+    // Counts every change of device_status (driver writes, FLR), so an
+    // observer can tell a status that stayed put from one that came back.
+    [[nodiscard]] auto status_changes() const noexcept -> std::uint64_t { return _status_changes; }
+
     [[nodiscard]] auto live() const noexcept -> bool { return _live; }
     [[nodiscard]] auto negotiated(unsigned bit) const noexcept -> bool {
         return (_common.negotiated_features() & feature_bit(bit)) != 0;
@@ -215,6 +244,7 @@ private:
     auto activate() -> void;
     auto drop_queues() -> void;
     auto raise_config() -> void;
+    auto set_vendor_flags(std::uint32_t flags) -> void;
 
     Device* _device;
     const GuestMemory* _memory;
@@ -224,6 +254,9 @@ private:
     std::vector<std::optional<SplitQueue>> _queues;
     std::uint8_t _isr{0};
     bool _live{false};
+    std::uint32_t _vendor_flags{0};
+    std::uint64_t _status_changes{0};
+    std::function<void(std::uint32_t)> _vendor_listener;
 };
 
 }  // namespace ak::oar::virtio

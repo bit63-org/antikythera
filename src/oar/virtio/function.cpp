@@ -63,7 +63,7 @@ PciFunction::PciFunction(Device& device, const GuestMemory& memory, InterruptSin
 
 auto PciFunction::capabilities() const -> std::vector<PciCapability> {
     using namespace bar_layout;
-    return {
+    std::vector<PciCapability> caps{
         {.type = CfgType::common,
          .bar = bar_index,
          .offset = common_offset,
@@ -79,6 +79,10 @@ auto PciFunction::capabilities() const -> std::vector<PciCapability> {
          .offset = device_offset,
          .length = _params.device_config_size},
     };
+    if (_params.eject_capability) {
+        caps.push_back({.type = CfgType::vendor});
+    }
+    return caps;
 }
 
 auto PciFunction::bar_read(std::uint32_t offset, std::size_t width)
@@ -108,8 +112,12 @@ auto PciFunction::bar_write(std::uint32_t offset, std::size_t width, std::uint64
     -> std::expected<void, AccessError> {
     using namespace bar_layout;
     if (in_window(offset, common_offset, common_cfg::size)) {
+        const std::uint8_t before = _common.status();
         auto written = _common.write(offset - common_offset, width, value);
         if (written) {
+            if (_common.status() != before) {
+                ++_status_changes;
+            }
             after_common_write();
         }
         return written;
@@ -186,6 +194,9 @@ auto PciFunction::drop_queues() -> void {
 }
 
 auto PciFunction::reset() -> void {
+    if (_common.status() != 0) {
+        ++_status_changes;
+    }
     _common.reset();
     static_cast<void>(_common.take_reset());
     _isr = 0;
@@ -268,6 +279,29 @@ auto PciFunction::raise_config() -> void {
     const std::uint16_t vector = _common.config_msix_vector();
     if (vector != msix_no_vector) {
         _interrupts->raise(vector);
+    }
+}
+
+auto PciFunction::request_eject() -> void {
+    if (!_params.eject_capability || eject_requested()) {
+        return;
+    }
+    set_vendor_flags(_vendor_flags | vendor_data::flag_eject_requested);
+    // Nothing in the device configuration changed, so the generation stays;
+    // the interrupt only wakes a driver or helper that wants to look.
+    raise_config();
+}
+
+auto PciFunction::cancel_eject() -> void {
+    if (eject_requested()) {
+        set_vendor_flags(_vendor_flags & ~vendor_data::flag_eject_requested);
+    }
+}
+
+auto PciFunction::set_vendor_flags(std::uint32_t flags) -> void {
+    _vendor_flags = flags;
+    if (_vendor_listener) {
+        _vendor_listener(flags);
     }
 }
 

@@ -103,6 +103,12 @@ auto decoders(std::span<const std::byte> body) -> void {
     if (auto c = oar::decode_cert_answer(body)) {
         same(body, oar::encode_cert_answer(*c));
     }
+    if (auto e = oar::decode_eject(body)) {
+        same(body, oar::encode_eject(*e));
+    }
+    if (auto e = oar::decode_eject_answer(body)) {
+        same(body, oar::encode_eject_answer(*e));
+    }
     // A usage page is checked against the cursor it answers: try the first
     // page and one further in.
     for (const std::uint16_t cursor : {std::uint16_t{0}, std::uint16_t{oar::max_usage_page}}) {

@@ -147,7 +147,8 @@ auto VirtioBlkFunction::create(const BlkParams& params, const virtio::GuestMemor
          .device_features = device_features(params),
          .num_queues = params.num_queues,
          .max_queue_size = params.queue_size,
-         .device_config_size = blk_cfg::size});
+         .device_config_size = blk_cfg::size,
+         .eject_capability = true});
     if (!pci) {
         return std::unexpected(BlkConfigError::bad_queues);
     }
@@ -612,6 +613,32 @@ auto VirtioBlkFunction::do_get_id(const Request& req) -> std::uint32_t {
         }
     }
     return static_cast<std::uint32_t>(at);
+}
+
+auto VirtioBlkFunction::cancel_eject() -> void {
+    _pci->cancel_eject();
+    _quiet_since.reset();
+}
+
+auto VirtioBlkFunction::eject_state(Clock::time_point now) -> EjectState {
+    if (!_pci->eject_requested()) {
+        _quiet_since.reset();
+        return EjectState::none;
+    }
+    if (_pci->status() != 0) {
+        _quiet_since.reset();
+        return EjectState::requested;
+    }
+    const auto changes = _pci->status_changes();
+    if (!_quiet_since || _quiet_since->second != changes) {
+        // First seen at 0, or the driver came back and went again since.
+        _quiet_since.emplace(now, changes);
+        return EjectState::requested;
+    }
+    if (now - _quiet_since->first < release_quiet || _in_flight != 0) {
+        return EjectState::requested;
+    }
+    return EjectState::released;
 }
 
 }  // namespace ak::oar::blk

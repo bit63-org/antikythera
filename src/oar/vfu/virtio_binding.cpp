@@ -144,11 +144,16 @@ auto VirtioBinding::bind(virtio::PciFunction& function) -> std::expected<void, s
     // Virtio vendor capabilities. The encoded bytes are a `struct vsc`
     // (id, next, length, ...); libvfio-user rewrites `next` as it links them.
     for (const auto& cap : function.capabilities()) {
-        std::vector<std::byte> bytes = virtio::encode_capability(cap, 0);
-        if (vfu_pci_add_capability(_ctx, 0, VFU_CAP_FLAG_READONLY, bytes.data()) < 0) {
+        std::vector<std::byte> bytes = virtio::encode_capability(cap, 0, function.vendor_flags());
+        const auto at = vfu_pci_add_capability(_ctx, 0, VFU_CAP_FLAG_READONLY, bytes.data());
+        if (at < 0) {
             return failed("add virtio capability");
         }
+        if (cap.type == virtio::CfgType::vendor) {
+            _vendor_cap = static_cast<long>(at);
+        }
     }
+    follow(function);
 
     if (vfu_setup_region(_ctx, VFU_PCI_DEV_BAR0_REGION_IDX, virtio::bar_layout::bar_size, bar0_cb,
                          VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM, nullptr, 0, -1, 0) < 0) {
@@ -294,8 +299,25 @@ auto VirtioBinding::retarget(virtio::PciFunction& function) -> std::expected<voi
         caps(*_function) != caps(function)) {
         return std::unexpected(std::string{"retarget: the function's PCI shape differs"});
     }
+    _function->set_vendor_listener({});
     _function = &function;
+    follow(function);
     return {};
+}
+
+auto VirtioBinding::follow(virtio::PciFunction& function) -> void {
+    function.set_vendor_listener([this](std::uint32_t flags) { write_vendor_flags(flags); });
+    write_vendor_flags(function.vendor_flags());
+}
+
+auto VirtioBinding::write_vendor_flags(std::uint32_t flags) -> void {
+    if (_vendor_cap < 0) {
+        return;
+    }
+    // libvfio-user serves config-space reads from this buffer, so the next
+    // read sees the new flags; the bus is little-endian, as is the host.
+    auto* config = reinterpret_cast<std::byte*>(vfu_pci_get_config_space(_ctx));
+    std::memcpy(config + _vendor_cap + virtio::vendor_data::flags_offset, &flags, sizeof flags);
 }
 
 auto VirtioBinding::log(const char* message) const -> void {

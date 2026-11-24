@@ -330,6 +330,22 @@ auto sample_cert_request() -> proto::CertRequest {
     return {.slot = 3, .role = proto::StorageRole::hold, .csr = der_seq(300)};
 }
 
+auto join(std::uint64_t nic, proto::RouteFamily family, std::uint8_t lead, std::uint8_t tail)
+    -> proto::GroupMembershipEntry {
+    proto::GroupMembershipEntry e{.nic_id = nic, .vni = 0x55, .family = family, .group = {}};
+    e.group[0] = std::byte{lead};
+    e.group[family == proto::RouteFamily::ipv4 ? 3 : 15] = std::byte{tail};
+    return e;
+}
+
+auto sample_membership() -> proto::GroupMembership {
+    return {.slot = 2,
+            .entries = {join(0x11, proto::RouteFamily::ipv4, 224, 251),
+                        join(0x11, proto::RouteFamily::ipv4, 239, 1),
+                        join(0x11, proto::RouteFamily::ipv6, 0xFF, 0x42),
+                        join(0x22, proto::RouteFamily::ipv4, 224, 251)}};
+}
+
 auto every_body() -> std::vector<proto::ReportBody> {
     auto all = all_bodies();
     std::ranges::move(volume_bodies(), std::back_inserter(all));
@@ -337,6 +353,8 @@ auto every_body() -> std::vector<proto::ReportBody> {
     all.emplace_back(sample_cert_request());
     all.emplace_back(
         proto::CertRequest{.slot = 0, .role = proto::StorageRole::initiator, .csr = der_seq(0)});
+    all.emplace_back(sample_membership());
+    all.emplace_back(proto::GroupMembership{.slot = 1, .entries = {}});
     return all;
 }
 
@@ -454,7 +472,7 @@ BOOST_AUTO_TEST_CASE(header_rules) {
     b = good;
     set_le16(b, off_kind, 0);
     BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
-    set_le16(b, off_kind, 16);
+    set_le16(b, off_kind, 17);
     BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
     b = good;
     b[off_reserved + 3] = std::byte{1};
@@ -982,6 +1000,72 @@ BOOST_AUTO_TEST_CASE(cert_request_layout_and_rules) {
     BOOST_TEST((decode_error(bad) == DecodeError::truncated));
     bad = b;
     set_le16(bad, body + 2, static_cast<std::uint16_t>(req.csr.size() - 1));
+    BOOST_TEST((decode_error(bad) == DecodeError::trailing_bytes));
+}
+
+// controller-interface Requirement 7.9 (task 15).
+BOOST_AUTO_TEST_CASE(group_membership_layout_and_rules) {
+    BOOST_TEST(static_cast<int>(proto::report_kind(sample_membership())) == 16);
+    static_assert(proto::max_group_membership_size < proto::max_report_size);
+    const auto b = encoded(make_report(sample_membership()));
+    constexpr std::size_t body = proto::report_header_size;
+    BOOST_TEST(b.size() == body + proto::group_membership_fixed_size +
+                               (4 * proto::group_membership_entry_size));
+    BOOST_TEST(std::to_integer<int>(b[body]) == 2);      // slot
+    BOOST_TEST(std::to_integer<int>(b[body + 2]) == 4);  // count
+    const std::size_t third =
+        body + proto::group_membership_fixed_size + (2 * proto::group_membership_entry_size);
+    BOOST_TEST(le64_at(b, third) == 0x11U);                   // nic_id
+    BOOST_TEST(std::to_integer<int>(b[third + 8]) == 0x55);   // vni
+    BOOST_TEST(std::to_integer<int>(b[third + 12]) == 6);     // family
+    BOOST_TEST(std::to_integer<int>(b[third + 16]) == 0xFF);  // group
+    BOOST_TEST(std::to_integer<int>(b[third + 31]) == 0x42);
+
+    const auto refused = [](proto::GroupMembership m, DecodeError want) {
+        BOOST_TEST((encode_error(make_report(m)) == want));
+    };
+    auto m = sample_membership();
+    m.entries[0].nic_id = 0;
+    refused(m, DecodeError::bad_nic_id);
+    m = sample_membership();
+    m.entries[0].vni = 0;
+    refused(m, DecodeError::bad_vni);
+    m = sample_membership();
+    m.entries[0].group[0] = std::byte{10};  // unicast
+    refused(m, DecodeError::bad_group);
+    m = sample_membership();
+    m.entries[0].family = static_cast<proto::RouteFamily>(5);
+    refused(m, DecodeError::unknown_value);
+    m = sample_membership();
+    std::swap(m.entries[0], m.entries[1]);
+    refused(m, DecodeError::not_ascending);
+    m = sample_membership();
+    m.entries.push_back(m.entries.back());
+    refused(m, DecodeError::not_ascending);
+    m = {};
+    for (std::uint64_t i = 1; i <= proto::max_group_membership_entries + 1; ++i) {
+        m.entries.push_back(join(i, proto::RouteFamily::ipv4, 239, 1));
+    }
+    refused(m, DecodeError::too_many_entries);
+
+    constexpr std::size_t first = body + proto::group_membership_fixed_size;
+    auto bad = b;
+    bad[body + 1] = std::byte{1};
+    BOOST_TEST((decode_error(bad) == DecodeError::reserved_not_zero));
+    bad = b;
+    bad[body + 4] = std::byte{1};
+    BOOST_TEST((decode_error(bad) == DecodeError::reserved_not_zero));
+    bad = b;
+    bad[first + 13] = std::byte{1};
+    BOOST_TEST((decode_error(bad) == DecodeError::reserved_not_zero));
+    bad = b;
+    set_le16(bad, body + 2, 0xFFFF);
+    BOOST_TEST((decode_error(bad) == DecodeError::too_many_entries));
+    bad = b;
+    set_le16(bad, body + 2, 5);
+    BOOST_TEST((decode_error(bad) == DecodeError::truncated));
+    bad = b;
+    set_le16(bad, body + 2, 3);
     BOOST_TEST((decode_error(bad) == DecodeError::trailing_bytes));
 }
 

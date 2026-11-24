@@ -103,6 +103,7 @@ helm reports to the controller with `Report` frames
 | `map_applied` | VNI and mapping version oar-net swapped in | 3.2, 5.3 |
 | `host_fault` | hull's fault code, slot and detail | 3.2 |
 | `group_usage` | cumulative per-NIC group meters (see "Multicast policy and usage") | 7.5 |
+| `group_membership` | one network role's snooped multicast joins, whole (kind 16) | 7.9 |
 
 Reports are not signed. mTLS authenticates helm, and the controller only
 trusts a server about that server (Requirement 3.3). The inventory is a
@@ -150,8 +151,33 @@ that missed versions catches up from the newest. A `drop` policy has
 every limit zero; a `multicast` policy has every limit non-zero
 (`max_groups_per_nic` may be zero until snooping is built) and within the
 oar-net bounds. Per-subnet policies come with subnets: a later version
-carries one entry per subnet. Phase 2 adds a `GroupMembers` frame (VNI,
-version, per-group VTEP lists) built from snooped joins.
+carries one entry per subnet.
+
+Snooping (Requirement 7.9) closes the loop. helm sends a
+`group_membership` report with one network role's whole join list
+(`slot`, then `(nic_id, vni, family, group)` entries, at most 1024,
+ascending) whenever it changes, and an empty one when the role goes away,
+so the controller can replace what it holds for that slot and a lost
+report is healed by the next. The controller answers with a signed
+`GroupMembers` frame per VPC, link record type 15:
+
+```
+GroupMembers {                // controller -> helm -> oar-net, signed;
+                              // src/proto/group_members.hpp, LE
+  0x00 magic 'AKGM' u32, 0x04 version u16 (1), 0x06 key_id u16,
+  0x08 server_id u64, 0x10 vni u32, 0x14 group_count u16 (<= 512),
+  0x16 reserved u16, 0x18 members_version u64,
+  0x20 groups, ascending by (family, group):
+       family u8 (4|6) | vtep_count u8 (1..64) | reserved [6] | group [16]
+       vteps: vtep_count x [16], ascending
+  then signature [64]         // Ed25519 over every byte before it
+}```
+
+At most 4,096 VTEP entries in all (77,920 bytes). Groups are IPv4
+224.0.0.0/4 or IPv6 multicast other than solicited-node; VTEPs are
+unicast. Like GroupPolicy it is a full per-VNI snapshot. A group not
+listed is unknown and flooded to the whole VPC, so a frame never waits
+for the controller.
 
 The `group_usage` report body is `count u16 | rsvd [6]` then `count`
 (at most 1024) entries of 96 bytes, in strictly increasing `(slot, nic_id,
@@ -302,8 +328,9 @@ block volume records `replica_config`, `volume_op`, `volume_key`, `lease_grant` 
 `role_certificate` (types 8 to 12, `.kiro/specs/block-volume-service/`),
 `image_key` (type 13, an encrypted image's key for the image volume a
 CREATE_VOLUME is about to create, `.kiro/specs/oar-blk-data-plane/` task 15),
-and `vpc_config` (type 14, a VpcConfig frame). Helm to controller: `hello` (`server_id u64 | boot_id
-u64`, the first record on every connection) and `report`. Report sequence
+`vpc_config` (type 14, a VpcConfig frame) and `group_members` (type 15,
+a GroupMembers frame). Helm to controller: `hello` (`server_id u64 |
+boot_id u64`, the first record on every connection) and `report`. Report sequence
 numbers restart when helm reboots, so the controller keys them by the
 connection's boot ID and drops any `(boot_id, report_seq)` it has already
 processed; that makes helm's replay after a reconnect idempotent. The framing only

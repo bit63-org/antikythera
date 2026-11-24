@@ -82,6 +82,8 @@ enum class DecodeError : std::uint8_t {
     bad_config_version,       // VPC config version 0 (versions start at 1)
     bad_vpc_config,           // a VPC prefix, gateway, domain or lease outside its rules
     bad_route,                // a route prefix with host bits set or too long for its family
+    bad_members_version,      // group member list version 0 (versions start at 1)
+    bad_group,                // a group address that is not a replicable multicast group
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -188,6 +190,10 @@ enum class DecodeError : std::uint8_t {
             return "VPC config field outside its rules";
         case DecodeError::bad_route:
             return "route prefix has host bits or a bad length";
+        case DecodeError::bad_members_version:
+            return "group members version 0";
+        case DecodeError::bad_group:
+            return "not a replicable multicast group";
     }
     return "unknown";
 }

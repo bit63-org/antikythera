@@ -65,6 +65,15 @@
   gets the exact frame; the default drops it), `ak-test-controller
   vpc-config`, `fuzz_vpc_config`. helm's fan-out and the network role's
   side are oar-net task 20; routes are applied by oar-net task 22.
+- [x] 15. `GroupMembers` codec and `group_membership` report kind in
+  `src/proto/`, `group_members` link record, tests, fuzz;
+  `ak-test-controller` can send it. _Requirements: 7.9_ — Done:
+  `src/proto/group_members.hpp` (`AKGM`, up to 512 groups and 4,096 VTEP
+  entries, Ed25519 over everything before the trailing 64), link record
+  type 15 checked by the ControllerSession
+  (`ControllerSink::on_group_members`; the default drops it), report kind
+  16 (one role's whole join list), `ak-test-controller group-members`,
+  `fuzz_group_members`. The oar-net side is task 14.
 - [ ] 6. Draft the kythira `ec2-compatible-api` spec in the kythira
   repository, from Requirements 6 and 9 (network volumes ported from
   `ak_hold_master`). _Requirements: 6, 9_

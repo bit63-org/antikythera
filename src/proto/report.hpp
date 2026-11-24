@@ -58,6 +58,13 @@
 //       replicas_remote u64 | replica_bytes_remote u64   (billable)
 //       replicas_local u64 | replica_bytes_local u64
 //       drop_policy u64 | drop_rate u64 | drop_fanout u64
+//   group_membership  -- one network role's snooped multicast joins, whole
+//                        (controller-interface Requirement 7.9, oar-net
+//                        Requirement 10.5)
+//     slot u8 | rsvd u8 | count u16 | rsvd u32
+//     entries  count x 32, strictly increasing (nic_id, family, group):
+//       nic_id u64 | vni u32 | family u8 (4 or 6) | rsvd [3]
+//       group [16] (IPv4 in the first 4 bytes, the rest zero)
 //
 // Network volume reports (.kiro/specs/block-volume-service/ design
 // "Reports"), from a hold role or oar-blk (the initiator) through helm.
@@ -114,6 +121,11 @@
 // between successive readings of a series keyed by (server, boot_id, slot,
 // nic_id, attachment). A detached entry is that series' final reading.
 //
+// A group_membership report replaces everything the controller holds for
+// that (server, slot): helm sends one whenever a role's joins change, and
+// an empty one when a role goes away, so a lost or reordered report is
+// healed by the next. Groups follow GroupMembers' rules (group_members.hpp).
+//
 // Every inventory list is in strictly increasing key order (functions by
 // (slot, function), the others by ID), so the encoding is canonical and
 // carries no duplicates. A function has an owner VM exactly when it is
@@ -147,6 +159,7 @@
 #include "common/wire.hpp"
 #include "proto/codec.hpp"
 #include "proto/der.hpp"
+#include "proto/group_members.hpp"
 #include "proto/map_update.hpp"
 #include "proto/replica_config.hpp"
 #include "proto/volume_op.hpp"
@@ -202,6 +215,11 @@ inline constexpr std::uint16_t hpke_kem_x25519 = 0x0020;
 inline constexpr std::size_t transport_key_size = 32;
 inline constexpr std::size_t enrollment_size = 8 + transport_key_size;
 inline constexpr std::size_t cert_request_fixed_size = 8;
+inline constexpr std::size_t group_membership_fixed_size = 8;
+inline constexpr std::size_t group_membership_entry_size = 32;
+inline constexpr std::size_t max_group_membership_entries = 1024;  // per network role
+inline constexpr std::size_t max_group_membership_size =
+    group_membership_fixed_size + (max_group_membership_entries * group_membership_entry_size);
 inline constexpr std::size_t max_csr_size = 4096;
 
 inline constexpr std::size_t max_report_size =
@@ -225,6 +243,7 @@ enum class ReportKind : std::uint16_t {
     snapshot_progress = 13,
     enrollment = 14,
     cert_request = 15,
+    group_membership = 16,
 };
 
 // Which storage role a certificate is for.
@@ -457,6 +476,22 @@ struct GroupUsage {
     friend auto operator==(const GroupUsage&, const GroupUsage&) -> bool = default;
 };
 
+// One NIC's join of one group, as a network role snooped it.
+struct GroupMembershipEntry {
+    std::uint64_t nic_id{0};
+    std::uint32_t vni{0};
+    RouteFamily family{RouteFamily::ipv4};
+    Ipv6Address group{};  // IPv4 in the first four bytes, the rest zero
+    friend auto operator==(const GroupMembershipEntry&, const GroupMembershipEntry&)
+        -> bool = default;
+};
+
+struct GroupMembership {
+    std::uint8_t slot{0};
+    std::vector<GroupMembershipEntry> entries;  // strictly ascending (nic_id, family, group)
+    friend auto operator==(const GroupMembership&, const GroupMembership&) -> bool = default;
+};
+
 struct ReplicaStatusEntry {
     std::uint64_t volume_id{0};
     std::uint64_t epoch{0};
@@ -551,10 +586,10 @@ struct CertRequest {
     friend auto operator==(const CertRequest&, const CertRequest&) -> bool = default;
 };
 
-using ReportBody =
-    std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport, MapApplied,
-                 HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault, AttachmentStatus,
-                 DemotionConfirmed, OpOutcome, SnapshotProgress, Enrollment, CertRequest>;
+using ReportBody = std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport,
+                                MapApplied, HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault,
+                                AttachmentStatus, DemotionConfirmed, OpOutcome, SnapshotProgress,
+                                Enrollment, CertRequest, GroupMembership>;
 
 struct Report {
     std::uint64_t server_id{0};
@@ -568,7 +603,7 @@ struct Report {
     return static_cast<ReportKind>(body.index() + 1);
 }
 static_assert(std::variant_size_v<ReportBody> ==
-              static_cast<std::size_t>(ReportKind::cert_request));
+              static_cast<std::size_t>(ReportKind::group_membership));
 
 namespace detail {
 
@@ -774,6 +809,36 @@ namespace detail {
     if (std::ranges::adjacent_find(u.entries, [&](const auto& a, const auto& b) {
             return key(a) >= key(b);
         }) != u.entries.end()) {
+        return std::unexpected(DecodeError::not_ascending);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const GroupMembership& m) noexcept
+    -> std::expected<void, DecodeError> {
+    if (m.entries.size() > max_group_membership_entries) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    for (const auto& e : m.entries) {
+        if (e.nic_id == 0) {
+            return std::unexpected(DecodeError::bad_nic_id);
+        }
+        if (e.vni == 0 || e.vni > max_vni) {
+            return std::unexpected(DecodeError::bad_vni);
+        }
+        if (e.family != RouteFamily::ipv4 && e.family != RouteFamily::ipv6) {
+            return std::unexpected(DecodeError::unknown_value);
+        }
+        if (!valid_member_group(e.family, e.group)) {
+            return std::unexpected(DecodeError::bad_group);
+        }
+    }
+    const auto key = [](const GroupMembershipEntry& e) {
+        return std::tuple{e.nic_id, e.family, e.group};
+    };
+    if (std::ranges::adjacent_find(m.entries, [&](const auto& a, const auto& b) {
+            return key(a) >= key(b);
+        }) != m.entries.end()) {
         return std::unexpected(DecodeError::not_ascending);
     }
     return {};
@@ -1495,6 +1560,55 @@ inline auto write_volume_event(wire::Writer& w, const SnapshotProgress& b) -> vo
     return out;
 }
 
+[[nodiscard]] inline auto decode_group_membership(std::span<const std::byte> body)
+    -> std::expected<GroupMembership, DecodeError> {
+    wire::Reader r{body};
+    auto slot = r.u8();
+    auto reserved1 = r.u8();
+    auto count = r.le16();
+    auto reserved2 = r.le32();
+    if (!slot || !reserved1 || !count || !reserved2) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (*reserved1 != 0 || *reserved2 != 0) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (*count > max_group_membership_entries) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    const std::size_t want = std::size_t{*count} * group_membership_entry_size;
+    if (r.remaining() < want) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (r.remaining() > want) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    GroupMembership out{.slot = *slot, .entries = {}};
+    out.entries.reserve(*count);
+    for (std::uint16_t i = 0; i < *count; ++i) {
+        auto nic = r.le64();
+        auto vni = r.le32();
+        auto family = r.u8();
+        auto pad = r.bytes(3);
+        auto group = r.bytes(ipv6_address_size);
+        if (!nic || !vni || !family || !pad || !group) {
+            return std::unexpected(DecodeError::truncated);
+        }
+        if (!all_zero(*pad)) {
+            return std::unexpected(DecodeError::reserved_not_zero);
+        }
+        auto& e = out.entries.emplace_back();
+        e.nic_id = *nic;
+        e.vni = *vni;
+        e.family = static_cast<RouteFamily>(*family);
+        std::ranges::copy(*group, e.group.begin());
+    }
+    if (auto ok = check_body(out); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return out;
+}
+
 inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
     std::visit(
         [&w]<typename T>(const T& b) {
@@ -1528,6 +1642,18 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
                 w.le64(b.map_version);
             } else if constexpr (std::is_same_v<T, GroupUsage>) {
                 write_group_usage(w, b);
+            } else if constexpr (std::is_same_v<T, GroupMembership>) {
+                w.u8(b.slot);
+                w.u8(0);
+                w.le16(static_cast<std::uint16_t>(b.entries.size()));
+                w.le32(0);
+                for (const auto& e : b.entries) {
+                    w.le64(e.nic_id);
+                    w.le32(e.vni);
+                    w.u8(static_cast<std::uint8_t>(e.family));
+                    w.bytes(std::array<std::byte, 3>{});
+                    w.bytes(e.group);
+                }
             } else if constexpr (std::is_same_v<T, ReplicaStatus>) {
                 write_replica_status(w, b);
             } else if constexpr (volume_event_size<T> != 0) {
@@ -1632,6 +1758,8 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
             return wrap(detail::decode_enrollment(body));
         case ReportKind::cert_request:
             return wrap(detail::decode_cert_request(body));
+        case ReportKind::group_membership:
+            return wrap(detail::decode_group_membership(body));
     }
     return std::unexpected(DecodeError::unknown_value);
 }

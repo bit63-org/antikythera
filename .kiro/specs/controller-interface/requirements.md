@@ -158,6 +158,12 @@ keep it from being abused.
 8. The EC2 module SHALL expose the setting and the usage (design in the
    kythira spec); prices are kythira billing configuration, not part of
    this interface.
+9. helm SHALL report each network role's snooped multicast joins whole
+   (`group_membership` report) whenever they change. The controller SHALL
+   turn the joins into per-group VTEP lists (the servers hosting a NIC
+   that joined) and deliver them as a signed, versioned `GroupMembers`
+   frame per VPC to every server hosting a NIC in it, so a known group
+   reaches only those servers (oar-net Requirement 10.5).
 
 
 ### Requirement 8: Tunnel key distribution

@@ -76,6 +76,7 @@
 #include "proto/map_update.hpp"
 #include "proto/report.hpp"
 #include "proto/tunnel_peers.hpp"
+#include "proto/group_members.hpp"
 #include "proto/vpc_config.hpp"
 #include "tls/tls.hpp"
 
@@ -113,6 +114,11 @@ public:
     // network role.
     virtual auto on_vpc_config(const proto::VpcConfigFrame& /*config*/,
                                std::span<const std::byte> /*frame*/) -> void {}
+    // A multicast VPC's per-group VTEP lists for this server; `frame` is
+    // its exact encoding, which helm forwards to the network roles
+    // unmodified. The default drops it, for sinks that run no network role.
+    virtual auto on_group_members(const proto::GroupMembers& /*members*/,
+                                  std::span<const std::byte> /*frame*/) -> void {}
     // Block volumes (.kiro/specs/block-volume-service/ task 12). A volume's
     // replica set and attachments at one epoch; `frame` is its exact
     // encoding, which the storage roles verify.

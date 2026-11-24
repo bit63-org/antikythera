@@ -27,6 +27,18 @@ auto disconnected() -> std::unexpected<LinkError> {
     return std::ranges::any_of(v, [](std::byte b) { return b != std::byte{0}; });
 }
 
+// The reports a hold role may send.
+[[nodiscard]] auto hold_kind(const proto::ReportBody& body) -> bool {
+    return std::holds_alternative<proto::ReplicaStatus>(body) ||
+           std::holds_alternative<proto::VolumeFault>(body) ||
+           std::holds_alternative<proto::DemotionConfirmed>(body) ||
+           std::holds_alternative<proto::OpOutcome>(body) ||
+           std::holds_alternative<proto::SnapshotProgress>(body);
+}
+
+// Reports taken from one role per pass, so a chatty role cannot hold the loop.
+constexpr std::size_t max_reports_per_pass = 64;
+
 }  // namespace
 
 // ---- SlotPort ---------------------------------------------------------------
@@ -99,6 +111,7 @@ HelmDaemon::HelmDaemon(DaemonConfig config, KeyStore& keys, AuditLog& audit, Hos
         _slots.try_emplace(s.slot, std::make_unique<SlotState>(s.slot, s.link));
     }
     _next_check = now() + _config.check_interval;
+    _next_reports = now();
     _snapshot = _router.inventory();
 }
 
@@ -141,6 +154,10 @@ auto HelmDaemon::run_once(std::chrono::milliseconds wait) -> void {
     if (now() >= _next_check) {
         check();
         _next_check = now() + _config.check_interval;
+    }
+    if (now() >= _next_reports) {
+        take_hold_reports();
+        _next_reports = now() + _config.report_interval;
     }
     publish();
 }
@@ -187,6 +204,22 @@ auto HelmDaemon::on_map_update(const proto::MapUpdate& update, std::span<const s
                      .frame = {frame.begin(), frame.end()}});
 }
 
+auto HelmDaemon::on_replica_config(const proto::ReplicaConfig& config,
+                                   std::span<const std::byte> frame) -> void {
+    enqueue(ConfigFrame{.volume_id = config.volume_id,
+                        .epoch = config.epoch,
+                        .frame = {frame.begin(), frame.end()}});
+}
+
+auto HelmDaemon::on_volume_op(const proto::VolumeOp& /*op*/, std::span<const std::byte> frame)
+    -> void {
+    enqueue(OpFrame{.frame = {frame.begin(), frame.end()}});
+}
+
+auto HelmDaemon::on_lease_grant(const proto::LeaseGrant& grant) -> void {
+    enqueue(grant);
+}
+
 auto HelmDaemon::post_host_slot(const mailbox::Slot& slot) -> void {
     enqueue(slot);
 }
@@ -217,6 +250,103 @@ auto HelmDaemon::handle(Item& item) -> void {
             ++_stats.host_slots;
         }
         _router.on_host_slot(*slot);
+    } else if (auto* config = std::get_if<ConfigFrame>(&item)) {
+        {
+            const std::scoped_lock lock{_inbox_mutex};
+            ++_stats.replica_configs;
+        }
+        forward_config(*config);
+    } else if (const auto* op = std::get_if<OpFrame>(&item)) {
+        {
+            const std::scoped_lock lock{_inbox_mutex};
+            ++_stats.volume_ops;
+        }
+        forward_op(*op);
+    } else if (const auto* grant = std::get_if<proto::LeaseGrant>(&item)) {
+        {
+            const std::scoped_lock lock{_inbox_mutex};
+            ++_stats.lease_grants;
+        }
+        forward_grant(*grant);
+    }
+}
+
+// ---- block volumes ------------------------------------------------------------
+
+auto HelmDaemon::is_hold(const SlotState& slot) -> bool {
+    return slot.link && slot.inventory && slot.inventory->role == oar::Role::hold;
+}
+
+auto HelmDaemon::count_refusal(const std::expected<void, LinkError>& r) -> void {
+    if (!r) {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.hold_refused;
+    }
+}
+
+auto HelmDaemon::forward_config(ConfigFrame& config) -> void {
+    // The roles refuse an older epoch themselves; keeping only the newest
+    // bounds the replay.
+    auto [it, added] = _volume_configs.try_emplace(config.volume_id);
+    if (!added && it->second.epoch > config.epoch) {
+        return;
+    }
+    it->second = std::move(config);
+    for (auto& [n, slot] : _slots) {
+        if (is_hold(*slot)) {
+            count_refusal(slot->link->replica_config(it->second.frame));
+        }
+    }
+}
+
+auto HelmDaemon::forward_op(const OpFrame& op) -> void {
+    for (auto& [n, slot] : _slots) {
+        if (is_hold(*slot)) {
+            count_refusal(slot->link->volume_op(op.frame));
+        }
+    }
+}
+
+auto HelmDaemon::forward_grant(const proto::LeaseGrant& grant) -> void {
+    for (auto& [n, slot] : _slots) {
+        if (is_hold(*slot)) {
+            count_refusal(
+                slot->link->lease_grant({.volume_id = grant.volume_id, .epoch = grant.epoch}));
+        }
+    }
+}
+
+auto HelmDaemon::replay_configs(SlotState& slot) -> void {
+    if (!is_hold(slot)) {
+        return;
+    }
+    for (const auto& [volume, config] : _volume_configs) {
+        count_refusal(slot.link->replica_config(config.frame));
+    }
+}
+
+auto HelmDaemon::take_hold_reports() -> void {
+    for (auto& [n, slot] : _slots) {
+        if (!is_hold(*slot)) {
+            continue;
+        }
+        auto taken = slot->link->hold_reports(max_reports_per_pass);
+        if (!taken) {
+            continue;  // tried again next pass; the role keeps them
+        }
+        for (const auto& bytes : *taken) {
+            auto rep = proto::decode_report(bytes);
+            if (!rep || !hold_kind(rep->body)) {
+                const std::scoped_lock lock{_inbox_mutex};
+                ++_stats.hold_reports_dropped;
+                continue;
+            }
+            {
+                const std::scoped_lock lock{_inbox_mutex};
+                ++_stats.hold_reports;
+            }
+            report(std::move(rep->body));  // renumbered by the controller session
+        }
     }
 }
 
@@ -278,6 +408,10 @@ auto HelmDaemon::attach(SlotState& slot) -> bool {
     }
     slot.pending = false;
     slot.inventory = *inv;
+    if (inv->role == oar::Role::hold) {
+        replay_configs(slot);  // a hold role has no functions for the router
+        return true;
+    }
     _router.add_slot(slot.number, slot.port, *inv);
     return true;
 }

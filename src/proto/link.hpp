@@ -22,6 +22,21 @@
 //   report_ack    controller -> helm   server_id u64 | report_seq u64: every
 //                                      report up to report_seq is processed
 //   tunnel_peers  controller -> helm   a TunnelPeers frame (tunnel_peers.hpp)
+//   replica_config controller -> helm  a ReplicaConfig (replica_config.hpp)
+//   volume_op     controller -> helm   a VolumeOp (volume_op.hpp)
+//   volume_key    controller -> helm   a VolumeKey (volume_key.hpp)
+//   lease_grant   controller -> helm   server_id u64 | volume_id u64 | epoch u64:
+//                                      the controller acknowledged this
+//                                      server's lease request as primary of
+//                                      the volume at that epoch
+//
+// The block volume records (.kiro/specs/block-volume-service/ task 12):
+// helm forwards replica_config, volume_op and lease_grant to its storage
+// roles (the signed frames unmodified; the roles verify them, as oar-net
+// does a MapUpdate), and opens volume_key in its secure element. A
+// lease_grant is unsigned: it travels only on this authenticated link and
+// helm's own sideband, and fences nothing but the reads of the role it
+// names (design "Epochs, leases and fencing").
 //
 // Report sequence numbers restart when helm reboots, so they are only
 // meaningful together with the boot ID: hello names it before any report,
@@ -48,17 +63,22 @@
 #include "proto/envelope.hpp"
 #include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
+#include "proto/replica_config.hpp"
 #include "proto/report.hpp"
 #include "proto/tunnel_peers.hpp"
+#include "proto/volume_key.hpp"
+#include "proto/volume_op.hpp"
 
 namespace ak::proto {
 
 inline constexpr std::size_t record_header_size = 8;
 inline constexpr std::size_t report_ack_size = 16;
 inline constexpr std::size_t hello_size = 16;
+inline constexpr std::size_t lease_grant_size = 24;
 inline constexpr std::size_t max_record_payload =
     std::max({envelope_size, max_map_update_size, max_report_size, report_ack_size, hello_size,
-              group_policy_size, max_tunnel_peers_size});
+              group_policy_size, max_tunnel_peers_size, max_replica_config_size, volume_op_size,
+              volume_key_size, lease_grant_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class RecordType : std::uint16_t {
@@ -69,6 +89,10 @@ enum class RecordType : std::uint16_t {
     hello = 5,
     group_policy = 6,
     tunnel_peers = 7,
+    replica_config = 8,
+    volume_op = 9,
+    volume_key = 10,
+    lease_grant = 11,
 };
 
 struct Record {
@@ -89,10 +113,17 @@ struct ReportAck {
     friend auto operator==(const ReportAck&, const ReportAck&) -> bool = default;
 };
 
+struct LeaseGrant {
+    std::uint64_t server_id{0};
+    std::uint64_t volume_id{0};
+    std::uint64_t epoch{0};
+    friend auto operator==(const LeaseGrant&, const LeaseGrant&) -> bool = default;
+};
+
 namespace detail {
 
 [[nodiscard]] constexpr auto known(RecordType t) noexcept -> bool {
-    return t >= RecordType::envelope && t <= RecordType::tunnel_peers;
+    return t >= RecordType::envelope && t <= RecordType::lease_grant;
 }
 
 }  // namespace detail
@@ -184,6 +215,53 @@ namespace detail {
         return std::unexpected(DecodeError::bad_boot_id);
     }
     return Hello{.server_id = *server_id, .boot_id = *boot_id};
+}
+
+[[nodiscard]] inline auto check_lease_grant(const LeaseGrant& g) noexcept
+    -> std::expected<void, DecodeError> {
+    if (g.server_id == 0) {
+        return std::unexpected(DecodeError::bad_server_id);
+    }
+    if (g.volume_id == 0) {
+        return std::unexpected(DecodeError::bad_id);
+    }
+    if (g.epoch == 0) {
+        return std::unexpected(DecodeError::bad_epoch);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto encode_lease_grant(const LeaseGrant& g)
+    -> std::expected<std::vector<std::byte>, DecodeError> {
+    if (auto ok = check_lease_grant(g); !ok) {
+        return std::unexpected(ok.error());
+    }
+    std::vector<std::byte> out;
+    out.reserve(lease_grant_size);
+    wire::Writer w{out};
+    w.le64(g.server_id);
+    w.le64(g.volume_id);
+    w.le64(g.epoch);
+    return out;
+}
+
+[[nodiscard]] inline auto decode_lease_grant(std::span<const std::byte> bytes) noexcept
+    -> std::expected<LeaseGrant, DecodeError> {
+    wire::Reader r{bytes};
+    auto server_id = r.le64();
+    auto volume_id = r.le64();
+    auto epoch = r.le64();
+    if (!server_id || !volume_id || !epoch) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (r.remaining() != 0) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    const LeaseGrant g{.server_id = *server_id, .volume_id = *volume_id, .epoch = *epoch};
+    if (auto ok = check_lease_grant(g); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return g;
 }
 
 // Incremental record parser for a byte stream. Feed it whatever the socket

@@ -63,6 +63,7 @@ namespace {
 constexpr unsigned e2e_timeout_seconds = 60;
 constexpr SlotNumber net_slot = 1;
 constexpr SlotNumber blk_slot = 2;
+constexpr SlotNumber hold_slot = 3;
 constexpr std::uint16_t net_functions = 2;
 constexpr std::uint16_t blk_functions = 1;
 constexpr std::uint64_t server = 7;
@@ -150,9 +151,52 @@ public:
     }
     auto health() -> std::expected<oar::Health, oar::Status> override { return oar::Health{}; }
 
+    // A hold role's side.
+    std::atomic<oar::Status> config_status{oar::Status::ok};
+    [[nodiscard]] auto configs() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _configs;
+    }
+    [[nodiscard]] auto ops() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _ops;
+    }
+    [[nodiscard]] auto grants() const -> std::vector<oar::LeaseGrant> {
+        const std::scoped_lock lock{_mutex};
+        return _grants;
+    }
+    auto queue_report(std::uint64_t seq, std::vector<std::byte> report) -> bool {
+        const std::scoped_lock lock{_mutex};
+        return _reports.push(seq, std::move(report));
+    }
+    auto replica_config(std::span<const std::byte> frame) -> oar::Status override {
+        const std::scoped_lock lock{_mutex};
+        _configs.emplace_back(frame.begin(), frame.end());
+        return config_status.load();
+    }
+    auto volume_op(std::span<const std::byte> frame) -> oar::Status override {
+        const std::scoped_lock lock{_mutex};
+        _ops.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
+    }
+    auto lease_grant(const oar::LeaseGrant& g) -> oar::Status override {
+        const std::scoped_lock lock{_mutex};
+        _grants.push_back(g);
+        return oar::Status::ok;
+    }
+    auto hold_reports(const oar::ReportRequest& r)
+        -> std::expected<oar::ReportChunk, oar::Status> override {
+        const std::scoped_lock lock{_mutex};
+        return _reports.serve(r);  // the chunk outlives the lock: one helm, one request at a time
+    }
+
 private:
     oar::Inventory _inventory;
     mutable std::mutex _mutex;
+    std::vector<std::vector<std::byte>> _configs;
+    std::vector<std::vector<std::byte>> _ops;
+    std::vector<oar::LeaseGrant> _grants;
+    oar::ReportQueue _reports;
     std::size_t _cleaned{0};
     std::vector<oar::PrepareFunction> _prepared;
     std::vector<std::vector<std::byte>> _frames;
@@ -321,22 +365,32 @@ struct Rig {
     FakeBackplane backplane;
     Board net{net_slot, oar::Role::net, FunctionType::nic_vf, net_functions};
     Board blk{blk_slot, oar::Role::blk, FunctionType::blk_fn, blk_functions};
+    Board hold{hold_slot, oar::Role::hold, FunctionType::blk_fn, 0};
     std::vector<proto::ReportBody> reports;  // loop thread only (the test thread)
     helm::HelmDaemon daemon;
 
     explicit Rig(std::chrono::milliseconds slot_link_timeout = link_timeout,
-                 helm::HostPort* host_port = nullptr)
-        : daemon{config(slot_link_timeout),
+                 helm::HostPort* host_port = nullptr, bool with_hold = false)
+        : daemon{config(slot_link_timeout, with_hold),
                  keys,
                  audit,
                  host_port != nullptr ? *host_port : host,
                  backplane,
-                 [this](SlotNumber s) { return s == net_slot ? net.connect() : blk.connect(); },
+                 [this](SlotNumber s) {
+                     return s == net_slot ? net.connect()
+                                          : (s == blk_slot ? blk.connect() : hold.connect());
+                 },
                  [this](proto::ReportBody b) { reports.push_back(std::move(b)); }} {}
 
-    static auto config(std::chrono::milliseconds slot_link_timeout) -> helm::DaemonConfig {
+    static auto config(std::chrono::milliseconds slot_link_timeout, bool with_hold = false)
+        -> helm::DaemonConfig {
         helm::DaemonConfig c;
-        for (const auto s : {net_slot, blk_slot}) {
+        std::vector<SlotNumber> slots{net_slot, blk_slot};
+        if (with_hold) {
+            slots.push_back(hold_slot);
+        }
+        c.report_interval = 0ms;  // every pass takes hold reports
+        for (const auto s : slots) {
             c.slots.push_back({.slot = s,
                                .link = {.address = helm_side(s),
                                         .mtu = ak::helm::mctp::baseline_mtu,
@@ -472,6 +526,115 @@ BOOST_AUTO_TEST_CASE(map_updates_reach_net_roles_only) {
     r.daemon.run_once(0ms);
     BOOST_TEST(r.count<proto::MapApplied>() == 1U);
     BOOST_TEST(r.daemon.stats().maps_refused == 1U);
+}
+
+namespace {
+
+auto hold_config(std::uint64_t epoch) -> std::pair<proto::ReplicaConfig, std::vector<std::byte>> {
+    proto::ReplicaConfig c;
+    c.key_id = 1;
+    c.server_id = server;
+    c.volume_id = 0x100;
+    c.epoch = epoch;
+    c.lineage_id = 0x1EE;
+    c.capacity_blocks = 1024;
+    c.block_size = proto::block_size_4096;
+    c.lease_ms = 4000;
+    c.qos = {.iops = 100, .mib_per_s = 10, .burst_iops = 100, .burst_mib = 10};
+    proto::ReplicaMember m;
+    m.server_id = server;
+    m.endpoint[0] = std::byte{0xFD};
+    m.endpoint[15] = std::byte{1};
+    m.port = 7300;
+    m.role = proto::ReplicaRole::primary;
+    m.replica_gen = 1;
+    c.members = {m};
+    auto b = proto::encode_replica_config(c);
+    BOOST_REQUIRE(b.has_value());
+    return {c, *b};
+}
+
+auto hold_report(proto::ReportBody body) -> std::vector<std::byte> {
+    auto b = proto::encode_report({.server_id = server, .report_seq = 1, .body = std::move(body)});
+    BOOST_REQUIRE(b.has_value());
+    return *b;
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(block_volume_frames_reach_hold_roles_only) {
+    Rig r{link_timeout, nullptr, true};
+    (void)r.daemon.boot();
+    BOOST_TEST(r.daemon.attached(hold_slot));
+    BOOST_TEST(r.free_functions() == net_functions + blk_functions);  // the hold role adds none
+    const auto [c2, f2] = hold_config(2);
+    const auto [c1, f1] = hold_config(1);
+    r.daemon.on_replica_config(c2, f2);
+    r.daemon.on_replica_config(c1, f1);  // older: kept back
+    const proto::VolumeOp op{.key_id = 1,
+                             .server_id = server,
+                             .volume_id = 0x100,
+                             .epoch = 2,
+                             .op_id = 9,
+                             .args = proto::ScrubVolume{.mib_per_s = 50},
+                             .signature = {}};
+    const auto op_frame = proto::encode_volume_op(op).value();
+    r.daemon.on_volume_op(op, op_frame);
+    r.daemon.on_lease_grant({.server_id = server, .volume_id = 0x100, .epoch = 2});
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.hold.role.configs().size() == 1U);
+    BOOST_TEST((r.hold.role.configs()[0] == f2));
+    BOOST_REQUIRE(r.hold.role.ops().size() == 1U);
+    BOOST_TEST((r.hold.role.ops()[0] == op_frame));
+    BOOST_REQUIRE(r.hold.role.grants().size() == 1U);
+    BOOST_TEST((r.hold.role.grants()[0] == oar::LeaseGrant{.volume_id = 0x100, .epoch = 2}));
+    BOOST_TEST(r.net.role.frames().empty());
+    BOOST_TEST(r.daemon.stats().replica_configs == 2U);
+    BOOST_TEST(r.daemon.stats().hold_refused == 0U);
+
+    // A role that refuses a config (a bad signature, say) is counted.
+    r.hold.role.config_status = oar::Status::failed;
+    const auto [c3, f3] = hold_config(3);
+    r.daemon.on_replica_config(c3, f3);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().hold_refused == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(a_restarted_hold_role_gets_every_config_again) {
+    Rig r{link_timeout, nullptr, true};
+    (void)r.daemon.boot();
+    const auto [c, f] = hold_config(4);
+    r.daemon.on_replica_config(c, f);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.hold.role.configs().size() == 1U);
+    r.daemon.on_slot_recovered(hold_slot);
+    BOOST_REQUIRE(r.hold.role.configs().size() == 2U);
+    BOOST_TEST((r.hold.role.configs()[1] == f));
+    BOOST_TEST(r.hold.connects == 2);
+}
+
+BOOST_AUTO_TEST_CASE(hold_reports_are_relayed_by_kind) {
+    Rig r{link_timeout, nullptr, true};
+    (void)r.daemon.boot();
+    const auto before = r.reports.size();
+    const proto::VolumeFault fault{.volume_id = 0x100,
+                                   .epoch = 2,
+                                   .suspect = 9,
+                                   .kind = proto::VolumeFaultKind::member_timeout,
+                                   .reporter = proto::FaultReporter::hold,
+                                   .slot = 0};
+    BOOST_REQUIRE(r.hold.role.queue_report(50, hold_report(fault)));
+    BOOST_REQUIRE(r.hold.role.queue_report(
+        51, hold_report(proto::VmExitedReport{
+                .vm_id = 1, .exit_status = 0, .reason = proto::ExitReason::guest_shutdown})));
+    BOOST_REQUIRE(r.hold.role.queue_report(52, std::vector<std::byte>(40, std::byte{1})));
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.reports.size() == before + 1);
+    BOOST_TEST((std::get<proto::VolumeFault>(r.reports.back()) == fault));
+    BOOST_TEST(r.daemon.stats().hold_reports == 1U);
+    BOOST_TEST(r.daemon.stats().hold_reports_dropped == 2U);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.reports.size() == before + 1);  // each once
 }
 
 BOOST_AUTO_TEST_CASE(an_unreachable_sideband_is_reported_and_retried) {

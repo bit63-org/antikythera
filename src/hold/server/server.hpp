@@ -10,8 +10,8 @@
 // decoded frames from TLS sessions whose peer certificate named a server
 // ID, and it answers through a SessionSink. Single-threaded.
 //
-// Volumes. apply_config() takes each ReplicaConfig helm hands down (helm
-// has verified the controller's signature). A config for another server
+// Volumes. apply_config() takes each ReplicaConfig helm hands down (the
+// caller, HoldRole, has verified the controller's signature). A config for another server
 // or an epoch below the newest applied is refused; the same epoch again
 // is a no-op. While this server is a member, it holds the member's
 // replica (vol-<id>.<replica_gen> under the data directory, created or

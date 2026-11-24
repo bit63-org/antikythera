@@ -45,7 +45,7 @@ auto known_status(std::uint8_t v) noexcept -> bool {
 }
 
 auto known_role(std::uint8_t v) noexcept -> bool {
-    return v >= std::to_underlying(Role::net) && v <= std::to_underlying(Role::gpu);
+    return v >= std::to_underlying(Role::net) && v <= std::to_underlying(Role::hold);
 }
 
 auto known_health(std::uint8_t v) noexcept -> bool {
@@ -244,6 +244,8 @@ auto role_serves(Role role, FunctionType type) noexcept -> bool {
             return type == FunctionType::blk_fn;
         case Role::gpu:
             return is_gpu(type);
+        case Role::hold:
+            return false;
     }
     return false;
 }
@@ -768,6 +770,185 @@ auto decode_group_policy_frame(std::span<const std::byte> body) noexcept
     return body;
 }
 
+auto encode_replica_config_frame(std::span<const std::byte> frame)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (auto ok = decode_replica_config_frame(frame); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return std::vector<std::byte>(frame.begin(), frame.end());
+}
+
+auto decode_replica_config_frame(std::span<const std::byte> body) noexcept
+    -> std::expected<std::span<const std::byte>, BodyError> {
+    if (body.size() < min_replica_config_frame) {
+        return std::unexpected(BodyError::truncated);
+    }
+    if (body.size() > max_replica_config_frame) {
+        return std::unexpected(BodyError::trailing_bytes);
+    }
+    return body;
+}
+
+auto encode_volume_op_frame(std::span<const std::byte> frame)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (auto ok = check_size(frame, volume_op_frame_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return std::vector<std::byte>(frame.begin(), frame.end());
+}
+
+auto decode_volume_op_frame(std::span<const std::byte> body) noexcept
+    -> std::expected<std::span<const std::byte>, BodyError> {
+    if (auto ok = check_size(body, volume_op_frame_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return body;
+}
+
+auto encode_lease_grant(const LeaseGrant& g) -> std::expected<std::vector<std::byte>, BodyError> {
+    if (g.volume_id == 0 || g.epoch == 0) {
+        return std::unexpected(BodyError::zero_id);
+    }
+    std::vector<std::byte> out;
+    out.reserve(lease_grant_size);
+    wire::Writer w{out};
+    w.le64(g.volume_id);
+    w.le64(g.epoch);
+    return out;
+}
+
+auto decode_lease_grant(std::span<const std::byte> body) noexcept
+    -> std::expected<LeaseGrant, BodyError> {
+    if (auto ok = check_size(body, lease_grant_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    wire::Reader r{body};
+    const LeaseGrant g{.volume_id = r.le64().value_or(0), .epoch = r.le64().value_or(0)};
+    if (g.volume_id == 0 || g.epoch == 0) {
+        return std::unexpected(BodyError::zero_id);
+    }
+    return g;
+}
+
+auto encode_report_request(const ReportRequest& req)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (req.offset >= max_role_report) {
+        return std::unexpected(BodyError::bad_chunk);
+    }
+    std::vector<std::byte> out;
+    out.reserve(report_request_size);
+    wire::Writer w{out};
+    w.le64(req.ack);
+    w.le32(req.offset);
+    w.le32(zero32);
+    return out;
+}
+
+auto decode_report_request(std::span<const std::byte> body) noexcept
+    -> std::expected<ReportRequest, BodyError> {
+    if (auto ok = check_size(body, report_request_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    wire::Reader r{body};
+    const ReportRequest req{.ack = r.le64().value_or(0), .offset = r.le32().value_or(0)};
+    if (r.le32().value_or(1) != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    if (req.offset >= max_role_report) {
+        return std::unexpected(BodyError::bad_chunk);
+    }
+    return req;
+}
+
+namespace {
+
+auto check_report_chunk(const ReportChunk& c) noexcept -> std::expected<void, BodyError> {
+    if (c.total == 0) {
+        if (c.report_seq != 0 || c.offset != 0 || !c.chunk.empty()) {
+            return std::unexpected(BodyError::bad_chunk);
+        }
+        return {};
+    }
+    if (c.report_seq == 0) {
+        return std::unexpected(BodyError::zero_id);
+    }
+    if (c.total > max_role_report || c.chunk.empty() || c.chunk.size() > max_report_chunk ||
+        c.offset >= c.total || c.chunk.size() > c.total - c.offset) {
+        return std::unexpected(BodyError::bad_chunk);
+    }
+    return {};
+}
+
+}  // namespace
+
+auto encode_report_chunk(const ReportChunk& c) -> std::expected<std::vector<std::byte>, BodyError> {
+    if (auto ok = check_report_chunk(c); !ok) {
+        return std::unexpected(ok.error());
+    }
+    std::vector<std::byte> out;
+    out.reserve(report_chunk_head_size + c.chunk.size());
+    wire::Writer w{out};
+    w.le64(c.report_seq);
+    w.le32(c.total);
+    w.le32(c.offset);
+    w.bytes(c.chunk);
+    return out;
+}
+
+auto decode_report_chunk(std::span<const std::byte> body) noexcept
+    -> std::expected<ReportChunk, BodyError> {
+    if (body.size() < report_chunk_head_size) {
+        return std::unexpected(BodyError::truncated);
+    }
+    wire::Reader r{body};
+    ReportChunk c;
+    c.report_seq = r.le64().value_or(0);
+    c.total = r.le32().value_or(0);
+    c.offset = r.le32().value_or(0);
+    c.chunk = r.rest();
+    if (auto ok = check_report_chunk(c); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return c;
+}
+
+auto ReportQueue::push(std::uint64_t seq, std::vector<std::byte> report) -> bool {
+    if (seq == 0 || report.empty() || report.size() > max_role_report) {
+        return false;
+    }
+    if (_limit == 0) {
+        ++_dropped;
+        return true;
+    }
+    while (_reports.size() >= _limit) {
+        _reports.pop_front();
+        ++_dropped;
+    }
+    _reports.push_back({.seq = seq, .bytes = std::move(report)});
+    return true;
+}
+
+auto ReportQueue::serve(const ReportRequest& request) -> std::expected<ReportChunk, Status> {
+    if (!_reports.empty() && request.ack != 0 && _reports.front().seq == request.ack) {
+        _reports.pop_front();
+    }
+    if (_reports.empty()) {
+        if (request.offset != 0) {
+            return std::unexpected(Status::bad_request);
+        }
+        return ReportChunk{};
+    }
+    const auto& head = _reports.front();
+    if (request.offset >= head.bytes.size()) {
+        return std::unexpected(Status::bad_request);
+    }
+    const auto n = std::min(max_report_chunk, head.bytes.size() - request.offset);
+    return ReportChunk{.report_seq = head.seq,
+                       .total = static_cast<std::uint32_t>(head.bytes.size()),
+                       .offset = request.offset,
+                       .chunk = std::span{head.bytes}.subspan(request.offset, n)};
+}
+
 auto encode_usage_request(std::uint16_t cursor)
     -> std::expected<std::vector<std::byte>, BodyError> {
     std::vector<std::byte> out;
@@ -998,6 +1179,8 @@ auto to_string(Role r) noexcept -> const char* {
             return "blk";
         case Role::gpu:
             return "gpu";
+        case Role::hold:
+            return "hold";
     }
     return "unknown";
 }

@@ -152,6 +152,50 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
             _sink->on_tunnel_peers(*peers, rec.payload);
             return {};
         }
+        case proto::RecordType::replica_config: {
+            auto config = proto::decode_replica_config(rec.payload);
+            if (!config) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (config->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_replica_config(*config, rec.payload);
+            return {};
+        }
+        case proto::RecordType::volume_op: {
+            auto op = proto::decode_volume_op(rec.payload);
+            if (!op) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (op->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_volume_op(*op, rec.payload);
+            return {};
+        }
+        case proto::RecordType::volume_key: {
+            auto key = proto::decode_volume_key(rec.payload);
+            if (!key) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (key->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_volume_key(*key, rec.payload);
+            return {};
+        }
+        case proto::RecordType::lease_grant: {
+            auto grant = proto::decode_lease_grant(rec.payload);
+            if (!grant) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (grant->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_lease_grant(*grant);
+            return {};
+        }
         case proto::RecordType::report_ack: {
             auto ack = proto::decode_report_ack(rec.payload);
             if (!ack) {

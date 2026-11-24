@@ -66,7 +66,7 @@ auto Node::create(store::FileLayer& files, NodeConfig config)
         new Node(files, std::move(config), std::move(*ctx), std::move(*listener), wake)};
 }
 
-auto Node::run_once(Clock::duration max_wait) -> void {
+auto Node::run_once(Clock::duration max_wait, int extra_fd) -> bool {
     auto now = Clock::now();
     auto wait = max_wait;
     if (const auto wake = _server.next_wake(now); wake) {
@@ -76,6 +76,7 @@ auto Node::run_once(Clock::duration max_wait) -> void {
     std::vector<SessionId> ids;
     fds.push_back({.fd = _listener.fd(), .events = POLLIN, .revents = 0});
     fds.push_back({.fd = _dials.wake, .events = POLLIN, .revents = 0});
+    fds.push_back({.fd = extra_fd, .events = POLLIN, .revents = 0});  // poll() skips fd -1
     for (auto& [id, c] : _conns) {
         if (c.stream.pending()) {
             wait = Clock::duration::zero();
@@ -88,7 +89,7 @@ auto Node::run_once(Clock::duration max_wait) -> void {
     now = Clock::now();
     for (std::size_t i = 0; i < ids.size(); ++i) {
         auto& c = _conns.at(ids[i]);
-        if (fds[i + 2].revents != 0 || c.stream.pending()) {
+        if (fds[i + 3].revents != 0 || c.stream.pending()) {
             read(c, now);
         }
     }
@@ -100,6 +101,7 @@ auto Node::run_once(Clock::duration max_wait) -> void {
     }
     _server.run(Clock::now());
     reap();
+    return extra_fd >= 0 && fds[2].revents != 0;
 }
 
 auto Node::accept() -> void {

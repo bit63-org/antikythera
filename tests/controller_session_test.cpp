@@ -7,6 +7,7 @@
 #define BOOST_TEST_MODULE controller_session_test
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -38,6 +39,10 @@ struct RecordingSink final : helm::ControllerSink {
     std::vector<std::pair<proto::MapUpdate, std::vector<std::byte>>> updates;
     std::vector<std::pair<proto::GroupPolicy, std::vector<std::byte>>> policies;
     std::vector<std::pair<proto::TunnelPeers, std::vector<std::byte>>> peer_sets;
+    std::vector<std::pair<proto::ReplicaConfig, std::vector<std::byte>>> configs;
+    std::vector<std::pair<proto::VolumeOp, std::vector<std::byte>>> ops;
+    std::vector<std::pair<proto::VolumeKey, std::vector<std::byte>>> keys;
+    std::vector<proto::LeaseGrant> grants;
 
     auto on_envelope(const proto::Envelope& e) -> void override { envelopes.push_back(e); }
     auto on_map_update(const proto::MapUpdate& u, std::span<const std::byte> frame)
@@ -52,6 +57,18 @@ struct RecordingSink final : helm::ControllerSink {
         -> void override {
         peer_sets.emplace_back(t, std::vector<std::byte>{frame.begin(), frame.end()});
     }
+    auto on_replica_config(const proto::ReplicaConfig& c, std::span<const std::byte> frame)
+        -> void override {
+        configs.emplace_back(c, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
+    auto on_volume_op(const proto::VolumeOp& o, std::span<const std::byte> frame) -> void override {
+        ops.emplace_back(o, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
+    auto on_volume_key(const proto::VolumeKey& k, std::span<const std::byte> frame)
+        -> void override {
+        keys.emplace_back(k, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
+    auto on_lease_grant(const proto::LeaseGrant& g) -> void override { grants.push_back(g); }
 };
 
 // A sink that keeps ControllerSink's default for tunnel peer sets.
@@ -128,6 +145,62 @@ auto map_update_record(std::uint64_t to) -> std::vector<std::byte> {
     auto b = proto::encode_map_update(m);
     BOOST_REQUIRE(b.has_value());
     return framed(RecordType::map_update, *b);
+}
+
+auto replica_config_record(std::uint64_t to) -> std::vector<std::byte> {
+    proto::ReplicaConfig c;
+    c.key_id = key;
+    c.server_id = to;
+    c.volume_id = 0x100;
+    c.epoch = 2;
+    c.lineage_id = 0x1EE;
+    c.capacity_blocks = 1024;
+    c.block_size = proto::block_size_4096;
+    c.lease_ms = 4000;
+    c.qos = {.iops = 100, .mib_per_s = 10, .burst_iops = 100, .burst_mib = 10};
+    proto::ReplicaMember m;
+    m.server_id = to;
+    m.endpoint[0] = std::byte{0xFD};
+    m.endpoint[15] = std::byte{1};
+    m.port = 7300;
+    m.role = proto::ReplicaRole::primary;
+    m.replica_gen = 1;
+    c.members = {m};
+    auto b = proto::encode_replica_config(c);
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::replica_config, *b);
+}
+
+auto volume_op_record(std::uint64_t to) -> std::vector<std::byte> {
+    const proto::VolumeOp op{.key_id = key,
+                             .server_id = to,
+                             .volume_id = 0x100,
+                             .epoch = 2,
+                             .op_id = 0x0B,
+                             .args = proto::ScrubVolume{.mib_per_s = 50},
+                             .signature = {}};
+    auto b = proto::encode_volume_op(op);
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::volume_op, *b);
+}
+
+auto volume_key_record(std::uint64_t to) -> std::vector<std::byte> {
+    proto::VolumeKey k{.server_id = to,
+                       .volume_id = 0x100,
+                       .attachment_id = 0xA1,
+                       .generation = 2,
+                       .hpke_enc = {},
+                       .wrapped_key = {}};
+    k.hpke_enc.fill(std::byte{0x11});
+    auto b = proto::encode_volume_key(k);
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::volume_key, *b);
+}
+
+auto lease_grant_record(std::uint64_t to) -> std::vector<std::byte> {
+    auto b = proto::encode_lease_grant({.server_id = to, .volume_id = 0x100, .epoch = 2});
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::lease_grant, *b);
 }
 
 auto group_policy_record(std::uint64_t to) -> std::vector<std::byte> {
@@ -271,6 +344,66 @@ BOOST_FIXTURE_TEST_CASE(envelopes_and_updates_reach_the_sink_unmodified, Fixture
     BOOST_TEST(sink.peer_sets[0].first.peers.size() == 1U);
     BOOST_TEST(std::ranges::equal(sink.peer_sets[0].second,
                                   std::span{peers}.subspan(proto::record_header_size)));
+}
+
+BOOST_FIXTURE_TEST_CASE(block_volume_records_reach_the_sink_unmodified, Fixture) {
+    session.on_connected();
+    std::vector<std::byte> stream;
+    for (const auto& r : {replica_config_record(server), volume_op_record(server),
+                          volume_key_record(server), lease_grant_record(server)}) {
+        stream.insert(stream.end(), r.begin(), r.end());
+    }
+    for (const auto b : stream) {
+        BOOST_REQUIRE(session.on_bytes(std::span{&b, 1}).has_value());
+    }
+    BOOST_REQUIRE(sink.configs.size() == 1U);
+    BOOST_TEST(sink.configs[0].first.epoch == 2U);
+    const auto config = replica_config_record(server);
+    BOOST_TEST(std::ranges::equal(sink.configs[0].second,
+                                  std::span{config}.subspan(proto::record_header_size)));
+    BOOST_REQUIRE(sink.ops.size() == 1U);
+    BOOST_TEST(sink.ops[0].first.op_id == 0x0BU);
+    BOOST_TEST(sink.ops[0].second.size() == proto::volume_op_size);
+    BOOST_REQUIRE(sink.keys.size() == 1U);
+    BOOST_TEST(sink.keys[0].first.attachment_id == 0xA1U);
+    BOOST_TEST(sink.keys[0].second.size() == proto::volume_key_size);
+    BOOST_REQUIRE(sink.grants.size() == 1U);
+    BOOST_TEST(
+        (sink.grants[0] == proto::LeaseGrant{.server_id = server, .volume_id = 0x100, .epoch = 2}));
+}
+
+BOOST_FIXTURE_TEST_CASE(block_volume_records_for_another_server_end_the_connection, Fixture) {
+    for (const auto& r : {replica_config_record(other_server), volume_op_record(other_server),
+                          volume_key_record(other_server), lease_grant_record(other_server)}) {
+        session.on_connected();
+        auto res = session.on_bytes(r);
+        BOOST_REQUIRE(!res.has_value());
+        BOOST_TEST((res.error() == SessionError::wrong_server));
+        session.on_disconnected();
+    }
+    auto bad = lease_grant_record(server);
+    std::fill(bad.end() - 8, bad.end(), std::byte{0});  // epoch 0
+    session.on_connected();
+    auto res = session.on_bytes(bad);
+    BOOST_REQUIRE(!res.has_value());
+    BOOST_TEST((res.error() == SessionError::bad_record));
+    BOOST_TEST(sink.grants.empty());
+}
+
+BOOST_AUTO_TEST_CASE(block_volume_records_default_to_dropped) {
+    DefaultSink sink;
+    helm::ControllerSession session{server, boot,
+                                    [] {
+                                        proto::Inventory inv;
+                                        inv.boot_id = 1;
+                                        return inv;
+                                    },
+                                    sink};
+    session.on_connected();
+    BOOST_TEST(session.on_bytes(replica_config_record(server)).has_value());
+    BOOST_TEST(session.on_bytes(lease_grant_record(server)).has_value());
+    BOOST_TEST(session.on_bytes(envelope_record(server, 10)).has_value());
+    BOOST_TEST(sink.envelopes == 1);
 }
 
 BOOST_AUTO_TEST_CASE(tunnel_peers_default_to_dropped) {

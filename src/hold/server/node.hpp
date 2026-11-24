@@ -75,8 +75,10 @@ public:
     [[nodiscard]] auto server() noexcept -> HoldServer& { return _server; }
     [[nodiscard]] auto connections() const noexcept -> std::size_t { return _conns.size(); }
 
-    // Waits up to max_wait for work, then does it.
-    auto run_once(Clock::duration max_wait) -> void;
+    // Waits up to max_wait for work, then does it. `extra_fd` (if not -1)
+    // is waited on too, for the caller's own work (helm's sideband): true
+    // when it is readable or has hung up.
+    auto run_once(Clock::duration max_wait, int extra_fd = -1) -> bool;
 
     auto send(SessionId session, std::vector<std::byte> frame) -> void override;
     auto dial(SessionId session, std::uint64_t server_id, const proto::StorageEndpoint& endpoint,

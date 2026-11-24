@@ -802,6 +802,117 @@ BOOST_AUTO_TEST_CASE(roles_without_group_meters_answer_unsupported) {
     BOOST_TEST((usage.error().status == oar::Status::unsupported));
 }
 
+// A hold role: configs, ops and lease grants in, reports out.
+class HoldRole final : public OarHandler {
+public:
+    std::vector<std::vector<std::byte>> configs;
+    std::vector<std::vector<std::byte>> ops;
+    std::vector<oar::LeaseGrant> grants;
+    oar::ReportQueue reports;
+
+    auto function_inventory() -> std::expected<oar::Inventory, oar::Status> override {
+        return oar::Inventory{.role = oar::Role::hold, .vtep = {}, .functions = {}};
+    }
+    auto prepare_function(const oar::PrepareFunction&) -> oar::Status override {
+        return oar::Status::unsupported;
+    }
+    auto clean_function(const oar::CleanFunction&) -> oar::Status override {
+        return oar::Status::unsupported;
+    }
+    auto deliver_key(const oar::DeliverKey&) -> oar::Status override {
+        return oar::Status::unsupported;
+    }
+    auto drop_key(const oar::DropKey&) -> oar::Status override { return oar::Status::unsupported; }
+    auto map_update(std::span<const std::byte>) -> oar::Status override {
+        return oar::Status::unsupported;
+    }
+    auto health() -> std::expected<oar::Health, oar::Status> override { return oar::Health{}; }
+    auto replica_config(std::span<const std::byte> frame) -> oar::Status override {
+        configs.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
+    }
+    auto volume_op(std::span<const std::byte> frame) -> oar::Status override {
+        ops.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
+    }
+    auto lease_grant(const oar::LeaseGrant& g) -> oar::Status override {
+        grants.push_back(g);
+        return oar::Status::ok;
+    }
+    auto hold_reports(const oar::ReportRequest& r)
+        -> std::expected<oar::ReportChunk, oar::Status> override {
+        return reports.serve(r);
+    }
+};
+
+BOOST_AUTO_TEST_CASE(hold_role_takes_configs_ops_and_grants) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    HoldRole role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const auto config_frame = pattern(oar::max_replica_config_frame);
+    const auto op_frame = pattern(oar::volume_op_frame_size);
+    {
+        const Server server{endpoint, role};
+        BOOST_TEST((link.function_inventory().value().role == oar::Role::hold));
+        BOOST_TEST(link.replica_config(config_frame).has_value());
+        BOOST_TEST(link.volume_op(op_frame).has_value());
+        BOOST_TEST(link.lease_grant({.volume_id = 7, .epoch = 3}).has_value());
+        BOOST_TEST((link.replica_config(std::span{config_frame}.first(10)).error().code ==
+                    LinkErrc::bad_request));
+        BOOST_TEST(
+            (link.lease_grant({.volume_id = 7, .epoch = 0}).error().code == LinkErrc::bad_request));
+    }
+    BOOST_REQUIRE(role.configs.size() == 1U);
+    BOOST_TEST(role.configs[0] == config_frame);
+    BOOST_REQUIRE(role.ops.size() == 1U);
+    BOOST_TEST(role.ops[0] == op_frame);
+    BOOST_REQUIRE(role.grants.size() == 1U);
+    BOOST_TEST((role.grants[0] == oar::LeaseGrant{.volume_id = 7, .epoch = 3}));
+}
+
+BOOST_AUTO_TEST_CASE(hold_reports_arrive_whole_and_once) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    HoldRole role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const auto big = pattern(3 * oar::max_report_chunk + 7);  // four chunks
+    const auto small = pattern(40);
+    BOOST_REQUIRE(role.reports.push(1000, big));
+    BOOST_REQUIRE(role.reports.push(1001, small));
+    BOOST_REQUIRE(role.reports.push(1002, small));
+    {
+        const Server server{endpoint, role};
+        auto got = link.hold_reports(2);
+        BOOST_REQUIRE(got.has_value());
+        BOOST_REQUIRE(got->size() == 2U);
+        BOOST_TEST((*got)[0] == big);
+        BOOST_TEST((*got)[1] == small);
+        got = link.hold_reports(8);  // acknowledges 1001, then takes 1002
+        BOOST_REQUIRE(got.has_value());
+        BOOST_TEST(got->size() == 1U);
+        got = link.hold_reports(8);
+        BOOST_REQUIRE(got.has_value());
+        BOOST_TEST(got->empty());
+    }
+    BOOST_TEST(role.reports.size() == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(roles_without_replicas_answer_unsupported) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    FakeOar fake;  // keeps the defaults
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const Server server{endpoint, fake};
+    BOOST_TEST((link.replica_config(pattern(oar::min_replica_config_frame)).error().status ==
+                oar::Status::unsupported));
+    BOOST_TEST((link.volume_op(pattern(oar::volume_op_frame_size)).error().status ==
+                oar::Status::unsupported));
+    BOOST_TEST((link.lease_grant({.volume_id = 1, .epoch = 1}).error().status ==
+                oar::Status::unsupported));
+    BOOST_TEST((link.hold_reports(1).error().status == oar::Status::unsupported));
+}
+
 BOOST_AUTO_TEST_CASE(names) {
     BOOST_TEST(std::string_view{ak::helm::to_string(LinkErrc::refused)} == "refused");
     BOOST_TEST(std::string_view{ak::helm::to_string(BindingError::queue_full)} == "queue_full");

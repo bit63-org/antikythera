@@ -42,6 +42,16 @@
 // which verifies it before applying it. It is reported applied
 // (CommandRouter::on_map_applied) once every connected net role accepted it.
 //
+// Block volumes (.kiro/specs/block-volume-service/ task 12). ReplicaConfig
+// and VolumeOp frames go unmodified to every hold role, which verifies
+// them, and so do the controller's lease acknowledgements. helm keeps the
+// newest config of each volume and hands them all again to a hold role
+// whose sideband it (re)opens, so a restarted role catches up without the
+// controller. Every report_interval it takes each hold role's queued
+// reports and relays those of the kinds a hold role sends (replica
+// status, volume faults, demotions, op outcomes, snapshot progress) to the
+// controller; anything else is dropped and counted.
+//
 // The daemon never powers anything off by itself: losing the controller
 // leaves running VMs alone (Requirement 2.3), and stopping run() leaves the
 // slots and the host as they are. shutdown() is the explicit power-off.
@@ -93,6 +103,9 @@ struct DaemonConfig {
     // How often the sequencer looks for lost links and unattached slots
     // are retried.
     std::chrono::milliseconds check_interval{std::chrono::seconds{1}};
+    // How often hold roles' reports are taken (their lease requests ride
+    // them, every lease_ms / 4).
+    std::chrono::milliseconds report_interval{std::chrono::milliseconds{100}};
     // Items waiting for the loop; more are dropped and counted. Only a loop
     // stuck far longer than any timeout fills it.
     std::size_t max_inbox{4096};
@@ -108,6 +121,13 @@ struct DaemonStats {
     std::uint64_t maps_refused{0};  // a net role refused it, or no net role is attached
     std::uint64_t inbox_dropped{0};
     std::uint64_t sideband_failures{0};  // a slot's sideband or inventory could not be read
+    // Block volumes.
+    std::uint64_t replica_configs{0};  // received from the controller
+    std::uint64_t volume_ops{0};
+    std::uint64_t lease_grants{0};
+    std::uint64_t hold_refused{0};          // a hold role refused or missed a frame or grant
+    std::uint64_t hold_reports{0};          // relayed to the controller
+    std::uint64_t hold_reports_dropped{0};  // undecodable, or of a kind a hold role never sends
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -154,6 +174,10 @@ public:
     auto on_envelope(const proto::Envelope& envelope) -> void override;
     auto on_map_update(const proto::MapUpdate& update, std::span<const std::byte> frame)
         -> void override;
+    auto on_replica_config(const proto::ReplicaConfig& config, std::span<const std::byte> frame)
+        -> void override;
+    auto on_volume_op(const proto::VolumeOp& op, std::span<const std::byte> frame) -> void override;
+    auto on_lease_grant(const proto::LeaseGrant& grant) -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
     // The newest published snapshot (ControllerSession's InventorySource).
@@ -172,7 +196,16 @@ private:
         std::uint64_t map_version{0};
         std::vector<std::byte> frame;
     };
-    using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot>;
+    struct ConfigFrame {
+        std::uint64_t volume_id{0};
+        std::uint64_t epoch{0};
+        std::vector<std::byte> frame;
+    };
+    struct OpFrame {
+        std::vector<std::byte> frame;
+    };
+    using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
+                              proto::LeaseGrant>;
 
     struct SlotState;
 
@@ -216,6 +249,14 @@ private:
     auto enqueue(Item item) -> void;
     auto handle(Item& item) -> void;
     auto apply_map(MapFrame& map) -> void;
+    // Block volumes: to every attached hold role.
+    [[nodiscard]] static auto is_hold(const SlotState& slot) -> bool;
+    auto forward_config(ConfigFrame& config) -> void;
+    auto forward_op(const OpFrame& op) -> void;
+    auto forward_grant(const proto::LeaseGrant& grant) -> void;
+    auto replay_configs(SlotState& slot) -> void;
+    auto take_hold_reports() -> void;
+    auto count_refusal(const std::expected<void, LinkError>& r) -> void;
     // Opens the sideband, reads the inventory, registers with the router.
     auto attach(SlotState& slot) -> bool;
     auto detach(SlotState& slot) noexcept -> void;
@@ -231,6 +272,8 @@ private:
     PowerSequencer _sequencer;
     std::map<SlotNumber, std::unique_ptr<SlotState>> _slots;
     Clock::time_point _next_check;
+    Clock::time_point _next_reports;
+    std::map<std::uint64_t, ConfigFrame> _volume_configs;  // the newest, by volume
 
     mutable std::mutex _inbox_mutex;
     std::condition_variable _inbox_ready;

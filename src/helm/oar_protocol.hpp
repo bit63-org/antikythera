@@ -39,6 +39,11 @@
 //   set_tunnel_peer     0  vtep [16] | 16 public_key [32] | 48 psk [32]
 //   remove_tunnel_peer  0  vtep [16]
 //   tunnel_peers        0  total u32 | 4  offset u32 | 8  chunk (as map_update)
+//   replica_config      0  frame (proto::ReplicaConfig, signed; min_replica_config_frame
+//                          to max_replica_config_frame bytes)
+//   volume_op           0  frame [volume_op_frame_size] (proto::VolumeOp, signed)
+//   lease_grant         0  volume_id u64 | 8  epoch u64
+//   hold_reports        0  ack u64 | 8  offset u32 | 12 reserved u32
 //
 // The tunnel requests deliver the network role's WireGuard keys (oar-net
 // Requirement 5.2): its own static X25519 private key, and for each peer
@@ -86,6 +91,19 @@
 // controller-managed peers with the frame's (oar-net Requirement 5.2). A
 // transfer of one type is abandoned by a chunk of the other.
 //
+// The block volume requests go to the hold role only
+// (.kiro/specs/block-volume-service/ task 12). replica_config and
+// volume_op forward one controller frame unmodified, like group_policy;
+// the role verifies it. lease_grant passes down the controller's
+// acknowledgement of the role's lease request as primary of the volume at
+// that epoch (non-zero both). hold_reports takes what the role reports
+// (proto::Report frames, numbered by the role from a random start so a
+// restarted role's numbers do not repeat its predecessor's): the role
+// answers with a chunk of the oldest report it still holds, from `offset`.
+// `ack` names the last report helm read whole: the role first drops its
+// oldest report if that is the one, so a lost response costs a resend,
+// never a report. A role with nothing to report answers total 0.
+//
 // Responses (oar -> helm) start with a 2-byte head:
 //
 //   0  status u8 (Status) | 1  reserved u8
@@ -98,6 +116,8 @@
 //                       22 count x { fn u16 | type u8 (FunctionType) | reserved u8 }
 //   health              2  state u8 (HealthState) | 3  reserved u8 | 4  fault_code u16
 //                       6  uptime_seconds u32
+//   hold_reports        2  report_seq u64 | 10 total u32 | 14 offset u32 | 18 chunk
+//                       (total 0: nothing to report, and the rest zero and empty)
 //   group_usage         2  total u16 | 4  count u16 | 6  reserved u32
 //                       10 count x 96 (the proto group_usage report entry, slot 0):
 //                          nic_id u64 | vni u32 | flags u8 | reserved [3] | attachment u64
@@ -116,6 +136,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <expected>
 #include <span>
 #include <utility>
@@ -194,6 +215,18 @@ inline constexpr std::size_t max_usage_page = 40;  // 3848 bytes: one message
 // proto::max_group_usage_entries, mirrored: one role never meters more.
 inline constexpr std::size_t max_usage_entries = 1024;
 inline constexpr std::uint8_t usage_detached = 0x01;
+// proto::ReplicaConfig frames, mirrored (one member and no attachment, five
+// members and sixteen attachments); tests/oar_protocol_test.cpp pins them.
+inline constexpr std::size_t min_replica_config_frame = 0x88 + 0x20 + 64;
+inline constexpr std::size_t max_replica_config_frame = 0x88 + (5 * 0x20) + (16 * 0x18) + 64;
+inline constexpr std::size_t volume_op_frame_size = 0x30 + 0x30 + 64;  // proto::volume_op_size
+inline constexpr std::size_t lease_grant_size = 16;
+inline constexpr std::size_t report_request_size = 16;
+inline constexpr std::size_t report_chunk_head_size = 16;
+inline constexpr std::size_t max_report_chunk =
+    max_body_size - response_head_size - report_chunk_head_size;
+// Largest report a role may send (at least proto::max_report_size, pinned).
+inline constexpr std::size_t max_role_report = std::size_t{1} << 17U;
 
 // Result of a request. Values are part of the wire protocol: never renumber.
 enum class Status : std::uint8_t {
@@ -211,6 +244,7 @@ enum class Role : std::uint8_t {
     net = 1,
     blk = 2,
     gpu = 3,
+    hold = 4,  // block volume replicas: no functions
 };
 
 // Values are wire protocol.
@@ -344,6 +378,29 @@ struct RemoveTunnelPeer {
     friend auto operator==(const RemoveTunnelPeer&, const RemoveTunnelPeer&) -> bool = default;
 };
 
+struct LeaseGrant {
+    VolumeId volume_id{0};
+    std::uint64_t epoch{0};
+
+    friend auto operator==(const LeaseGrant&, const LeaseGrant&) -> bool = default;
+};
+
+struct ReportRequest {
+    std::uint64_t ack{0};  // the last report read whole, or 0
+    std::uint32_t offset{0};
+
+    friend auto operator==(const ReportRequest&, const ReportRequest&) -> bool = default;
+};
+
+// One chunk of the role's oldest report. `chunk` views into the role's
+// queue when encoding, into the message when decoding.
+struct ReportChunk {
+    std::uint64_t report_seq{0};
+    std::uint32_t total{0};  // 0: nothing to report
+    std::uint32_t offset{0};
+    std::span<const std::byte> chunk;
+};
+
 // One chunk of a MapUpdate frame. `chunk` views into the message.
 struct MapChunk {
     std::uint32_t total{0};
@@ -413,6 +470,27 @@ struct MapChunk {
 // The frame, a view into the body: exactly group_policy_frame_size bytes.
 [[nodiscard]] auto decode_group_policy_frame(std::span<const std::byte> body) noexcept
     -> std::expected<std::span<const std::byte>, BodyError>;
+
+// replica_config and volume_op bodies: the frame itself, a view into the
+// body. Only its size is checked here; the role decodes and verifies it.
+[[nodiscard]] auto encode_replica_config_frame(std::span<const std::byte> frame)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_replica_config_frame(std::span<const std::byte> body) noexcept
+    -> std::expected<std::span<const std::byte>, BodyError>;
+[[nodiscard]] auto encode_volume_op_frame(std::span<const std::byte> frame)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_volume_op_frame(std::span<const std::byte> body) noexcept
+    -> std::expected<std::span<const std::byte>, BodyError>;
+
+[[nodiscard]] auto encode_lease_grant(const LeaseGrant& g)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_lease_grant(std::span<const std::byte> body) noexcept
+    -> std::expected<LeaseGrant, BodyError>;
+
+[[nodiscard]] auto encode_report_request(const ReportRequest& r)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_report_request(std::span<const std::byte> body) noexcept
+    -> std::expected<ReportRequest, BodyError>;
 
 [[nodiscard]] auto encode_usage_request(std::uint16_t cursor)
     -> std::expected<std::vector<std::byte>, BodyError>;
@@ -499,6 +577,33 @@ private:
     bool _open{false};  // a snapshot whose last page has not been served
 };
 
+// The role's side of hold_reports: the reports it has not yet seen helm
+// read whole, oldest first, at most `limit` (older ones are dropped and
+// counted: a status report supersedes them, and faults repeat).
+class ReportQueue {
+public:
+    explicit ReportQueue(std::size_t limit = 1024) : _limit{limit} {}
+
+    // `report` is an encoded proto::Report numbered `seq` (non-zero, never
+    // repeated); empty or larger than max_role_report is refused.
+    auto push(std::uint64_t seq, std::vector<std::byte> report) -> bool;
+    // Drops the oldest report if it is `request.ack`, then answers with a
+    // chunk of the oldest left (valid until the next call).
+    auto serve(const ReportRequest& request) -> std::expected<ReportChunk, Status>;
+
+    [[nodiscard]] auto size() const noexcept -> std::size_t { return _reports.size(); }
+    [[nodiscard]] auto dropped() const noexcept -> std::uint64_t { return _dropped; }
+
+private:
+    struct Entry {
+        std::uint64_t seq{0};
+        std::vector<std::byte> bytes;
+    };
+    std::size_t _limit;
+    std::deque<Entry> _reports;
+    std::uint64_t _dropped{0};
+};
+
 // A decoded response head. `body` is what follows it, empty unless status is ok.
 struct ResponseView {
     Status status{Status::ok};
@@ -523,6 +628,12 @@ struct ResponseView {
     -> std::expected<std::vector<std::byte>, BodyError>;
 [[nodiscard]] auto decode_usage_page(std::span<const std::byte> body, std::uint16_t cursor)
     -> std::expected<UsagePage, BodyError>;
+
+// hold_reports chunk bodies.
+[[nodiscard]] auto encode_report_chunk(const ReportChunk& c)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_report_chunk(std::span<const std::byte> body) noexcept
+    -> std::expected<ReportChunk, BodyError>;
 
 [[nodiscard]] auto encode_health(const Health& h)
     -> std::expected<std::vector<std::byte>, BodyError>;

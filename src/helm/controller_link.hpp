@@ -33,7 +33,9 @@
 //     trusted to (helm-control-plane design).
 //   - It checks each MapUpdate's and TunnelPeers frame's shape and target
 //     the same way and hands it, with its exact signed bytes, to helm,
-//     which forwards it to oar-net to verify and apply.
+//     which forwards it to oar-net to verify and apply. ReplicaConfig,
+//     VolumeOp, VolumeKey and LeaseGrant records are checked and handed
+//     over the same way (block volumes).
 //   - Any protocol violation (a malformed record, a record that only helm
 //     sends, an envelope for another server, an ack for a report never
 //     sent) ends the connection; the link reconnects and re-registers.
@@ -100,6 +102,20 @@ public:
     // it, for sinks that run no network role.
     virtual auto on_tunnel_peers(const proto::TunnelPeers& /*peers*/,
                                  std::span<const std::byte> /*frame*/) -> void {}
+    // Block volumes (.kiro/specs/block-volume-service/ task 12). A volume's
+    // replica set and attachments at one epoch; `frame` is its exact
+    // encoding, which the storage roles verify.
+    virtual auto on_replica_config(const proto::ReplicaConfig& /*config*/,
+                                   std::span<const std::byte> /*frame*/) -> void {}
+    // A one-shot operation on a replica, verified by the role like a config.
+    virtual auto on_volume_op(const proto::VolumeOp& /*op*/, std::span<const std::byte> /*frame*/)
+        -> void {}
+    // A network volume's key, wrapped to this helm's secure element;
+    // `frame` carries the HPKE AAD (proto::volume_key_aad).
+    virtual auto on_volume_key(const proto::VolumeKey& /*key*/,
+                               std::span<const std::byte> /*frame*/) -> void {}
+    // The controller acknowledged a storage role's lease request.
+    virtual auto on_lease_grant(const proto::LeaseGrant& /*grant*/) -> void {}
 };
 
 enum class SessionError : std::uint8_t {

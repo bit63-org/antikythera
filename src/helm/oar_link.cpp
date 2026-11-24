@@ -286,6 +286,71 @@ auto OarLink::group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkE
     return out;
 }
 
+auto OarLink::replica_config(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
+    auto body = oar::encode_replica_config_frame(frame);
+    if (!body) {
+        return std::unexpected(bad_request());
+    }
+    return expect_empty(transact(mctp::VendorType::replica_config, *body));
+}
+
+auto OarLink::volume_op(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
+    auto body = oar::encode_volume_op_frame(frame);
+    if (!body) {
+        return std::unexpected(bad_request());
+    }
+    return expect_empty(transact(mctp::VendorType::volume_op, *body));
+}
+
+auto OarLink::lease_grant(const oar::LeaseGrant& grant) -> std::expected<void, LinkError> {
+    auto body = oar::encode_lease_grant(grant);
+    if (!body) {
+        return std::unexpected(bad_request());
+    }
+    return expect_empty(transact(mctp::VendorType::lease_grant, *body));
+}
+
+auto OarLink::hold_reports(std::size_t max)
+    -> std::expected<std::vector<std::vector<std::byte>>, LinkError> {
+    std::vector<std::vector<std::byte>> out;
+    while (out.size() < max) {
+        std::vector<std::byte> report;
+        std::uint64_t seq = 0;
+        std::uint32_t total = 0;
+        do {
+            auto body = oar::encode_report_request(
+                {.ack = _report_ack, .offset = static_cast<std::uint32_t>(report.size())});
+            if (!body) {
+                return std::unexpected(bad_request());
+            }
+            auto response = transact(mctp::VendorType::hold_reports, *body);
+            if (!response) {
+                return std::unexpected(response.error());
+            }
+            auto chunk = oar::decode_report_chunk(*response);
+            if (!chunk) {
+                return std::unexpected(bad_response());
+            }
+            if (chunk->total == 0) {
+                if (!report.empty()) {
+                    return std::unexpected(bad_response());  // it vanished part way
+                }
+                return out;
+            }
+            if (chunk->offset != report.size() ||
+                (!report.empty() && (chunk->report_seq != seq || chunk->total != total))) {
+                return std::unexpected(bad_response());
+            }
+            seq = chunk->report_seq;
+            total = chunk->total;
+            report.insert(report.end(), chunk->chunk.begin(), chunk->chunk.end());
+        } while (report.size() < total);
+        _report_ack = seq;
+        out.push_back(std::move(report));
+    }
+    return out;
+}
+
 auto OarLink::health() -> std::expected<oar::Health, LinkError> {
     std::vector<std::byte> body;
     auto response = transact(mctp::VendorType::health, body);
@@ -538,6 +603,30 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
                                                                    : page.error());
             }
             return with_body(oar::encode_usage_page(*page, *cursor));
+        }
+        case mctp::VendorType::replica_config: {
+            auto frame = oar::decode_replica_config_frame(body);
+            return status_only(frame ? handler.replica_config(*frame) : oar::Status::bad_request);
+        }
+        case mctp::VendorType::volume_op: {
+            auto frame = oar::decode_volume_op_frame(body);
+            return status_only(frame ? handler.volume_op(*frame) : oar::Status::bad_request);
+        }
+        case mctp::VendorType::lease_grant: {
+            auto grant = oar::decode_lease_grant(body);
+            return status_only(grant ? handler.lease_grant(*grant) : oar::Status::bad_request);
+        }
+        case mctp::VendorType::hold_reports: {
+            auto req = oar::decode_report_request(body);
+            if (!req) {
+                return status_only(oar::Status::bad_request);
+            }
+            auto chunk = handler.hold_reports(*req);
+            if (!chunk) {
+                return status_only(chunk.error() == oar::Status::ok ? oar::Status::failed
+                                                                    : chunk.error());
+            }
+            return with_body(oar::encode_report_chunk(*chunk));
         }
         case mctp::VendorType::health: {
             if (!oar::decode_empty(body)) {

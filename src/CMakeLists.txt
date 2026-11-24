@@ -143,7 +143,7 @@ target_link_libraries(ak_hold_store
 
 # The hold role (.kiro/specs/block-volume-service/ task 6): request
 # handling, fencing and QoS (server), and the TLS node on the storage
-# segment; ak-hold runs it with a stub for helm's sideband.
+# segment.
 add_library(ak_hold_server
   hold/server/node.cpp
   hold/server/server.cpp)
@@ -151,8 +151,15 @@ add_library(ak::hold_server ALIAS ak_hold_server)
 target_link_libraries(ak_hold_server
   PUBLIC ak::hold_store ak::proto ak::tls
   PRIVATE ak::warnings ak::hardening)
+# The hold role's end of helm's sideband (task 12).
+add_library(ak_hold_role hold/server/hold_role.cpp)
+add_library(ak::hold_role ALIAS ak_hold_role)
+target_link_libraries(ak_hold_role
+  PUBLIC ak::hold_server ak::helm
+  PRIVATE ak::warnings ak::hardening)
 add_executable(ak-hold hold/hold_main.cpp)
-target_link_libraries(ak-hold PRIVATE ak::hold_server ak::warnings ak::hardening)
+target_link_libraries(ak-hold
+  PRIVATE ak::hold_role ak::hull OpenSSL::Crypto ak::warnings ak::hardening)
 install(TARGETS ak-hold RUNTIME DESTINATION bin)
 
 # harbor's test controller: signs commands and mapping updates and drives

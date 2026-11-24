@@ -883,6 +883,10 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::group_policy:
         case proto::RecordType::report_ack:
         case proto::RecordType::tunnel_peers:
+        case proto::RecordType::replica_config:
+        case proto::RecordType::volume_op:
+        case proto::RecordType::volume_key:
+        case proto::RecordType::lease_grant:
             break;
     }
     return std::unexpected("helm sent a controller-only record");

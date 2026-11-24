@@ -5,7 +5,8 @@
 // chunk size, so the same stream is also exercised split across reads.
 // Every record must re-frame to the bytes it came from, the decoder must
 // never buffer more than one maximum record plus one chunk, and once it
-// fails it must keep failing.
+// fails it must keep failing. A lease_grant payload that decodes must
+// encode back to the same bytes.
 
 #include <algorithm>
 #include <cstddef>
@@ -38,6 +39,14 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
             }
             if (!r->has_value()) {
                 break;
+            }
+            if ((*r)->type == ak::proto::RecordType::lease_grant) {
+                if (auto g = ak::proto::decode_lease_grant((*r)->payload); g) {
+                    auto again = ak::proto::encode_lease_grant(*g);
+                    if (!again || *again != (*r)->payload) {
+                        std::abort();
+                    }
+                }
             }
             auto b = ak::proto::encode_record((*r)->type, (*r)->payload);
             if (!b) {

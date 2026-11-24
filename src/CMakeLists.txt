@@ -107,17 +107,25 @@ install(TARGETS ak-helm RUNTIME DESTINATION bin)
 
 # hull: host-agent command authentication (Ed25519 signatures and sequence
 # numbers), the mailbox client and its VFIO mapping, the core / huge-page
-# allocator, and the per-VMM jail and cgroup.
+# allocator, the per-VMM jail and cgroup, and the VM supervisor with its
+# Cloud Hypervisor API client.
 add_library(ak_hull
+  hull/agent_handler.cpp
+  hull/ch_config.cpp
   hull/command_auth.cpp
   hull/cpu_topology.cpp
+  hull/device_inventory.cpp
   hull/jail.cpp
+  hull/json.cpp
   hull/mailbox_client.cpp
   hull/resource_allocator.cpp
   hull/sequence_tracker.cpp
   hull/signature_verifier.cpp
   hull/vfio_mailbox.cpp
-  hull/vm_cgroup.cpp)
+  hull/vm_cgroup.cpp
+  hull/vm_supervisor.cpp
+  hull/vmm_api.cpp
+  hull/vmm_launcher.cpp)
 add_library(ak::hull ALIAS ak_hull)
 target_link_libraries(ak_hull
   PUBLIC ak::common ak::helm OpenSSL::Crypto

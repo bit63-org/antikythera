@@ -76,6 +76,13 @@ jobs:
           install -D -m 0755 build/tests/jail_probe /tmp/ak-jail-probe/jail_probe
           sudo AK_JAIL_TEST_CGROUP=1 build/tests/jail_test --log_level=message -- /tmp/ak-jail-probe/jail_probe
 
+      # The same for hull's VMM launcher (task 8): fake_vmm stands in for
+      # cloud-hypervisor under a reserved UID, as the agent will run it.
+      - name: VMM launcher as root
+        run: |
+          install -D -m 0755 build/tests/fake_vmm /tmp/ak-fake-vmm/fake_vmm
+          sudo build/tests/vmm_launcher_test --log_level=message -- /tmp/ak-fake-vmm/fake_vmm
+
       # tests/wireguard_interop.sh also needs root: the Tunnel against
       # a kernel wg device. The wireguard module ships in linux-modules.
       - name: Kernel WireGuard interop

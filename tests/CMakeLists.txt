@@ -94,6 +94,21 @@ if(AK_SANITIZE OR AK_FUZZ)
 endif()
 ak_add_test(jail_test SOURCES jail_test.cpp LIBS ak::hull
             ARGS -- $<TARGET_FILE:jail_probe>)
+
+# The VM supervisor (hull task 8): the VMM API client and its parsers, the
+# supervisor with fakes, and the real launcher starting fake_vmm (a stand-in
+# for cloud-hypervisor) inside real jails.
+ak_add_test(vmm_api_test      SOURCES vmm_api_test.cpp      LIBS ak::hull)
+ak_add_test(vm_supervisor_test SOURCES vm_supervisor_test.cpp LIBS ak::hull)
+add_executable(fake_vmm fake_vmm.cpp)
+target_link_libraries(fake_vmm PRIVATE ak::warnings)
+if(AK_SANITIZE OR AK_FUZZ)
+  # Like jail_probe: it runs under Landlock without /proc/self/maps.
+  target_compile_options(fake_vmm PRIVATE -fno-sanitize=all)
+  target_link_options(fake_vmm PRIVATE -fno-sanitize=all)
+endif()
+ak_add_test(vmm_launcher_test SOURCES vmm_launcher_test.cpp LIBS ak::hull
+            ARGS -- $<TARGET_FILE:fake_vmm>)
 ak_add_test(proto_envelope_test   SOURCES proto_envelope_test.cpp   LIBS ak::proto ak::helm)
 ak_add_test(proto_map_update_test SOURCES proto_map_update_test.cpp LIBS ak::proto)
 ak_add_test(proto_report_test     SOURCES proto_report_test.cpp     LIBS ak::proto ak::helm)

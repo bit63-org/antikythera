@@ -22,6 +22,11 @@
 // the primary while one is joining. Initiators' faults reach the controller by another path (not
 // modelled): the members' reports confirm a lost primary.
 //
+// Elasticity (task 19): a run may also grow the volume mid-workload, after
+// which the guest writes across the old end too, and move it to a
+// two-replica class and back, so a replica leaves and is rebuilt while
+// I/O goes on.
+//
 // AK_SIM_SEED=<n> reruns one seed; AK_SIM_SEEDS=<n> sets how many seeds
 // the run covers. ctest runs a short sweep; `ctest -C Nightly -L nightly`
 // runs the long one.
@@ -72,6 +77,10 @@ constexpr std::uint64_t vol = 7;
 constexpr std::uint64_t att = 70;
 constexpr std::uint32_t bs = 4096;
 constexpr std::uint64_t blocks = 32;  // the range the workload touches
+constexpr std::uint64_t capacity = 256;
+constexpr std::uint64_t grown_capacity = 512;
+// After a grow the workload also touches this window across the old end.
+constexpr std::uint64_t window = capacity - (blocks / 2);
 constexpr std::uint16_t port = 7300;
 constexpr std::size_t max_outstanding = 4;
 
@@ -100,6 +109,10 @@ struct Params {
     // Also crash the primary at this point of the workload, down long
     // enough that the controller replaces it.
     std::optional<Clock::duration> crash_primary;
+    // Grow the volume to grown_capacity at this point of the workload.
+    std::optional<Clock::duration> grow_at;
+    // Move to a two-replica class here, and back to three 3 s later.
+    std::optional<Clock::duration> reclass_at;
 };
 
 // One guest operation and what it saw.
@@ -196,12 +209,11 @@ public:
                                    .has_value());
         }
         auto cls = m::provisioned_class();  // three replicas
-        cls.qos = {
-            .iops = 1'000'000, .mib_per_s = 100'000, .burst_iops = 1'000'000, .burst_mib = 100'000};
+        cls.qos = sim_qos();
         BOOST_TEST_REQUIRE(master
                                .create_volume({.volume_id = vol,
                                                .lineage_id = vol,
-                                               .capacity_blocks = 256,
+                                               .capacity_blocks = capacity,
                                                .block_size = bs,
                                                .volume_class = cls,
                                                .multi_attach = false,
@@ -264,6 +276,8 @@ public:
         auto next_tick = t0;
         auto next_fault = t0 + 500ms;
         bool crashed = false;
+        bool grown = false;
+        int reclass = 0;
         auto next_op = t0;
         while (now < stop + _p.settle) {
             const bool working = now < stop;
@@ -274,6 +288,18 @@ public:
             if (working && _p.crash_primary && !crashed && now >= t0 + *_p.crash_primary) {
                 crash(_holds.at(primary()), 15s);
                 crashed = true;
+            }
+            if (working && _p.grow_at && !grown && now >= t0 + *_p.grow_at) {
+                BOOST_TEST_REQUIRE(master.resize(vol, grown_capacity, mnow()).has_value());
+                grown = true;
+            }
+            if (working && _p.reclass_at && reclass < 2 &&
+                now >= t0 + *_p.reclass_at + (reclass == 0 ? 0s : 3s)) {
+                auto cls = reclass == 0 ? m::general_class() : m::provisioned_class();
+                cls.qos = sim_qos();
+                if (master.set_class(vol, cls, mnow())) {
+                    ++reclass;
+                }
             }
             if (working && _p.faults && now >= next_fault) {
                 fault();
@@ -301,6 +327,9 @@ public:
                 }
                 if (_p.crash_primary && !crashed) {
                     wake = std::min(wake, t0 + *_p.crash_primary);
+                }
+                if (_p.grow_at && !grown) {
+                    wake = std::min(wake, t0 + *_p.grow_at);
                 }
             }
             if (!_events.empty()) {
@@ -335,6 +364,11 @@ public:
     }
 
     [[nodiscard]] auto ops() const -> std::size_t { return _ops.size(); }
+    // Guest operations that touched blocks at or past `lba`.
+    [[nodiscard]] auto ops_past(std::uint64_t lba) const -> std::size_t {
+        return static_cast<std::size_t>(std::ranges::count_if(
+            _ops, [&](const auto& kv) { return kv.second.lba + kv.second.n > lba; }));
+    }
     [[nodiscard]] auto crashes() const -> std::size_t { return _crashes; }
     [[nodiscard]] auto primary_crashes() const -> std::size_t { return _primary_crashes; }
     [[nodiscard]] auto primary_now() const -> std::uint64_t { return primary(); }
@@ -378,6 +412,11 @@ private:
         std::uint64_t epoch{0};
     };
     using Event = std::variant<Frame, Dial, Closed, Deliver, Up, Grant>;
+
+    static auto sim_qos() -> proto::VolumeQos {
+        return {
+            .iops = 1'000'000, .mib_per_s = 100'000, .burst_iops = 1'000'000, .burst_mib = 100'000};
+    }
 
     // Dropped members come back within the run.
     static auto timing() -> m::Timing {
@@ -647,6 +686,9 @@ private:
         const auto p = primary();
         const auto& h = _holds.at(p);
         return in_sync() == 3 && h.up && h.server->replicating(vol) == 0 &&
+               h.server->replica(vol) != nullptr &&
+               h.server->replica(vol)->meta().capacity_blocks ==
+                   master.volume(vol)->spec.capacity_blocks &&
                h.server->queued(vol) == 0 && !h.server->reconciling(vol);
     }
 
@@ -657,8 +699,12 @@ private:
         const auto id = _next_op++;
         auto& op = _ops[id];
         op.write = _rng() % 2 == 0;
-        op.lba = _rng() % blocks;
-        op.n = std::min<std::uint64_t>(1 + (_rng() % 4), blocks - op.lba);
+        // Once the initiator has the grown capacity, half the I/O goes
+        // across the old end.
+        const bool across = core.capacity_bytes() >= grown_capacity * bs && _rng() % 2 == 0;
+        const std::uint64_t base = across ? window : 0;
+        op.lba = base + (_rng() % blocks);
+        op.n = std::min<std::uint64_t>(1 + (_rng() % 4), base + blocks - op.lba);
         op.buf.resize(op.n * bs);
         op.invoked = now;
         ++_outstanding;
@@ -734,8 +780,10 @@ private:
         auto read_all = [&](std::uint64_t id) {
             auto* r = _holds.at(id).server->replica(vol);
             BOOST_TEST_REQUIRE(r != nullptr);
-            Bytes out(blocks * bs);
-            std::vector<std::uint32_t> crcs(blocks);
+            const std::uint64_t n = master.volume(vol)->spec.capacity_blocks;
+            BOOST_TEST_REQUIRE(r->meta().capacity_blocks == n);
+            Bytes out(n * bs);
+            std::vector<std::uint32_t> crcs(n);
             auto bad = r->read(0, out, crcs);
             BOOST_TEST_REQUIRE(bad.has_value());
             const auto& reopened = _holds.at(id).reopened;
@@ -808,23 +856,72 @@ auto run_seeds(std::uint64_t first, std::uint64_t count, Params p) -> void {
 }  // namespace
 
 BOOST_AUTO_TEST_CASE(runs_without_faults, *utf::timeout(ak::test::unit_timeout_seconds)) {
-    run_seeds(
-        1, 1,
-        {.workload = 5s, .settle = 30s, .max_latency = 2ms, .faults = false, .crash_primary = {}});
+    run_seeds(1, 1,
+              {.workload = 5s,
+               .settle = 30s,
+               .max_latency = 2ms,
+               .faults = false,
+               .crash_primary = {},
+               .grow_at = {},
+               .reclass_at = {}});
 }
 
 BOOST_AUTO_TEST_CASE(survives_crashes_and_cuts, *utf::timeout(ak::test::unit_timeout_seconds)) {
-    run_seeds(
-        100, 4,
-        {.workload = 5s, .settle = 60s, .max_latency = 2ms, .faults = true, .crash_primary = {}});
+    run_seeds(100, 4,
+              {.workload = 5s,
+               .settle = 60s,
+               .max_latency = 2ms,
+               .faults = true,
+               .crash_primary = {},
+               .grow_at = {},
+               .reclass_at = {}});
+}
+
+BOOST_AUTO_TEST_CASE(grows_and_changes_class_under_load,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    // The resize reaches the members first and the initiator after; the
+    // guest's writes past the old end start only then, and every one
+    // lands on every replica. The class change drops a replica and
+    // rebuilds one while I/O goes on (Requirements 10.3-10.4).
+    World w{11,
+            {.workload = 8s,
+             .settle = 60s,
+             .max_latency = 2ms,
+             .faults = false,
+             .crash_primary = {},
+             .grow_at = 1s,
+             .reclass_at = 2s}};
+    w.run();
+    w.check();
+    BOOST_TEST(w.master.volume(vol)->spec.capacity_blocks == grown_capacity);
+    BOOST_TEST(w.core.capacity_bytes() == grown_capacity * bs);
+    BOOST_TEST(w.master.volume(vol)->spec.volume_class.replicas == 3U);
+    BOOST_TEST(w.copied() > 0U);  // the third replica was rebuilt
+    BOOST_TEST(w.ops_past(capacity) > 0U);
+}
+
+BOOST_AUTO_TEST_CASE(grows_while_holds_crash, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    run_seeds(200, 3,
+              {.workload = 5s,
+               .settle = 60s,
+               .max_latency = 2ms,
+               .faults = true,
+               .crash_primary = {},
+               .grow_at = 1500ms,
+               .reclass_at = {}});
 }
 
 BOOST_AUTO_TEST_CASE(fails_over_a_lost_primary, *utf::timeout(ak::test::unit_timeout_seconds)) {
     // No other faults: a clean failover, then the old primary comes back
     // as a joining member and is resynced into the set.
-    World w{
-        7,
-        {.workload = 5s, .settle = 60s, .max_latency = 2ms, .faults = false, .crash_primary = 2s}};
+    World w{7,
+            {.workload = 5s,
+             .settle = 60s,
+             .max_latency = 2ms,
+             .faults = false,
+             .crash_primary = 2s,
+             .grow_at = {},
+             .reclass_at = {}}};
     const auto first = w.primary_now();
     w.run();
     w.check();
@@ -835,7 +932,12 @@ BOOST_AUTO_TEST_CASE(fails_over_a_lost_primary, *utf::timeout(ak::test::unit_tim
 
 // The nightly sweep (ctest -C Nightly -L nightly): many more seeds.
 BOOST_AUTO_TEST_CASE(long_sweep, *utf::disabled()) {
-    run_seeds(
-        10'000, 500,
-        {.workload = 60s, .settle = 120s, .max_latency = 5ms, .faults = true, .crash_primary = {}});
+    run_seeds(10'000, 500,
+              {.workload = 60s,
+               .settle = 120s,
+               .max_latency = 5ms,
+               .faults = true,
+               .crash_primary = {},
+               .grow_at = {},
+               .reclass_at = {}});
 }

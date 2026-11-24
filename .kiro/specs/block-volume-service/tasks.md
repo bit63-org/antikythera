@@ -110,9 +110,12 @@ repository. Prerequisites outside this spec: oar-blk task 14
 - [ ] 18. Multi-attach: several attachments per config, `rw`/`ro` mix,
   per-server `VolumeKey`, harbor test with VMs on two servers writing
   disjoint and overlapping ranges. _Requirements: 4_ (cloud, then tikhov)
-- [ ] 19. Elastic volumes: online grow with virtio-blk config-change
+- [x] 19. Elastic volumes: online grow with virtio-blk config-change
   interrupt and parser bound update, QoS and class changes, replica-count
-  changes. _Requirements: 10.3-10.4_ (cloud)
+  changes. _Requirements: 10.3-10.4_ (cloud) As built: crash-safe
+  `ReplicaStore::grow` (meta rebuilt aside and renamed in), hold grows on
+  the resize epoch, `InitiatorCore` and `VirtioBlkFunction::grow`,
+  `Master::set_class`; simulation cases under load and crashes.
 
 ### Phase F: snapshots and restore
 

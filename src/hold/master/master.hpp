@@ -33,6 +33,12 @@
 //                 highest reported sequence once its lease has run out
 //                 (6.6); with no in-sync replica left the volume is
 //                 io_suspended and impaired until enable_io() (6.8).
+//   elasticity    resize() grows a volume (never shrinks it) and set_qos()
+//                 changes its limits, each at a new epoch; set_class()
+//                 changes its class: the class's limits at once, and its
+//                 replica count through the rules below, a rebuild for
+//                 each replica added and an immediate removal for each
+//                 one dropped (10.3-10.4).
 //   rebuild       a volume short of its replication factor gets a joining
 //                 replica: the same server when a replica it lost comes
 //                 back (or still reachable, after rejoin_after) within the
@@ -60,8 +66,8 @@
 // and a member that has not applied the current epoch is sent its config
 // again. Frames leave unsigned with no key_id: the transport signs them.
 //
-// Not modelled here: clones, scrub scheduling, hydration progress and
-// class changes that alter the replica count (later tasks).
+// Not modelled here: clones, scrub scheduling and hydration progress
+// (later tasks).
 
 #include <chrono>
 #include <cstddef>
@@ -281,6 +287,18 @@ public:
     [[nodiscard]] auto resize(std::uint64_t volume, std::uint64_t capacity_blocks, Time now)
         -> std::expected<void, Error>;
     [[nodiscard]] auto set_qos(std::uint64_t volume, const proto::VolumeQos& qos, Time now)
+        -> std::expected<void, Error>;
+    // Moves the volume to class `cls` while it stays attached
+    // (Requirement 10.4): its QoS becomes the class's at a new epoch. With
+    // more replicas, tick() adds them as rebuilds (Requirement 7); with
+    // fewer, the surplus leaves in that same epoch and its replicas are
+    // deleted: joining ones first, then secondaries on a draining server,
+    // on a server that is down, on the fullest server. The primary and a
+    // move's source and target never leave this way. Refused: a class
+    // without multi-attach for a multi-attach volume (multi_attach_needed),
+    // and fewer replicas while a move runs (busy) or with I/O suspended or
+    // a failover pending (suspended).
+    [[nodiscard]] auto set_class(std::uint64_t volume, const VolumeClass& cls, Time now)
         -> std::expected<void, Error>;
     // Resumes an io_suspended volume from its best surviving replica,
     // accepting the loss of recent writes (Requirement 6.8).

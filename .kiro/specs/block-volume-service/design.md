@@ -634,6 +634,44 @@ before helm reports the release.
 - **Class or limit change**: a new epoch with new QoS numbers; a change of
   replica count adds or removes members as in "Moving volumes".
 
+As built (task 19):
+
+- **Grow on a member.** `ReplicaStore::grow` builds the next `meta` aside
+  as `meta.new` (every region after the checksums moves with the
+  capacity), syncs it, extends `data` and syncs it, then renames
+  `meta.new` over `meta` and syncs the directory, so a crash leaves the
+  old replica or the grown one. `open()` removes a leftover `meta.new` and
+  cuts `data` back to the old capacity. The cost is one pass over the
+  checksum array (4 bytes per block). The hold role grows its replica when
+  it applies the resize epoch, before recording that epoch, and grows a
+  replica it finds smaller on disk (a member that missed the resize);
+  smaller configs are refused. A replica created later starts at the new
+  size.
+- **Restored volumes.** The `meta` header gains `source_blocks` (in what
+  was reserved space, 0 unless a volume with a source grew): blocks past
+  it never await hydration, so a never-written block there reads as zeros
+  with CRC 0, as on a volume without a source, while zeros without a
+  checksum inside the source are still a torn write.
+- **Initiator and guest.** `InitiatorCore::set_route` takes a larger
+  capacity and new QoS limits from a later config (a smaller capacity or
+  another block size is refused). oar-blk's role then calls
+  `VirtioBlkFunction::grow`, which moves the parser's bound, rewrites
+  `virtio_blk_config.capacity`, bumps `config_generation` and raises the
+  configuration-change interrupt. The master publishes members first, so
+  the hold has grown before an initiator sends a request past the old end;
+  a request at the new epoch that reaches a member still at the old one
+  is redirected like any other epoch skew.
+- **Class changes** (`Master::set_class`): the class's QoS at a new epoch;
+  more replicas join through ordinary rebuild on the next tick; fewer leave
+  in that same epoch, a joining replica first, then a secondary on a
+  draining server, on a down server, on the fullest server, never the
+  primary nor a move's source or target, and their replicas are deleted.
+  Fewer replicas are refused while a move runs or I/O is suspended, and a
+  class without multi-attach for a multi-attach volume.
+- The simulation grows the volume and changes its class under load,
+  with and without crashes (`grows_and_changes_class_under_load`,
+  `grows_while_holds_crash`).
+
 ## Snapshots
 
 ### Format: image manifest version 2

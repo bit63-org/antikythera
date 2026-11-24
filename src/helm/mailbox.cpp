@@ -110,9 +110,15 @@ auto write_device(wire::Writer& w, const DeviceRef& d) -> void {
     w.le16(d.function);
 }
 
+// DETACH_DEVICE: force or destroy_vm.
 constexpr auto valid_policy(std::uint8_t raw) noexcept -> bool {
     return raw == std::to_underlying(DetachPolicy::force) ||
            raw == std::to_underlying(DetachPolicy::destroy_vm);
+}
+
+// DETACH_VOLUME also takes wait (cooperative detach).
+constexpr auto valid_volume_policy(std::uint8_t raw) noexcept -> bool {
+    return valid_policy(raw) || raw == std::to_underlying(DetachPolicy::wait);
 }
 
 constexpr auto valid_timeout(std::uint16_t t) noexcept -> bool {
@@ -296,7 +302,7 @@ auto decode_detach_volume(const Message& msg) noexcept -> std::expected<DetachVo
     const std::uint8_t policy = *r->u8();
     const std::uint8_t rsvd = *r->u8();
     if (out.volume_id == 0 || out.vm_id == 0 || !dev || dev->type != DeviceType::blk_fn ||
-        !valid_timeout(out.timeout_s) || !valid_policy(policy) || rsvd != reserved_byte) {
+        !valid_timeout(out.timeout_s) || !valid_volume_policy(policy) || rsvd != reserved_byte) {
         return invalid();
     }
     out.device = *dev;

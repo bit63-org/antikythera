@@ -82,11 +82,39 @@
 //                  prepare_function with the attachment, which opens the
 //                  role's session to the primary; commit: open the key in
 //                  the secure element and deliver it.
-//   DETACH_VOLUME  only by the VM that attached; commit: release the
+//   DETACH_VOLUME  only by the VM that attached; under force or
+//                  destroy_vm only once the newest config no longer lists
+//                  the attachment's generation (the controller fenced it,
+//                  Requirement 3.5), else conflict; commit: release the
 //                  function (cleaning closes the session) and forget the
 //                  attachment's key.
 //   DELETE_VOLUME, REWRAP_VOLUME are the controller's (no mailbox command):
 //                  unknown_volume, as for any volume helm does not hold.
+//
+// Cooperative detach (.kiro/specs/block-volume-service/ Requirements
+// 3.3-3.6, design "Detach blocked while mounted"). DETACH_VOLUME under the
+// `wait` policy, for every volume kind:
+//
+//   1. Prepare as for any detach, then eject(request) on the storage role,
+//      which sets eject_requested in the function's vendor capability and
+//      interrupts the guest. A role that refuses fails the command.
+//   2. Hold the command, unrelayed, while the mailbox waits (no other
+//      command passes it: hull's sequence check would refuse it relayed
+//      out of order). Every eject_poll_interval, query the role.
+//   3. Released (the driver reset the device and left it alone, with no
+//      request of its own still in the backend): relay the slot to hull
+//      unmodified; it is in flight as usual from then on, and hull's
+//      hot-unplug meets a device the guest already let go of.
+//   4. Not released by timeout_s: answer `busy` without relaying. The
+//      volume stays attached and serving, and the request stays set so a
+//      guest that lets go later still can; helm keeps querying and reports
+//      the release (an attachment_status for a network volume). The
+//      controller then sends DETACH_VOLUME again, which finds the release
+//      and relays at once, or a forced detach.
+//
+// Network volumes report attachment_status eject_requested, released and
+// busy as they happen. Local and image volumes have no attachment to name
+// (the report needs one), so for them the command's outcome is the report.
 //
 // A media step that fails after commit (delete or rewrap) cannot be undone
 // either: it is counted in storage_failures. A failed delete leaves only
@@ -210,6 +238,11 @@ public:
         return std::unexpected(
             LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported});
     }
+    // Cooperative detach, to the storage role.
+    virtual auto eject(const oar::Eject& /*request*/) -> std::expected<oar::EjectState, LinkError> {
+        return std::unexpected(
+            LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported});
+    }
 };
 
 class OarLinkPort final : public OarPort {
@@ -230,6 +263,7 @@ public:
     auto group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError> override;
     auto replica_config(std::span<const std::byte> frame)
         -> std::expected<void, LinkError> override;
+    auto eject(const oar::Eject& request) -> std::expected<oar::EjectState, LinkError> override;
 
 private:
     OarLink* _link;
@@ -258,6 +292,10 @@ struct RouterConfig {
     std::chrono::milliseconds release_timeout{std::chrono::seconds{60}};
     // How long a GPU function may wait in `cleaning` for SCRUB_DONE.
     std::chrono::milliseconds clean_timeout{std::chrono::minutes{10}};
+    // How often a cooperative detach asks the storage role whether the
+    // guest released the function. The role needs 2 s of quiet to call a
+    // function released, so finer polling buys little.
+    std::chrono::milliseconds eject_poll_interval{std::chrono::milliseconds{500}};
     // This server (the ControllerSession's): network volume attachments
     // naming it are the ones it serves.
     std::uint64_t server_id{0};
@@ -279,6 +317,8 @@ struct RouterStats {
     std::uint64_t inconsistencies{0};        // hull confirmed something helm's state disagrees with
     std::uint64_t key_delivery_failures{0};  // ATTACH_VOLUME succeeded, the key did not arrive
     std::uint64_t storage_failures{0};       // a committed delete or rewrap failed on the media
+    std::uint64_t detaches_released{0};      // cooperative detaches the guest released
+    std::uint64_t detaches_busy{0};          // cooperative detaches answered busy
 };
 
 class CommandRouter {
@@ -321,7 +361,14 @@ public:
     // ControllerSession to fill in, core and page counts for hull's report.
     [[nodiscard]] auto inventory() const -> proto::Inventory;
     [[nodiscard]] auto stats() const noexcept -> const RouterStats& { return _stats; }
-    [[nodiscard]] auto busy() const noexcept -> bool { return _in_flight.has_value(); }
+    // A command holds the mailbox: relayed and unanswered, or a
+    // cooperative detach waiting for the guest.
+    [[nodiscard]] auto busy() const noexcept -> bool {
+        return _in_flight.has_value() || _waiting.has_value();
+    }
+    // Functions whose guest has been asked to release them and that are
+    // still attached (waiting, busy or released but not yet detached).
+    [[nodiscard]] auto ejecting() const noexcept -> std::size_t { return _ejecting.size(); }
     [[nodiscard]] auto queued() const noexcept -> std::size_t { return _queue.size(); }
 
 private:
@@ -343,6 +390,23 @@ private:
         mailbox::Body body;
         Undo undo;
         Clock::time_point deadline;
+    };
+
+    // A DETACH_VOLUME under `wait`, held until the guest releases the
+    // function (relayed then) or timeout_s passes (busy).
+    struct Waiting {
+        std::uint64_t seq{0};
+        mailbox::Slot slot{};
+        mailbox::DetachVolume body;
+        Clock::time_point deadline;
+    };
+
+    // A function whose guest was asked to release it.
+    struct Ejecting {
+        VolumeId volume{0};
+        bool busy{false};      // a detach timed out on it
+        bool released{false};  // the role said so (reported once)
+        Clock::time_point next_query;
     };
 
     struct Vm {
@@ -371,6 +435,24 @@ private:
     [[nodiscard]] auto now() const -> Clock::time_point;
     auto pump() -> void;
     auto dispatch(const proto::Envelope& envelope) -> void;
+    // Audits, writes the slot to the mailbox and puts the command in flight;
+    // compensates and refuses if either fails.
+    auto relay(std::uint64_t seq, const mailbox::Slot& slot, const mailbox::Body& body, Undo undo)
+        -> void;
+    // Cooperative detach: asks the guest to release, then relays or waits.
+    auto start_wait(std::uint64_t seq, const mailbox::Slot& slot,
+                    const mailbox::DetachVolume& detach) -> void;
+    // Asks the role where a function stands; records and reports a release.
+    // nullopt if the role could not be asked.
+    auto query_eject(FunctionId id) -> std::optional<oar::EjectState>;
+    // Records a role's answer: the first `released` is audited and reported.
+    auto note_eject(FunctionId id, oar::EjectState state) -> void;
+    auto poll_ejects(Clock::time_point t) -> void;
+    // attachment_status for a network volume attached here (no-op otherwise).
+    auto report_attachment(VolumeId volume, std::uint8_t slot, proto::AttachmentState state)
+        -> void;
+    // A network volume's attachment generation is gone from its newest config.
+    [[nodiscard]] auto fenced(const NetworkVolume& net) const -> bool;
     auto prepare(std::uint64_t seq, const mailbox::Body& body, Undo& undo)
         -> std::expected<void, mailbox::Status>;
     auto reserve(VmId vm, const mailbox::DeviceRef& device, Undo& undo)
@@ -423,6 +505,8 @@ private:
     std::uint64_t _last_seq;
     std::deque<proto::Envelope> _queue;
     std::optional<InFlight> _in_flight;
+    std::optional<Waiting> _waiting;
+    std::map<FunctionId, Ejecting> _ejecting;
     std::set<std::uint64_t> _timed_out;         // relayed, timed out, answer not yet seen
     std::map<std::uint64_t, Outcome> _history;  // finished outcomes, for retries
 

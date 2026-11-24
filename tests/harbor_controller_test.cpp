@@ -182,6 +182,13 @@ BOOST_AUTO_TEST_CASE(commands_parse_to_their_bodies) {
                     .nic_id = 0x10,
                     .mac = {std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
                             std::byte{0x10}}}}));
+    BOOST_TEST((body_of("detach-volume 9 7 2 1 30 wait") ==
+                mb::Body{mb::DetachVolume{
+                    .volume_id = 9,
+                    .vm_id = 7,
+                    .device = {.slot = 2, .type = mb::DeviceType::blk_fn, .function = 1},
+                    .timeout_s = 30,
+                    .policy = mb::DetachPolicy::wait}}));
     BOOST_TEST((body_of("destroy-vm 7 persist") ==
                 mb::Body{mb::DestroyVm{.vm_id = 7, .persist_volumes = true}}));
     {

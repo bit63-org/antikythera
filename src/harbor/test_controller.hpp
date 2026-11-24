@@ -36,7 +36,9 @@
 //                        image volume (oar-blk Requirement 8)
 //   delete-volume VOLUME
 //   attach-volume VOLUME VM SLOT FN
-//   detach-volume VOLUME VM SLOT FN TIMEOUT_S force|destroy-vm
+//   detach-volume VOLUME VM SLOT FN TIMEOUT_S force|destroy-vm|wait
+//                        wait: cooperative detach; `busy` if the guest
+//                        holds the disk past TIMEOUT_S
 //   rewrap-volume VOLUME FROM_VM TO_VM
 //   create-network VNI
 //   delete-network VNI
@@ -51,7 +53,8 @@
 //                        the WireGuard peers of this server's VTEP; KEY is the
 //                        peer's X25519 public key as 64 hex digits
 //   expect STATUS        the last command's outcome must be STATUS
-//                        (ok, accepted, bad_signature, stale_sequence, wrong_server, ...)
+//                        (ok, accepted, bad_signature, stale_sequence, wrong_server,
+//                        busy, ...)
 //   wait KIND            wait for a report of KIND (inventory, command_outcome,
 //                        pool_state, vm_exited, map_applied, host_fault,
 //                        group_usage, replica_status, volume_fault,

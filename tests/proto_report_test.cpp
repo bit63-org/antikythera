@@ -367,6 +367,8 @@ BOOST_AUTO_TEST_CASE(enums_match_helm_and_the_mailbox) {
                   static_cast<int>(mb::Status::unsupported));
     static_assert(static_cast<int>(proto::CommandStatus::wrong_server) ==
                   static_cast<int>(mb::Status::wrong_server));
+    static_assert(static_cast<int>(proto::CommandStatus::busy) ==
+                  static_cast<int>(mb::Status::busy));
     static_assert(static_cast<int>(proto::ExitReason::vmm_failure) ==
                   static_cast<int>(mb::ExitReason::vmm_failure));
     static_assert(static_cast<int>(proto::FaultCode::resources_exhausted) ==
@@ -608,7 +610,7 @@ BOOST_AUTO_TEST_CASE(event_rules) {
         {proto::CommandOutcome{.in_reply_to = 1, .command = 0, .payload = {}}, DecodeError::bad_id},
         {proto::CommandOutcome{.in_reply_to = 1,
                                .command = 1,
-                               .status = static_cast<proto::CommandStatus>(14),
+                               .status = static_cast<proto::CommandStatus>(15),
                                .payload = {}},
          DecodeError::unknown_value},
         {proto::CommandOutcome{.in_reply_to = 1,

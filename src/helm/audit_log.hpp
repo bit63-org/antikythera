@@ -65,6 +65,9 @@ enum class AuditEvent : std::uint8_t {
     volume_key_rewrapped,  // vm = the new owner
     volume_key_destroyed,
     volume_key_delivery_failed,  // ATTACH_VOLUME succeeded but the key did not reach the role
+    eject_requested,             // cooperative detach: the guest was asked to release the function
+    eject_released,              // the guest released it (helm may now relay the detach)
+    detach_busy,                 // the guest did not release it by the command's timeout
 };
 
 [[nodiscard]] auto to_string(AuditEvent e) noexcept -> const char*;

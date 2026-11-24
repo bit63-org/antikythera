@@ -1,6 +1,6 @@
 # Implementation Plan — hold: the fault-tolerant block volume service
 
-## Status: 0/24 tasks complete
+## Status: 13/24 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -77,12 +77,16 @@ repository. Prerequisites outside this spec: oar-blk task 14
   opened with HPKE in the secure element (software SE first), network
   volume attach in the CommandRouter, enrollment of the SE public key
   and role certificates. _Requirements: 9.3, 12.2-12.3, 13.1_ (cloud)
-- [ ] 13. Cooperative detach for every volume kind: vendor virtio
+- [x] 13. Cooperative detach for every volume kind: vendor virtio
   capability with `eject_requested`, release detection in
   `VirtioBlkFunction`, mailbox `DetachPolicy::wait`, `busy` reporting,
   forced detach after fencing; hull Requirement 7.2 amendment; the
   `guest/ak-guest-eject` helper with a udev rule and shellcheck.
   _Requirements: 3.3-3.6_ (cloud)
+  Not yet: a mailbox command to withdraw a pending request (a busy
+  request stays set until the guest releases, a forced detach, or the
+  VM goes); hull's own `vm.remove-device` path (hull task 9) and the
+  harbor run with a real guest (task 15).
 - [ ] 14. controller-interface and backplane spec updates: a
   management-fabric port on storage-capable data-plane slots, the storage
   VLAN and traffic classes (backplane), and EC2 mapping of

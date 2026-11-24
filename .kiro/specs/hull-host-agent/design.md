@@ -68,6 +68,14 @@ exec `cloud-hypervisor` with:
 Attach/detach use Cloud Hypervisor's `vm.add-device` / `vm.remove-device`
 over the API socket.
 
+`DETACH_VOLUME` under the `wait` policy (Requirement 7.2) reaches the
+agent only after helm has seen the guest release the function through
+the oar-blk vendor capability (block-volume-service design "Detach
+blocked while mounted"), so `vm.remove-device` completes without a guest
+eject wait and the timeout and policy are not applied. helm answers a
+guest that never releases with `busy` itself; the agent never sees that
+command.
+
 ### Reset
 
 - Whole-slot functions: secondary bus reset through the downstream port's

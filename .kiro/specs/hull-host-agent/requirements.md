@@ -122,8 +122,14 @@ passthrough only, so that the host never touches device data.
 
 1. `ATTACH_DEVICE` SHALL hot-plug a function into a running VM via the
    VMM's API socket (inside the jail).
-2. `DETACH_DEVICE` SHALL request guest eject, wait up to the command's
-   timeout, then apply the command's policy (`force` or `destroy_vm`).
+2. `DETACH_DEVICE` and `DETACH_VOLUME` SHALL request guest eject, wait
+   up to the command's timeout, then apply the command's policy (`force`
+   or `destroy_vm`). Under `DETACH_VOLUME`'s third policy, `wait`
+   (cooperative detach, block-volume-service Requirement 3.3), the agent
+   SHALL NOT eject before helm reports the guest's release: helm relays
+   such a command only after the storage role has seen the guest let go
+   of the function, so the agent hot-unplugs at once and never forces or
+   destroys the VM for it. `DETACH_DEVICE` does not take `wait`.
 3. After detach the function SHALL be reset and released exactly as in
    Requirement 6.3.
 

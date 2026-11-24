@@ -23,6 +23,13 @@
 // client, pinning the member's IP SAN), so a dead member never stalls the
 // loop; run_once() takes the finished ones, keeps a connection only if its
 // certificate names the member's server ID, and tells the server.
+//
+// Enrollment (task 12): a node may start before it has a certificate
+// (NodeConfig::tls with an empty cert_pem). Until set_tls() gives it one
+// it listens but closes every connection unanswered and every dial fails,
+// so peers see it as unreachable, never as a server without an identity.
+// set_tls() also takes a renewed certificate: new connections and dials
+// use it, established ones keep theirs.
 
 #include <chrono>
 #include <cstddef>
@@ -53,7 +60,8 @@ using proto::storage_io_tos;
 struct NodeConfig {
     std::string host;       // the storage segment address to listen on
     std::uint16_t port{0};  // 0: any free port (see Node::port)
-    tls::Config tls;        // role server; peer_name empty; also dials members
+    tls::Config tls;        // role server; peer_name empty; also dials members (empty cert_pem:
+                            // no certificate yet, see set_tls)
     ServerConfig server;
     std::chrono::milliseconds handshake_timeout{5000};
     std::chrono::milliseconds write_timeout{5000};
@@ -74,6 +82,12 @@ public:
     [[nodiscard]] auto port() const noexcept -> std::uint16_t { return _listener.port(); }
     [[nodiscard]] auto server() noexcept -> HoldServer& { return _server; }
     [[nodiscard]] auto connections() const noexcept -> std::size_t { return _conns.size(); }
+
+    // The node's certificate, first or renewed (role and peer_name are
+    // set here). Fails, keeping what it had, if the configuration does
+    // not load.
+    auto set_tls(tls::Config config) -> std::expected<void, tls::Error>;
+    [[nodiscard]] auto has_identity() const noexcept -> bool { return _ctx.has_value(); }
 
     // Waits up to max_wait for work, then does it. `extra_fd` (if not -1)
     // is waited on too, for the caller's own work (helm's sideband): true
@@ -111,8 +125,8 @@ private:
         std::vector<Dialed> done;
     };
 
-    Node(store::FileLayer& files, NodeConfig config, tls::Context ctx, tls::Listener listener,
-         int dial_wake) noexcept;
+    Node(store::FileLayer& files, NodeConfig config, std::optional<tls::Context> ctx,
+         tls::Listener listener, int dial_wake) noexcept;
 
     auto accept() -> void;
     auto read(Connection& c, Clock::time_point now) -> void;
@@ -120,7 +134,7 @@ private:
     auto take_dials(Clock::time_point now) -> void;
 
     NodeConfig _config;
-    tls::Context _ctx;
+    std::optional<tls::Context> _ctx;  // empty until the node has a certificate
     tls::Listener _listener;
     HoldServer _server;
     std::map<SessionId, Connection> _conns;

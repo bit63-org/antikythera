@@ -225,6 +225,26 @@ auto OarLink::tunnel_peers(std::span<const std::byte> frame) -> std::expected<vo
     return send_chunked(mctp::VendorType::tunnel_peers, frame);
 }
 
+auto OarLink::role_certificate(std::span<const std::byte> chain) -> std::expected<void, LinkError> {
+    if (chain.empty() || chain.size() > oar::max_cert_chain) {
+        return std::unexpected(bad_request());
+    }
+    return send_chunked(mctp::VendorType::role_certificate, chain);
+}
+
+auto OarLink::cert_request() -> std::expected<CertRequest, LinkError> {
+    std::vector<std::byte> body;
+    auto response = transact(mctp::VendorType::cert_request, body);
+    if (!response) {
+        return std::unexpected(response.error());
+    }
+    auto answer = oar::decode_cert_answer(*response);
+    if (!answer) {
+        return std::unexpected(LinkError{.code = LinkErrc::bad_response});
+    }
+    return CertRequest{.role = answer->role, .csr = {answer->csr.begin(), answer->csr.end()}};
+}
+
 auto OarLink::send_chunked(mctp::VendorType type, std::span<const std::byte> frame)
     -> std::expected<void, LinkError> {
     const auto total = static_cast<std::uint32_t>(frame.size());
@@ -587,7 +607,19 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
         }
         case mctp::VendorType::map_update:
         case mctp::VendorType::tunnel_peers:
+        case mctp::VendorType::role_certificate:
             return status_only(frame_chunk(handler, type, body));
+        case mctp::VendorType::cert_request: {
+            if (!oar::decode_empty(body)) {
+                return status_only(oar::Status::bad_request);
+            }
+            auto answer = handler.cert_request();
+            if (!answer) {
+                return status_only(answer.error() == oar::Status::ok ? oar::Status::failed
+                                                                     : answer.error());
+            }
+            return with_body(oar::encode_cert_answer(*answer));
+        }
         case mctp::VendorType::group_policy: {
             auto frame = oar::decode_group_policy_frame(body);
             return status_only(frame ? handler.group_policy(*frame) : oar::Status::bad_request);
@@ -649,8 +681,9 @@ auto OarEndpoint::frame_chunk(OarHandler& handler, mctp::VendorType type,
         reset_frame();
         return oar::Status::bad_request;
     }
-    const std::size_t limit =
-        type == mctp::VendorType::map_update ? oar::max_map_frame : oar::max_tunnel_peers_frame;
+    const std::size_t limit = type == mctp::VendorType::map_update     ? oar::max_map_frame
+                              : type == mctp::VendorType::tunnel_peers ? oar::max_tunnel_peers_frame
+                                                                       : oar::max_cert_chain;
     if (chunk->offset == 0) {
         // A new transfer; whatever was in progress is abandoned.
         reset_frame();
@@ -669,8 +702,9 @@ auto OarEndpoint::frame_chunk(OarHandler& handler, mctp::VendorType type,
     if (_frame.size() < _frame_total) {
         return oar::Status::ok;
     }
-    const auto status = type == mctp::VendorType::map_update ? handler.map_update(_frame)
-                                                             : handler.tunnel_peers(_frame);
+    const auto status = type == mctp::VendorType::map_update     ? handler.map_update(_frame)
+                        : type == mctp::VendorType::tunnel_peers ? handler.tunnel_peers(_frame)
+                                                                 : handler.role_certificate(_frame);
     reset_frame();
     return status;
 }

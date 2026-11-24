@@ -23,6 +23,8 @@
 //   hold_reports        pump() moves HoldServer::take_reports into an
 //                       oar::ReportQueue as encoded proto::Reports
 //                       numbered from a random start, which helm drains
+//   cert_request,       the role's storage identity (enrollment), when
+//   role_certificate    set_enrollment gave it one; unsupported otherwise
 //
 // A refusal answers failed (a frame that decodes but fails its checks) or
 // bad_request (one that does not decode). Single-threaded: call it from
@@ -35,6 +37,7 @@
 #include <span>
 
 #include "helm/oar_link.hpp"
+#include "helm/role_enrollment.hpp"
 #include "hold/server/server.hpp"
 
 namespace ak::hold {
@@ -64,6 +67,12 @@ public:
     // Takes what the server has for helm's report path.
     auto pump(Clock::time_point now) -> void;
 
+    // Enrollment: answer cert_request and role_certificate through
+    // `enrollment`, which must outlive the role.
+    auto set_enrollment(helm::RoleEnrollment& enrollment) noexcept -> void {
+        _enrollment = &enrollment;
+    }
+
     auto function_inventory() -> std::expected<oar::Inventory, oar::Status> override;
     auto prepare_function(const oar::PrepareFunction& request) -> oar::Status override;
     auto clean_function(const oar::CleanFunction& request) -> oar::Status override;
@@ -76,6 +85,8 @@ public:
     auto lease_grant(const oar::LeaseGrant& grant) -> oar::Status override;
     auto hold_reports(const oar::ReportRequest& request)
         -> std::expected<oar::ReportChunk, oar::Status> override;
+    auto cert_request() -> std::expected<oar::CertAnswer, oar::Status> override;
+    auto role_certificate(std::span<const std::byte> chain) -> oar::Status override;
 
     [[nodiscard]] auto stats() const noexcept -> const HoldRoleStats& { return _stats; }
     [[nodiscard]] auto queued_reports() const noexcept -> std::size_t { return _reports.size(); }
@@ -91,6 +102,7 @@ private:
     Clock::time_point _started;
     oar::ReportQueue _reports;
     HoldRoleStats _stats;
+    helm::RoleEnrollment* _enrollment{nullptr};
 };
 
 }  // namespace ak::hold

@@ -147,6 +147,16 @@ public:
     // time.
     auto hold_reports(std::size_t max)
         -> std::expected<std::vector<std::vector<std::byte>>, LinkError>;
+    // Enrollment, to a storage role: its certificate request (empty while
+    // it wants none), and the controller's certificate chain for it, sent
+    // in chunks; fails without sending if the chain is empty or larger
+    // than oar::max_cert_chain.
+    struct CertRequest {
+        oar::Role role{oar::Role::blk};
+        std::vector<std::byte> csr;
+    };
+    auto cert_request() -> std::expected<CertRequest, LinkError>;
+    auto role_certificate(std::span<const std::byte> chain) -> std::expected<void, LinkError>;
 
     [[nodiscard]] auto stats() const noexcept -> const LinkStats& { return _stats; }
 
@@ -159,7 +169,8 @@ private:
         -> std::expected<void, LinkError>;
     auto await_response(mctp::VendorType type, std::uint8_t tag)
         -> std::expected<std::vector<std::byte>, LinkError>;
-    // Sends a frame as consecutive chunks of `type` (map_update, tunnel_peers).
+    // Sends a frame as consecutive chunks of `type` (map_update,
+    // tunnel_peers, role_certificate).
     auto send_chunked(mctp::VendorType type, std::span<const std::byte> frame)
         -> std::expected<void, LinkError>;
 
@@ -246,6 +257,16 @@ public:
         -> std::expected<oar::ReportChunk, oar::Status> {
         return std::unexpected(oar::Status::unsupported);
     }
+    // Enrollment, which only storage roles (blk, hold) take part in. The
+    // answer's csr must stay valid until the call returns to the endpoint;
+    // `chain` (a whole, reassembled chain, not yet parsed) only during the
+    // call.
+    virtual auto cert_request() -> std::expected<oar::CertAnswer, oar::Status> {
+        return std::unexpected(oar::Status::unsupported);
+    }
+    virtual auto role_certificate(std::span<const std::byte> /*chain*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
 };
 
 class OarEndpoint {
@@ -267,7 +288,7 @@ public:
 private:
     auto dispatch(OarHandler& handler, mctp::VendorType type, std::span<const std::byte> body)
         -> std::vector<std::byte>;
-    // One chunk of a map_update or tunnel_peers transfer.
+    // One chunk of a map_update, tunnel_peers or role_certificate transfer.
     auto frame_chunk(OarHandler& handler, mctp::VendorType type, std::span<const std::byte> body)
         -> oar::Status;
     auto reset_frame() noexcept -> void;

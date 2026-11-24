@@ -923,6 +923,50 @@ auto decode_report_chunk(std::span<const std::byte> body) noexcept
     return c;
 }
 
+auto encode_cert_answer(const CertAnswer& a) -> std::expected<std::vector<std::byte>, BodyError> {
+    if (a.role != Role::blk && a.role != Role::hold) {
+        return std::unexpected(BodyError::unknown_enum);
+    }
+    if (a.csr.size() > max_csr) {
+        return std::unexpected(BodyError::bad_csr);
+    }
+    std::vector<std::byte> out;
+    out.reserve(cert_answer_head_size + a.csr.size());
+    wire::Writer w{out};
+    w.u8(static_cast<std::uint8_t>(a.role));
+    w.u8(0);
+    w.le16(static_cast<std::uint16_t>(a.csr.size()));
+    w.bytes(a.csr);
+    return out;
+}
+
+auto decode_cert_answer(std::span<const std::byte> body) noexcept
+    -> std::expected<CertAnswer, BodyError> {
+    if (body.size() < cert_answer_head_size) {
+        return std::unexpected(BodyError::truncated);
+    }
+    wire::Reader r{body};
+    const auto role = static_cast<Role>(r.u8().value_or(0));
+    const auto reserved = r.u8().value_or(0);
+    const auto len = r.le16().value_or(0);
+    if (reserved != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    if (role != Role::blk && role != Role::hold) {
+        return std::unexpected(BodyError::unknown_enum);
+    }
+    if (len > max_csr) {
+        return std::unexpected(BodyError::bad_csr);
+    }
+    if (r.remaining() < len) {
+        return std::unexpected(BodyError::truncated);
+    }
+    if (r.remaining() > len) {
+        return std::unexpected(BodyError::trailing_bytes);
+    }
+    return CertAnswer{.role = role, .csr = r.rest()};
+}
+
 auto ReportQueue::push(std::uint64_t seq, std::vector<std::byte> report) -> bool {
     if (seq == 0 || report.empty() || report.size() > max_role_report) {
         return false;
@@ -1242,6 +1286,8 @@ auto to_string(BodyError e) noexcept -> const char* {
             return "zero_key";
         case BodyError::bad_image:
             return "bad_image";
+        case BodyError::bad_csr:
+            return "bad_csr";
         case BodyError::status_with_body:
             return "status_with_body";
     }

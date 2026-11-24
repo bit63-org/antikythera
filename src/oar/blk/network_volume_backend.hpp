@@ -71,6 +71,9 @@ public:
 
     // helm: the volume's ReplicaConfig, first and after each change.
     [[nodiscard]] auto set_route(const proto::ReplicaConfig& c) -> std::expected<void, RouteError>;
+    // A renewed storage certificate: the next connection presents it; an
+    // open session keeps the one it was made with.
+    auto set_tls(const tls::Config& config) -> void;
     [[nodiscard]] auto routed() const noexcept -> bool;
     [[nodiscard]] auto fenced() const noexcept -> bool;
     [[nodiscard]] auto take_faults() -> std::vector<InitiatorFault>;

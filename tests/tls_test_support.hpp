@@ -11,9 +11,12 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include <cstddef>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ak::test {
 
@@ -119,7 +122,42 @@ public:
         return {.cert = detail::to_pem(cert.get()), .key = detail::to_pem(key.get())};
     }
 
+    // Signs a DER certificate request (checking its signature) the way the
+    // controller's CA would: the request's key, with `san` as the CA
+    // decides it, valid from `from` to `until` seconds from now. Returns
+    // the DER leaf.
+    [[nodiscard]] auto sign_request(std::span<const std::byte> csr, const std::string& san,
+                                    long from = -60, long until = 3600) -> std::vector<std::byte> {
+        const auto* p = reinterpret_cast<const unsigned char*>(csr.data());
+        std::unique_ptr<X509_REQ, decltype(&X509_REQ_free)> req{
+            d2i_X509_REQ(nullptr, &p, static_cast<long>(csr.size())), &X509_REQ_free};
+        detail::require(req != nullptr, "d2i_X509_REQ");
+        EVP_PKEY* pub = X509_REQ_get0_pubkey(req.get());
+        detail::require(pub != nullptr && X509_REQ_verify(req.get(), pub) == 1, "X509_REQ_verify");
+        auto cert = detail::make_cert("storage", pub, _cert.get(), ++_serial);
+        X509_gmtime_adj(X509_getm_notBefore(cert.get()), from);
+        X509_gmtime_adj(X509_getm_notAfter(cert.get()), until);
+        detail::add_ext(cert.get(), _cert.get(), NID_basic_constraints, "critical,CA:FALSE");
+        detail::add_ext(cert.get(), _cert.get(), NID_key_usage, "critical,digitalSignature");
+        detail::add_ext(cert.get(), _cert.get(), NID_ext_key_usage, "serverAuth,clientAuth");
+        detail::add_ext(cert.get(), _cert.get(), NID_subject_alt_name, san.c_str());
+        detail::require(X509_sign(cert.get(), _key.get(), EVP_sha256()) > 0, "X509_sign");
+        return der_of(cert.get());
+    }
+
+    // The CA certificate itself, DER.
+    [[nodiscard]] auto cert_der() const -> std::vector<std::byte> { return der_of(_cert.get()); }
+
 private:
+    static auto der_of(X509* cert) -> std::vector<std::byte> {
+        const int len = i2d_X509(cert, nullptr);
+        detail::require(len > 0, "i2d_X509");
+        std::vector<std::byte> out(static_cast<std::size_t>(len));
+        auto* o = reinterpret_cast<unsigned char*>(out.data());
+        detail::require(i2d_X509(cert, &o) == len, "i2d_X509");
+        return out;
+    }
+
     detail::PkeyPtr _key;
     detail::X509Ptr _cert;
     long _serial{1};

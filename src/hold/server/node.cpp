@@ -33,8 +33,8 @@ Node::Dials::~Dials() {
     }
 }
 
-Node::Node(store::FileLayer& files, NodeConfig config, tls::Context ctx, tls::Listener listener,
-           int dial_wake) noexcept
+Node::Node(store::FileLayer& files, NodeConfig config, std::optional<tls::Context> ctx,
+           tls::Listener listener, int dial_wake) noexcept
     : _config{std::move(config)},
       _ctx{std::move(ctx)},
       _listener{std::move(listener)},
@@ -50,9 +50,14 @@ Node::~Node() {
 auto Node::create(store::FileLayer& files, NodeConfig config)
     -> std::expected<std::unique_ptr<Node>, tls::Error> {
     config.tls.role = tls::Role::server;
-    auto ctx = tls::Context::create(config.tls);
-    if (!ctx) {
-        return std::unexpected(ctx.error());
+    config.tls.peer_name.clear();
+    std::optional<tls::Context> ctx;
+    if (!config.tls.cert_pem.empty()) {
+        auto created = tls::Context::create(config.tls);
+        if (!created) {
+            return std::unexpected(created.error());
+        }
+        ctx = std::move(*created);
     }
     auto listener = tls::Listener::bind(config.host, config.port);
     if (!listener) {
@@ -63,7 +68,7 @@ auto Node::create(store::FileLayer& files, NodeConfig config)
         return std::unexpected(tls::Error::io);
     }
     return std::unique_ptr<Node>{
-        new Node(files, std::move(config), std::move(*ctx), std::move(*listener), wake)};
+        new Node(files, std::move(config), std::move(ctx), std::move(*listener), wake)};
 }
 
 auto Node::run_once(Clock::duration max_wait, int extra_fd) -> bool {
@@ -109,8 +114,12 @@ auto Node::accept() -> void {
     if (!fd) {
         return;
     }
+    if (!_ctx) {
+        static_cast<void>(::close(*fd));  // no certificate yet: unreachable
+        return;
+    }
     mark_storage_class(*fd);
-    auto stream = tls::Stream::accept(_ctx, *fd, Clock::now() + _config.handshake_timeout);
+    auto stream = tls::Stream::accept(*_ctx, *fd, Clock::now() + _config.handshake_timeout);
     if (!stream) {
         return;
     }
@@ -173,7 +182,9 @@ auto Node::dial(SessionId session, std::uint64_t server_id, const proto::Storage
                 std::uint16_t port) -> void {
     auto config = _config.tls;
     config.role = tls::Role::client;
-    config.peer_name = proto::endpoint_text(endpoint);  // the member's IP SAN
+    // The member's IP SAN; none (the dial fails) while there is no
+    // certificate to present.
+    config.peer_name = _ctx ? proto::endpoint_text(endpoint) : std::string{};
     const auto deadline = Clock::now() + _config.handshake_timeout;
     _dialing.emplace(
         session, std::thread{[dials = &_dials, session, server_id, port, deadline,
@@ -191,6 +202,18 @@ auto Node::dial(SessionId session, std::uint64_t server_id, const proto::Storage
             const std::uint64_t one = 1;
             static_cast<void>(::write(dials->wake, &one, sizeof one));
         }});
+}
+
+auto Node::set_tls(tls::Config config) -> std::expected<void, tls::Error> {
+    config.role = tls::Role::server;
+    config.peer_name.clear();
+    auto ctx = tls::Context::create(config);
+    if (!ctx) {
+        return std::unexpected(ctx.error());
+    }
+    _ctx = std::move(*ctx);
+    _config.tls = std::move(config);
+    return {};
 }
 
 auto Node::hang_up(SessionId session) -> void {

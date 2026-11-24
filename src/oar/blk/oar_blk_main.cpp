@@ -34,9 +34,15 @@
 // Network volumes (block-volume-service task 12): --server-id is this
 // server, each --controller-key a controller key ID and its Ed25519 public
 // key in 64 hex digits (a volume's ReplicaConfig must verify under one),
-// and --storage-ca/--storage-cert/--storage-key the storage certificate
-// (carrying urn:antikythera:server:N) the role presents to hold roles.
-// All of them or none: without them the role takes no network volumes.
+// and --storage-ca/--storage-cert/--storage-key the storage identity the
+// role presents to hold roles. All of them or none: without them the role
+// takes no network volumes. The role enrolls: --storage-key is its own
+// key, created (0600) if the file does not exist, and --storage-cert where
+// it keeps the certificate (carrying urn:antikythera:server:N) the
+// controller's CA issues for it, asked for through helm and checked
+// against --storage-ca, the server and the key. A --storage-cert that
+// already passes is used at once; until one does, network attachments
+// are refused.
 //
 // Volume keys arrive only over the sideband and live only in each
 // function's locked key slot; the process disables core dumps and ptrace
@@ -77,6 +83,7 @@
 #include "oar/blk/s3_object_store.hpp"
 #include "oar/blk/key_slot.hpp"
 #include "oar/vfu/virtio_binding.hpp"
+#include "tls/role_identity.hpp"
 
 namespace {
 
@@ -395,6 +402,7 @@ auto main(int argc, char** argv) -> int {
     std::function<bool(std::span<const std::byte>, std::span<const std::byte, 64>, std::uint16_t)>
         verify;
     std::optional<ak::tls::Config> storage_tls;
+    std::optional<ak::tls::RoleIdentity> identity;
     if (opts->server_id) {
         auto keys = ak::hull::SignatureVerifier::create(opts->keys);
         if (!keys) {
@@ -408,17 +416,27 @@ auto main(int argc, char** argv) -> int {
             return verifier->verify(msg, sig, key_id).has_value();
         };
         const auto ca = read_text(opts->storage_ca);
-        const auto cert = read_text(opts->storage_cert);
-        const auto key = read_text(opts->storage_key);
-        if (!ca || !cert || !key) {
-            std::println(stderr, "{}: cannot read the storage CA, certificate or key", log_name);
+        if (!ca) {
+            std::println(stderr, "{}: cannot read the storage CA", log_name);
             return EXIT_FAILURE;
         }
-        storage_tls = ak::tls::Config{.role = ak::tls::Role::client,
-                                      .ca_pem = *ca,
-                                      .cert_pem = *cert,
-                                      .key_pem = *key,
-                                      .peer_name = {}};
+        auto opened = ak::tls::RoleIdentity::open({.key_path = opts->storage_key,
+                                                   .cert_path = opts->storage_cert,
+                                                   .ca_pem = *ca,
+                                                   .server_id = *opts->server_id,
+                                                   .common_name = "oar-blk",
+                                                   .addresses = {}});
+        if (!opened) {
+            std::println(stderr, "{}: storage identity: {}", log_name,
+                         ak::tls::to_string(opened.error()));
+            return EXIT_FAILURE;
+        }
+        identity = std::move(*opened);
+        storage_tls = identity->config(ak::tls::Role::client);
+        if (!storage_tls) {
+            std::println(stderr, "{}: no storage certificate yet: waiting for enrollment",
+                         log_name);
+        }
         // A hold that hangs up mid-write must not end the process.
         static_cast<void>(std::signal(SIGPIPE, SIG_IGN));
     }
@@ -446,6 +464,16 @@ auto main(int argc, char** argv) -> int {
     if (!role) {
         std::println(stderr, "{}: {}", log_name, role.error());
         return EXIT_FAILURE;
+    }
+    std::optional<helm::RoleEnrollment> enrollment;
+    if (identity) {
+        enrollment.emplace(*identity, helm::oar::Role::blk, ak::tls::Role::client,
+                           [&role](const ak::tls::Config& cfg) {
+                               (*role)->set_storage_tls(cfg);
+                               std::println(stderr, "{}: storage certificate installed", log_name);
+                               return true;
+                           });
+        (*role)->set_enrollment(*enrollment);
     }
 
     remove_stale_socket(opts->sideband);

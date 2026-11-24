@@ -289,8 +289,11 @@ auto BlkRole::serve_active(Slot& s, std::unique_ptr<VirtioBlkFunction> f, std::u
 
 auto BlkRole::prepare_network(Slot& s, const oar::PrepareFunction& /*request*/,
                               const oar::BlkConfig& cfg) -> oar::Status {
-    if (!_config.verify_config || !_config.storage_tls) {
+    if (!_config.verify_config) {
         return oar::Status::unsupported;
+    }
+    if (!_config.storage_tls) {
+        return oar::Status::failed;  // not enrolled yet: no certificate to present
     }
     const auto c = _configs.find(cfg.volume_id);
     if (c == _configs.end()) {
@@ -331,8 +334,28 @@ auto BlkRole::prepare_network(Slot& s, const oar::PrepareFunction& /*request*/,
     return serve_active(s, std::move(*f), cfg.volume_id, nullptr, network);
 }
 
+auto BlkRole::cert_request() -> std::expected<oar::CertAnswer, oar::Status> {
+    if (_enrollment == nullptr) {
+        return std::unexpected(oar::Status::unsupported);
+    }
+    return _enrollment->answer();
+}
+
+auto BlkRole::role_certificate(std::span<const std::byte> chain) -> oar::Status {
+    return _enrollment == nullptr ? oar::Status::unsupported : _enrollment->install(chain);
+}
+
+auto BlkRole::set_storage_tls(const tls::Config& config) -> void {
+    _config.storage_tls = config;
+    for (auto& s : _slots) {
+        if (s.network != nullptr) {
+            s.network->set_tls(config);
+        }
+    }
+}
+
 auto BlkRole::replica_config(std::span<const std::byte> frame) -> oar::Status {
-    if (!_config.verify_config || !_config.storage_tls) {
+    if (!_config.verify_config) {
         return oar::Status::unsupported;
     }
     auto c = proto::decode_replica_config(frame);

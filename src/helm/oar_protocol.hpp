@@ -48,6 +48,8 @@
 //   volume_op           0  frame [volume_op_frame_size] (proto::VolumeOp, signed)
 //   lease_grant         0  volume_id u64 | 8  epoch u64
 //   hold_reports        0  ack u64 | 8  offset u32 | 12 reserved u32
+//   cert_request        (empty)
+//   role_certificate    0  total u32 | 4  offset u32 | 8  chunk (as map_update)
 //
 // The tunnel requests deliver the network role's WireGuard keys (oar-net
 // Requirement 5.2): its own static X25519 private key, and for each peer
@@ -108,6 +110,16 @@
 // oldest report if that is the one, so a lost response costs a resend,
 // never a report. A role with nothing to report answers total 0.
 //
+// Enrollment (block-volume-service task 12), to a storage role (blk or
+// hold): cert_request asks the role whether it wants a certificate, and
+// the role answers with its PKCS#10 request (DER), or csr_len 0 while the
+// certificate it holds is good. helm reports a request to the controller
+// (proto::CertRequest) and passes the controller's answer down with
+// role_certificate: the DER chain, leaf first, in map_update's chunk
+// format, up to max_cert_chain bytes. The role checks the chain against
+// its storage CA, its server ID and its own key before it uses or keeps
+// it, so neither body needs more than its framing checked here.
+//
 // Responses (oar -> helm) start with a 2-byte head:
 //
 //   0  status u8 (Status) | 1  reserved u8
@@ -122,6 +134,8 @@
 //                       6  uptime_seconds u32
 //   hold_reports        2  report_seq u64 | 10 total u32 | 14 offset u32 | 18 chunk
 //                       (total 0: nothing to report, and the rest zero and empty)
+//   cert_request        2  role u8 (Role: blk or hold) | 3  reserved u8 | 4  csr_len u16
+//                       6  csr [csr_len] (0..max_csr bytes)
 //   group_usage         2  total u16 | 4  count u16 | 6  reserved u32
 //                       10 count x 96 (the proto group_usage report entry, slot 0):
 //                          nic_id u64 | vni u32 | flags u8 | reserved [3] | attachment u64
@@ -231,6 +245,13 @@ inline constexpr std::size_t max_report_chunk =
     max_body_size - response_head_size - report_chunk_head_size;
 // Largest report a role may send (at least proto::max_report_size, pinned).
 inline constexpr std::size_t max_role_report = std::size_t{1} << 17U;
+inline constexpr std::size_t cert_answer_head_size = 4;
+// Largest certificate request that fits one cert_request answer (below
+// proto::max_csr_size; a P-256 request is a few hundred bytes).
+inline constexpr std::size_t max_csr = max_body_size - response_head_size - cert_answer_head_size;
+// proto::max_cert_chain_size, mirrored; tests/oar_protocol_test.cpp pins it.
+inline constexpr std::size_t max_cert_chain = 16384;
+static_assert(max_cert_chain <= max_map_frame);
 
 // Result of a request. Values are part of the wire protocol: never renumber.
 enum class Status : std::uint8_t {
@@ -283,6 +304,7 @@ enum class BodyError : std::uint8_t {
     bad_key_length,     // wrapped key empty, too long, or not the length the body says
     zero_key,           // a tunnel private or public key is all zero
     bad_image,          // an image volume's image name is all zero
+    bad_csr,            // a certificate request longer than max_csr
 };
 
 [[nodiscard]] auto to_string(BodyError e) noexcept -> const char*;
@@ -409,6 +431,14 @@ struct ReportChunk {
     std::uint32_t total{0};  // 0: nothing to report
     std::uint32_t offset{0};
     std::span<const std::byte> chunk;
+};
+
+// A storage role's answer to cert_request. `csr` views into the role's
+// storage when encoding, into the message when decoding; empty: the role
+// wants no certificate now.
+struct CertAnswer {
+    Role role{Role::blk};
+    std::span<const std::byte> csr;
 };
 
 // One chunk of a MapUpdate frame. `chunk` views into the message.
@@ -644,6 +674,12 @@ struct ResponseView {
     -> std::expected<std::vector<std::byte>, BodyError>;
 [[nodiscard]] auto decode_report_chunk(std::span<const std::byte> body) noexcept
     -> std::expected<ReportChunk, BodyError>;
+
+// cert_request answer bodies.
+[[nodiscard]] auto encode_cert_answer(const CertAnswer& a)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_cert_answer(std::span<const std::byte> body) noexcept
+    -> std::expected<CertAnswer, BodyError>;
 
 [[nodiscard]] auto encode_health(const Health& h)
     -> std::expected<std::vector<std::byte>, BodyError>;

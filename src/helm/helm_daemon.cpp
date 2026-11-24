@@ -121,6 +121,7 @@ HelmDaemon::HelmDaemon(DaemonConfig config, KeyStore& keys, AuditLog& audit, Hos
     }
     _next_check = now() + _config.check_interval;
     _next_reports = now();
+    _next_identity = now();
     _snapshot = _router.inventory();
 }
 
@@ -167,6 +168,12 @@ auto HelmDaemon::run_once(std::chrono::milliseconds wait) -> void {
     if (now() >= _next_reports) {
         take_hold_reports();
         _next_reports = now() + _config.report_interval;
+    }
+    if (now() >= _next_identity) {
+        for (auto& [n, slot] : _slots) {
+            poll_identity(*slot);
+        }
+        _next_identity = now() + _config.identity_interval;
     }
     publish();
 }
@@ -229,6 +236,10 @@ auto HelmDaemon::on_lease_grant(const proto::LeaseGrant& grant) -> void {
     enqueue(grant);
 }
 
+auto HelmDaemon::on_role_certificate(const proto::RoleCertificate& certificate) -> void {
+    enqueue(certificate);
+}
+
 auto HelmDaemon::on_volume_key(const proto::VolumeKey& /*key*/, std::span<const std::byte> frame)
     -> void {
     enqueue(KeyFrame{.frame = {frame.begin(), frame.end()}});
@@ -288,7 +299,54 @@ auto HelmDaemon::handle(Item& item) -> void {
         const auto kept = _keys->put_attachment_key(key->frame);
         const std::scoped_lock lock{_inbox_mutex};
         ++(kept ? _stats.volume_keys : _stats.volume_keys_refused);
+    } else if (const auto* cert = std::get_if<proto::RoleCertificate>(&item)) {
+        deliver_certificate(*cert);
     }
+}
+
+// ---- enrollment ---------------------------------------------------------------
+
+auto HelmDaemon::is_storage(const SlotState& slot) -> bool {
+    return is_blk(slot) || is_hold(slot);
+}
+
+auto HelmDaemon::poll_identity(SlotState& slot) -> void {
+    if (!is_storage(slot)) {
+        return;
+    }
+    auto asked = slot.link->cert_request();
+    if (!asked || asked->csr.empty() || asked->role != slot.inventory->role) {
+        return;  // unsupported, nothing wanted, or a role that changed its story
+    }
+    if (asked->csr == slot.reported_csr && now() < slot.reported_at + _config.identity_retry) {
+        return;  // already with the controller
+    }
+    proto::CertRequest request{.slot = slot.number,
+                               .role = asked->role == oar::Role::hold
+                                           ? proto::StorageRole::hold
+                                           : proto::StorageRole::initiator,
+                               .csr = std::move(asked->csr)};
+    if (!proto::detail::check_body(request)) {
+        return;  // not a DER request: the controller would refuse the report
+    }
+    slot.reported_csr = request.csr;
+    slot.reported_at = now();
+    {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.cert_requests;
+    }
+    report(std::move(request));
+}
+
+auto HelmDaemon::deliver_certificate(const proto::RoleCertificate& certificate) -> void {
+    auto* slot = slot_state(certificate.slot);
+    const bool taken =
+        slot != nullptr && is_storage(*slot) && slot->link->role_certificate(certificate.chain);
+    if (taken) {
+        slot->reported_csr.clear();  // a later request is a renewal: report it
+    }
+    const std::scoped_lock lock{_inbox_mutex};
+    ++(taken ? _stats.role_certificates : _stats.role_certificates_refused);
 }
 
 // ---- block volumes ------------------------------------------------------------
@@ -444,6 +502,8 @@ auto HelmDaemon::attach(SlotState& slot) -> bool {
     }
     slot.pending = false;
     slot.inventory = *inv;
+    slot.reported_csr.clear();  // a restarted role's request is reported afresh
+    poll_identity(slot);
     if (inv->role == oar::Role::hold) {
         replay_configs(slot);  // a hold role has no functions for the router
         return true;

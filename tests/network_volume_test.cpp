@@ -11,10 +11,13 @@
 #include <boost/test/unit_test.hpp>
 
 #include <poll.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <csignal>
+#include <filesystem>
+#include <string>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -25,12 +28,14 @@
 #include <utility>
 #include <vector>
 
+#include "hold/server/hold_role.hpp"
 #include "hold/server/node.hpp"
 #include "hold/store/file_layer.hpp"
 #include "oar/blk/network_volume_backend.hpp"
 #include "proto/replica_config.hpp"
 #include "proto/server_identity.hpp"
 #include "test_support.hpp"
+#include "tls/role_identity.hpp"
 #include "tls/tls.hpp"
 #include "tls_test_support.hpp"
 
@@ -246,6 +251,86 @@ BOOST_AUTO_TEST_CASE(fails_requests_when_no_primary_answers,
     b->submit_read(0, out, r.fn());
     BOOST_TEST_REQUIRE(run(*b, [&] { return r.result.has_value(); }));
     BOOST_TEST((!r.result->has_value() && r.result->error() == BackendError::io));
+}
+
+BOOST_AUTO_TEST_CASE(a_hold_answers_no_one_until_it_enrolls,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    ak::test::TestCa ca{"storage CA"};
+    ak::hold::store::MemFiles files;
+    auto node = ak::hold::Node::create(
+        files, {.host = "127.0.0.1",
+                .port = 0,
+                .tls = {.role = tls::Role::server,
+                        .ca_pem = ca.cert_pem(),
+                        .cert_pem = {},  // no certificate yet
+                        .key_pem = {},
+                        .peer_name = {}},
+                .server = {.server_id = hold_id, .data_dir = "/srv/hold", .leases = false},
+                .handshake_timeout = 2000ms,
+                .write_timeout = 2000ms});
+    BOOST_TEST_REQUIRE(node.has_value());
+    BOOST_TEST(!(*node)->has_identity());
+    BOOST_TEST_REQUIRE(
+        (*node)->server().apply_config(config(hold_id, (*node)->port()), Clock::now()).has_value());
+
+    // The hold's sideband role, enrolling through a RoleIdentity.
+    std::string tmpl = (std::filesystem::temp_directory_path() / "ak-hold-enroll-XXXXXX").string();
+    BOOST_TEST_REQUIRE(::mkdtemp(tmpl.data()) != nullptr);
+    const std::filesystem::path dir{tmpl};
+    auto identity = tls::RoleIdentity::open({.key_path = dir / "storage.key",
+                                             .cert_path = dir / "storage.crt",
+                                             .ca_pem = ca.cert_pem(),
+                                             .server_id = hold_id,
+                                             .common_name = "hold",
+                                             .addresses = {"127.0.0.1"}});
+    BOOST_TEST_REQUIRE(identity.has_value());
+    ak::hold::HoldRole role{(*node)->server(), hold_id, [](auto, auto, auto) { return true; }, 1};
+    ak::helm::RoleEnrollment enrollment{
+        *identity, ak::helm::oar::Role::hold, tls::Role::server,
+        [&node](const tls::Config& c) { return (*node)->set_tls(c).has_value(); }};
+    role.set_enrollment(enrollment);
+
+    auto b = backend(ca, 1500ms);
+    BOOST_TEST_REQUIRE(b->set_route(config(compute_id, (*node)->port())).has_value());
+    const auto both = [&](const std::function<bool()>& done) {
+        const auto until = Clock::now() + 10s;
+        while (!done() && Clock::now() < until) {
+            (*node)->run_once(5ms);
+            static_cast<void>(b->poll());
+        }
+        return done();
+    };
+    const auto data = blocks_of(3, 2);
+    Done early;
+    b->submit_write(0, data, early.fn());
+    BOOST_TEST_REQUIRE(both([&] { return early.result.has_value(); }));
+    BOOST_TEST(!early.result->has_value());  // nobody answered before its deadline
+    BOOST_TEST((*node)->connections() == 0U);
+
+    auto asked = role.cert_request();
+    BOOST_TEST_REQUIRE(asked.has_value());
+    BOOST_TEST((asked->role == ak::helm::oar::Role::hold));
+    const Bytes csr{asked->csr.begin(), asked->csr.end()};
+    BOOST_TEST((role.role_certificate(ca.sign_request(csr, uri(hold_id))) ==
+                ak::helm::oar::Status::failed));  // lacks the storage address
+    BOOST_TEST(!(*node)->has_identity());
+    BOOST_TEST((role.role_certificate(ca.sign_request(csr, uri(hold_id) + ",IP:127.0.0.1")) ==
+                ak::helm::oar::Status::ok));
+    BOOST_TEST((*node)->has_identity());
+    BOOST_TEST(role.cert_request().value().csr.empty());
+
+    Done w;
+    b->submit_write(0, data, w.fn());
+    BOOST_TEST_REQUIRE(both([&] { return w.result.has_value(); }));
+    BOOST_TEST(w.result->has_value());
+    Bytes out(data.size());
+    Done r;
+    b->submit_read(0, out, r.fn());
+    BOOST_TEST_REQUIRE(both([&] { return r.result.has_value(); }));
+    BOOST_TEST(r.result->has_value());
+    BOOST_TEST(std::ranges::equal(out, data));
+    b.reset();
+    std::filesystem::remove_all(dir);
 }
 
 BOOST_AUTO_TEST_CASE(drops_pending_requests_on_destruction,

@@ -122,7 +122,11 @@ auto NetworkVolumeBackend::Shared::open(const HoldTarget& t) -> std::optional<tl
     if (host.empty()) {
         return std::nullopt;
     }
-    auto config = tls;
+    tls::Config config;
+    {
+        const std::scoped_lock lock{mutex};  // set_tls may replace it
+        config = tls;
+    }
     config.role = tls::Role::client;
     config.peer_name = host;  // the primary's IP SAN
     auto ctx = tls::Context::create(config);
@@ -280,6 +284,11 @@ NetworkVolumeBackend::~NetworkVolumeBackend() {
     }
     signal(_shared->io_fd);
     _shared->thread.join();
+}
+
+auto NetworkVolumeBackend::set_tls(const tls::Config& config) -> void {
+    const std::scoped_lock lock{_shared->mutex};
+    _shared->tls = config;
 }
 
 auto NetworkVolumeBackend::set_route(const proto::ReplicaConfig& c)

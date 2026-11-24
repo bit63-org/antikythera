@@ -183,6 +183,18 @@ helm opens it inside the secure element, keeps it as a `ScopedKey` for
 the attachment's lifetime and delivers it with the existing `deliver_key`.
 It never touches the mailbox or the host (Requirement 12.2-12.3).
 
+As built (task 12): the HPKE info is `"antikythera volume key v1"`
+(`proto::volume_key_info`), so a key wrapped to the same transport key
+for another purpose does not open as a VolumeKey. helm keeps the frame
+still wrapped, per attachment (newest generation wins, at most 4096),
+after one test open on receipt, and opens it again in the secure element
+for each delivery, so the plaintext lives only between the secure element
+and OarLink. The software secure element derives its X25519 transport key
+from its master key (HPKE DeriveKeyPair over HMAC-SHA256(master,
+"antikythera se transport key v1")), so the key is stable across restarts
+and dies with the master key. HPKE is built from OpenSSL 3.0 primitives
+(OSSL_HPKE needs 3.2) and checked against the CFRG test vector.
+
 ### Reports (hold and oar-blk → helm → controller)
 
 Additions to `src/proto/report.hpp`:

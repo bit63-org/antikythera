@@ -19,6 +19,15 @@
 // calls let helm persist the wrapped keys (VM keys on helm's own storage,
 // volume keys on the media) and reload them after a restart; imported blobs
 // are authenticated on first use, not on import.
+//
+// Network volume keys (.kiro/specs/block-volume-service/ design "VolumeKey")
+// are kept per attachment, still wrapped: put_attachment_key() takes the
+// controller's VolumeKey frame, opens it once in the secure element to
+// refuse a bad one up front, and keeps the frame; open_attachment_key()
+// opens it again for each delivery (an attach, or oar-blk restarting), so
+// the plaintext exists only on its way to OarLink. A newer generation of
+// the attachment replaces the older; drop_attachment_key() forgets it at
+// detach. At most max_attachment_keys are kept.
 
 #include <cstdint>
 #include <expected>
@@ -27,6 +36,7 @@
 #include <vector>
 
 #include "helm/secure_element.hpp"
+#include "proto/volume_key.hpp"
 
 namespace ak::helm {
 
@@ -41,7 +51,15 @@ enum class KeyError : std::uint8_t {
     wrong_kind,      // an imported blob of the wrong KeyKind
     corrupt_key,     // a wrapped key failed authentication
     secure_element,  // the secure element failed (RNG, crypto)
+    // Attachment keys.
+    stale_generation,  // older than the attachment's key already kept
+    unknown_attachment,
+    too_many_keys,  // max_attachment_keys are kept already
 };
+
+inline constexpr std::size_t max_attachment_keys = 4096;
+
+using AttachmentId = std::uint64_t;
 
 [[nodiscard]] auto to_string(KeyError e) noexcept -> const char*;
 
@@ -63,6 +81,20 @@ public:
     // kept (SecureElement::create_ephemeral_key).
     auto create_ephemeral_key() -> std::expected<ScopedKey, KeyError>;
 
+    // Network volume keys, per attachment (see above). `frame` is the
+    // encoded VolumeKey the controller sent.
+    auto put_attachment_key(std::span<const std::byte> frame) -> std::expected<void, KeyError>;
+    // The attachment's key, if `generation` is the one kept.
+    auto open_attachment_key(AttachmentId attachment, std::uint32_t generation)
+        -> std::expected<ScopedKey, KeyError>;
+    // The kept key's header (volume and generation), without opening it.
+    [[nodiscard]] auto attachment_key(AttachmentId attachment) const
+        -> std::optional<proto::VolumeKey>;
+    auto drop_attachment_key(AttachmentId attachment) -> void;
+    [[nodiscard]] auto attachment_key_count() const noexcept -> std::size_t {
+        return _attachment_keys.size();
+    }
+
     // Reload persisted wrapped keys. A volume key's owner must already be
     // known.
     auto import_vm_key(WrappedVmKey key) -> std::expected<void, KeyError>;
@@ -79,6 +111,7 @@ private:
     SecureElement* _se;
     std::map<VmId, WrappedVmKey> _vm_keys;
     std::map<VolumeId, WrappedVolumeKey> _volume_keys;
+    std::map<AttachmentId, std::vector<std::byte>> _attachment_keys;  // VolumeKey frames
 };
 
 }  // namespace ak::helm

@@ -103,6 +103,7 @@ auto HelmDaemon::SlotPort::rewrap_volume(const oar::RewrapVolume& request)
 HelmDaemon::HelmDaemon(DaemonConfig config, KeyStore& keys, AuditLog& audit, HostPort& host,
                        Backplane& backplane, SidebandConnector connect, ReportOut reports)
     : _config{std::move(config)},
+      _keys{&keys},
       _connect{std::move(connect)},
       _reports{std::move(reports)},
       _router{_config.router, _pool, keys, host, *this, audit},
@@ -220,6 +221,11 @@ auto HelmDaemon::on_lease_grant(const proto::LeaseGrant& grant) -> void {
     enqueue(grant);
 }
 
+auto HelmDaemon::on_volume_key(const proto::VolumeKey& /*key*/, std::span<const std::byte> frame)
+    -> void {
+    enqueue(KeyFrame{.frame = {frame.begin(), frame.end()}});
+}
+
 auto HelmDaemon::post_host_slot(const mailbox::Slot& slot) -> void {
     enqueue(slot);
 }
@@ -268,6 +274,12 @@ auto HelmDaemon::handle(Item& item) -> void {
             ++_stats.lease_grants;
         }
         forward_grant(*grant);
+    } else if (const auto* key = std::get_if<KeyFrame>(&item)) {
+        // Opened in the secure element and kept wrapped, per attachment,
+        // for the attach that delivers it (KeyStore).
+        const auto kept = _keys->put_attachment_key(key->frame);
+        const std::scoped_lock lock{_inbox_mutex};
+        ++(kept ? _stats.volume_keys : _stats.volume_keys_refused);
     }
 }
 

@@ -28,6 +28,8 @@
 #include "helm/key_store.hpp"
 #include "helm/scoped_key.hpp"
 #include "helm/secure_element.hpp"
+#include "helm/volume_key_seal.hpp"
+#include "proto/volume_key.hpp"
 #include "test_support.hpp"
 
 namespace ak::helm {
@@ -48,6 +50,7 @@ using ak::helm::KeyStore;
 using ak::helm::ScopedKey;
 using ak::helm::ScopedKeyTestAccess;
 using ak::helm::SecretBytes;
+using ak::helm::SecureElement;
 using ak::helm::SeError;
 using ak::helm::SoftwareSecureElement;
 using ak::helm::VmId;
@@ -129,6 +132,30 @@ auto flipped(const WrappedKey& k) -> WrappedKey {
     auto out = WrappedKey::decode(bytes);
     BOOST_REQUIRE(out.has_value());
     return std::move(*out);
+}
+
+// What kythira KMS does: wraps `key` to `recipient` for one attachment.
+auto wrap_for(const ak::helm::hpke::PublicKey& recipient, std::span<const std::byte> key,
+              std::uint64_t attachment = 7, std::uint32_t generation = 1)
+    -> std::vector<std::byte> {
+    BOOST_REQUIRE(key.size() == ak::proto::volume_data_key_size);
+    auto frame = ak::helm::seal_volume_key(recipient,
+                                           {.server_id = 3,
+                                            .volume_id = vol_a,
+                                            .attachment_id = attachment,
+                                            .generation = generation,
+                                            .hpke_enc = {},
+                                            .wrapped_key = {}},
+                                           key.first<ak::proto::volume_data_key_size>());
+    BOOST_REQUIRE(frame.has_value());
+    return *frame;
+}
+
+auto open_frame(SecureElement& se, std::span<const std::byte> frame)
+    -> std::expected<ScopedKey, SeError> {
+    const auto k = ak::proto::decode_volume_key(frame);
+    BOOST_REQUIRE(k.has_value());
+    return se.open_volume_key(ak::proto::volume_key_aad(frame), k->hpke_enc, k->wrapped_key);
 }
 
 }  // namespace
@@ -336,6 +363,67 @@ BOOST_AUTO_TEST_CASE(refuses_directory, *boost::unit_test::timeout(unit_timeout_
     BOOST_TEST((SoftwareSecureElement::open(dir.path).error() == SeError::master_key_insecure));
 }
 
+BOOST_AUTO_TEST_CASE(opens_volume_keys_wrapped_to_its_transport_key,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    TempDir dir;
+    const auto path = dir.path / master_key_name;
+    std::vector<std::byte> data_key(ak::helm::volume_key_size);
+    for (std::size_t i = 0; i < data_key.size(); ++i) {
+        data_key[i] = static_cast<std::byte>(i * 3);
+    }
+    std::vector<std::byte> frame;
+    ak::helm::hpke::PublicKey pk{};
+    {
+        auto se = SoftwareSecureElement::open(path);
+        BOOST_REQUIRE(se.has_value());
+        auto got = se->transport_public_key();
+        BOOST_REQUIRE(got.has_value());
+        pk = *got;
+        frame = wrap_for(pk, data_key);
+        auto key = open_frame(*se, frame);
+        BOOST_REQUIRE(key.has_value());
+        BOOST_TEST((key_of(*key) == data_key));
+    }
+    // The transport key survives a restart: it comes from the master key.
+    auto se = SoftwareSecureElement::open(path);
+    BOOST_REQUIRE(se.has_value());
+    BOOST_TEST((se->transport_public_key().value() == pk));
+    auto key = open_frame(*se, frame);
+    BOOST_REQUIRE(key.has_value());
+    BOOST_TEST((key_of(*key) == data_key));
+
+    // Another secure element has another transport key and cannot open it.
+    auto other = make_se();
+    BOOST_TEST((other.transport_public_key().value() != pk));
+    BOOST_TEST((open_frame(other, frame).error() == SeError::authentication_failed));
+}
+
+BOOST_AUTO_TEST_CASE(a_volume_key_opens_only_for_its_own_header,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto se = make_se();
+    const std::vector<std::byte> data_key(ak::helm::volume_key_size, fill_byte);
+    const auto frame = wrap_for(se.transport_public_key().value(), data_key);
+    // The same wrapped key moved to another attachment's header.
+    auto k = ak::proto::decode_volume_key(frame).value();
+    k.attachment_id = 8;
+    const auto moved = ak::proto::encode_volume_key(k).value();
+    BOOST_TEST((open_frame(se, moved).error() == SeError::authentication_failed));
+    // A changed ciphertext.
+    k = ak::proto::decode_volume_key(frame).value();
+    k.wrapped_key[0] ^= flip_mask;
+    BOOST_TEST((open_frame(se, ak::proto::encode_volume_key(k).value()).error() ==
+                SeError::authentication_failed));
+    // Wrapped under another info string (another use of the same key).
+    k = ak::proto::decode_volume_key(frame).value();
+    const auto sealed = ak::helm::hpke::seal(se.transport_public_key().value(), {},
+                                             ak::proto::volume_key_aad(frame), data_key);
+    BOOST_REQUIRE(sealed.has_value());
+    std::ranges::copy(sealed->enc, k.hpke_enc.begin());
+    std::ranges::copy(sealed->ciphertext, k.wrapped_key.begin());
+    BOOST_TEST((open_frame(se, ak::proto::encode_volume_key(k).value()).error() ==
+                SeError::authentication_failed));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_AUTO_TEST_SUITE(key_store)
@@ -517,6 +605,46 @@ BOOST_AUTO_TEST_CASE(secure_element_checks_owner,
     // A volume key where a VM key belongs.
     const ak::helm::WrappedVmKey bogus{.vm = vm_one, .key = vol->key};
     BOOST_TEST((se.create_volume_key(bogus, vol_b).error() == SeError::wrong_kind));
+}
+
+BOOST_AUTO_TEST_CASE(keeps_network_volume_keys_per_attachment,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto se = make_se();
+    KeyStore store{se};
+    const auto pk = se.transport_public_key().value();
+    const std::vector<std::byte> gen1(ak::helm::volume_key_size, std::byte{1});
+    const std::vector<std::byte> gen2(ak::helm::volume_key_size, std::byte{2});
+    BOOST_TEST((store.open_attachment_key(7, 1).error() == KeyError::unknown_attachment));
+
+    BOOST_REQUIRE(store.put_attachment_key(wrap_for(pk, gen1, 7, 1)).has_value());
+    BOOST_TEST(store.attachment_key(7)->volume_id == vol_a);
+    // Opened again for every delivery.
+    for (int i = 0; i < 2; ++i) {
+        auto key = store.open_attachment_key(7, 1);
+        BOOST_REQUIRE(key.has_value());
+        BOOST_TEST((key_of(*key) == gen1));
+    }
+    // A newer generation replaces it; the older is then stale either way.
+    BOOST_REQUIRE(store.put_attachment_key(wrap_for(pk, gen2, 7, 2)).has_value());
+    BOOST_TEST(
+        (store.put_attachment_key(wrap_for(pk, gen1, 7, 1)).error() == KeyError::stale_generation));
+    BOOST_TEST((store.open_attachment_key(7, 1).error() == KeyError::stale_generation));
+    BOOST_TEST((key_of(store.open_attachment_key(7, 2).value()) == gen2));
+    BOOST_TEST((store.open_attachment_key(7, 3).error() == KeyError::unknown_attachment));
+
+    // One wrapped to another secure element is refused and not kept.
+    auto other = make_se();
+    BOOST_TEST((
+        store.put_attachment_key(wrap_for(other.transport_public_key().value(), gen1, 8)).error() ==
+        KeyError::corrupt_key));
+    BOOST_TEST(
+        (store.put_attachment_key(std::vector<std::byte>(10)).error() == KeyError::corrupt_key));
+    BOOST_TEST(!store.attachment_key(8).has_value());
+    BOOST_TEST(store.attachment_key_count() == 1U);
+
+    store.drop_attachment_key(7);
+    BOOST_TEST((store.open_attachment_key(7, 2).error() == KeyError::unknown_attachment));
+    BOOST_TEST(store.attachment_key_count() == 0U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

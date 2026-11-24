@@ -38,6 +38,7 @@
 #include "helm/oar_link.hpp"
 #include "helm/secure_element.hpp"
 #include "helm/sideband_binding.hpp"
+#include "helm/volume_key_seal.hpp"
 #include "hull/signature_verifier.hpp"
 #include "proto/test_vectors.hpp"
 #include "test_support.hpp"
@@ -635,6 +636,34 @@ BOOST_AUTO_TEST_CASE(hold_reports_are_relayed_by_kind) {
     BOOST_TEST(r.daemon.stats().hold_reports_dropped == 2U);
     r.daemon.run_once(0ms);
     BOOST_TEST(r.reports.size() == before + 1);  // each once
+}
+
+BOOST_AUTO_TEST_CASE(volume_keys_are_opened_and_kept_per_attachment) {
+    Rig r;
+    (void)r.daemon.boot();
+    const std::array<std::byte, proto::volume_data_key_size> data_key{std::byte{9}};
+    const proto::VolumeKey header{.server_id = server,
+                                  .volume_id = 0x100,
+                                  .attachment_id = 55,
+                                  .generation = 1,
+                                  .hpke_enc = {},
+                                  .wrapped_key = {}};
+    const auto frame = helm::seal_volume_key(r.se.transport_public_key().value(), header, data_key);
+    BOOST_REQUIRE(frame.has_value());
+    r.daemon.on_volume_key(proto::decode_volume_key(*frame).value(), *frame);
+    // Wrapped to another helm: refused.
+    auto other = make_se();
+    auto stray = header;
+    stray.attachment_id = 56;
+    const auto bad = helm::seal_volume_key(other.transport_public_key().value(), stray, data_key);
+    BOOST_REQUIRE(bad.has_value());
+    r.daemon.on_volume_key(proto::decode_volume_key(*bad).value(), *bad);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().volume_keys == 1U);
+    BOOST_TEST(r.daemon.stats().volume_keys_refused == 1U);
+    BOOST_TEST(r.keys.attachment_key(55).has_value());
+    BOOST_TEST(!r.keys.attachment_key(56).has_value());
+    BOOST_TEST(r.keys.open_attachment_key(55, 1).has_value());
 }
 
 BOOST_AUTO_TEST_CASE(an_unreachable_sideband_is_reported_and_retried) {

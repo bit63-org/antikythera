@@ -813,6 +813,25 @@ auto decode_replica_config_frame(std::span<const std::byte> body) noexcept
     return body;
 }
 
+auto encode_vpc_config_frame(std::span<const std::byte> frame)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (auto ok = decode_vpc_config_frame(frame); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return std::vector<std::byte>(frame.begin(), frame.end());
+}
+
+auto decode_vpc_config_frame(std::span<const std::byte> body) noexcept
+    -> std::expected<std::span<const std::byte>, BodyError> {
+    if (body.size() < min_vpc_config_frame) {
+        return std::unexpected(BodyError::truncated);
+    }
+    if (body.size() > max_vpc_config_frame) {
+        return std::unexpected(BodyError::trailing_bytes);
+    }
+    return body;
+}
+
 auto encode_volume_op_frame(std::span<const std::byte> frame)
     -> std::expected<std::vector<std::byte>, BodyError> {
     if (auto ok = check_size(frame, volume_op_frame_size); !ok) {

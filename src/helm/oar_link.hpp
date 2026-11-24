@@ -139,6 +139,9 @@ public:
     // (nic_id, attachment) order. A page that disagrees with the first
     // page's total, or a role that never finishes, is a bad_response.
     auto group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError>;
+    // Forwards one controller VpcConfig frame (min_vpc_config_frame to
+    // max_vpc_config_frame bytes) to a network role.
+    auto vpc_config(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
     // Block volumes, to a hold role: one controller ReplicaConfig or
     // VolumeOp frame unmodified, and a lease acknowledgement.
     auto replica_config(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
@@ -247,6 +250,12 @@ public:
     }
     // A whole, reassembled TunnelPeers frame, not yet decoded or verified.
     virtual auto tunnel_peers(std::span<const std::byte> /*frame*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    // A VPC's gateway configuration, which only the network role keeps
+    // (oar-net Requirement 12). `frame` is not yet decoded or verified and
+    // is valid only during the call.
+    virtual auto vpc_config(std::span<const std::byte> /*frame*/) -> oar::Status {
         return oar::Status::unsupported;
     }
     // Block volumes, which only the hold role keeps. The frames are not yet

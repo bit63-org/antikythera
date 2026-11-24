@@ -274,9 +274,17 @@
   delivers to a local attached NIC in a configured VNI, from the
   metadata address, to an address that NIC owns. `fuzz_vswitch` checks
   that the endpoint only hears a NIC from that NIC's own address.
-- [ ] 20. Signed `VpcConfig` frame (controller-interface, to be specced
-  there) forwarded by helm over OarLink and applied by `NetRole`.
-  _Requirements: 12.1_
+- [x] 20. Signed `VpcConfig` frame (controller-interface Requirement 10,
+  task 14) forwarded by helm over OarLink and applied by `NetRole`.
+  _Requirements: 12.1_ — OarLink `vpc_config` (vendor type 0x18) carries
+  the frame whole (at most 3,669 bytes, one message). `HelmDaemon` keeps
+  the newest per VNI and sends it to every attached network role, and all
+  of them again, before the router registers functions, to a role whose
+  sideband reopens. `NetRole` checks it like a map_update (server, then
+  signature, then version per VNI: the same version answers ok untouched,
+  an older one fails) and applies it with `VSwitch::set_vpc_config`; a
+  frame the VSwitch refuses leaves the previous config. Frames with routes
+  are refused whole until task 22 applies them.
 - [ ] 21. Metadata service: the endpoint on the oar-net board, helm's
   service keyed by NIC ID, IMDSv2 tokens (helm and controller specs).
   _Requirements: 13.4_

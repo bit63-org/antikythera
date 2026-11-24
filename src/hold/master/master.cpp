@@ -480,8 +480,24 @@ auto Master::attach(std::uint64_t volume, std::uint64_t attachment_id, std::uint
                              .generation = generation,
                              .mode = mode});
     std::ranges::sort(v.attachments, {}, &proto::VolumeAttachment::attachment_id);
+    _transport->send_volume_key({.server_id = server,
+                                 .volume_id = volume,
+                                 .lineage_id = v.spec.lineage_id,
+                                 .attachment_id = attachment_id,
+                                 .generation = generation});
     commit(v, now);
     return generation;
+}
+
+auto Master::key_allowed(std::uint64_t server, std::uint64_t volume, std::uint64_t attachment_id,
+                         std::uint32_t generation) const -> bool {
+    const Volume* v = this->volume(volume);
+    if (v == nullptr) {
+        return false;
+    }
+    const auto it =
+        std::ranges::find(v->attachments, attachment_id, &proto::VolumeAttachment::attachment_id);
+    return it != v->attachments.end() && it->server_id == server && it->generation == generation;
 }
 
 auto Master::detach(std::uint64_t volume, std::uint64_t attachment_id, Time now)
@@ -1149,6 +1165,16 @@ auto Master::on_outcome(std::uint64_t /*server*/, const proto::OpOutcome& o, Tim
         return;  // a duplicate, or not ours
     }
     const proto::VolumeOp op = it->second.op;
+    if (const auto* del = std::get_if<proto::DeleteReplica>(&op.args);
+        del != nullptr && o.status == proto::OpStatus::stale_epoch) {
+        // The server has not applied the epoch that removed the replica
+        // (8.4): resent on tick, unless the replica is a member again.
+        const Volume* v = find(o.volume_id);
+        const Member* m = v == nullptr ? nullptr : member_on(*v, op.server_id);
+        if (m == nullptr || m->replica_gen != del->replica_gen) {
+            return;
+        }
+    }
     _ops.erase(it);
     if (std::holds_alternative<proto::ScrubVolume>(op.args)) {
         Volume* v = find(o.volume_id);

@@ -147,6 +147,15 @@
 // server stops being a member, its replica is replaced, or it starts
 // joining; a later op starts over.
 //
+// Deleting replicas (task 17, Requirements 8.4-8.5). delete_replica()
+// takes the controller's op for a replica that left the set: a move's
+// source, a drained or long-gone replica, a deleted volume. The replica's
+// directory goes (and the directory entry is synced) unless the newest
+// config this server holds still names it as a member with that
+// replica_gen, which can only mean this server has not yet applied the
+// epoch that removed it: stale_epoch, and the controller resends. A
+// replica already gone, or never here, is ok, so a resend is harmless.
+//
 // QoS (Requirement 10.2): each volume's requests wait in its queue until
 // its limiter (qos.hpp) admits them; run() serves the volumes round-robin,
 // at most `quantum` requests each per pass, so a busy volume cannot starve
@@ -257,6 +266,7 @@ struct ServerStats {
     std::uint64_t reconciled{0};    // extents rewritten by promotions
     std::uint64_t copied{0};        // SYNC_DATA regions sent
     std::uint64_t scrubbed{0};      // blocks read by scrubs
+    std::uint64_t deleted{0};       // replica directories removed by delete_replica
 };
 
 class HoldServer {
@@ -303,6 +313,13 @@ public:
     auto start_scrub(std::uint64_t volume_id, std::uint64_t op_id, std::uint64_t epoch,
                      std::uint32_t mib_per_s, Clock::time_point now) -> void;
     [[nodiscard]] auto scrubbing(std::uint64_t volume_id) const -> bool;
+    // The controller's delete_replica VolumeOp (see above); the outcome
+    // goes up with take_reports().
+    auto delete_replica(std::uint64_t volume_id, std::uint64_t op_id, std::uint64_t epoch,
+                        std::uint32_t replica_gen, Clock::time_point now) -> void;
+    // Replica directories this server holds for `volume_id`, any generation.
+    [[nodiscard]] auto replica_on_disk(std::uint64_t volume_id, std::uint32_t replica_gen) const
+        -> bool;
 
 private:
     struct Session {

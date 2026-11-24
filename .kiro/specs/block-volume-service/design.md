@@ -520,6 +520,22 @@ every replica off it, a bounded number at a time, and report empty.
 **Unattached volumes** move the same way; the volume stays attachable
 throughout because attachments only need the current primary.
 
+As built (task 17): the source's replica goes with a `delete_replica`
+VolumeOp once the epoch without it is committed. A hold answers
+`stale_epoch` while its newest config still lists that replica (it has
+not applied the removal yet) and the master resends; a replica already
+gone is `ok`, so resends are harmless, and `drained()` holds only once
+every delete is answered. A hold sends a `replica_status` as soon as it
+applies a config it is a member of and when a joining copy completes,
+so a new primary's lease request (and a joined replica's `in_sync`)
+does not wait for the next status interval; without that every handover
+paused reads for about a second. A new primary numbers its writes above
+the members' reported commit points as well as their intents: a target
+that joined by copy alone, with no write forwarded while it joined,
+holds no seq of its own. The simulation (`hold_sim_test`) moves primaries
+and secondaries, drains two servers and moves an unattached volume under
+load; the longest guest operation across those runs is under 300 ms.
+
 **Local ↔ network conversion** (Requirement 8.6): a keyed copy on the
 volume's server. oar-blk opens the local volume (its key from helm) and
 the new network volume (its key from KMS via `VolumeKey`), and copies
@@ -674,6 +690,11 @@ As built (task 13, helm and guest side):
   per-block order of Requirement 4.2.
 - `ro` is enforced twice: the initiator offers `VIRTIO_BLK_F_RO` and fails
   writes, and hold refuses `WRITE` from a read-only generation.
+- As built (task 18): `Master::attach` calls
+  `Transport::send_volume_key` with a `KeyGrant` (server, volume,
+  lineage, attachment, generation) for the attaching server alone,
+  before the config naming the attachment goes out; `key_allowed()`
+  answers whether a server may hold a key now, for any resend.
 - virtio-blk has no persistent reservations, so cluster software must
   fence through the API (forced detach). SCSI-3/NVMe reservations would
   need a virtio-scsi or NVMe function and are a later option; the EC2

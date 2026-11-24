@@ -118,9 +118,30 @@ repository. Prerequisites outside this spec: oar-blk task 14
 - [ ] 17. Live moves: secondary move, planned primary handover with
   `demotion_confirmed`, drain of a storage server; simulation and harbor
   cases. _Requirements: 8.1-8.5_ (cloud, then tikhov)
+  - [x] 17.1 Cloud half: holds run `delete_replica` (the controller
+    resends it until the source has applied its removal); simulation
+    cases for a primary handover, a secondary move, a two-server drain
+    and a move while unattached, checking three replicas in sync
+    throughout, no guest error, no operation as long as a second, and
+    every left replica deleted. Fixes found on the way: a new primary
+    asks for its lease at once (reads paused about 1 s after every
+    handover), a never-written volume can be copied (its joining member
+    never got in sync), and a primary that joined by copy alone numbers
+    its writes above what the members hold (they acknowledged them
+    unwritten, so replicas diverged).
+  - [ ] 17.2 harbor cases (tikhov): waits for task 15.
 - [ ] 18. Multi-attach: several attachments per config, `rw`/`ro` mix,
   per-server `VolumeKey`, harbor test with VMs on two servers writing
   disjoint and overlapping ranges. _Requirements: 4_ (cloud, then tikhov)
+  - [x] 18.1 Cloud half: the master sends each attachment's key to its
+    own server (`Transport::send_volume_key`, `key_allowed()`); a
+    simulation of two read-write guests and one read-only guest on three
+    compute servers, linearizable per block across guests, with the
+    read-only guest's writes failing and one guest cut off from the
+    controller and detached (its I/O then fails, the others see no
+    error), alone and under crashes, cuts and a primary move.
+  - [ ] 18.2 harbor test with VMs on two servers (tikhov): waits for
+    task 15.
 - [x] 19. Elastic volumes: online grow with virtio-blk config-change
   interrupt and parser bound update, QoS and class changes, replica-count
   changes. _Requirements: 10.3-10.4_ (cloud) As built: crash-safe

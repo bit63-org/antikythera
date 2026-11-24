@@ -118,6 +118,10 @@ auto HoldRole::volume_op(std::span<const std::byte> frame) -> oar::Status {
         _server.start_scrub(op->volume_id, op->op_id, op->epoch, scrub->mib_per_s, _clock());
         return oar::Status::ok;
     }
+    if (const auto* del = std::get_if<proto::DeleteReplica>(&op->args); del != nullptr) {
+        _server.delete_replica(op->volume_id, op->op_id, op->epoch, del->replica_gen, _clock());
+        return oar::Status::ok;
+    }
     queue(proto::OpOutcome{.volume_id = op->volume_id,
                            .op_id = op->op_id,
                            .epoch = op->epoch,

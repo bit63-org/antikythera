@@ -1,6 +1,6 @@
 # Implementation Plan — build-and-ci
 
-## Status: 8/11 tasks complete (task 8 is open only for 8.5, the required-check list)
+## Status: 9/11 tasks complete (task 8 is open only for 8.5, the required-check list)
 
 ## Tasks
 
@@ -46,7 +46,10 @@
   wire `scripts/oci-build-cache/start-sccache.sh`, add antikythera's three
   credentials. **Needs Clark's go (real-cloud spend).**
   _Requirements: 4.2–4.4_
-- [ ] 10. arm64 cross-build job. _Requirements: 5.5_
+- [x] 10. arm64 cross-build job: `.github/workflows/arm64.yml`, GCC 14
+  cross on a hosted VM, build only, path-filtered on pull requests and
+  not a required check (see design); `-fcf-protection=full` becomes
+  `-mbranch-protection=standard` on aarch64. _Requirements: 5.5_
 - [x] 11. Cloud development environment: `.claude/hooks/session-start.sh`,
   a SessionStart hook that installs the toolchain and test dependencies.
   _Requirements: 6_

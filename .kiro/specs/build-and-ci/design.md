@@ -86,10 +86,27 @@ GitHub Actions, one workflow, jobs:
 | `sanitize` | Clang 19 | `AK_SANITIZE=ON`, build, ctest |
 | `fuzz` | Clang 19 | `AK_FUZZ=ON`, build, short smoke run of each target |
 | `lint` | — | clang-format 22.1.5 `--dry-run --Werror`, clang-tidy 19, shellcheck |
-| `arm64` | GCC 14 cross | configure and build for `arm64-linux` |
+| `arm64` | GCC 14 cross | configure and build for `arm64-linux` (`arm64.yml`) |
 
-All jobs are required checks on main. Concurrency groups cancel superseded
-runs on the same branch.
+All jobs are required checks on main, except `arm64`. Concurrency groups
+cancel superseded runs on the same branch.
+
+`arm64` lives in its own workflow, `.github/workflows/arm64.yml`. It runs
+on a GitHub-hosted VM rather than the shared self-hosted scale set, on
+every push to main, and on pull requests only when they touch
+`CMakeLists.txt`, `cmake/`, the vcpkg manifest or the workflow itself.
+The self-hosted queue is the CI bottleneck, and the tree's arm64 breaks
+so far have been build-system ones (an x86-only hardening flag), so this
+trades a merge of latency on a source-only arm64 break for not adding a
+job to every pull request. A path-filtered check cannot be required,
+since pull requests that skip it would never report it; that is the one
+deviation from Requirement 5.6. The cross toolchain is GCC 14
+(`g++-14-aarch64-linux-gnu`) against Ubuntu multiarch arm64 OpenSSL and
+Boost.Test from ports.ubuntu.com, set up by
+`.github/scripts/arm64-multiarch.sh` and
+`cmake/toolchains/aarch64-linux-gnu.cmake`. Debug, like the other builds;
+the tree does not yet build clean in Release under GCC 14's `-O2` flow
+warnings on either architecture.
 
 ## Cloud development environment
 

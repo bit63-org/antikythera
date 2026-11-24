@@ -30,6 +30,8 @@
 #                      against a real kernel tree, checks the result and
 #                      builds the strict kernel (about two minutes; not
 #                      yet a required check)
+#   arm64              in arm64.yml: GCC 14 cross-build on a hosted VM,
+#                      path-filtered on pull requests, not required
 
 name: ci
 

@@ -6,11 +6,14 @@
 #include <algorithm>
 #include <cctype>
 #include <functional>
+#include <iterator>
+#include <tuple>
 #include <set>
 #include <string_view>
 
 #include "oar/net/dhcp4.hpp"
 #include "oar/net/dhcp6.hpp"
+#include "proto/group_members.hpp"
 
 namespace ak::oar::net {
 
@@ -118,7 +121,10 @@ auto local_only_source(const packet::ParsedPacket& p) noexcept -> bool {
     if (is_ipv6(p)) {
         return packet::is_unspecified(p.src6) || packet::is_ipv6_link_local(p.src6);
     }
-    return packet::is_unspecified(p.src4) && udp_ports(p, dhcp4_client_port, dhcp4_server_port);
+    // An IGMP report before the guest has an address comes from 0.0.0.0
+    // (RFC 3376 4.2.13); snooping consumes it.
+    return packet::is_unspecified(p.src4) &&
+           (udp_ports(p, dhcp4_client_port, dhcp4_server_port) || p.protocol == igmp::ipproto_igmp);
 }
 
 auto ip_multicast_destination(const packet::ParsedPacket& p) noexcept -> bool {
@@ -406,6 +412,20 @@ auto to_string(GroupPolicyError e) noexcept -> const char* {
     return "unknown";
 }
 
+auto to_string(GroupMembersError e) noexcept -> const char* {
+    switch (e) {
+        case GroupMembersError::vni_out_of_range:
+            return "vni_out_of_range";
+        case GroupMembersError::too_many_groups:
+            return "too_many_groups";
+        case GroupMembersError::bad_group:
+            return "bad_group";
+        case GroupMembersError::bad_vteps:
+            return "bad_vteps";
+    }
+    return "unknown";
+}
+
 auto to_string(VpcConfigError e) noexcept -> const char* {
     switch (e) {
         case VpcConfigError::vni_out_of_range:
@@ -626,6 +646,26 @@ auto VSwitch::handle_rs(geneve::NicId src, const NicBinding& binding, const pack
 auto VSwitch::poll() -> void {
     const Clock::time_point now = _now();
     const auto snap = _mappings->snapshot();
+    for (auto& [nic, state] : _group) {
+        const auto erased =
+            std::erase_if(state.groups, [now](const auto& g) { return g.second <= now; });
+        if (erased != 0) {
+            _membership_count -= erased;
+            _counters.snoop_expired += erased;
+            ++_membership_changes;
+        }
+        const auto binding = snap->lookup(nic);
+        if (!binding || !snap->is_local(nic) || !_group_policies.contains(binding->vni)) {
+            continue;
+        }
+        const VpcConfig* const cfg = vpc_config(binding->vni);
+        if (cfg != nullptr &&
+            (!state.last_query ||
+             now - *state.last_query >= std::chrono::seconds{igmp::query_interval_seconds})) {
+            send_queries(nic, state, *cfg);
+            state.last_query = now;
+        }
+    }
     for (const auto& [nic, port] : _ports) {
         const auto binding = snap->lookup(nic);
         if (!binding || !snap->is_local(nic)) {
@@ -795,6 +835,147 @@ auto VSwitch::inject_metadata(geneve::NicId nic, std::span<const std::byte> ip_p
     return true;
 }
 
+auto VSwitch::send_queries(geneve::NicId nic, NicGroupState& /*state*/, const VpcConfig& cfg)
+    -> void {
+    if (deliver(nic, igmp::build_query4(cfg.gateway_mac, cfg.ipv4_gateway))) {
+        ++_counters.queries_sent;
+    }
+    if (cfg.ipv6_prefix &&
+        deliver(nic, igmp::build_query6(cfg.gateway_mac, gateway_link_local(cfg.gateway_mac)))) {
+        ++_counters.queries_sent;
+    }
+}
+
+auto VSwitch::snoop(geneve::NicId src, const NicBinding& binding, const packet::ParsedPacket& p,
+                    igmp::Kind kind) -> void {
+    if (kind != igmp::Kind::report) {
+        ++_counters.tx_drop_router_msg;  // only the gateway queries
+        return;
+    }
+    ++_counters.snoop_reports;
+    const auto changes = igmp::parse_report(p);
+    if (!changes) {
+        ++_counters.snoop_malformed;
+        return;
+    }
+    const auto policy = _group_policies.find(binding.vni);
+    if (policy == _group_policies.end()) {
+        ++_counters.snoop_ignored;
+        return;
+    }
+    NicGroupState& state = _group[src];  // attached senders always have one
+    const Clock::time_point expiry = _now() + std::chrono::seconds{igmp::membership_seconds};
+    for (const igmp::Change& c : *changes) {
+        const auto it = state.groups.find(c.group);
+        if (!c.join) {
+            if (it != state.groups.end()) {
+                state.groups.erase(it);
+                --_membership_count;
+                ++_membership_changes;
+                ++_counters.snoop_leaves;
+            }
+        } else if (it != state.groups.end()) {
+            it->second = expiry;
+        } else if (state.groups.size() >= policy->second.max_groups_per_nic ||
+                   _membership_count >= max_role_memberships) {
+            ++_counters.snoop_drop_cap;
+        } else {
+            state.groups.emplace(c.group, expiry);
+            ++_membership_count;
+            ++_membership_changes;
+            ++_counters.snoop_joins;
+        }
+    }
+}
+
+auto VSwitch::trim_memberships(std::uint32_t vni, std::size_t cap) -> void {
+    const auto snap = _mappings->snapshot();
+    for (auto& [nic, state] : _group) {
+        const auto binding = snap->lookup(nic);
+        if (!binding || binding->vni != vni || state.groups.size() <= cap) {
+            continue;
+        }
+        const std::size_t extra = state.groups.size() - cap;
+        state.groups.erase(std::next(state.groups.begin(), static_cast<std::ptrdiff_t>(cap)),
+                           state.groups.end());
+        _membership_count -= extra;
+        ++_membership_changes;
+    }
+}
+
+auto VSwitch::set_group_members(std::uint32_t vni, const GroupMembers& members)
+    -> std::expected<void, GroupMembersError> {
+    if (vni == 0 || vni > geneve::vni_max) {
+        return std::unexpected(GroupMembersError::vni_out_of_range);
+    }
+    if (members.size() > proto::max_member_groups) {
+        return std::unexpected(GroupMembersError::too_many_groups);
+    }
+    std::size_t total = 0;
+    for (const auto& [group, vteps] : members) {
+        if (!igmp::replicable(group)) {
+            return std::unexpected(GroupMembersError::bad_group);
+        }
+        total += vteps.size();
+        const bool bad = std::ranges::any_of(vteps, [](const Ipv6Address& v) {
+            return packet::is_unspecified(v) || packet::is_ipv6_multicast(v);
+        });
+        if (vteps.empty() || vteps.size() > proto::max_group_vteps ||
+            total > proto::max_member_vteps || bad || !std::ranges::is_sorted(vteps) ||
+            std::ranges::adjacent_find(vteps) != vteps.end()) {
+            return std::unexpected(GroupMembersError::bad_vteps);
+        }
+    }
+    if (members.empty()) {
+        _group_members.erase(vni);
+    } else {
+        _group_members.insert_or_assign(vni, members);
+    }
+    return {};
+}
+
+auto VSwitch::group_members(std::uint32_t vni) const -> const GroupMembers* {
+    const auto it = _group_members.find(vni);
+    return it == _group_members.end() ? nullptr : &it->second;
+}
+
+auto VSwitch::memberships() const -> std::vector<Membership> {
+    const auto snap = _mappings->snapshot();
+    std::vector<Membership> out;
+    out.reserve(_membership_count);
+    for (const auto& [nic, state] : _group) {
+        const auto binding = snap->lookup(nic);
+        if (!binding) {
+            continue;
+        }
+        for (const auto& entry : state.groups) {
+            out.push_back({.nic = nic, .vni = binding->vni, .group = entry.first});
+        }
+    }
+    std::ranges::sort(out, [](const Membership& a, const Membership& b) {
+        return std::tie(a.nic, a.group) < std::tie(b.nic, b.group);
+    });
+    return out;
+}
+
+auto VSwitch::listed_vteps(std::uint32_t vni, const packet::ParsedPacket* ip) const
+    -> const std::vector<Ipv6Address>* {
+    if (ip == nullptr) {
+        return nullptr;
+    }
+    const auto lists = _group_members.find(vni);
+    if (lists == _group_members.end()) {
+        return nullptr;
+    }
+    const auto it = lists->second.find(igmp::destination_group(*ip));
+    return it == lists->second.end() ? nullptr : &it->second;
+}
+
+auto VSwitch::joined(geneve::NicId nic, const igmp::Group& g) const -> bool {
+    const auto it = _group.find(nic);
+    return it != _group.end() && it->second.groups.contains(g);
+}
+
 auto VSwitch::NicIdHash::operator()(geneve::NicId id) const noexcept -> std::size_t {
     return std::hash<std::uint64_t>{}(id.value);
 }
@@ -824,6 +1005,10 @@ auto VSwitch::detach(geneve::NicId nic) -> bool {
     _metadata_buckets.erase(nic);
     const auto it = _group.find(nic);
     if (it != _group.end()) {
+        if (!it->second.groups.empty()) {
+            _membership_count -= it->second.groups.size();
+            ++_membership_changes;
+        }
         _retired.push_back({.nic = nic,
                             .attachment = it->second.attachment,
                             .detached = true,
@@ -841,10 +1026,12 @@ auto VSwitch::set_group_policy(std::uint32_t vni, const GroupPolicy& policy)
     switch (policy.mode) {
         case GroupMode::drop:
             if (policy.rate_frames != 0 || policy.burst_frames != 0 || policy.rate_bytes != 0 ||
-                policy.burst_bytes != 0 || policy.max_remote_vteps != 0) {
+                policy.burst_bytes != 0 || policy.max_remote_vteps != 0 ||
+                policy.max_groups_per_nic != 0) {
                 return std::unexpected(GroupPolicyError::nonzero_limits);
             }
             _group_policies.erase(vni);
+            trim_memberships(vni, 0);
             return {};
         case GroupMode::multicast:
             break;
@@ -858,10 +1045,12 @@ auto VSwitch::set_group_policy(std::uint32_t vni, const GroupPolicy& policy)
     if (policy.rate_frames > group_rate_frames_max ||
         policy.burst_frames > group_burst_frames_max || policy.rate_bytes > group_rate_bytes_max ||
         policy.burst_bytes > group_burst_bytes_max ||
-        policy.max_remote_vteps > group_max_remote_vteps_max) {
+        policy.max_remote_vteps > group_max_remote_vteps_max ||
+        policy.max_groups_per_nic > group_max_groups_per_nic_max) {
         return std::unexpected(GroupPolicyError::limit_too_large);
     }
     _group_policies.insert_or_assign(vni, policy);
+    trim_memberships(vni, policy.max_groups_per_nic);
     return {};
 }
 
@@ -1020,6 +1209,10 @@ auto VSwitch::transmit(const TxFrame& tx) -> void {
         ++_counters.tx_drop_router_msg;
         return;
     }
+    if (const auto kind = igmp::classify(*pkt); kind) {
+        snoop(tx.source, *binding, *pkt, *kind);
+        return;
+    }
     if (const auto icmp = icmpv6_type(*pkt); icmp) {
         if (*icmp == neighbor::icmpv6_neighbor_advertisement &&
             !own_na_target(*pkt, tx.source, binding->vni)) {
@@ -1094,7 +1287,7 @@ auto VSwitch::forward(const MappingSnapshot& snap, geneve::NicId src, const NicB
                       std::span<const std::byte> frame, const packet::ParsedPacket* ip) -> void {
     const MacAddress dst_mac = mac_at(frame, dst_mac_offset);
     if ((dst_mac[0] & group_bit) == group_bit) {
-        replicate(snap, src, binding.vni, frame, ip == nullptr || ip_multicast_destination(*ip));
+        replicate(snap, src, binding.vni, frame, ip);
         return;
     }
     const auto dst = snap.find_by_mac(binding.vni, dst_mac);
@@ -1263,7 +1456,8 @@ auto VSwitch::handle_nd(const MappingSnapshot& snap, geneve::NicId src, const Ni
 }
 
 auto VSwitch::replicate(const MappingSnapshot& snap, geneve::NicId src, std::uint32_t vni,
-                        std::span<const std::byte> frame, bool ip_ok) -> void {
+                        std::span<const std::byte> frame, const packet::ParsedPacket* ip) -> void {
+    const bool ip_ok = ip == nullptr || ip_multicast_destination(*ip);
     NicGroupState& state = _group[src];  // attached senders always have one
     GroupMeter& meter = state.meter;
     const auto policy_it = _group_policies.find(vni);
@@ -1280,6 +1474,10 @@ auto VSwitch::replicate(const MappingSnapshot& snap, geneve::NicId src, std::uin
     }
     const GroupPolicy& policy = policy_it->second;
 
+    // A listed group goes to its VTEPs and the local NICs that joined it;
+    // any other group to the whole VNI.
+    const std::vector<Ipv6Address>* const listed = listed_vteps(vni, ip);
+    const igmp::Group group = ip == nullptr ? igmp::Group{} : igmp::destination_group(*ip);
     std::vector<geneve::NicId> locals;
     std::vector<Ipv6Address> vteps;
     for (const MapEntry& e : snap.entries(vni)) {
@@ -1287,10 +1485,16 @@ auto VSwitch::replicate(const MappingSnapshot& snap, geneve::NicId src, std::uin
             continue;
         }
         if (snap.is_local(e.nic_id)) {
-            locals.push_back(e.nic_id);
-        } else if (std::ranges::find(vteps, e.owner_vtep) == vteps.end()) {
+            if (listed == nullptr || joined(e.nic_id, group)) {
+                locals.push_back(e.nic_id);
+            }
+        } else if (listed == nullptr && std::ranges::find(vteps, e.owner_vtep) == vteps.end()) {
             vteps.push_back(e.owner_vtep);
         }
+    }
+    if (listed != nullptr) {
+        std::ranges::copy_if(*listed, std::back_inserter(vteps),
+                             [&](const Ipv6Address& v) { return v != snap.local_vtep(); });
     }
     if (vteps.size() > policy.max_remote_vteps) {
         ++meter.drop_fanout;
@@ -1304,6 +1508,9 @@ auto VSwitch::replicate(const MappingSnapshot& snap, geneve::NicId src, std::uin
     }
 
     ++_counters.tx_flooded;
+    if (listed != nullptr) {
+        ++_counters.tx_replicas_pruned;
+    }
     ++meter.frames;
     meter.bytes += frame.size();
     for (const geneve::NicId nic : locals) {
@@ -1343,8 +1550,18 @@ auto VSwitch::receive(const geneve::Packet& packet, const Ipv6Address& outer_src
         if (!inner_allowed(packet, *dst)) {
             return dst;
         }
+        // A listed group reaches only the local NICs that joined it.
+        std::optional<packet::ParsedPacket> ip;
+        if (_group_members.contains(packet.vni)) {
+            if (auto parsed = packet::parse(packet.inner); parsed) {
+                ip = *parsed;
+            }
+        }
+        const bool listed = listed_vteps(packet.vni, ip ? &*ip : nullptr) != nullptr;
+        const igmp::Group group = ip ? igmp::destination_group(*ip) : igmp::Group{};
         for (const MapEntry& e : snap->entries(packet.vni)) {
-            if (snap->is_local(e.nic_id) && deliver(e.nic_id, packet.inner)) {
+            if (snap->is_local(e.nic_id) && (!listed || joined(e.nic_id, group)) &&
+                deliver(e.nic_id, packet.inner)) {
                 ++_counters.rx_delivered;
             }
         }

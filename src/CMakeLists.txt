@@ -20,6 +20,7 @@ add_library(ak_oar_net
   oar/net/dhcp4.cpp
   oar/net/dhcp6.cpp
   oar/net/geneve.cpp
+  oar/net/igmp.cpp
   oar/net/mapping_table.cpp
   oar/net/mtu.cpp
   oar/net/neighbor.cpp

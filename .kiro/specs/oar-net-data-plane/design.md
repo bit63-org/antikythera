@@ -107,7 +107,8 @@ Requirement 10. Each VNI has a `GroupPolicy`: `mode` (`drop`, the
 default, or `multicast`), per-source-NIC `rate_frames`/`burst_frames` and
 `rate_bytes`/`burst_bytes`, and `max_remote_vteps`, the flood-list cap. A
 `multicast` policy must set every limit; a `drop` policy carries none.
-Phase 2 adds `max_groups_per_nic` and per-group VTEP lists.
+`max_groups_per_nic` (0 to 256) caps snooped joins per NIC; 0 refuses
+every join, so every group stays unknown (see "Multicast snooping").
 
 Transmit, after the ARP/ND proxy has had the frame:
 
@@ -143,6 +144,40 @@ The policy arrives as a controller-signed `GroupPolicy` frame that helm
 forwards unmodified over OarLink (`group_policy`), checked like
 `map_update` (target server, key ID, Ed25519 signature, version newer
 than the applied one). helm polls meters with `group_usage`.
+
+### Multicast snooping
+
+Requirement 10.5, task 14; `src/oar/net/igmp.*` reads the messages.
+
+- Reports. In an opted-in VNI, IGMPv1/v2/v3 and MLDv1/v2 reports from a
+  guest (after the source check; IGMP from `0.0.0.0` and MLD from
+  link-local are allowed) record or remove `(NIC, group)` joins. v3/v2
+  group records join on EXCLUDE modes and on INCLUDE or ALLOW with
+  sources, and leave on INCLUDE with none; sources are not tracked,
+  because replication is per group. Groups the GroupMembers rules call
+  unreplicable (solicited-node, non-multicast) are skipped. Reports are
+  consumed, never replicated. Over `max_groups_per_nic`, or over
+  `max_role_memberships` (1024) in the role, a join is refused
+  (`snoop_drop_cap`). A lowered cap trims, a `drop` policy clears.
+  Guests' queries and other IGMP types are `tx_drop_router_msg`.
+- Querier. The VPC gateway (it needs a `VpcConfig`) sends every attached
+  NIC of an opted-in VNI an IGMPv3 general query, and an MLDv2 one with
+  an IPv6 prefix, at once and then every 125 s (Router Alert, TTL 1,
+  max response 10 s, robustness 2). A join not refreshed within 260 s
+  expires (`snoop_expired`). A restarted role therefore relearns its
+  NICs' joins within one interval.
+- VTEP lists. `set_group_members(vni, lists)` holds the controller's
+  per-group VTEP lists (the signed `GroupMembers` frame). A frame for a
+  listed group goes to the listed VTEPs except this one, and only to the
+  local NICs that joined it, on transmit and receive
+  (`tx_replicas_pruned`); an unlisted group still goes to the whole VNI,
+  so a new group works before the controller has heard of it. The rate
+  limit and `max_remote_vteps` apply to whichever list is used.
+- Reporting. `memberships()` lists every join of an attached, mapped NIC
+  with its VNI, ascending; `membership_changes()` tells a reader when to
+  look again. helm reports a role's whole list as a `group_membership`
+  report (controller-interface design "Multicast policy and usage").
+
 
 ### IP awareness
 

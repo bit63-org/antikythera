@@ -80,9 +80,8 @@ Requirement 2.1). There is no separate storage fabric and no storage
 traffic on the tenant VPC fabric.
 
 - **Ports.** Every oar-blk and hold board gets a management-fabric port
-  (a backplane amendment for storage-capable data-plane slots), separate
-  from helm's own management port. The object store is reached the same
-  way.
+  (backplane Requirement 4.4), separate from helm's own management port.
+  The object store is reached the same way.
 - **Segmentation.** Data-plane roles are untrusted, while helm's
   controller link is the server's most trusted network path, so the two
   never share a segment: storage traffic runs on a storage VLAN (and
@@ -96,7 +95,10 @@ traffic on the tenant VPC fabric.
   lease renewals and reports through helm), storage I/O (initiator to
   primary, replication), and background (rebuild, resync, hydration,
   scrub, snapshot upload). hold and oar-blk set DSCP/802.1p on their
-  sockets; helm marks its own. Leases ride the control class, so a
+  sockets (AF41 and AF11, backplane Requirement 7.4); helm marks its own
+  CS6, and the switch re-marks storage-segment frames that claim CS6.
+  The VLAN, ACL and class rules are backplane Requirement 7; helm's side
+  is controller-interface Requirement 2.4. Leases ride the control class, so a
   saturated storage segment cannot cost a healthy primary its lease
   (Requirement 13.6).
 - **Sizing.** Every guest write crosses the fabric once to the primary
@@ -106,7 +108,8 @@ traffic on the tenant VPC fabric.
   "Resync and rebuild" is a fraction of the storage class's share, not of
   the whole link. The 1 TiB-per-hour rebuild target (Requirement 7.6)
   needs about 300 MB/s of background capacity, so a 25 GbE management
-  uplink is the practical floor for storage servers.
+  uplink is the practical floor for storage servers (backplane
+  Requirement 4.5).
 - **harbor.** The storage segment is a VLAN on harbor's management
   bridge, with the per-server namespaces of harbor task 7.
 

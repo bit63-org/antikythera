@@ -48,6 +48,11 @@ EC2 concepts map onto it.
    certificate authority SHALL be kythira's.
 3. Loss of the link SHALL NOT affect running VMs; commands resume with the
    next sequence number when it returns.
+4. helm's management interface SHALL be on the management fabric's
+   control segment, which the storage segment cannot reach (backplane
+   Requirement 7.1-7.3), and helm SHALL mark the controller link,
+   including lease traffic it relays, as the control class (backplane
+   Requirement 7.4).
 
 ### Requirement 3: Inventory and status
 
@@ -92,15 +97,21 @@ work against kythira, backed by antikythera servers.
    | `RunInstances` | place → `CREATE_VOLUME` (root, from AMI) → `CREATE_VM` → `ATTACH_VOLUME` → `ATTACH_DEVICE` (NIC) per ENI |
    | `TerminateInstances` | `DESTROY_VM {persist_volumes = !DeleteOnTermination}` |
    | `StopInstances` / `StartInstances` | `DESTROY_VM {persist_volumes = true}` / `CREATE_VM` + re-attach on any server holding capacity |
-   | `CreateVolume` / `DeleteVolume` | `CREATE_VOLUME` / `DELETE_VOLUME` (crypto-erase) |
-   | `AttachVolume` / `DetachVolume` | `ATTACH_VOLUME` / `DETACH_VOLUME` |
+   | `CreateVolume` / `DeleteVolume` | network volume: Requirement 9; local volume: `CREATE_VOLUME` / `DELETE_VOLUME` (crypto-erase) |
+   | `AttachVolume` / `DetachVolume` | `ATTACH_VOLUME` / `DETACH_VOLUME`; for a network volume with the ReplicaConfig, `VolumeKey` and fencing steps of Requirement 9 |
    | `CreateVpc` / `DeleteVpc` | `CREATE_NETWORK` / `DELETE_NETWORK` (VNI allocation) |
    | `CreateNetworkInterface`, `AttachNetworkInterface`, `DetachNetworkInterface` | NIC ID + MAC allocation; `ATTACH_DEVICE` / `DETACH_DEVICE`; `MAP_UPDATE` |
    | `DescribeInstances`, `DescribeVolumes`, `DescribeVpcs` | served from controller state |
 
-2. Volumes SHALL be server-local in the first release; an instance's
-   volumes and the instance SHALL be co-located, and `StartInstances` SHALL
-   prefer the server holding them.
+2. EBS volumes (`CreateVolume`, `RunInstances` `Ebs` block device
+   mappings) SHALL be network volumes of block-volume-service, attachable
+   from any server; they SHALL NOT pin an instance to a server, and
+   `StopInstances` / `StartInstances` MAY place the instance on any
+   server with capacity (Requirement 9.9). Local volumes are the
+   instance-store analogue (`VirtualName` `ephemeralN` mappings): they
+   stay server-local, an instance with one SHALL be co-located with it,
+   and `StartInstances` SHALL use the server holding it. This replaces
+   the first release's rule that every volume is server-local.
 3. EC2 encryption parameters (`Encrypted`, `KmsKeyId`) SHALL map to
    antikythera's always-on per-VM encryption; IF a `KmsKeyId` is given THEN
    the controller SHALL wrap the server's VM key under that kythira KMS key
@@ -169,3 +180,95 @@ peers' public keys from the controller, so the authenticated underlay
    one pair at a time, choosing PSP only where both ends support it. Only
    WireGuard is implemented; a role SHALL refuse a peer set naming a mode
    it does not run.
+
+### Requirement 9: EC2 mapping of network volumes
+
+**User Story:** As a kythira user, I want the AWS CLI and SDKs' EBS calls
+to drive block-volume-service's replicated network volumes, with EBS's
+parameters, states and errors.
+
+This is the mapping block-volume-service Requirement 14 asks for. Volume
+classes, ReplicaConfig, VolumeOp, VolumeKey and the reports are defined
+in block-volume-service; this requirement says what each EC2 call does
+with them. Design "Network volumes in EC2" gives the parameter and state
+tables.
+
+#### Acceptance Criteria
+
+1. `CreateVolume` SHALL place a replica set and publish its first
+   ReplicaConfig, with no mailbox command. `VolumeType` `gp2` and `gp3`
+   SHALL map to the `general` class and `io1` and `io2` to
+   `provisioned`; `st1`, `sc1` and `standard` SHALL be refused with
+   `UnsupportedOperation`. `Size`, `Iops` and `Throughput` SHALL become
+   the config's capacity and QoS, validated against EBS's rules for the
+   type and the class's hardware maxima. `SnapshotId` SHALL make a
+   same-lineage restore, or a keyed copy into a new lineage when
+   `KmsKeyId` differs from the snapshot's (block-volume Requirement 12.5).
+   `MultiAttachEnabled` SHALL set `multi_attach` and SHALL be refused
+   with `InvalidParameterCombination` outside the `provisioned` class.
+   `Encrypted` and `KmsKeyId` SHALL follow Requirement 6.3; every volume
+   is encrypted and SHALL report `Encrypted = true`.
+2. `DeleteVolume` SHALL be refused with `VolumeInUse` while the volume
+   has an attachment; otherwise it SHALL send `delete_replica` to every
+   member, and the lineage's KMS key SHALL be scheduled for deletion when
+   its last volume and snapshot are gone.
+3. `AttachVolume` SHALL add an attachment (new ID and generation) at a
+   new epoch, send the ReplicaConfig to the members and to the
+   instance's server, send that server a `VolumeKey`, and then
+   `ATTACH_VOLUME`. A second attachment SHALL be refused with
+   `VolumeInUse` unless the volume is `multi_attach`, and the sixteenth
+   is the last. Attaching to a stopped instance SHALL record the
+   attachment only; the key and the mailbox command follow at start.
+4. `DetachVolume` without `Force` SHALL send `DETACH_VOLUME` with
+   `DetachPolicy` `wait` and the volume's detach timeout; a timeout SHALL
+   leave the attachment `busy`, attached and serving, until the guest
+   releases or a forced detach replaces it. `DetachVolume` with `Force`
+   SHALL first publish a ReplicaConfig without the attachment's
+   generation, wait for the primary to report it `fenced` (or for the
+   primary's lease to lapse), and only then send `DETACH_VOLUME`
+   `force`. Detaching the root volume of a running instance SHALL be
+   refused with `OperationNotPermitted`.
+5. `ModifyVolume` SHALL apply `Size` (grow only; shrink refused with
+   `InvalidParameterValue`), `VolumeType`, `Iops`, `Throughput` and
+   `MultiAttachEnabled` while attached, as a new epoch; a change of
+   replication factor SHALL add or remove members as a move.
+   `DescribeVolumesModifications` SHALL report `modifying` until every
+   member and initiator has applied the epoch, `optimizing` while added
+   replicas rebuild, then `completed` (or `failed`).
+6. `DescribeVolumes` and `DescribeVolumeStatus` SHALL report the volume
+   states, attachment states and status checks of block-volume
+   Requirement 14.2, derived from reports as design "Network volumes in
+   EC2" tabulates; a volume with `io_suspended` SHALL report status
+   `impaired` with a `potential-data-inconsistency` event and the
+   `enable-volume-io` action. `EnableVolumeIO` SHALL run block-volume
+   Requirement 6.8, and the `AutoEnableIO` volume attribute
+   (`ModifyVolumeAttribute`, `DescribeVolumeAttribute`) SHALL make the
+   controller run it without being asked.
+7. `CreateSnapshot` SHALL take a single-volume cut and upload;
+   `CreateSnapshots` SHALL take one multi-volume cut across the
+   instance's network volumes (excluding the root with
+   `ExcludeBootVolume`; local volumes, like instance store, are never
+   included). Snapshots SHALL report `pending` with `Progress` from
+   `snapshot_progress`, then `completed` or `error`. `DeleteSnapshot`
+   SHALL delete the manifest and garbage-collect the lineage's chunks;
+   `DescribeSnapshots` SHALL be served from controller state.
+8. `EnableFastSnapshotRestores` (and `Disable…`, `Describe…`) SHALL
+   record a per-snapshot, per-zone flag; volumes created from a flagged
+   snapshot SHALL stay `creating` until fully hydrated and report
+   `FastRestored = true`. `CopyVolumes` SHALL clone the source into a new
+   volume of the same lineage in seconds, refusing parameters that would
+   need a new key.
+9. `RunInstances` `Ebs` block device mappings SHALL create and attach a
+   network volume each (the root from the AMI as a plaintext-image or
+   snapshot restore), honouring `DeleteOnTermination` (default true for
+   the root from the AMI); `TerminateInstances` SHALL delete those that
+   carry it and leave the rest `available`. `StopInstances` SHALL retire
+   every attachment's generation before the instance can start
+   elsewhere (block-volume Requirement 6.9); `StartInstances` SHALL
+   attach them again with new generations on the chosen server.
+10. EBS features with no backing SHALL be refused with
+    `UnsupportedOperation`, never silently accepted, among them: HDD
+    volume types, snapshot archive tier, cross-region `CopySnapshot`,
+    snapshot sharing across accounts, Recycle Bin and snapshot lock,
+    Outposts, and the EBS direct APIs.
+

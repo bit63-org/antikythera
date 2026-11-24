@@ -287,8 +287,12 @@ The process ignores SIGPIPE, since OpenSSL writes to the socket with
 ## Placement inputs
 
 From inventory: free whole cores, free 1 GiB pages, free functions by type,
-local volumes. The first placement policy: volumes pin the server; otherwise
-most free cores.
+local volumes. Local volumes pin the server; network volumes do not
+(Requirement 6.2), so an instance with only network volumes goes to the
+server with most free cores and a free blk function per attachment.
+Replica placement for network volumes is block-volume-service's
+(failure domains, reference model `ak_hold_master`), independent of where
+the instance runs.
 
 ## Sequencing RunInstances
 
@@ -304,6 +308,90 @@ controller                       helm                hull
 
 Each step is acknowledged before the next; failure triggers the
 controller's compensation (destroy in reverse order).
+
+For an `Ebs` root volume, `CREATE_VOLUME` is not a mailbox command: the
+controller places the replica set and publishes its ReplicaConfig, waits
+for every member's `replica_status`, then sends the instance's server
+the ReplicaConfig and `VolumeKey` before `ATTACH_VOLUME`. The AMI's root
+is restored as a foreign-key image hydrated by oar-blk, so the VM can
+boot before hydration finishes.
+
+## Network volumes in EC2
+
+Requirement 9 in tables. Names in `code` on the right are
+block-volume-service's (`src/proto/replica_config.hpp`,
+`src/proto/report.hpp`).
+
+### Parameters
+
+| EC2 parameter | Network volume |
+|---|---|
+| `VolumeType` `gp2`, `gp3` | class `general`: 2 replicas; gp3 defaults 3000 IOPS and 125 MiB/s; gp2's size-derived IOPS become fixed QoS numbers |
+| `VolumeType` `io1`, `io2` | class `provisioned`: 3 replicas; `Iops` required |
+| `VolumeType` `st1`, `sc1`, `standard` | `UnsupportedOperation` |
+| `Size` (GiB) | `capacity_blocks = Size × 2³⁰ / block_size`, `block_size` 512 (what EBS presents) |
+| `Iops`, `Throughput` | `qos.iops`, `qos.mib_per_s`; bursts from class policy; values beyond the class maximum: `InvalidParameterValue` |
+| `SnapshotId` | `source {snapshot}`; same lineage, or a new lineage with oar-blk hydration when `KmsKeyId` differs |
+| `VolumeInitializationRate` | `source.hydrate_mib_per_s` (else the controller default) |
+| `MultiAttachEnabled` | flag `multi_attach`; `provisioned` only |
+| `Encrypted`, `KmsKeyId` | always encrypted, per-lineage KMS key optionally protected by `KmsKeyId` (Requirement 6.3) |
+| `AvailabilityZone` | the region's one zone; any other is `InvalidParameterValue` |
+| `OutpostArn` | `UnsupportedOperation` |
+| `Device` (`AttachVolume`) | recorded and reported; the guest sees virtio-blk devices in attach order, as Nitro guests see NVMe, so the name is a label |
+
+### Volume states
+
+| EC2 `State` | Controller condition |
+|---|---|
+| `creating` | placed, epoch 1 published, not every member has reported `replica_status`; with fast restore, until hydration completes |
+| `available` | every member reported, no attachment |
+| `in-use` | at least one attachment in any state but `detached` |
+| `deleting` | `delete_replica` sent, not every `op_outcome` back |
+| `deleted` | every member reported `delete_replica` done; the record is kept for `DescribeVolumes` for an hour |
+| `error` | placement found no failure-domain-diverse members, a member failed to create its replica, or KMS refused the key |
+
+### Attachment states
+
+| EC2 attachment `State` | Condition |
+|---|---|
+| `attaching` | attachment in the published ReplicaConfig, `ATTACH_VOLUME` not yet answered |
+| `attached` | hull answered `ok`; `attachment_status` `attached` |
+| `detaching` | `DETACH_VOLUME` (`wait`) relayed or the forced path's fencing epoch published; `eject_requested`, or `fenced` before the unplug |
+| `busy` | `DETACH_VOLUME` answered `busy` / `attachment_status` `busy`: the guest still holds the disk; it stays attached and serving |
+| `detached` | hull answered `ok` to the unplug and the controller published the epoch that retires the generation |
+
+### Status checks
+
+| `VolumeStatus` | Condition |
+|---|---|
+| `ok` | a primary with a current lease and at least the class's replication factor in sync |
+| `warning` | serving, but fewer in-sync replicas than the class's factor (rebuild queued or running), or hydration still running on a non-fast-restored volume |
+| `impaired` | `io_suspended` or `impaired` in the newest ReplicaConfig; event `potential-data-inconsistency`, action `enable-volume-io` unless `AutoEnableIO` already ran it |
+| `insufficient-data` | `creating`, or no report from the primary's server within the 10 s report timeout |
+
+`DescribeVolumeStatus` also reports the `io-enabled` and
+`io-performance` details: `io-performance` is `degraded` while the
+primary reports time throttled below the provisioned rate (Requirement
+10.5 counters) for a sustained minute.
+
+### Operations
+
+| EC2 action | Steps |
+|---|---|
+| `ModifyVolume` | new epoch with new `capacity_blocks` (members extend first, then initiators raise the config change) and QoS; replica-count change = add `joining` members or retire members as a move; modification `modifying` → `optimizing` (rebuilds) → `completed` |
+| `EnableVolumeIO` | promote the most up-to-date surviving replica at a new epoch, clear `io_suspended`, record a possible-loss event |
+| `CreateSnapshot` | `VolumeOp` `snapshot_prepare` / `snapshot_commit` / `snapshot_upload` on one volume; snapshot ID ↔ manifest name kept by the controller |
+| `CreateSnapshots` | multi-volume cut over the instance's network volumes; one snapshot per volume, same cut |
+| `DeleteSnapshot` | delete the manifest, mark-and-sweep the lineage's chunks |
+| `EnableFastSnapshotRestores` | flag per (snapshot, zone): `enabling` → `enabled` at once, since fast restore is a creation-time behaviour here; a creation-credit bucket per snapshot bounds the hydration load it can cause |
+| `CopyVolumes` | `VolumeOp` `clone` on every member after a cut; new volume ID, same lineage; size or QoS changes applied as a `ModifyVolume` after |
+| `TerminateInstances` | `DESTROY_VM`; retire every attachment's generation; `DeleteVolume` for those with `DeleteOnTermination` |
+| `StopInstances` / `StartInstances` | `DESTROY_VM {persist_volumes = true}` and retire the generations / place anywhere, new generations, `VolumeKey` per attachment, `ATTACH_VOLUME` each |
+
+None of this needs a new mailbox command: the mailbox sees only
+`ATTACH_VOLUME`, `DETACH_VOLUME` (with `DetachPolicy` `wait = 3`) and
+the VM commands; everything else is ReplicaConfig, VolumeOp, VolumeKey
+and reports on the controller link.
 
 ## Where the code lives
 

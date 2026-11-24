@@ -58,7 +58,8 @@
   `HelmDaemon` and `TunnelPeerSet` into `NetRole` follows helm main and
   oar-net task 11.)
 - [ ] 6. Draft the kythira `ec2-compatible-api` spec in the kythira
-  repository, from Requirement 6. _Requirements: 6_
+  repository, from Requirements 6 and 9 (network volumes ported from
+  `ak_hold_master`). _Requirements: 6, 9_
 - [ ] 7. End-to-end: AWS CLI `run-instances` against kythira, landing in a
   harbor server. _Requirements: 6.1_
 - [ ] 12. Controller policy state, admission checks and usage metering

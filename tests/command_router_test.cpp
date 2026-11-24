@@ -1163,7 +1163,12 @@ BOOST_AUTO_TEST_CASE(stuck_releases_fault_until_a_power_cycle,
     h.run(detach);
     BOOST_TEST((h.state(net_slot, fn_one) == FunctionState::releasing));
 
+    // hull may spend the detach's own timeout waiting for the guest's
+    // eject before it releases the function: that time is not a fault.
     h.t += release_timeout;
+    h.router.poll();
+    BOOST_TEST((h.state(net_slot, fn_one) == FunctionState::releasing));
+    h.t += std::chrono::seconds{detach_timeout_s};
     h.router.poll();
     BOOST_TEST((h.state(net_slot, fn_one) == FunctionState::faulted));
     BOOST_TEST((h.router.inventory().health == proto::Health::degraded));

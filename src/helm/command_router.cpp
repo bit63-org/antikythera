@@ -803,7 +803,7 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body, const U
         }
         _vms.erase(d->vm_id);
     } else if (const auto* dd = std::get_if<mailbox::DetachDevice>(&body)) {
-        if (!release(function_id(dd->device), dd->vm_id)) {
+        if (!release(function_id(dd->device), dd->vm_id, std::chrono::seconds{dd->timeout_s})) {
             ++_stats.inconsistencies;
         }
     } else if (const auto* cv = std::get_if<mailbox::CreateVolume>(&body)) {
@@ -838,7 +838,7 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body, const U
         }
         deliver_volume_key(seq, *av);
     } else if (const auto* xv = std::get_if<mailbox::DetachVolume>(&body)) {
-        if (!release(function_id(xv->device), xv->vm_id)) {
+        if (!release(function_id(xv->device), xv->vm_id, std::chrono::seconds{xv->timeout_s})) {
             ++_stats.inconsistencies;
         }
         _attached.erase(xv->volume_id);
@@ -1209,13 +1209,13 @@ auto CommandRouter::pool_event(FunctionId id, PoolEvent event) -> bool {
     return true;
 }
 
-auto CommandRouter::release(FunctionId id, VmId vm) -> bool {
+auto CommandRouter::release(FunctionId id, VmId vm, std::chrono::milliseconds grace) -> bool {
     const auto before = _pool->find(id);
     if (!before || !_pool->release(id, vm)) {
         return false;
     }
     report_transition(id, before->state, *_pool->find(id), vm);
-    _deadlines[id] = now() + _config.release_timeout;
+    _deadlines[id] = now() + _config.release_timeout + grace;
     _ejecting.erase(id);  // detached: cleaning clears the request on the role
     return true;
 }

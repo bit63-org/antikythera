@@ -143,7 +143,9 @@
 // requests time out inside OarLink and fail the command the same way.
 //
 // Releases and cleaning (Requirement 3.3, 3.4). A released function waits
-// in `releasing` for hull's DEVICE_RELEASED (up to release_timeout), then
+// in `releasing` for hull's DEVICE_RELEASED (up to release_timeout; after
+// DETACH_DEVICE or DETACH_VOLUME, timeout_s longer, because hull answers
+// those `accepted` and may wait that long for the guest to eject), then
 // its role cleans it: NIC and storage roles synchronously over the
 // sideband; GPU functions wait for hull's SCRUB_DONE (up to
 // clean_timeout). Failure or timeout faults the function until its slot is
@@ -501,7 +503,8 @@ private:
     // Pool moves that report themselves.
     auto pool_event(FunctionId id, PoolEvent event) -> bool;
     auto assign(FunctionId id, VmId vm) -> bool;
-    auto release(FunctionId id, VmId vm) -> bool;
+    // `grace` extends the wait for DEVICE_RELEASED beyond release_timeout.
+    auto release(FunctionId id, VmId vm, std::chrono::milliseconds grace = {}) -> bool;
     auto start_cleaning(FunctionId id) -> void;
     auto report_transition(FunctionId id, FunctionState from, const FunctionInfo& after,
                            std::optional<VmId> vm) -> void;

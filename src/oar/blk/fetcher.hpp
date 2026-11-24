@@ -90,7 +90,8 @@ public:
                      FetchCallback done) -> void;
     auto prefetch(const std::shared_ptr<CachedImage>& image, std::uint32_t chunk) -> void;
 
-    // Waits until nothing is queued or in flight (tests).
+    // Waits until nothing is queued or in flight and every callback of a
+    // finished fetch has returned (tests).
     auto drain() -> void;
     [[nodiscard]] auto counters() const -> FetcherCounters;
 
@@ -130,6 +131,7 @@ private:
     std::deque<std::shared_ptr<Job>> _demand;
     std::deque<std::shared_ptr<Job>> _prefetch;
     std::map<Key, std::shared_ptr<Job>> _jobs;  // queued or in flight
+    std::size_t _calling{0};                    // workers running a finished job's callbacks
     FetcherCounters _counters;
     std::vector<std::thread> _workers;
 };

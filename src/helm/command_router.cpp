@@ -95,6 +95,10 @@ auto OarLinkPort::replica_config(std::span<const std::byte> frame)
     return _link->replica_config(frame);
 }
 
+auto OarLinkPort::eject(const oar::Eject& request) -> std::expected<oar::EjectState, LinkError> {
+    return _link->eject(request);
+}
+
 auto OarLinkPort::group_policy(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
     return _link->group_policy(frame);
 }
@@ -249,7 +253,7 @@ auto CommandRouter::on_envelope(const proto::Envelope& envelope) -> void {
 }
 
 auto CommandRouter::pump() -> void {
-    while (!_in_flight && !_queue.empty()) {
+    while (!_in_flight && !_waiting && !_queue.empty()) {
         const auto envelope = _queue.front();
         _queue.pop_front();
         dispatch(envelope);
@@ -280,23 +284,183 @@ auto CommandRouter::dispatch(const proto::Envelope& envelope) -> void {
         refuse(seq, claimed, ok.error());
         return;
     }
+    if (const auto* d = std::get_if<mailbox::DetachVolume>(&*body);
+        d != nullptr && d->policy == mailbox::DetachPolicy::wait) {
+        start_wait(seq, slot, *d);  // prepare reserved nothing: no undo
+        return;
+    }
+    relay(seq, slot, *body, undo);
+}
+
+auto CommandRouter::relay(std::uint64_t seq, const mailbox::Slot& slot, const mailbox::Body& body,
+                          Undo undo) -> void {
+    const auto type = mailbox::type_of(body);
     // The relay record comes first; if it cannot be written the command is
     // not relayed.
     if (!audit(AuditRecord::of(AuditEvent::command_relayed)
                    .with_seq(seq)
-                   .with_command(command_code(claimed)))) {
+                   .with_command(command_code(type)))) {
         compensate(seq, undo);
-        refuse(seq, claimed, mailbox::Status::internal_error);
+        refuse(seq, type, mailbox::Status::internal_error);
         return;
     }
     if (!_host->post_command(slot)) {
         compensate(seq, undo);
-        refuse(seq, claimed, mailbox::Status::internal_error);
+        refuse(seq, type, mailbox::Status::internal_error);
         return;
     }
     ++_stats.relayed;
     _in_flight = InFlight{
-        .seq = seq, .body = *body, .undo = undo, .deadline = now() + _config.command_timeout};
+        .seq = seq, .body = body, .undo = undo, .deadline = now() + _config.command_timeout};
+}
+
+// ---- cooperative detach ----------------------------------------------------
+
+auto CommandRouter::start_wait(std::uint64_t seq, const mailbox::Slot& slot,
+                               const mailbox::DetachVolume& detach) -> void {
+    const auto id = function_id(detach.device);
+    auto* port = port_for(detach.device.slot);
+    if (port == nullptr) {
+        refuse(seq, mailbox::Type::detach_volume, mailbox::Status::unknown_device);
+        return;
+    }
+    // request is idempotent: a function already asked (an earlier detach
+    // went busy) is asked again, which changes nothing on the role.
+    const auto state = port->eject({.fn = detach.device.function, .op = oar::EjectOp::request});
+    if (!state) {
+        refuse(seq, mailbox::Type::detach_volume, link_status(state.error()));
+        return;
+    }
+    const auto t = now();
+    auto [it, fresh] = _ejecting.try_emplace(id);
+    it->second.volume = detach.volume_id;
+    it->second.next_query = t + _config.eject_poll_interval;
+    if (fresh) {
+        audit(AuditRecord::of(AuditEvent::eject_requested)
+                  .with_seq(seq)
+                  .with_vm(detach.vm_id)
+                  .with_volume(detach.volume_id)
+                  .with_function(id));
+        report_attachment(detach.volume_id, detach.device.slot,
+                          proto::AttachmentState::eject_requested);
+    }
+    note_eject(id, *state);
+    if (*state == oar::EjectState::released) {
+        ++_stats.detaches_released;
+        relay(seq, slot, detach, Undo{});
+        return;
+    }
+    _waiting = Waiting{.seq = seq,
+                       .slot = slot,
+                       .body = detach,
+                       .deadline = t + std::chrono::seconds{detach.timeout_s}};
+}
+
+auto CommandRouter::query_eject(FunctionId id) -> std::optional<oar::EjectState> {
+    const auto it = _ejecting.find(id);
+    auto* port = port_for(slot_of(id));
+    if (it == _ejecting.end() || port == nullptr) {
+        return std::nullopt;
+    }
+    if (it->second.released) {
+        return oar::EjectState::released;
+    }
+    const auto state = port->eject({.fn = function_number_of(id), .op = oar::EjectOp::query});
+    if (!state) {
+        return std::nullopt;
+    }
+    note_eject(id, *state);
+    return *state;
+}
+
+auto CommandRouter::note_eject(FunctionId id, oar::EjectState state) -> void {
+    const auto it = _ejecting.find(id);
+    if (it == _ejecting.end() || it->second.released) {
+        return;
+    }
+    if (state == oar::EjectState::released) {
+        it->second.released = true;
+        const auto info = _pool->find(id);
+        audit(AuditRecord::of(AuditEvent::eject_released)
+                  .with_vm(info && info->owner ? *info->owner : VmId{0})
+                  .with_volume(it->second.volume)
+                  .with_function(id));
+        report_attachment(it->second.volume, slot_of(id), proto::AttachmentState::released);
+    }
+}
+
+auto CommandRouter::poll_ejects(Clock::time_point t) -> void {
+    if (_waiting) {
+        const auto id = function_id(_waiting->body.device);
+        auto it = _ejecting.find(id);
+        const bool due = it == _ejecting.end() || t >= it->second.next_query;
+        if (due && it != _ejecting.end()) {
+            it->second.next_query = t + _config.eject_poll_interval;
+        }
+        if (due && query_eject(id) == oar::EjectState::released) {
+            auto w = std::move(*_waiting);
+            _waiting.reset();
+            ++_stats.detaches_released;
+            relay(w.seq, w.slot, w.body, Undo{});
+        } else if (t >= _waiting->deadline) {
+            // The guest still holds it: stay attached and serving
+            // (Requirement 3.3). The request stays set.
+            auto w = std::move(*_waiting);
+            _waiting.reset();
+            ++_stats.detaches_busy;
+            if (it != _ejecting.end()) {
+                it->second.busy = true;
+            }
+            audit(AuditRecord::of(AuditEvent::detach_busy)
+                      .with_seq(w.seq)
+                      .with_vm(w.body.vm_id)
+                      .with_volume(w.body.volume_id)
+                      .with_function(id));
+            report_attachment(w.body.volume_id, w.body.device.slot, proto::AttachmentState::busy);
+            finish(w.seq, mailbox::Type::detach_volume, mailbox::Status::busy);
+        }
+        if (!_waiting) {
+            pump();
+        }
+    }
+    // Busy detaches: a guest that lets go later is reported, so the
+    // controller can detach again.
+    for (auto& [id, e] : _ejecting) {
+        if (!e.busy || e.released || t < e.next_query) {
+            continue;
+        }
+        e.next_query = t + _config.eject_poll_interval;
+        (void)query_eject(id);
+    }
+}
+
+auto CommandRouter::report_attachment(VolumeId volume, std::uint8_t slot,
+                                      proto::AttachmentState state) -> void {
+    const auto it = _network.find(volume);
+    if (it == _network.end() || it->second.attached_by == 0 || it->second.attachment == 0 ||
+        it->second.generation == 0) {
+        return;
+    }
+    _reports->report(proto::AttachmentStatus{.attachment_id = it->second.attachment,
+                                             .volume_id = volume,
+                                             .generation = it->second.generation,
+                                             .state = state,
+                                             .slot = slot,
+                                             .in_flight = 0});
+}
+
+auto CommandRouter::fenced(const NetworkVolume& net) const -> bool {
+    const auto c = proto::decode_replica_config(net.frame);
+    if (!c) {
+        return false;
+    }
+    // hold authorizes a session by the server its certificate names and
+    // the generation, so the attachment is fenced once no entry grants
+    // that pair to this server.
+    return std::ranges::none_of(c->attachments, [&](const proto::VolumeAttachment& a) {
+        return a.server_id == _config.server_id && a.attachment_id == net.attachment &&
+               a.generation == net.generation;
+    });
 }
 
 auto CommandRouter::reserve(VmId vm, const mailbox::DeviceRef& device, Undo& undo)
@@ -494,6 +658,14 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
             return std::unexpected(Status::unknown_volume);
         }
         if (network && net->second.attached_by != d->vm_id) {
+            return std::unexpected(Status::conflict);
+        }
+        // Removing a network volume the guest may still be using needs the
+        // attachment fenced first, so no request of its can reach the
+        // volume afterwards (Requirements 3.5, 3.6): the controller
+        // publishes a config without its generation before it forces.
+        // Under wait, the guest's release is what makes it safe.
+        if (network && d->policy != mailbox::DetachPolicy::wait && !fenced(net->second)) {
             return std::unexpected(Status::conflict);
         }
         const auto id = function_id(d->device);
@@ -973,6 +1145,7 @@ auto CommandRouter::poll() -> void {
         finish(seq, command, mailbox::Status::timed_out);
         pump();
     }
+    poll_ejects(t);
     for (auto it = _deadlines.begin(); it != _deadlines.end();) {
         if (t < it->second) {
             ++it;
@@ -1002,6 +1175,7 @@ auto CommandRouter::release(FunctionId id, VmId vm) -> bool {
     }
     report_transition(id, before->state, *_pool->find(id), vm);
     _deadlines[id] = now() + _config.release_timeout;
+    _ejecting.erase(id);  // detached: cleaning clears the request on the role
     return true;
 }
 

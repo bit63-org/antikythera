@@ -126,6 +126,9 @@ struct FakeOar final : helm::OarPort {
     std::optional<LinkError> delete_error;
     std::optional<LinkError> rewrap_error;
     std::vector<std::vector<std::byte>> configs;  // replica_config frames
+    std::vector<oar::Eject> ejects;
+    oar::EjectState eject_state{oar::EjectState::requested};  // answer to request and query
+    std::optional<LinkError> eject_error;
 
     auto prepare_function(const oar::PrepareFunction& r)
         -> std::expected<void, LinkError> override {
@@ -193,6 +196,13 @@ struct FakeOar final : helm::OarPort {
         configs.emplace_back(frame.begin(), frame.end());
         return {};
     }
+    auto eject(const oar::Eject& r) -> std::expected<oar::EjectState, LinkError> override {
+        ejects.push_back(r);
+        if (eject_error) {
+            return std::unexpected(*eject_error);
+        }
+        return r.op == oar::EjectOp::cancel ? oar::EjectState::none : eject_state;
+    }
 };
 
 struct FakeReports final : helm::ReportSink {
@@ -212,6 +222,15 @@ struct FakeReports final : helm::ReportSink {
         auto o = outcomes();
         BOOST_REQUIRE(!o.empty());
         return o.back();
+    }
+    [[nodiscard]] auto attachment_states() const -> std::vector<proto::AttachmentState> {
+        std::vector<proto::AttachmentState> out;
+        for (const auto& b : all) {
+            if (const auto* a = std::get_if<proto::AttachmentStatus>(&b)) {
+                out.push_back(a->state);
+            }
+        }
+        return out;
     }
     [[nodiscard]] auto pool_changes() const -> std::vector<proto::PoolStateChange> {
         std::vector<proto::PoolStateChange> out;
@@ -1214,6 +1233,8 @@ BOOST_AUTO_TEST_CASE(network_volumes_attach_with_the_controllers_key,
     BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::conflict));
     BOOST_TEST(h.keys.attachment_key(net_attachment).has_value());
     detach.vm_id = vm_one;
+    // A forced detach needs the attachment fenced first (Requirement 3.5).
+    BOOST_TEST(h.router.on_replica_config(net_config(3, other_server)));
     h.run(detach);
     BOOST_TEST((h.state(blk_slot, fn_one) == FunctionState::releasing));
     BOOST_TEST(!h.keys.attachment_key(net_attachment).has_value());
@@ -1238,4 +1259,251 @@ BOOST_AUTO_TEST_CASE(a_network_volume_detached_here_is_forgotten,
     h.run(mb::DestroyVm{.vm_id = vm_one, .persist_volumes = true});
     BOOST_TEST(h.router.network_configs().empty());
     BOOST_TEST(!h.keys.attachment_key(net_attachment).has_value());
+}
+
+// ---- cooperative detach (block-volume-service task 13) ----------------------
+
+namespace {
+
+const auto eject_poll = helm::RouterConfig{}.eject_poll_interval;
+
+auto wait_detach(VolumeId volume, VmId vm, std::uint16_t fn) -> mb::DetachVolume {
+    return {.volume_id = volume,
+            .vm_id = vm,
+            .device = blk(fn),
+            .timeout_s = detach_timeout_s,
+            .policy = mb::DetachPolicy::wait};
+}
+
+// A VM with a local volume attached on blk function 0.
+auto attached_local(Helm& h) -> void {
+    h.run(mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib});
+    h.run(mb::CreateVolume{.volume_id = vol_one, .owner_vm = vm_one, .size_gib = size_gib});
+    h.run(mb::AttachVolume{.volume_id = vol_one, .vm_id = vm_one, .device = blk(fn_zero)});
+    h.reports.all.clear();
+}
+
+// A VM with the network volume of net_config() attached on blk function 1.
+auto attached_network(Helm& h) -> void {
+    h.run(mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib});
+    BOOST_REQUIRE(h.router.on_replica_config(net_config(1)));
+    std::array<std::byte, 64> data_key{};
+    BOOST_REQUIRE(h.keys.put_attachment_key(net_key(h.se, data_key)).has_value());
+    h.run(mb::AttachVolume{.volume_id = vol_two, .vm_id = vm_one, .device = blk(fn_one)});
+    h.reports.all.clear();
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(a_wait_detach_reaches_hull_only_after_the_guest_lets_go,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    attached_local(h);
+    const auto posted = h.host.posted.size();
+    const auto detach = wait_detach(vol_one, vm_one, fn_zero);
+    const auto s = h.send(detach);
+    // The guest was asked; hull was not.
+    BOOST_REQUIRE(h.blk_role.ejects.size() == 1U);
+    BOOST_TEST((h.blk_role.ejects.at(0) == oar::Eject{.fn = fn_zero, .op = oar::EjectOp::request}));
+    BOOST_TEST(h.host.posted.size() == posted);
+    BOOST_TEST(h.router.busy());
+    BOOST_TEST(h.reports.outcomes().empty());
+    BOOST_TEST(h.audit_text().find("eject_requested") != std::string::npos);
+
+    // The mailbox stays held: a later command waits behind it, since hull
+    // would refuse the detach's sequence number after a higher one.
+    const auto later =
+        h.send(mb::CreateVm{.vm_id = vm_two, .vcpus = vcpus, .memory_mib = memory_mib});
+    BOOST_TEST(h.router.queued() == 1U);
+
+    // Polls ask, no more often than the interval.
+    h.router.poll();
+    BOOST_TEST(h.blk_role.ejects.size() == 1U);
+    h.t += eject_poll;
+    h.router.poll();
+    BOOST_REQUIRE(h.blk_role.ejects.size() == 2U);
+    BOOST_TEST((h.blk_role.ejects.at(1).op == oar::EjectOp::query));
+    BOOST_TEST(h.host.posted.size() == posted);
+
+    // Released: the slot goes to hull unmodified, and on its ok the
+    // function is released as for any detach.
+    h.blk_role.eject_state = oar::EjectState::released;
+    h.t += eject_poll;
+    h.router.poll();
+    BOOST_REQUIRE(h.host.posted.size() == posted + 1);
+    BOOST_TEST((h.host.posted.back() == command_slot(s, detach)));
+    BOOST_TEST(h.router.stats().detaches_released == 1U);
+    h.answer(s, detach);
+    BOOST_TEST((h.state(blk_slot, fn_zero) == FunctionState::releasing));
+    BOOST_TEST((status_of(h.reports.outcomes().at(0)) == mb::Status::ok));
+    BOOST_TEST(h.router.ejecting() == 0U);
+    // Then the queued command.
+    BOOST_REQUIRE(h.host.posted.size() == posted + 2);
+    h.answer(later, mb::CreateVm{.vm_id = vm_two, .vcpus = vcpus, .memory_mib = memory_mib});
+    BOOST_TEST(!h.router.busy());
+}
+
+BOOST_AUTO_TEST_CASE(a_guest_that_holds_the_disk_leaves_it_attached_and_busy,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    attached_local(h);
+    const auto posted = h.host.posted.size();
+    const auto detach = wait_detach(vol_one, vm_one, fn_zero);
+    const auto s = h.send(detach);
+    h.t += std::chrono::seconds{detach_timeout_s};
+    h.router.poll();
+    // busy, from helm; hull never saw it, and the disk keeps serving.
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::busy));
+    BOOST_TEST(h.reports.last_outcome().in_reply_to == s);
+    BOOST_TEST(h.host.posted.size() == posted);
+    BOOST_TEST((h.state(blk_slot, fn_zero) == FunctionState::assigned));
+    BOOST_TEST(h.blk_role.cleaned.empty());
+    BOOST_TEST(!h.router.busy());
+    BOOST_TEST(h.router.stats().detaches_busy == 1U);
+    BOOST_TEST(h.router.ejecting() == 1U);
+    BOOST_TEST(h.audit_text().find("detach_busy") != std::string::npos);
+    // The request was not withdrawn.
+    BOOST_TEST(std::ranges::none_of(
+        h.blk_role.ejects, [](const oar::Eject& e) { return e.op == oar::EjectOp::cancel; }));
+    // A retry of the same command gets the same answer.
+    h.router.on_envelope(envelope(s, detach));
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::busy));
+    BOOST_TEST(h.host.posted.size() == posted);
+
+    // Other commands pass again.
+    h.run(mb::CreateVm{.vm_id = vm_two, .vcpus = vcpus, .memory_mib = memory_mib});
+    BOOST_TEST(h.host.posted.size() == posted + 1);
+
+    // The guest lets go later; helm keeps looking and sees it.
+    h.blk_role.eject_state = oar::EjectState::released;
+    const auto asked = h.blk_role.ejects.size();
+    h.t += eject_poll;
+    h.router.poll();
+    BOOST_TEST(h.blk_role.ejects.size() == asked + 1);
+    h.t += eject_poll;
+    h.router.poll();
+    BOOST_TEST(h.blk_role.ejects.size() == asked + 1);  // seen once is enough
+    // The controller detaches again: relayed at once.
+    const auto again = h.send(detach);
+    BOOST_TEST(h.host.posted.size() == posted + 2);
+    h.answer(again, detach);
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::ok));
+    BOOST_TEST((h.state(blk_slot, fn_zero) == FunctionState::releasing));
+    BOOST_TEST(h.router.ejecting() == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(a_forced_detach_replaces_a_busy_one,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    attached_local(h);
+    h.send(wait_detach(vol_one, vm_one, fn_zero));
+    h.t += std::chrono::seconds{detach_timeout_s};
+    h.router.poll();
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::busy));
+    auto force = wait_detach(vol_one, vm_one, fn_zero);
+    force.policy = mb::DetachPolicy::force;
+    const auto posted = h.host.posted.size();
+    h.run(force);
+    BOOST_TEST(h.host.posted.size() == posted + 1);
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::ok));
+    BOOST_TEST((h.state(blk_slot, fn_zero) == FunctionState::releasing));
+    BOOST_TEST(h.router.ejecting() == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(a_released_function_detaches_without_waiting,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    attached_local(h);
+    h.blk_role.eject_state = oar::EjectState::released;
+    const auto posted = h.host.posted.size();
+    const auto detach = wait_detach(vol_one, vm_one, fn_zero);
+    const auto s = h.send(detach);
+    BOOST_TEST(h.host.posted.size() == posted + 1);
+    BOOST_TEST(h.blk_role.ejects.size() == 1U);
+    h.answer(s, detach);
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::ok));
+}
+
+BOOST_AUTO_TEST_CASE(a_role_that_cannot_eject_fails_the_detach,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    attached_local(h);
+    h.blk_role.eject_error =
+        LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported};
+    const auto posted = h.host.posted.size();
+    h.send(wait_detach(vol_one, vm_one, fn_zero));
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::unsupported));
+    BOOST_TEST(h.host.posted.size() == posted);
+    BOOST_TEST(!h.router.busy());
+    BOOST_TEST(h.router.ejecting() == 0U);
+    BOOST_TEST((h.state(blk_slot, fn_zero) == FunctionState::assigned));
+
+    // A detach that does not belong to the VM is refused before the guest
+    // is asked.
+    h.blk_role.eject_error.reset();
+    h.send(wait_detach(vol_one, vm_two, fn_zero));
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::conflict));
+    BOOST_TEST(h.blk_role.ejects.size() == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(a_network_volume_reports_its_attachment_through_the_detach,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    attached_network(h);
+    const auto detach = wait_detach(vol_two, vm_one, fn_one);
+    h.send(detach);
+    h.t += std::chrono::seconds{detach_timeout_s};
+    h.router.poll();
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::busy));
+    BOOST_TEST(
+        (h.reports.attachment_states() ==
+         std::vector{proto::AttachmentState::eject_requested, proto::AttachmentState::busy}));
+    const auto it = std::ranges::find_if(h.reports.all, [](const proto::ReportBody& b) {
+        return std::holds_alternative<proto::AttachmentStatus>(b);
+    });
+    BOOST_REQUIRE(it != h.reports.all.end());
+    const auto& a = std::get<proto::AttachmentStatus>(*it);
+    BOOST_TEST(a.attachment_id == net_attachment);
+    BOOST_TEST(a.volume_id == vol_two);
+    BOOST_TEST(a.generation == 1U);
+    BOOST_TEST(a.slot == blk_slot);
+    // Every report the router makes must encode.
+    BOOST_TEST(proto::encode_report({.server_id = server, .report_seq = 1, .body = a}).has_value());
+
+    // A later release is reported, so the controller can detach again.
+    h.blk_role.eject_state = oar::EjectState::released;
+    h.t += eject_poll;
+    h.router.poll();
+    BOOST_TEST((h.reports.attachment_states().back() == proto::AttachmentState::released));
+    h.run(detach);
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::ok));
+    BOOST_TEST(!h.keys.attachment_key(net_attachment).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(a_forced_network_detach_needs_the_attachment_fenced,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    attached_network(h);
+    auto force = wait_detach(vol_two, vm_one, fn_one);
+    force.policy = mb::DetachPolicy::force;
+    const auto posted = h.host.posted.size();
+    // The config still lists the attachment's generation: its requests
+    // could still reach the volume (Requirement 3.5).
+    h.send(force);
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::conflict));
+    force.policy = mb::DetachPolicy::destroy_vm;
+    h.send(force);
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::conflict));
+    BOOST_TEST(h.host.posted.size() == posted);
+    BOOST_TEST(h.keys.attachment_key(net_attachment).has_value());
+
+    // The controller fences (a config without it), then forces.
+    BOOST_TEST(h.router.on_replica_config(net_config(2, other_server)));
+    force.policy = mb::DetachPolicy::force;
+    h.run(force);
+    BOOST_TEST(h.host.posted.size() == posted + 1);
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::ok));
+    BOOST_TEST((h.state(blk_slot, fn_one) == FunctionState::releasing));
+    BOOST_TEST(!h.keys.attachment_key(net_attachment).has_value());
+    BOOST_TEST(h.router.network_configs().empty());
 }

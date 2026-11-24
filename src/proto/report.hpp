@@ -318,6 +318,7 @@ enum class CommandStatus : std::uint16_t {
     internal_error = 11,
     unsupported = 12,
     wrong_server = 13,
+    busy = 14,  // a cooperative detach the guest has not released (helm, not hull)
 };
 
 // helm::mailbox::ExitReason.
@@ -581,7 +582,7 @@ namespace detail {
     return s <= FunctionState::faulted;
 }
 [[nodiscard]] constexpr auto known(CommandStatus s) noexcept -> bool {
-    return s <= CommandStatus::wrong_server;
+    return s <= CommandStatus::busy;
 }
 [[nodiscard]] constexpr auto known(ExitReason r) noexcept -> bool {
     return r >= ExitReason::guest_shutdown && r <= ExitReason::vmm_failure;

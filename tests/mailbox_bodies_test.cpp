@@ -53,7 +53,8 @@ constexpr std::size_t rsvd_in_tail = 7;
 constexpr std::byte zero{0};
 constexpr std::byte nonzero{1};
 constexpr std::byte bad_device_type{5};
-constexpr std::byte bad_policy{3};
+constexpr std::byte wait_policy{3};  // DETACH_VOLUME only
+constexpr std::byte bad_policy{4};
 constexpr std::uint8_t too_long_timeout = 0x59;  // low byte of 601 (0x0259)
 constexpr std::uint8_t too_long_timeout_hi = 0x02;
 
@@ -168,6 +169,11 @@ auto every_body() -> std::vector<mb::Body> {
                          .device = blk,
                          .timeout_s = mb::max_detach_timeout_s,
                          .policy = mb::DetachPolicy::force},
+        mb::DetachVolume{.volume_id = volume,
+                         .vm_id = vm_a,
+                         .device = blk,
+                         .timeout_s = timeout_s,
+                         .policy = mb::DetachPolicy::wait},
         mb::RewrapVolume{.volume_id = volume, .from_vm = vm_a, .to_vm = vm_b},
         mb::CreateNetwork{.vni = vni},
         mb::DeleteNetwork{.vni = mb::max_vni},
@@ -380,11 +386,14 @@ BOOST_AUTO_TEST_CASE(policy_timeout_and_reserved_bytes,
     const std::size_t tail = after_vm_id;  // the *_in_tail offsets count from the device ref
     expect_invalid(dd, tail + policy_in_tail, zero);
     expect_invalid(dd, tail + policy_in_tail, bad_policy);
+    // NICs and GPUs have no cooperative release.
+    expect_invalid(dd, tail + policy_in_tail, wait_policy);
     expect_invalid(dd, tail + rsvd_in_tail, nonzero);
 
     const mb::DetachVolume dv{
         .volume_id = volume, .vm_id = vm_a, .device = blk, .timeout_s = timeout_s};
     const std::size_t vtail = after_two_ids;
+    expect_invalid(dv, vtail + policy_in_tail, zero);
     expect_invalid(dv, vtail + policy_in_tail, bad_policy);
     expect_invalid(dv, vtail + rsvd_in_tail, nonzero);
     auto bytes = mb::encode_body(dv);

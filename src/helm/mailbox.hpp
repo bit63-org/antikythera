@@ -222,9 +222,20 @@ struct DeviceRef {
 
 // What hull does when the guest has not ejected a function by the timeout
 // (hull-host-agent Requirement 7.2).
+//
+// `wait` (DETACH_VOLUME only) is cooperative detach
+// (.kiro/specs/block-volume-service/ Requirement 3.3, design "Detach
+// blocked while mounted"): helm asks the guest to release the function
+// and relays the command to hull only once it has, so hull's hot-unplug
+// finds a device the guest has already let go of and never ejects one it
+// still holds. A guest that does not release it by timeout_s leaves the
+// volume attached and serving; helm answers the command `busy` itself.
+// force and destroy_vm on a network volume need its attachment fenced
+// first (Requirement 3.5).
 enum class DetachPolicy : std::uint8_t {
     force = 1,       // hot-unplug anyway
     destroy_vm = 2,  // destroy the whole VM
+    wait = 3,        // only after the guest released it; never forced
 };
 
 inline constexpr std::uint16_t max_detach_timeout_s = 600;
@@ -262,7 +273,8 @@ struct AttachDevice {
 };
 
 // DETACH_DEVICE: vm_id u64 | device (4) | timeout_s u16 | policy u8 | rsvd u8
-// (16 bytes). device.type must not be blk_fn; 1 <= timeout_s <= 600.
+// (16 bytes). device.type must not be blk_fn; 1 <= timeout_s <= 600;
+// policy force or destroy_vm (NICs and GPUs have no cooperative release).
 struct DetachDevice {
     std::uint64_t vm_id{0};
     DeviceRef device;
@@ -308,7 +320,7 @@ struct AttachVolume {
 };
 
 // DETACH_VOLUME: volume_id u64 | vm_id u64 | device (4) | timeout_s u16 |
-// policy u8 | rsvd u8  (24 bytes). device.type must be blk_fn.
+// policy u8 | rsvd u8  (24 bytes). device.type must be blk_fn; any policy.
 struct DetachVolume {
     std::uint64_t volume_id{0};
     std::uint64_t vm_id{0};
@@ -359,6 +371,10 @@ enum class Status : std::uint16_t {
     internal_error = 11,
     unsupported = 12,
     wrong_server = 13,  // the command names another server (protocol v3 server_id)
+    // helm's answer to a DETACH_VOLUME under `wait` whose guest did not
+    // release the function in time: it stays attached and serving. hull
+    // never sends it, so a response carrying it is malformed.
+    busy = 14,
 };
 
 inline constexpr std::size_t response_fixed_size = 12;

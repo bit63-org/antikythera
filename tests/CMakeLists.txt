@@ -100,6 +100,12 @@ ak_add_test(jail_test SOURCES jail_test.cpp LIBS ak::hull
 # for cloud-hypervisor) inside real jails.
 ak_add_test(vmm_api_test      SOURCES vmm_api_test.cpp      LIBS ak::hull)
 ak_add_test(vm_supervisor_test SOURCES vm_supervisor_test.cpp LIBS ak::hull)
+# hull-init and the agent's setup (task 3): host_setup_test runs hull-init
+# over a fake sysfs tree; capabilities_test drops in a forked child.
+ak_add_test(host_setup_test   SOURCES host_setup_test.cpp   LIBS ak::hull)
+target_compile_definitions(host_setup_test PRIVATE HULL_INIT_PATH="$<TARGET_FILE:hull-init>")
+add_dependencies(host_setup_test hull-init)
+ak_add_test(capabilities_test SOURCES capabilities_test.cpp LIBS ak::hull)
 add_executable(fake_vmm fake_vmm.cpp)
 target_link_libraries(fake_vmm PRIVATE ak::warnings)
 if(AK_SANITIZE OR AK_FUZZ)

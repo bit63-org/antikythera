@@ -111,10 +111,12 @@ install(TARGETS ak-helm RUNTIME DESTINATION bin)
 # Cloud Hypervisor API client.
 add_library(ak_hull
   hull/agent_handler.cpp
+  hull/capabilities.cpp
   hull/ch_config.cpp
   hull/command_auth.cpp
   hull/cpu_topology.cpp
   hull/device_inventory.cpp
+  hull/host_setup.cpp
   hull/jail.cpp
   hull/json.cpp
   hull/mailbox_client.cpp
@@ -130,6 +132,24 @@ add_library(ak::hull ALIAS ak_hull)
 target_link_libraries(ak_hull
   PUBLIC ak::common ak::helm OpenSSL::Crypto
   PRIVATE ak::warnings ak::hardening)
+
+# The controller public keys compiled into hull-agent (Requirement 4.1):
+# "<id>:<64 hex digits>" entries separated by ';'. Empty by default, in
+# which case hull-agent refuses to start; a production build sets it.
+set(AK_HULL_CONTROLLER_KEYS "" CACHE STRING
+  "hull-agent's controller public keys: <id>:<hex>;<id>:<hex>...")
+configure_file(hull/controller_keys.hpp.in
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/hull/controller_keys.hpp @ONLY)
+
+# hull-init: mounts, binds the allow-listed functions to vfio-pci, checks
+# their IOMMU groups, writes the inventory and execs hull-agent (task 3).
+add_executable(hull-init hull/init_main.cpp)
+target_link_libraries(hull-init PRIVATE ak::hull ak::warnings ak::hardening)
+# hull-agent: the mailbox loop over the VM supervisor (tasks 3, 4, 8, 9).
+add_executable(hull-agent hull/agent_main.cpp)
+target_include_directories(hull-agent PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_link_libraries(hull-agent PRIVATE ak::hull ak::warnings ak::hardening)
+install(TARGETS hull-init hull-agent RUNTIME DESTINATION sbin)
 
 # The controller's volume state machine (.kiro/specs/block-volume-service/
 # task 4): placement, epochs, leases, failover, rebuild, moves, snapshots

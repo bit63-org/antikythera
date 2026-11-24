@@ -145,6 +145,21 @@ public:
     // without a source.
     [[nodiscard]] auto repair(std::uint64_t lba, std::span<const std::byte> block,
                               std::uint32_t crc) -> std::expected<void, StoreError>;
+    // Resync and rebuild (task 11). copy() stores blocks as another
+    // replica holds them, checksums included, bad ones too (a read finds
+    // and repairs those): data, sync, checksums, sync, no intent. A crash
+    // in between leaves a region the copy sends again.
+    [[nodiscard]] auto copy(std::uint64_t lba, std::span<const std::byte> data,
+                            std::span<const std::uint32_t> crcs) -> std::expected<void, StoreError>;
+    // Whether any block of [lba, lba + blocks) was ever written (has a
+    // checksum): what a rebuild copies.
+    [[nodiscard]] auto written(std::uint64_t lba, std::uint64_t blocks)
+        -> std::expected<bool, StoreError>;
+    // A rebuilt replica takes up a primary's stream at `seq`: the intent
+    // ring is emptied (durably) and the sequence restarts there, so writes
+    // numbered below what this replica held before are taken, not
+    // mistaken for resends. Its old intents must already be in the copy.
+    [[nodiscard]] auto rebase(std::uint64_t seq) -> std::expected<void, StoreError>;
     [[nodiscard]] auto unhydrated(std::uint64_t lba) -> std::expected<bool, StoreError>;
     [[nodiscard]] auto chunk_state(std::uint64_t chunk) -> std::expected<ChunkState, StoreError>;
     // Chunks written since the last clear_changed (a snapshot freeze).

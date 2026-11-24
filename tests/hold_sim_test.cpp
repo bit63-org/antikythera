@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-// .kiro/specs/block-volume-service/ tasks 9 and 10: the deterministic
+// .kiro/specs/block-volume-service/ tasks 9 to 11: the deterministic
 // simulation (Requirement 15.1). The real master, three real hold servers
 // over crash-model files and the real initiator run on one simulated
 // clock, joined by a simulated network: each session is a pair of FIFO
@@ -10,15 +10,17 @@
 // schedule crashes holds, the primary among them (power loss, then
 // restart from what survived), and cuts sessions while a guest workload
 // of overlapping reads and writes runs; the controller drops members that
-// stop acknowledging and replaces a primary that stops answering.
-// Afterwards every operation must have completed, every read must be
-// linearizable per block, and every in-sync replica must hold the same
-// data; throughout, at most one hold may hold a lease.
+// stop acknowledging, replaces a primary that stops answering, and brings
+// dropped members back as joining replicas that the primary resyncs or
+// rebuilds. Afterwards every operation must have completed, every read
+// must be linearizable per block, all three replicas must be back in
+// sync, and every in-sync replica must hold the same data; throughout, at
+// most one hold may hold a lease.
 //
-// Crashes come only while all three replicas are in sync: a dropped
-// member returns with resync (task 11), which will extend this harness.
-// Initiators' faults reach the controller by another path (not modelled):
-// the members' reports confirm a lost primary.
+// Crashes come while every hold is up and at least two replicas are in
+// sync, so one is always left to serve; a joining member may crash, and
+// the primary while one is joining. Initiators' faults reach the controller by another path (not
+// modelled): the members' reports confirm a lost primary.
 //
 // AK_SIM_SEED=<n> reruns one seed; AK_SIM_SEEDS=<n> sets how many seeds
 // the run covers. ctest runs a short sweep; `ctest -C Nightly -L nightly`
@@ -178,7 +180,7 @@ class World final : public m::Transport {
 
 public:
     World(std::uint64_t seed, Params p)
-        : _rng{seed}, _p{p}, master{*this}, core{{.attachment_id = att}} {
+        : _rng{seed}, _p{p}, master{*this, timing()}, core{{.attachment_id = att}} {
         for (std::uint64_t id = 1; id <= 3; ++id) {
             auto& h = _holds[id];
             h.id = id;
@@ -338,6 +340,13 @@ public:
     [[nodiscard]] auto primary_now() const -> std::uint64_t { return primary(); }
     [[nodiscard]] auto epoch() const -> std::uint64_t { return master.volume(vol)->epoch; }
     [[nodiscard]] auto cuts() const -> std::size_t { return _cuts; }
+    [[nodiscard]] auto copied() const -> std::uint64_t {
+        std::uint64_t n = 0;
+        for (const auto& [id, h] : _holds) {
+            n += h.server ? h.server->stats().copied : 0;
+        }
+        return n;
+    }
 
     m::Master master;
     blk::InitiatorCore core;
@@ -369,6 +378,13 @@ private:
         std::uint64_t epoch{0};
     };
     using Event = std::variant<Frame, Dial, Closed, Deliver, Up, Grant>;
+
+    // Dropped members come back within the run.
+    static auto timing() -> m::Timing {
+        m::Timing t;
+        t.rejoin_after = m::Time{3000};
+        return t;
+    }
 
     [[nodiscard]] auto mnow() const -> m::Time {
         return std::chrono::duration_cast<m::Time>(now.time_since_epoch());
@@ -561,17 +577,20 @@ private:
         return 0;
     }
 
-    // A crash is survivable only while every replica is in sync: a member
-    // the controller dropped comes back with resync (task 11).
+    // A crash is survivable while another in-sync replica is left: with
+    // two in sync, any hold may go, a joining one or the primary too.
     [[nodiscard]] auto may_crash() const -> bool {
         const auto* v = master.volume(vol);
-        return _restart.empty() && !v->failover && v->members.size() == 3 &&
-               std::ranges::all_of(v->members,
-                                   [](const auto& mem) {
-                                       return mem.role == proto::ReplicaRole::primary ||
-                                              mem.role == proto::ReplicaRole::secondary;
-                                   }) &&
+        return _restart.empty() && !v->failover && in_sync() >= 2 &&
                std::ranges::all_of(_holds, [](const auto& kv) { return kv.second.up; });
+    }
+
+    [[nodiscard]] auto in_sync() const -> std::size_t {
+        return static_cast<std::size_t>(
+            std::ranges::count_if(master.volume(vol)->members, [](const auto& mem) {
+                return mem.role == proto::ReplicaRole::primary ||
+                       mem.role == proto::ReplicaRole::secondary;
+            }));
     }
 
     auto fault() -> void {
@@ -627,8 +646,8 @@ private:
         }
         const auto p = primary();
         const auto& h = _holds.at(p);
-        return h.up && h.server->replicating(vol) == 0 && h.server->queued(vol) == 0 &&
-               !h.server->reconciling(vol);
+        return in_sync() == 3 && h.up && h.server->replicating(vol) == 0 &&
+               h.server->queued(vol) == 0 && !h.server->reconciling(vol);
     }
 
     // ---- the guest ----------------------------------------------------------
@@ -704,8 +723,8 @@ private:
         }
     }
 
-    // Every in-sync replica holds what the primary does (one the
-    // controller dropped waits for resync, task 11). Checksums may lag the
+    // Every replica is back in sync and holds what the primary does.
+    // Checksums may lag the
     // data only inside extents a replica's intent ring held when it
     // reopened after a crash (a crash can lose checksum updates the ring
     // covers): a read repairs those from a member, and resync rewrites
@@ -729,6 +748,7 @@ private:
             return out;
         };
         const auto expect = read_all(p);
+        BOOST_TEST(in_sync() == 3U);
         for (const auto& mem : master.volume(vol)->members) {
             if (mem.server_id != p && mem.role == proto::ReplicaRole::secondary) {
                 BOOST_TEST_INFO("replica on " << mem.server_id);
@@ -779,8 +799,8 @@ auto run_seeds(std::uint64_t first, std::uint64_t count, Params p) -> void {
             w.check();
             BOOST_TEST_MESSAGE("seed " << seed << ": " << w.ops() << " ops, " << w.crashes()
                                        << " crashes (" << w.primary_crashes()
-                                       << " of the primary), " << w.cuts() << " cuts, epoch "
-                                       << w.epoch());
+                                       << " of the primary), " << w.cuts() << " cuts, "
+                                       << w.copied() << " regions copied, epoch " << w.epoch());
         }
     }
 }
@@ -801,7 +821,7 @@ BOOST_AUTO_TEST_CASE(survives_crashes_and_cuts, *utf::timeout(ak::test::unit_tim
 
 BOOST_AUTO_TEST_CASE(fails_over_a_lost_primary, *utf::timeout(ak::test::unit_timeout_seconds)) {
     // No other faults: a clean failover, then the old primary comes back
-    // outside the replica set (until resync, task 11).
+    // as a joining member and is resynced into the set.
     World w{
         7,
         {.workload = 5s, .settle = 60s, .max_latency = 2ms, .faults = false, .crash_primary = 2s}};

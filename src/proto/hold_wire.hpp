@@ -51,7 +51,7 @@
 //   repl_ack  R   <-  seq u64 (also on a failure status)
 //   intents       ->  empty;  R: count u32 | reserved u32 | count x 24:
 //                     seq u64 | lba u64 | blocks u32 | reserved u32, seq strictly ascending
-//   sync_data     ->  seq u64 | block data;  R: empty
+//   sync_data     ->  seq u64 | block data (flag last: the copy ends here);  R: empty
 //   hydrate_fill  ->  block data;  R: empty
 //   ping          ->  commit_seq u64;  R: commit_seq u64
 //   redirect  R   <-  primary_server u64 | primary_epoch u64 (0: unknown), any status
@@ -123,7 +123,8 @@ enum class HoldOpcode : std::uint8_t {
 namespace hold_flags {
 inline constexpr std::uint16_t response = 0x1;
 inline constexpr std::uint16_t hydrate = 0x2;  // write / repl_write: fill unwritten blocks only
-inline constexpr std::uint16_t all = response | hydrate;
+inline constexpr std::uint16_t last = 0x4;     // sync_data: the copy is complete with this one
+inline constexpr std::uint16_t all = response | hydrate | last;
 }  // namespace hold_flags
 
 enum class HoldStatus : std::uint16_t {
@@ -343,6 +344,9 @@ namespace detail {
     }
     if ((h.flags & hold_flags::hydrate) != 0 &&
         (resp || (h.opcode != HoldOpcode::write && h.opcode != HoldOpcode::repl_write))) {
+        return std::unexpected(DecodeError::bad_hold_direction);
+    }
+    if ((h.flags & hold_flags::last) != 0 && (resp || h.opcode != HoldOpcode::sync_data)) {
         return std::unexpected(DecodeError::bad_hold_direction);
     }
     if (is_block_opcode(h.opcode)) {

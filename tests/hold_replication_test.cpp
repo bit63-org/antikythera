@@ -919,3 +919,232 @@ BOOST_AUTO_TEST_CASE(promotion_overrides_what_only_a_member_holds,
     BOOST_TEST(net.stored(3, 4, 2) == a);
     BOOST_TEST(net.stored(2, 4, 2) == a);
 }
+
+// ---- resync and rebuild (task 11) ------------------------------------------
+
+namespace {
+
+// 8-block regions (4 KiB at 512-byte blocks): 32 of them in a volume.
+constexpr std::uint64_t region = 8;
+
+auto small_regions() -> ServerConfig {
+    auto c = no_leases();
+    c.chunk_shift = 12;
+    return c;
+}
+
+// The regions SYNC_DATA carried (by first LBA), markers apart.
+auto copied(const Net& net) -> std::multiset<std::uint64_t> {
+    std::multiset<std::uint64_t> out;
+    for (const auto& h : net.seen) {
+        if (h.opcode == HoldOpcode::sync_data && (h.flags & proto::hold_flags::response) == 0 &&
+            (h.flags & proto::hold_flags::last) == 0) {
+            out.insert(h.lba / region);
+        }
+    }
+    return out;
+}
+
+auto markers(const Net& net) -> std::size_t {
+    return static_cast<std::size_t>(std::ranges::count_if(net.seen, [](const auto& h) {
+        return h.opcode == HoldOpcode::sync_data && (h.flags & proto::hold_flags::last) != 0;
+    }));
+}
+
+auto state_of(Net& net, std::uint64_t id) -> proto::ReplicaState {
+    net.run_for(1s);  // a status is due
+    const auto e = status_of(net.hold(id).take_reports(net.now));
+    BOOST_TEST_REQUIRE(e.has_value());
+    return e->state;
+}
+
+auto members_1_2(proto::ReplicaRole three = proto::ReplicaRole::joining)
+    -> std::vector<proto::ReplicaMember> {
+    return {member(1, proto::ReplicaRole::primary), member(2, proto::ReplicaRole::secondary),
+            member(3, three)};
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(rebuilds_a_new_member_from_written_regions,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net{small_regions()};
+    net.apply(config(
+        1, {member(1, proto::ReplicaRole::primary), member(2, proto::ReplicaRole::secondary)}));
+    net.step();
+    const auto s = net.initiator();
+    const auto a = blocks_of(1, 2);
+    const auto b = blocks_of(2, 1);
+    const auto c = blocks_of(3, 10);  // two regions
+    BOOST_TEST((net.status(s, net.write(s, 1, a)) == HoldStatus::ok));
+    BOOST_TEST((net.status(s, net.write(s, 100, b)) == HoldStatus::ok));
+    BOOST_TEST((net.status(s, net.write(s, 200, c)) == HoldStatus::ok));
+
+    // Member 3 joins: only the written regions are copied, then the marker.
+    net.apply(config(2, members_1_2()));
+    net.step();
+    BOOST_TEST((copied(net) == std::multiset<std::uint64_t>{0, 12, 25, 26}));
+    BOOST_TEST(markers(net) == 1U);
+    BOOST_TEST(net.hold(1).stats().copied == 5U);
+    BOOST_TEST(net.stored(3, 0, 256) == net.stored(1, 0, 256));
+    BOOST_TEST((state_of(net, 3) == proto::ReplicaState::in_sync));
+
+    // New writes reach it on the same stream; it takes up the primary's seq.
+    const auto d = blocks_of(4, 1);
+    const auto s2 = net.initiator(1, 2);
+    BOOST_TEST((net.status(s2, net.write(s2, 101, d, 1, 2)) == HoldStatus::ok));
+    BOOST_TEST(net.stored(3, 101, 1) == d);
+    BOOST_TEST(net.hold(3).replica(vol)->last_seq() == net.hold(1).replica(vol)->last_seq());
+
+    // The controller makes it a secondary; nothing more is copied.
+    net.apply(config(3, members_1_2(proto::ReplicaRole::secondary)));
+    net.run_for(2s);
+    BOOST_TEST(net.hold(1).stats().copied == 5U);
+}
+
+BOOST_AUTO_TEST_CASE(resyncs_only_what_a_returning_member_missed,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net{small_regions()};
+    net.apply(config(1));
+    net.step();
+    const auto s = net.initiator();
+    for (std::uint64_t r = 0; r < 32; ++r) {  // every region written, then committed
+        BOOST_TEST((net.status(s, net.write(s, r * region, blocks_of(r, 1))) == HoldStatus::ok));
+    }
+    BOOST_TEST((net.status(s, net.write(s, 3, blocks_of(40, 1))) == HoldStatus::ok));
+    BOOST_TEST((net.status(s, net.write(s, 4, blocks_of(41, 1))) == HoldStatus::ok));
+
+    // Member 3 fails during a write to region 5, and is dropped.
+    net.server(3).up = false;
+    net.cut(3);
+    const auto w = net.write(s, 5 * region, blocks_of(50, 1));
+    net.apply(config(
+        2, {member(1, proto::ReplicaRole::primary), member(2, proto::ReplicaRole::secondary)}));
+    net.step();
+    BOOST_TEST((net.status(s, w) == HoldStatus::ok));
+    const auto s2 = net.initiator(1, 2);
+    BOOST_TEST((net.status(s2, net.write(s2, (20 * region) + 3, blocks_of(51, 2), 1, 2)) ==
+                HoldStatus::ok));
+
+    // It comes back within the window: regions 5 and 20 are copied, and
+    // region 0, where its last write before failing may still sit in its
+    // intent ring; nothing else.
+    net.server(3).up = true;
+    net.apply(config(3, members_1_2()));
+    net.step();
+    const auto got = copied(net);
+    BOOST_TEST(got.count(5) == 1U);
+    BOOST_TEST(got.count(20) == 1U);
+    BOOST_TEST(got.size() <= 3U);
+    for (const auto r : got) {
+        BOOST_TEST_INFO(r);
+        BOOST_TEST((r == 0 || r == 5 || r == 20));
+    }
+    BOOST_TEST(markers(net) == 1U);
+    BOOST_TEST(net.stored(3, 0, 256) == net.stored(1, 0, 256));
+    BOOST_TEST((state_of(net, 3) == proto::ReplicaState::in_sync));
+
+    // Its first write since rebases it onto the primary's stream.
+    const auto s3 = net.initiator(1, 3);
+    const auto d = blocks_of(52, 1);
+    BOOST_TEST((net.status(s3, net.write(s3, 77, d, 1, 3)) == HoldStatus::ok));
+    BOOST_TEST(net.stored(3, 77, 1) == d);
+    BOOST_TEST(net.hold(3).replica(vol)->last_seq() == net.hold(1).replica(vol)->last_seq());
+}
+
+BOOST_AUTO_TEST_CASE(rebuilds_in_full_past_the_resync_window,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net{small_regions()};
+    auto c1 = config(1);
+    c1.resync_window_s = 10;
+    net.apply(c1);
+    net.step();
+    const auto s = net.initiator();
+    for (std::uint64_t r = 0; r < 4; ++r) {
+        BOOST_TEST((net.status(s, net.write(s, r * region, blocks_of(r, 1))) == HoldStatus::ok));
+    }
+    net.server(3).up = false;
+    net.cut(3);
+    auto c2 = config(
+        2, {member(1, proto::ReplicaRole::primary), member(2, proto::ReplicaRole::secondary)});
+    c2.resync_window_s = 10;
+    net.apply(c2);
+    net.run_for(11s);
+    net.server(3).up = true;
+    auto c3 = config(3, members_1_2());
+    c3.resync_window_s = 10;
+    net.apply(c3);
+    net.step();
+    BOOST_TEST((copied(net) == std::multiset<std::uint64_t>{0, 1, 2, 3}));
+    BOOST_TEST((state_of(net, 3) == proto::ReplicaState::in_sync));
+}
+
+BOOST_AUTO_TEST_CASE(paces_a_copy_and_resumes_it_after_a_lost_session,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    auto cfg = small_regions();
+    cfg.copy_bytes_per_s = region * bs;  // a region a second
+    Net net{cfg};
+    net.apply(config(
+        1, {member(1, proto::ReplicaRole::primary), member(2, proto::ReplicaRole::secondary)}));
+    net.step();
+    const auto s = net.initiator();
+    for (std::uint64_t r = 0; r < 6; ++r) {
+        BOOST_TEST((net.status(s, net.write(s, r * region, blocks_of(r, 1))) == HoldStatus::ok));
+    }
+    net.apply(config(2, members_1_2()));
+    net.step();
+    BOOST_TEST(copied(net).size() <= 2U);  // the budget's burst
+    net.run_for(2500ms);
+    const auto before = copied(net).size();
+    BOOST_TEST(before >= 3U);
+    BOOST_TEST(before < 6U);
+    BOOST_TEST((state_of(net, 3) == proto::ReplicaState::joining));
+
+    // A write meanwhile goes to the member on the same stream.
+    const auto d = blocks_of(9, 1);
+    const auto s2 = net.initiator(1, 2);
+    BOOST_TEST((net.status(s2, net.write(s2, 4 * region, d, 1, 2)) == HoldStatus::ok));
+
+    // The session breaks: the copy goes on from what was not acknowledged.
+    net.cut(3);
+    net.run_for(10s);
+    BOOST_TEST(markers(net) == 1U);
+    BOOST_TEST(net.stored(3, 0, 256) == net.stored(1, 0, 256));
+    BOOST_TEST(net.stored(3, 4 * region, 1) == d);
+    BOOST_TEST((state_of(net, 3) == proto::ReplicaState::in_sync));
+    // A new session from the primary sends the marker again; until then
+    // the member is not in sync.
+    net.cut(1);
+    BOOST_TEST((status_of(net.hold(3).take_reports(net.now + 1s)).value().state ==
+                proto::ReplicaState::joining));
+    net.run_for(2s);
+    BOOST_TEST(markers(net) == 2U);
+    BOOST_TEST((state_of(net, 3) == proto::ReplicaState::in_sync));
+}
+
+BOOST_AUTO_TEST_CASE(a_joining_member_takes_up_a_lower_stream,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net{small_regions()};
+    // Server 3 holds a replica well ahead of the stream it joins.
+    net.apply(config(
+        1, {member(1, proto::ReplicaRole::primary), member(3, proto::ReplicaRole::secondary)}));
+    net.step();
+    const auto s = net.initiator();
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        BOOST_TEST((net.status(s, net.write(s, 1, blocks_of(i, 1))) == HoldStatus::ok));
+    }
+    BOOST_TEST(net.hold(3).replica(vol)->last_seq() == 10U);
+    net.apply(config(2, {member(2, proto::ReplicaRole::primary)}));
+    const auto s2 = net.initiator(2, 2);
+    const auto a = blocks_of(20, 1);
+    BOOST_TEST((net.status(s2, net.write(s2, 1, a, 2, 2)) == HoldStatus::ok));
+    net.apply(config(
+        3, {member(2, proto::ReplicaRole::primary), member(3, proto::ReplicaRole::joining)}));
+    net.step();
+    const auto s3 = net.initiator(2, 3);
+    const auto b = blocks_of(21, 1);
+    BOOST_TEST((net.status(s3, net.write(s3, 9, b, 2, 3)) == HoldStatus::ok));
+    BOOST_TEST(net.hold(3).replica(vol)->last_seq() == net.hold(2).replica(vol)->last_seq());
+    BOOST_TEST(net.stored(3, 9, 1) == b);  // taken, not mistaken for a resend
+    BOOST_TEST(net.stored(3, 1, 1) == a);  // copied
+}

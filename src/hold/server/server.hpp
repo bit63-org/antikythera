@@ -100,6 +100,25 @@
 // HELLO_OK; commit_seq claims stay truthful, so a member's uncommitted
 // extents survive until every member holds the reconciled copy.
 //
+// Resync and rebuild (task 11, design "Resync and rebuild"). A joining
+// member gets every new write at once, and a copy of what it lacks as
+// SYNC_DATA regions on the same ordered stream, so a region's copy,
+// read when it is sent, never overwrites a later write (the region lock
+// of the design, free in a single-threaded server). What it lacks: when
+// the controller removed it from this primary's set within the config's
+// resync window, the regions written since it last acknowledged (kept in
+// this primary's memory: a restart or a new primary means a full copy);
+// otherwise every region ever written. Either way also the extents its
+// own INTENTS reports. The copy goes copy_window regions at a time, paced
+// by a byte budget for the role and one per volume, and only while the
+// volume has no tenant request waiting. After the last region comes a
+// SYNC_DATA with the `last` flag; once the member has applied it on its
+// current session from the primary, it reports in_sync, and the
+// controller makes it a secondary. A joining member takes up the stream
+// wherever it is: on a session's first REPL_WRITE it rebases its replica
+// onto that seq. Blocks awaiting hydration are not copied (hydration
+// reaches members with the snapshot task).
+//
 // QoS (Requirement 10.2): each volume's requests wait in its queue until
 // its limiter (qos.hpp) admits them; run() serves the volumes round-robin,
 // at most `quantum` requests each per pass, so a busy volume cannot starve
@@ -114,9 +133,12 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
+#include <utility>
 #include <vector>
 
+#include "common/token_bucket.hpp"
 #include "hold/server/qos.hpp"
 #include "hold/store/file_layer.hpp"
 #include "hold/store/replica_store.hpp"
@@ -173,6 +195,10 @@ struct ServerConfig {
     std::chrono::milliseconds primary_timeout{2000};
     std::chrono::milliseconds ping_interval{1000};
     std::chrono::milliseconds status_interval{1000};
+    // Task 11.
+    std::size_t copy_window{4};                           // SYNC_DATA regions in flight per member
+    double copy_bytes_per_s{400.0 * 1024 * 1024};         // all copies of the role
+    double copy_volume_bytes_per_s{200.0 * 1024 * 1024};  // each volume's copies
 };
 
 enum class ConfigError : std::uint8_t {
@@ -196,6 +222,7 @@ struct ServerStats {
     std::uint64_t repaired{0};      // blocks rewritten from a member's copy
     std::uint64_t unrepairable{0};  // bad blocks with no good copy to be had
     std::uint64_t reconciled{0};    // extents rewritten by promotions
+    std::uint64_t copied{0};        // SYNC_DATA regions sent
 };
 
 class HoldServer {
@@ -257,6 +284,17 @@ private:
         std::uint64_t seq{0};         // REPL_WRITE
         std::uint64_t commit_seq{0};  // REPL_WRITE
     };
+    // A joining member's copy.
+    struct Copy {
+        bool planned{false};                // `todo` and `scan` are set
+        std::set<std::uint64_t> todo;       // regions to send
+        std::optional<std::uint64_t> scan;  // full: the next region to look at
+        std::set<std::uint64_t> holes;  // full: regions its intents name, sent even if unwritten
+        std::map<std::uint64_t, std::uint64_t> sent;  // request ID -> region
+        std::uint64_t marker{0};                      // the `last` SYNC_DATA's request ID
+        std::uint64_t tail{0};                        // a block already sent: the marker's
+        bool finished{false};                         // and the member has it
+    };
     // The primary's session to one member.
     struct Link {
         enum class State : std::uint8_t {
@@ -273,8 +311,9 @@ private:
         bool backoff{false};     // lost: redial_at is set by the next run()
         Clock::time_point next_ping{};
         std::uint64_t commit_seen{0};    // the member's commit point in HELLO_OK
-        std::uint64_t intents_asked{0};  // reconcile: the INTENTS request ID
-        bool intents_answered{false};
+        std::uint64_t intents_asked{0};  // the INTENTS request ID
+        bool intents_answered{false};    // reconcile: this member has answered
+        std::optional<Copy> copy;
     };
     // A write committed here, awaiting the members.
     struct Replicating {
@@ -315,6 +354,14 @@ private:
         Clock::time_point heard{};  // member: the primary's last frame
         bool primary_reported{false};
         std::vector<std::uint64_t> timeout_reported;  // members, this epoch
+        // Task 11.
+        struct Dirty {
+            std::set<std::uint64_t> chunks;
+            Clock::time_point since{};
+        };
+        std::map<std::pair<std::uint64_t, std::uint32_t>, Dirty> dirty;  // by (server, gen)
+        TokenBucket copy_budget;  // primary: this volume's copies
+        SessionId synced{0};      // joining member: the primary session that completed its copy
     };
     // The outcome of the fencing checks.
     struct Verdict {
@@ -337,6 +384,16 @@ private:
     auto finish_reconcile(Volume& v) -> void;
     auto watch(Volume& v, Clock::time_point now) -> void;
     auto report_timeout(Volume& v, proto::VolumeFaultKind kind, std::uint64_t suspect) -> void;
+    [[nodiscard]] auto region_blocks(const Volume& v) const -> std::uint64_t;
+    auto mark_regions(const Volume& v, std::set<std::uint64_t>& regions, std::uint64_t lba,
+                      std::uint64_t blocks) const -> void;
+    auto record_dirty(Volume& v, const Link& l, Clock::time_point now) -> void;
+    auto plan_copy(Volume& v, Link& l, const proto::HoldIntents& theirs) -> void;
+    auto pump_copies(Volume& v, Clock::time_point now) -> void;
+    // Frames sent; the store failed if v.store is gone.
+    auto send_copy(Volume& v, Link& l, std::uint64_t lba, std::uint64_t blocks, bool last)
+        -> std::size_t;
+    [[nodiscard]] auto copy_ready(const Volume& v, const Link& l) const -> bool;
     auto sync_links(Volume& v, Clock::time_point now) -> void;
     auto drop_link(Volume& v, Link& l, Clock::time_point now) -> void;
     auto send_link(Volume& v, Link& l, proto::HoldFrame f) -> void;
@@ -367,6 +424,7 @@ private:
     std::uint64_t _rr{0};  // the volume run() starts from
     ServerStats _stats;
     std::vector<proto::ReportBody> _reports;
+    TokenBucket _copy_budget;
     Clock::time_point _now{};  // the latest time a caller gave
     std::optional<Clock::time_point> _next_status;
 };

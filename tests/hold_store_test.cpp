@@ -494,6 +494,58 @@ BOOST_AUTO_TEST_CASE(rewrites_writes_still_in_the_ring,
     BOOST_TEST((read_blocks(*s, 8, 1)->data == b));
 }
 
+BOOST_AUTO_TEST_CASE(copies_blocks_as_another_replica_holds_them,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    MemFiles files;
+    auto s = create(files, make_meta(64));
+    BOOST_TEST(!*s->written(0, 64));
+    const auto good = content(1, 512, 2);
+    auto crcs = crcs_of(good, 512);
+    crcs[1] ^= 1U;  // the source's second block is bad: it stays bad here
+    BOOST_TEST_REQUIRE(s->copy(10, good, crcs).has_value());
+    BOOST_TEST((read_blocks(*s, 10, 2)->data == good));
+    BOOST_TEST((read_blocks(*s, 10, 2)->bad == std::vector<std::uint64_t>{11}));
+    BOOST_TEST(*s->written(8, 4));
+    BOOST_TEST(!*s->written(0, 10));
+    BOOST_TEST(!*s->written(12, 52));
+    // Never-written blocks copy as such.
+    BOOST_TEST_REQUIRE(s->copy(20, Bytes(512), std::vector<std::uint32_t>{0}).has_value());
+    BOOST_TEST(read_blocks(*s, 20, 1)->bad.empty());
+    BOOST_TEST(!*s->written(20, 1));
+    BOOST_TEST(s->last_seq() == 0U);  // no intent, no seq
+    BOOST_TEST(s->copy(63, good, crcs_of(good, 512)).error() == StoreError::bad_request);
+    BOOST_TEST(s->written(64, 1).error() == StoreError::bad_request);
+    BOOST_TEST(s->written(0, 0).error() == StoreError::bad_request);
+    // Durable: a crash keeps it.
+    s.reset();
+    files.crash(3);
+    s = reopen(files);
+    BOOST_TEST((read_blocks(*s, 10, 1)->data == block_of(good, 512, 0)));
+}
+
+BOOST_AUTO_TEST_CASE(rebases_onto_a_new_stream, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    MemFiles files;
+    auto s = create(files, make_meta(64));
+    for (std::uint64_t seq = 1; seq <= 50; ++seq) {
+        BOOST_TEST_REQUIRE(write_one(*s, seq, seq % 60, content(seq, 512)).has_value());
+    }
+    s->set_commit(40);
+    BOOST_TEST(s->intents().size() == 10U);
+    // A new primary's stream is at 7.
+    BOOST_TEST_REQUIRE(s->rebase(7).has_value());
+    BOOST_TEST(s->last_seq() == 7U);
+    BOOST_TEST(s->commit_seq() == 7U);
+    BOOST_TEST(s->intents().empty());
+    BOOST_TEST_REQUIRE(write_one(*s, 8, 0, content(99, 512)).has_value());
+    BOOST_TEST((read_blocks(*s, 50, 1)->data == content(50, 512)));  // data stays
+    // The emptied ring is durable: only seq 8 comes back.
+    s.reset();
+    files.crash(5);
+    s = reopen(files);
+    BOOST_TEST(s->last_seq() == 8U);
+    BOOST_TEST((s->intents() == std::vector<Intent>{{.seq = 8, .lba = 0, .blocks = 1}}));
+}
+
 BOOST_AUTO_TEST_CASE(records_epochs_in_alternate_slots,
                      *utf::timeout(ak::test::unit_timeout_seconds)) {
     MemFiles files;

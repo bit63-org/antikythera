@@ -1,6 +1,6 @@
 # Implementation Plan — build-and-ci
 
-## Status: 8/11 tasks complete
+## Status: 8/11 tasks complete (task 8 is open only for 8.5, the required-check list)
 
 ## Tasks
 
@@ -24,7 +24,24 @@
 - [ ] 8. GitHub Actions CI: GCC 14 and Clang 19 build + ctest, sanitizer
   job, fuzz build and smoke run, clang-format, clang-tidy, shellcheck, L1
   cache; make every job a required check on main.
-  _Requirements: 4.2, 4.3, 5.1–5.4, 5.6_
+  _Requirements: 4.2, 4.3, 5.1–5.4, 5.6_ — Most of it runs in
+  `.github/workflows/ci.yml` and `kernel-interop.yml`:
+  - [x] 8.1 `build (gcc-14)` and `build (clang-19)`: Debug build and
+    `ctest` on every pull request and push to main. _Requirements: 5.1_
+  - [x] 8.2 The Clang 19 job builds with `AK_SANITIZE=ON` (ASan + UBSan)
+    and `AK_FUZZ=ON`, runs `ctest` under the sanitizers and gives every
+    `fuzz_*` target a 20-second smoke run. _Requirements: 5.2_
+  - [x] 8.3 `lint`: clang-format 22.1.5, clang-tidy 19 with the
+    repository's `.clang-tidy`, shellcheck. _Requirements: 5.3, 5.4_
+  - [x] 8.4 Build cache: on the self-hosted ARC runners sccache
+    stores objects in kythira-cache through its Redis port, with separate
+    ACL users for main pushes and pull requests; a missing setting or a
+    cache that does not answer builds without a launcher and warns. CI
+    takes its libraries from the Ubuntu archive instead of vcpkg, so
+    there is no vcpkg installed tree to cache. _Requirements: 4.2, 4.3_
+  - [ ] 8.5 Every job a required check on main. `build (gcc-14)`,
+    `build (clang-19)`, `lint` and `kernel-interop` are required;
+    `kernel-config` is not yet. _Requirements: 5.6_
 - [ ] 9. OCI L2 cache: port kythira's `oci-build-cache` composite action,
   wire `scripts/oci-build-cache/start-sccache.sh`, add antikythera's three
   credentials. **Needs Clark's go (real-cloud spend).**

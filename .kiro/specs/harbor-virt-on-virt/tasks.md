@@ -1,6 +1,6 @@
 # Implementation Plan — harbor: the virt-on-virt prototype
 
-## Status: 5/10 tasks complete (task 2 written; `deps.sh qemu` not yet run end to end)
+## Status: 4/10 tasks complete (task 2 written; `deps.sh qemu` not yet run end to end)
 
 ## Tasks
 

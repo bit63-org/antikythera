@@ -13,7 +13,7 @@ Steering that applies to all of them is in `../steering/`.
 | [block-volume-service](block-volume-service/) | hold: replicated network volumes for VM guests (EBS-like), failover, rebuild, live moves, snapshots | 0/24 |
 | [oar-gpu-data-plane](oar-gpu-data-plane/) | GPUs: designed now, built after network and storage | designed |
 | [harbor-virt-on-virt](harbor-virt-on-virt/) | Nested-KVM prototype of the whole system | 4/10 |
-| [controller-interface](controller-interface/) | Signed commands, mappings, inventory; kythira EC2 mapping | 9/12 |
+| [controller-interface](controller-interface/) | Signed commands, mappings, inventory; kythira EC2 mapping | 10/13 |
 | [backplane-hardware](backplane-hardware/) | Physical PCIe backplane requirements | deferred |
 | [build-and-ci](build-and-ci/) | Toolchain, vcpkg, caching and CI, following kythira | 8/11 |
 

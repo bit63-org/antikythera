@@ -1,7 +1,9 @@
 # Amazon EBS gap analysis
 
-_Status as of 2026-11-21, against `main` (oar-blk tasks 1-6 and 9-11
-merged). EBS facts are from AWS's public documentation as of late 2025._
+_Status as of 2026-11-24, against `main` (oar-blk tasks 1-6 and 9-14 and
+block-volume-service tasks 1-12 merged; the network volume pieces run in
+the deterministic simulation but not yet in harbor). EBS facts are from
+AWS's public documentation as of late 2025._
 
 ## Goal
 
@@ -15,19 +17,22 @@ is a planning document; the requirements live in the spec.
 
 ## The volume options today
 
-All three present an ordinary virtio-blk function from the oar-blk role,
+All of them present an ordinary virtio-blk function from the oar-blk role,
 encrypted with AES-256-XTS below the guest with a key only that role
 holds (oar-blk Requirements 1-2).
 
 | Option | What it is | State |
 |---|---|---|
 | **Local volume** | A sparse file (on hardware, an NVMe region) behind one server's oar-blk, with a wrapped key in its header. Persists across VM destroy unless `persist_volumes = false`, crypto-erased on delete, moves between VMs on the same server only with `REWRAP_VOLUME` | file backend and helm flows merged (#40 and earlier); boot from volume and harbor scenarios open (oar-blk 7-8) |
-| **Image volume** | A read-only image in S3-compatible storage, fetched lazily in verified 1 MiB chunks into a shared cache, with the VM's writes in an ephemeral encrypted overlay discarded on detach | manifest, cache, fetcher, overlay, S3 client merged (#50 #53 #54 #58); `ak-image-pack`, helm wiring, async misses, encrypted images and harbor boot open (oar-blk 12-16) |
+| **Image volume** | A read-only image in S3-compatible storage, fetched lazily in verified 1 MiB chunks into a shared cache, with the VM's writes in an ephemeral encrypted overlay discarded on detach | manifest, cache, fetcher, overlay, S3 client, `ak-image-pack`, helm wiring and async misses merged (#50 #53 #54 #58 #67-#70, oar-blk 9-14); encrypted images and harbor boot open (oar-blk 15-16) |
+| **Network volume** (hold) | A volume replicated to two or three hold servers, served to the compute server's oar-blk by the primary over mutual TLS 1.3, with the volume key opened in helm's secure element | built and exercised by the simulation (#73-#88, block-volume 1-12): replica store, replication, failover, resync and rebuild, helm integration. Cooperative detach, harbor runs, live moves, multi-attach, elastic volumes and snapshots open (block-volume 13-24) |
 | **Self-encrypting NVMe** | Opal namespaces behind a storage manager VM | deferred |
 
-None of them survives the loss of its server, none can be moved to
-another server, and there are no snapshots, resize, or performance
-classes. In EC2 terms, they are instance store, not EBS.
+The local and image volumes do not survive the loss of their server and
+cannot be moved to another server; in EC2 terms they are instance store.
+The network volume is the EBS-like option. It survives a server loss in
+the simulation, but has not yet run in harbor, and there are still no
+snapshots, resize, or performance classes.
 
 ## Feature map
 
@@ -36,13 +41,13 @@ Status: **have** (built), **partial**, **spec** (in block-volume-service),
 
 | EBS feature | EBS | Today | Status | Where |
 |---|---|---|---|---|
-| Network-attached volumes, attach to any instance in the AZ | yes | local only | spec | Req 1, 9 |
+| Network-attached volumes, attach to any instance in the AZ | yes | network volume attach through helm (block-volume 7, 12) | partial | Req 1, 9; harbor in block-volume 15 |
 | Boot from volume | yes | local volume (oar-blk 7), image volume (oar-blk 16) | spec | Req 2 |
 | Root volume from AMI, usable before fully copied | lazy load from snapshot | image volume, but ephemeral | spec | Req 2.3, 11.4, 11.7 |
-| Replication within the AZ | yes, transparent | none | spec | Req 5 (2 or 3 replicas, failure domains) |
+| Replication within the AZ | yes, transparent | writes replicated to every member (block-volume 8) | partial | Req 5 (2 or 3 replicas, failure domains) |
 | Durability | 99.8-99.9 % (gp2/gp3/io1), 99.999 % (io2) | server-bound | spec | Req 5.3: AFR ≤ 0.1 % / ≤ 0.001 % |
-| Automatic failure detection, failover, rebuild | yes | none | spec | Req 6, 7 |
-| Volume status checks, I/O suspended on inconsistency, `EnableVolumeIO` | yes | none | spec | Req 6.8, 14.2 |
+| Automatic failure detection, failover, rebuild | yes | failover, resync and rebuild in the simulation (block-volume 10-11) | partial | Req 6, 7; harbor fault injection in block-volume 16 |
+| Volume status checks, I/O suspended on inconsistency, `EnableVolumeIO` | yes | `io_suspended` and `EnableVolumeIO` in hold (block-volume 10); EC2 actions in kythira | partial | Req 6.8, 14.2 |
 | Detach and reattach to another instance | yes | same server only | spec | Req 9 |
 | Stop/start instance on other hardware | yes | must return to the volume's server | spec | Req 2.4 |
 | `DeleteOnTermination` | yes | `persist_volumes` per VM | spec | Req 9.4 (per volume) |
@@ -55,7 +60,7 @@ Status: **have** (built), **partial**, **spec** (in block-volume-service),
 | Max volume size | 64 TiB (gp3, io2 BX) | 64 TiB mailbox limit | spec | Req 1.4: at least 16 TiB |
 | Elastic Volumes (grow, change type/IOPS live) | yes, once per 6 h | no | spec | Req 10.3-10.4 |
 | Encryption at rest | KMS, opt-in or account default | always on, per-VM key | have / spec | Req 12: KMS per-lineage data key, rewrapped to each helm |
-| Encryption in transit | Nitro, in hardware | n/a | spec | Req 1.2 (ciphertext only), 13.1 (mTLS) |
+| Encryption in transit | Nitro, in hardware | ciphertext only, over TLS 1.3 with server-bound certificates (block-volume 6) | have | Req 1.2 (ciphertext only), 13.1 (mTLS) |
 | Guest holds no key | yes | yes | have | oar-blk Req 2 |
 | Snapshots, incremental, in S3 | yes | none | spec | Req 11.1-11.3 (image manifest v2, per-chunk objects) |
 | Crash-consistent multi-volume snapshots | `CreateSnapshots` | none | spec | Req 11.2 |

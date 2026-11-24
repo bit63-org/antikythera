@@ -32,7 +32,9 @@ build also works against system packages. See
 - **Status**: Required. `ak_tls` links `OpenSSL::SSL` for the mutually
   authenticated TLS 1.3 ControllerLink. `ak_hull` links `OpenSSL::Crypto`
   for command signature verification, `ak_helm` for the key store (AES-256-GCM
-  key wrapping, `RAND_bytes`, `OPENSSL_cleanse`) and the VTEP WireGuard key
+  key wrapping, `RAND_bytes`, `OPENSSL_cleanse`), HPKE for network volume
+  keys (X25519, HMAC-SHA256, AES-256-GCM; built from these primitives
+  because `OSSL_HPKE` needs OpenSSL 3.2) and the VTEP WireGuard key
   pairs (X25519 generation), `ak_oar_blk` for AES-256-XTS volume
   encryption, `ak_oar_blk_image` for image digests (and `ak-image-pack` for
   encrypting images and wiping the image key), `ak_oar_blk_s3`

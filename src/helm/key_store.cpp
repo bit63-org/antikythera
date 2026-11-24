@@ -51,6 +51,12 @@ auto to_string(KeyError e) noexcept -> const char* {
             return "corrupt_key";
         case KeyError::secure_element:
             return "secure_element";
+        case KeyError::stale_generation:
+            return "stale_generation";
+        case KeyError::unknown_attachment:
+            return "unknown_attachment";
+        case KeyError::too_many_keys:
+            return "too_many_keys";
     }
     return "unknown";
 }
@@ -129,6 +135,74 @@ auto KeyStore::create_ephemeral_key() -> std::expected<ScopedKey, KeyError> {
         return std::unexpected(from_se(key.error()));
     }
     return std::move(*key);
+}
+
+namespace {
+
+auto open_frame(SecureElement& se, std::span<const std::byte> frame, const proto::VolumeKey& k)
+    -> std::expected<ScopedKey, KeyError> {
+    auto key = se.open_volume_key(proto::volume_key_aad(frame), k.hpke_enc, k.wrapped_key);
+    if (!key) {
+        return std::unexpected(from_se(key.error()));
+    }
+    return std::move(*key);
+}
+
+}  // namespace
+
+auto KeyStore::put_attachment_key(std::span<const std::byte> frame)
+    -> std::expected<void, KeyError> {
+    const auto k = proto::decode_volume_key(frame);
+    if (!k) {
+        return std::unexpected(KeyError::corrupt_key);
+    }
+    const auto it = _attachment_keys.find(k->attachment_id);
+    if (it != _attachment_keys.end()) {
+        const auto kept = proto::decode_volume_key(it->second);
+        if (kept && kept->generation > k->generation) {
+            return std::unexpected(KeyError::stale_generation);
+        }
+    } else if (_attachment_keys.size() >= max_attachment_keys) {
+        return std::unexpected(KeyError::too_many_keys);
+    }
+    if (auto opened = open_frame(*_se, frame, *k); !opened) {
+        return std::unexpected(opened.error());
+    }  // the plaintext is wiped here
+    _attachment_keys[k->attachment_id] = {frame.begin(), frame.end()};
+    return {};
+}
+
+auto KeyStore::open_attachment_key(AttachmentId attachment, std::uint32_t generation)
+    -> std::expected<ScopedKey, KeyError> {
+    const auto it = _attachment_keys.find(attachment);
+    if (it == _attachment_keys.end()) {
+        return std::unexpected(KeyError::unknown_attachment);
+    }
+    const auto k = proto::decode_volume_key(it->second);
+    if (!k) {
+        return std::unexpected(KeyError::corrupt_key);
+    }
+    if (k->generation != generation) {
+        return std::unexpected(k->generation > generation ? KeyError::stale_generation
+                                                          : KeyError::unknown_attachment);
+    }
+    return open_frame(*_se, it->second, *k);
+}
+
+auto KeyStore::attachment_key(AttachmentId attachment) const -> std::optional<proto::VolumeKey> {
+    const auto it = _attachment_keys.find(attachment);
+    if (it == _attachment_keys.end()) {
+        return std::nullopt;
+    }
+    auto k = proto::decode_volume_key(it->second);
+    if (!k) {
+        return std::nullopt;
+    }
+    return *k;
+}
+
+auto KeyStore::drop_attachment_key(AttachmentId attachment) -> void {
+    _attachment_keys.erase(attachment);
 }
 
 auto KeyStore::rewrap(VolumeId volume, VmId new_owner) -> std::expected<void, KeyError> {

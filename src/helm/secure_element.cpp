@@ -14,9 +14,11 @@
 
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 
 #include "common/wire.hpp"
+#include "proto/volume_key.hpp"
 
 namespace ak::helm {
 
@@ -31,6 +33,9 @@ constexpr int gcm_nonce_size = static_cast<int>(WrappedKey::nonce_size);
 constexpr mode_t master_key_mode = 0600;
 constexpr mode_t group_other_bits = 077;
 
+static_assert(proto::volume_data_key_size == volume_key_size &&
+              proto::hpke_enc_size == hpke::enc_size &&
+              proto::wrapped_volume_key_size == volume_key_size + hpke::tag_size);
 static_assert(master_key_size == vm_key_size,
               "VM keys and the master key are both AES-256 key-encryption keys");
 
@@ -379,6 +384,54 @@ auto SoftwareSecureElement::open(const std::filesystem::path& path)
         return std::unexpected(master.error());
     }
     return SoftwareSecureElement{std::move(*master)};
+}
+
+auto SoftwareSecureElement::transport_key() const -> std::expected<hpke::KeyPair, SeError> {
+    static constexpr std::string_view label = "antikythera se transport key v1";
+    SecretBytes<hpke::ikm_size> ikm;
+    unsigned int len = 0;
+    if (HMAC(EVP_sha256(), as_uchar(_master.span()), static_cast<int>(master_key_size),
+             reinterpret_cast<const unsigned char*>(label.data()), label.size(),
+             as_uchar_mut(ikm.span()), &len) == nullptr ||
+        len != hpke::ikm_size) {
+        ERR_clear_error();
+        return std::unexpected(SeError::crypto_failure);
+    }
+    auto pair = hpke::derive_key_pair(ikm.span());
+    if (!pair) {
+        return std::unexpected(SeError::crypto_failure);
+    }
+    return std::move(*pair);
+}
+
+auto SoftwareSecureElement::transport_public_key() -> std::expected<hpke::PublicKey, SeError> {
+    auto pair = transport_key();
+    if (!pair) {
+        return std::unexpected(pair.error());
+    }
+    return pair->public_key;
+}
+
+auto SoftwareSecureElement::open_volume_key(
+    std::span<const std::byte> aad, std::span<const std::byte, hpke::enc_size> enc,
+    std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
+    -> std::expected<ScopedKey, SeError> {
+    auto pair = transport_key();
+    if (!pair) {
+        return std::unexpected(pair.error());
+    }
+    SecretBytes<volume_key_size> key;
+    const auto info = proto::volume_key_info;
+    auto opened =
+        hpke::open(pair->private_key.span(), enc,
+                   std::as_bytes(std::span{info.data(), info.size()}), aad, wrapped, key.span());
+    if (!opened) {
+        ERR_clear_error();
+        return std::unexpected(opened.error() == hpke::Error::crypto_failure
+                                   ? SeError::crypto_failure
+                                   : SeError::authentication_failed);
+    }
+    return make_scoped_key(key.span());
 }
 
 auto SoftwareSecureElement::ephemeral() -> std::expected<SoftwareSecureElement, SeError> {

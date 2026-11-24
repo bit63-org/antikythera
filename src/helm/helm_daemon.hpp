@@ -50,7 +50,9 @@
 // controller. Every report_interval it takes each hold role's queued
 // reports and relays those of the kinds a hold role sends (replica
 // status, volume faults, demotions, op outcomes, snapshot progress) to the
-// controller; anything else is dropped and counted.
+// controller; anything else is dropped and counted. A VolumeKey goes to
+// the KeyStore, which opens it in the secure element and keeps it wrapped
+// for the attachment it names (KeyStore::put_attachment_key).
 //
 // The daemon never powers anything off by itself: losing the controller
 // leaves running VMs alone (Requirement 2.3), and stopping run() leaves the
@@ -128,6 +130,8 @@ struct DaemonStats {
     std::uint64_t hold_refused{0};          // a hold role refused or missed a frame or grant
     std::uint64_t hold_reports{0};          // relayed to the controller
     std::uint64_t hold_reports_dropped{0};  // undecodable, or of a kind a hold role never sends
+    std::uint64_t volume_keys{0};           // opened and kept (KeyStore::put_attachment_key)
+    std::uint64_t volume_keys_refused{0};   // did not open, stale, or too many
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -178,6 +182,8 @@ public:
         -> void override;
     auto on_volume_op(const proto::VolumeOp& op, std::span<const std::byte> frame) -> void override;
     auto on_lease_grant(const proto::LeaseGrant& grant) -> void override;
+    auto on_volume_key(const proto::VolumeKey& key, std::span<const std::byte> frame)
+        -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
     // The newest published snapshot (ControllerSession's InventorySource).
@@ -204,8 +210,11 @@ private:
     struct OpFrame {
         std::vector<std::byte> frame;
     };
+    struct KeyFrame {
+        std::vector<std::byte> frame;
+    };
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
-                              proto::LeaseGrant>;
+                              proto::LeaseGrant, KeyFrame>;
 
     struct SlotState;
 
@@ -265,6 +274,7 @@ private:
     auto slot_state(SlotNumber slot) -> SlotState*;
 
     DaemonConfig _config;
+    KeyStore* _keys;
     SidebandConnector _connect;
     ReportOut _reports;
     DevicePool _pool;

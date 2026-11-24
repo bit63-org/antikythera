@@ -28,8 +28,17 @@
 //
 // kind 1 = VM key (key_len 32), kind 2 = volume key (key_len 64).
 //
+// Network volume keys (.kiro/specs/block-volume-service/ design "VolumeKey")
+// do not use this hierarchy: kythira KMS wraps each one with HPKE (hpke.hpp)
+// to the secure element's X25519 transport key, and open_volume_key()
+// unwraps it straight into a ScopedKey. The transport private key never
+// leaves the secure element; enrollment registers transport_public_key().
+//
 // SoftwareSecureElement is the harbor stand-in: the master key is a 32-byte
 // file, created 0600 on first use and refused if anyone else can read it.
+// Its transport key is derived from the master key (HPKE DeriveKeyPair over
+// HMAC-SHA256(master, "antikythera se transport key v1")), so it is stable
+// across restarts and dies with the master key.
 
 #include <array>
 #include <cstddef>
@@ -41,6 +50,7 @@
 #include <vector>
 
 #include "helm/device_pool.hpp"
+#include "helm/hpke.hpp"
 #include "helm/scoped_key.hpp"
 
 namespace ak::helm {
@@ -159,6 +169,17 @@ public:
                                    const WrappedVolumeKey& volume)
         -> std::expected<WrappedVolumeKey, SeError> = 0;
 
+    // The X25519 public key network volume keys are wrapped to.
+    virtual auto transport_public_key() -> std::expected<hpke::PublicKey, SeError> = 0;
+
+    // Opens a VolumeKey's wrapped key (HPKE, info proto::volume_key_info,
+    // `aad` the frame header). authentication_failed if it was wrapped to
+    // another key or for another header, or was changed.
+    virtual auto open_volume_key(
+        std::span<const std::byte> aad, std::span<const std::byte, hpke::enc_size> enc,
+        std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
+        -> std::expected<ScopedKey, SeError> = 0;
+
     // Draws a fresh random volume key that is never wrapped or stored: an
     // image volume's attachment key (oar-blk Requirement 8.6), gone once
     // delivered. The default draws it from OpenSSL's RNG.
@@ -199,6 +220,11 @@ public:
     auto rewrap_volume_key(const WrappedVmKey& from, const WrappedVmKey& to,
                            const WrappedVolumeKey& volume)
         -> std::expected<WrappedVolumeKey, SeError> override;
+    auto transport_public_key() -> std::expected<hpke::PublicKey, SeError> override;
+    auto open_volume_key(std::span<const std::byte> aad,
+                         std::span<const std::byte, hpke::enc_size> enc,
+                         std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
+        -> std::expected<ScopedKey, SeError> override;
 
 private:
     explicit SoftwareSecureElement(SecretBytes<master_key_size> master) noexcept
@@ -206,6 +232,7 @@ private:
 
     [[nodiscard]] auto unwrap_vm_key(const WrappedVmKey& vm) const
         -> std::expected<SecretBytes<vm_key_size>, SeError>;
+    [[nodiscard]] auto transport_key() const -> std::expected<hpke::KeyPair, SeError>;
 
     SecretBytes<master_key_size> _master;
 };

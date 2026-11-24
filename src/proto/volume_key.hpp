@@ -28,7 +28,9 @@
 // key opens only for the server, volume, attachment and generation it was
 // wrapped for. The frame is not signed: the mTLS controller link
 // authenticates the controller, and the AEAD makes any change to the
-// header or ciphertext fail to open.
+// header or ciphertext fail to open. The HPKE info is volume_key_info.
+// The recipient key is the helm secure element's X25519 transport key,
+// which enrollment registers with the controller.
 
 #include <algorithm>
 #include <array>
@@ -36,6 +38,7 @@
 #include <cstdint>
 #include <expected>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "common/wire.hpp"
@@ -53,6 +56,10 @@ inline constexpr std::size_t aead_tag_size = 16;
 inline constexpr std::size_t wrapped_volume_key_size = volume_data_key_size + aead_tag_size;
 inline constexpr std::size_t volume_key_size =
     volume_key_aad_size + hpke_enc_size + wrapped_volume_key_size;
+
+// HPKE info for every VolumeKey: names the use, so a key wrapped to the
+// same transport key for any other purpose cannot be passed off as one.
+inline constexpr std::string_view volume_key_info = "antikythera volume key v1";
 
 using HpkeEnc = std::array<std::byte, hpke_enc_size>;
 using WrappedVolumeKey = std::array<std::byte, wrapped_volume_key_size>;

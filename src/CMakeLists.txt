@@ -79,6 +79,7 @@ add_library(ak_helm
   helm/device_pool.cpp
   helm/helm_config.cpp
   helm/helm_daemon.cpp
+  helm/hpke.cpp
   helm/key_store.cpp
   helm/mailbox.cpp
   helm/mailbox_device.cpp
@@ -89,7 +90,8 @@ add_library(ak_helm
   helm/scoped_key.cpp
   helm/secure_element.cpp
   helm/sideband_binding.cpp
-  helm/tunnel_keyring.cpp)
+  helm/tunnel_keyring.cpp
+  helm/volume_key_seal.cpp)
 add_library(ak::helm ALIAS ak_helm)
 target_link_libraries(ak_helm
   PUBLIC ak::common ak::proto ak::tls

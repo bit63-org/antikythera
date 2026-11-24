@@ -28,7 +28,9 @@
 #include "helm/key_store.hpp"
 #include "helm/mailbox.hpp"
 #include "helm/secure_element.hpp"
+#include "helm/volume_key_seal.hpp"
 #include "proto/envelope.hpp"
+#include "proto/replica_config.hpp"
 #include "proto/report.hpp"
 #include "test_support.hpp"
 
@@ -123,6 +125,7 @@ struct FakeOar final : helm::OarPort {
     std::optional<LinkError> create_error;
     std::optional<LinkError> delete_error;
     std::optional<LinkError> rewrap_error;
+    std::vector<std::vector<std::byte>> configs;  // replica_config frames
 
     auto prepare_function(const oar::PrepareFunction& r)
         -> std::expected<void, LinkError> override {
@@ -183,6 +186,11 @@ struct FakeOar final : helm::OarPort {
         if (rewrap_error) {
             return std::unexpected(*rewrap_error);
         }
+        return {};
+    }
+    auto replica_config(std::span<const std::byte> frame)
+        -> std::expected<void, LinkError> override {
+        configs.emplace_back(frame.begin(), frame.end());
         return {};
     }
 };
@@ -333,6 +341,7 @@ struct Helm {
                                     .command_timeout = command_timeout,
                                     .release_timeout = release_timeout,
                                     .clean_timeout = clean_timeout,
+                                    .server_id = server,
                                     .max_queued = max_queued,
                                     .outcome_history = helm::RouterConfig{}.outcome_history,
                                     .clock = [this] { return t; }},
@@ -1104,4 +1113,129 @@ BOOST_AUTO_TEST_CASE(inventory_lists_every_function,
     with_boot.boot_id = 1;
     BOOST_TEST(proto::encode_report({.server_id = server, .report_seq = 1, .body = with_boot})
                    .has_value());
+}
+
+// ---- network volumes (block-volume-service task 12) ----------------------------
+
+namespace {
+
+constexpr std::uint64_t net_attachment = 77;
+constexpr std::uint64_t other_server = 9;
+
+auto net_config(std::uint64_t epoch, std::uint64_t attached_server = server)
+    -> std::vector<std::byte> {
+    proto::ReplicaConfig c;
+    c.key_id = 1;
+    c.server_id = server;
+    c.volume_id = vol_two;
+    c.epoch = epoch;
+    c.lineage_id = 9;
+    c.capacity_blocks = 1024;
+    c.block_size = proto::block_size_4096;
+    c.qos = {.iops = 100, .mib_per_s = 10, .burst_iops = 100, .burst_mib = 10};
+    c.lease_ms = 4000;
+    proto::ReplicaMember m;
+    m.server_id = 5;
+    m.endpoint[15] = std::byte{1};
+    m.port = 7300;
+    m.role = proto::ReplicaRole::primary;
+    m.replica_gen = 1;
+    c.members = {m};
+    c.attachments = {{.attachment_id = net_attachment,
+                      .server_id = attached_server,
+                      .generation = 1,
+                      .mode = proto::AttachMode::rw}};
+    auto f = proto::encode_replica_config(c);
+    BOOST_REQUIRE(f.has_value());
+    return *f;
+}
+
+auto net_key(helm::SoftwareSecureElement& se, std::span<const std::byte, 64> key,
+             std::uint32_t generation = 1) -> std::vector<std::byte> {
+    auto f = helm::seal_volume_key(se.transport_public_key().value(),
+                                   {.server_id = server,
+                                    .volume_id = vol_two,
+                                    .attachment_id = net_attachment,
+                                    .generation = generation,
+                                    .hpke_enc = {},
+                                    .wrapped_key = {}},
+                                   key);
+    BOOST_REQUIRE(f.has_value());
+    return *f;
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(network_volumes_attach_with_the_controllers_key,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    h.run(mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib});
+    // Only configs that attach the volume here are kept.
+    BOOST_TEST(!h.router.on_replica_config(net_config(1, other_server)));
+    const mb::AttachVolume attach{.volume_id = vol_two, .vm_id = vm_one, .device = blk(fn_one)};
+    h.send(attach);
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::unknown_volume));
+
+    BOOST_TEST(h.router.on_replica_config(net_config(2)));
+    BOOST_TEST(!h.router.on_replica_config(net_config(1)));  // older
+    BOOST_TEST(h.router.network_configs().size() == 1U);
+    // Without the attachment's key, helm refuses before hull sees it.
+    const auto posted = h.host.posted.size();
+    h.send(attach);
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::unknown_volume));
+    BOOST_TEST(h.host.posted.size() == posted);
+    BOOST_TEST((h.state(blk_slot, fn_one) == FunctionState::free));
+
+    std::array<std::byte, 64> data_key{};
+    data_key.fill(std::byte{0x3C});
+    BOOST_REQUIRE(h.keys.put_attachment_key(net_key(h.se, data_key)).has_value());
+    const auto a = h.send(attach);
+    // The config goes to the storage role first, then the attachment.
+    BOOST_REQUIRE(h.blk_role.configs.size() == 1U);
+    BOOST_TEST((h.blk_role.configs.at(0) == net_config(2)));
+    BOOST_REQUIRE(h.blk_role.prepared.size() == 1U);
+    BOOST_TEST((h.blk_role.prepared.at(0).config ==
+                oar::FunctionConfig{oar::BlkConfig{
+                    .volume_id = vol_two, .attachment_id = net_attachment, .generation = 1}}));
+    BOOST_TEST(h.blk_role.keys.empty());
+    h.answer(a, attach);
+    BOOST_REQUIRE(h.blk_role.keys.size() == 1U);
+    BOOST_TEST(
+        (h.blk_role.key_bytes.at(0) == std::vector<std::byte>(data_key.begin(), data_key.end())));
+    BOOST_TEST(h.host_faults().empty());
+
+    // Only the VM that attached can detach; then the key is forgotten.
+    mb::DetachVolume detach{.volume_id = vol_two,
+                            .vm_id = vm_two,
+                            .device = blk(fn_one),
+                            .timeout_s = detach_timeout_s,
+                            .policy = mb::DetachPolicy::force};
+    h.send(detach);
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::conflict));
+    BOOST_TEST(h.keys.attachment_key(net_attachment).has_value());
+    detach.vm_id = vm_one;
+    h.run(detach);
+    BOOST_TEST((h.state(blk_slot, fn_one) == FunctionState::releasing));
+    BOOST_TEST(!h.keys.attachment_key(net_attachment).has_value());
+    // The volume itself is the controller's: no delete through the mailbox.
+    h.send(mb::DeleteVolume{.volume_id = vol_two});
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::unknown_volume));
+}
+
+BOOST_AUTO_TEST_CASE(a_network_volume_detached_here_is_forgotten,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    h.run(mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib});
+    BOOST_REQUIRE(h.router.on_replica_config(net_config(1)));
+    std::array<std::byte, 64> data_key{};
+    BOOST_REQUIRE(h.keys.put_attachment_key(net_key(h.se, data_key)).has_value());
+    const mb::AttachVolume attach{.volume_id = vol_two, .vm_id = vm_one, .device = blk(fn_one)};
+    h.run(attach);
+    // The controller moves the attachment away (forced detach fences
+    // first): the role must still see that config while attached.
+    BOOST_TEST(h.router.on_replica_config(net_config(2, other_server)));
+    BOOST_TEST(h.router.network_configs().size() == 1U);
+    h.run(mb::DestroyVm{.vm_id = vm_one, .persist_volumes = true});
+    BOOST_TEST(h.router.network_configs().empty());
+    BOOST_TEST(!h.keys.attachment_key(net_attachment).has_value());
 }

@@ -16,8 +16,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -41,11 +43,16 @@
 #include "helm/oar_link.hpp"
 #include "helm/secure_element.hpp"
 #include "helm/sideband_binding.hpp"
+#include "hold/server/node.hpp"
+#include "hold/store/file_layer.hpp"
 #include "oar/blk/blk_role.hpp"
 #include "oar/blk/file_backend.hpp"
 #include "oar/blk/image_manifest.hpp"
 #include "oar/blk/image_pack.hpp"
+#include "proto/replica_config.hpp"
+#include "proto/server_identity.hpp"
 #include "test_support.hpp"
+#include "tls_test_support.hpp"
 #include "virtio_driver_support.hpp"
 
 // Boost.Test's customization point for types it cannot print itself.
@@ -344,6 +351,144 @@ private:
 constexpr std::uint16_t image_store_id = 4;
 constexpr std::string_view image_prefix = "images";
 
+// Network volumes (block-volume-service task 12).
+constexpr std::uint64_t compute_id = 2;  // this server
+constexpr std::uint64_t hold_id = 5;
+constexpr std::uint64_t net_attachment = 77;
+constexpr std::uint16_t controller_key = 3;
+constexpr auto good_sig = std::byte{0xA5};
+
+// A hung-up hold must not end the test (the roles' mains ignore SIGPIPE).
+struct IgnoreSigpipe {
+    IgnoreSigpipe() { static_cast<void>(std::signal(SIGPIPE, SIG_IGN)); }
+};
+const IgnoreSigpipe ignore_sigpipe;
+
+auto server_san(std::uint64_t id) -> std::string {
+    return "URI:" + ak::proto::server_uri(id);
+}
+
+// A network volume's ReplicaConfig as the controller signs it for
+// `server`: one primary hold on 127.0.0.1:`port`, attached here.
+auto net_config(std::uint64_t server, std::uint16_t port, std::uint64_t epoch = 1,
+                ak::proto::AttachMode mode = ak::proto::AttachMode::rw)
+    -> ak::proto::ReplicaConfig {
+    ak::proto::ReplicaConfig c;
+    c.key_id = controller_key;
+    c.server_id = server;
+    c.volume_id = vol_one;
+    c.epoch = epoch;
+    c.lineage_id = 9;
+    c.capacity_blocks = volume_sectors;
+    c.block_size = blk::sector_size;
+    c.qos = {.iops = 100000, .mib_per_s = 10000, .burst_iops = 100000, .burst_mib = 10000};
+    c.lease_ms = 4000;
+    ak::proto::ReplicaMember m;
+    m.server_id = hold_id;
+    m.endpoint[10] = std::byte{0xFF};  // ::ffff:127.0.0.1
+    m.endpoint[11] = std::byte{0xFF};
+    m.endpoint[12] = std::byte{127};
+    m.endpoint[15] = std::byte{1};
+    m.port = port;
+    m.role = ak::proto::ReplicaRole::primary;
+    m.replica_gen = 1;
+    c.members = {m};
+    c.attachments = {
+        {.attachment_id = net_attachment, .server_id = compute_id, .generation = 1, .mode = mode}};
+    c.signature.fill(good_sig);
+    return c;
+}
+
+auto frame_of(const ak::proto::ReplicaConfig& c) -> std::vector<std::byte> {
+    auto f = ak::proto::encode_replica_config(c);
+    BOOST_REQUIRE(f.has_value());
+    return *f;
+}
+
+// A hold primary on 127.0.0.1, on its own thread.
+class Hold {
+public:
+    explicit Hold(ak::test::TestCa& ca) {
+        const auto pem = ca.issue("hold", "IP:127.0.0.1, " + server_san(hold_id));
+        auto node = ak::hold::Node::create(
+            _files, {.host = "127.0.0.1",
+                     .port = 0,
+                     .tls = {.role = ak::tls::Role::server,
+                             .ca_pem = ca.cert_pem(),
+                             .cert_pem = pem.cert,
+                             .key_pem = pem.key,
+                             .peer_name = {}},
+                     .server = {.server_id = hold_id, .data_dir = "/srv/hold", .leases = false},
+                     .handshake_timeout = std::chrono::milliseconds{2000},
+                     .write_timeout = std::chrono::milliseconds{2000}});
+        BOOST_REQUIRE(node.has_value());
+        _node = std::move(*node);
+        BOOST_REQUIRE(_node->server()
+                          .apply_config(net_config(hold_id, port()), ak::hold::Clock::now())
+                          .has_value());
+        _thread = std::thread{[this] {
+            while (!_stop.load()) {
+                {
+                    const std::scoped_lock lock{_mutex};
+                    if (_pending) {
+                        _applied = _node->server()
+                                       .apply_config(*_pending, ak::hold::Clock::now())
+                                       .has_value();
+                        _pending.reset();
+                    }
+                }
+                _node->run_once(std::chrono::milliseconds{20});
+            }
+        }};
+    }
+    // Applies `c` on the node's thread (the server is single-threaded).
+    auto apply(const ak::proto::ReplicaConfig& c) -> bool {
+        {
+            const std::scoped_lock lock{_mutex};
+            _applied.reset();
+            _pending = c;
+        }
+        for (int i = 0; i < 200; ++i) {
+            {
+                const std::scoped_lock lock{_mutex};
+                if (_applied) {
+                    return *_applied;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        return false;
+    }
+    Hold(const Hold&) = delete;
+    auto operator=(const Hold&) -> Hold& = delete;
+    Hold(Hold&&) = delete;
+    auto operator=(Hold&&) -> Hold& = delete;
+    ~Hold() {
+        _stop.store(true);
+        _thread.join();
+    }
+    [[nodiscard]] auto port() const -> std::uint16_t { return _node->port(); }
+
+private:
+    ak::hold::store::MemFiles _files;
+    std::unique_ptr<ak::hold::Node> _node;
+    std::atomic<bool> _stop{false};
+    std::mutex _mutex;
+    std::optional<ak::proto::ReplicaConfig> _pending;
+    std::optional<bool> _applied;
+    std::thread _thread;
+};
+
+// The storage certificate of this (compute) server.
+auto compute_tls(ak::test::TestCa& ca) -> ak::tls::Config {
+    const auto pem = ca.issue("compute", server_san(compute_id));
+    return {.role = ak::tls::Role::client,
+            .ca_pem = ca.cert_pem(),
+            .cert_pem = pem.cert,
+            .key_pem = pem.key,
+            .peer_name = {}};
+}
+
 // A role over two fake transports and a fresh volume directory; with
 // `images`, also an image store (in memory) and a chunk cache.
 struct Rig {
@@ -355,9 +500,19 @@ struct Rig {
     MemoryStore store;
     std::unique_ptr<blk::ChunkCache> cache;
     std::unique_ptr<blk::Fetcher> fetcher;
+    std::uint64_t network_server{compute_id};
+    // A stand-in for Ed25519: every signature byte good_sig, the known key.
+    std::function<bool(std::span<const std::byte>, std::span<const std::byte, 64>, std::uint16_t)>
+        verify = [](std::span<const std::byte> /*msg*/, std::span<const std::byte, 64> sig,
+                    std::uint16_t key) {
+            return key == controller_key &&
+                   std::ranges::all_of(sig, [](std::byte b) { return b == good_sig; });
+        };
+    std::optional<ak::tls::Config> storage_tls;
     std::unique_ptr<blk::BlkRole> role;
 
-    explicit Rig(bool images = false) {
+    explicit Rig(bool images = false, std::optional<ak::tls::Config> tls = std::nullopt)
+        : storage_tls{std::move(tls)} {
         std::map<std::uint16_t, blk::ImageStore> stores;
         if (images) {
             auto c = blk::ChunkCache::create(dir.path, std::uint64_t{16} << 20U);
@@ -384,6 +539,10 @@ struct Rig {
                                        .max_readahead_chunks = 8,
                                        .image_max_in_flight = 4,
                                        .manifest_deadline = std::chrono::milliseconds{1000},
+                                       .server_id = network_server,
+                                       .verify_config = verify,
+                                       .storage_tls = storage_tls,
+                                       .initiator = {},
                                        .clock = {}},
                                       {&t0, &t1});
         BOOST_REQUIRE(r);
@@ -885,6 +1044,101 @@ BOOST_AUTO_TEST_CASE(image_volume_refuses_a_missing_or_wrong_image) {
                                            .image_name = name}) == oar::Status::ok);
     BOOST_TEST((rig.prepare(fn0, vm_one, 0x203) == oar::Status::failed));
     BOOST_TEST(!rig.role->attached(fn0).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(network_volume_serves_the_guest_through_hold) {
+    ak::test::TestCa ca{"storage CA"};
+    Hold hold{ca};
+    Rig rig{false, compute_tls(ca)};
+    BOOST_REQUIRE((rig.role->replica_config(frame_of(net_config(compute_id, hold.port()))) ==
+                   oar::Status::ok));
+    BOOST_REQUIRE((rig.role->prepare_function(
+                       {.fn = fn0,
+                        .type = ak::helm::FunctionType::blk_fn,
+                        .vm_id = vm_one,
+                        .config = oar::BlkConfig{.volume_id = vol_one,
+                                                 .attachment_id = net_attachment,
+                                                 .generation = 1}}) == oar::Status::ok));
+    BOOST_TEST((rig.role->attached(fn0) == vol_one));
+    BOOST_TEST(rig.role->function(fn0)->awaiting_key());
+    rig.t0.flr();  // the VMM opens the function
+    BOOST_REQUIRE(rig.deliver(fn0, vol_one) == oar::Status::ok);
+
+    Guest g{rig.ram0, *rig.t0.served(), rig.role.get()};
+    BOOST_REQUIRE(g.up());
+    BOOST_TEST(g.serial() == blk::volume_serial(vol_one));
+    const auto plain = marker();
+    const auto w = g.post(RequestType::out, marker_sector, plain);
+    BOOST_REQUIRE(g.wait(w));
+    BOOST_TEST((g.status(w) == Status::ok));
+    BOOST_TEST(g.read(marker_sector) == plain, boost::test_tools::per_element());
+
+    // A new epoch re-routes the live attachment; it keeps serving.
+    BOOST_REQUIRE(hold.apply(net_config(hold_id, hold.port(), 2)));
+    BOOST_TEST((rig.role->replica_config(frame_of(net_config(compute_id, hold.port(), 2))) ==
+                oar::Status::ok));
+    BOOST_TEST(g.read(marker_sector) == plain, boost::test_tools::per_element());
+
+    // Detach closes the session and frees the function.
+    BOOST_REQUIRE(rig.clean(fn0) == oar::Status::ok);
+    BOOST_TEST(!rig.role->attached(fn0).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(network_volume_configs_must_be_signed_for_this_server) {
+    ak::test::TestCa ca{"storage CA"};
+    {
+        Rig plain;  // no storage certificate: no network volumes
+        BOOST_TEST((plain.role->replica_config(frame_of(net_config(compute_id, 4430))) ==
+                    oar::Status::unsupported));
+    }
+    Rig rig{false, compute_tls(ca)};
+    auto bad_sig = net_config(compute_id, 4430);
+    bad_sig.signature[0] = std::byte{0};
+    BOOST_TEST((rig.role->replica_config(frame_of(bad_sig)) == oar::Status::failed));
+    BOOST_TEST((rig.role->replica_config(frame_of(net_config(hold_id, 4430))) ==
+                oar::Status::failed));  // signed for another server
+    BOOST_TEST((rig.role->replica_config(std::vector<std::byte>(12)) == oar::Status::bad_request));
+
+    const auto prepare = [&](std::uint64_t attachment, std::uint32_t generation) {
+        return rig.role->prepare_function(
+            {.fn = fn0,
+             .type = ak::helm::FunctionType::blk_fn,
+             .vm_id = vm_one,
+             .config = oar::BlkConfig{
+                 .volume_id = vol_one, .attachment_id = attachment, .generation = generation}});
+    };
+    BOOST_TEST((prepare(net_attachment, 1) == oar::Status::failed));  // no config yet
+    BOOST_REQUIRE(
+        (rig.role->replica_config(frame_of(net_config(compute_id, 4430, 2))) == oar::Status::ok));
+    BOOST_TEST((rig.role->replica_config(frame_of(net_config(compute_id, 4430, 1))) ==
+                oar::Status::failed));                                    // stale
+    BOOST_TEST((prepare(net_attachment, 2) == oar::Status::failed));      // wrong generation
+    BOOST_TEST((prepare(net_attachment + 1, 1) == oar::Status::failed));  // unknown attachment
+    BOOST_TEST(!rig.role->attached(fn0).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(network_volume_read_only_attachment_refuses_writes) {
+    ak::test::TestCa ca{"storage CA"};
+    const Hold hold{ca};
+    Rig rig{false, compute_tls(ca)};
+    BOOST_REQUIRE(
+        (rig.role->replica_config(frame_of(net_config(
+             compute_id, hold.port(), 1, ak::proto::AttachMode::ro))) == oar::Status::ok));
+    BOOST_REQUIRE((rig.role->prepare_function(
+                       {.fn = fn0,
+                        .type = ak::helm::FunctionType::blk_fn,
+                        .vm_id = vm_one,
+                        .config = oar::BlkConfig{.volume_id = vol_one,
+                                                 .attachment_id = net_attachment,
+                                                 .generation = 1}}) == oar::Status::ok));
+    rig.t0.flr();
+    BOOST_REQUIRE(rig.deliver(fn0, vol_one) == oar::Status::ok);
+    Guest g{rig.ram0, *rig.t0.served(), rig.role.get()};
+    BOOST_REQUIRE(g.up());
+    const auto w = g.post(RequestType::out, marker_sector, marker());
+    BOOST_REQUIRE(g.wait(w));
+    BOOST_TEST((g.status(w) != Status::ok));
+    static_cast<void>(g.read(marker_sector));  // reads still work
 }
 
 BOOST_AUTO_TEST_SUITE_END()

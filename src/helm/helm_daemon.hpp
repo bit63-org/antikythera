@@ -52,7 +52,10 @@
 // status, volume faults, demotions, op outcomes, snapshot progress) to the
 // controller; anything else is dropped and counted. A VolumeKey goes to
 // the KeyStore, which opens it in the secure element and keeps it wrapped
-// for the attachment it names (KeyStore::put_attachment_key).
+// for the attachment it names (KeyStore::put_attachment_key). A config
+// whose attachments name this server also goes to the CommandRouter (which
+// attaches the volume on ATTACH_VOLUME) and to every storage (blk) role,
+// and again to a storage role whose sideband (re)opens.
 //
 // The daemon never powers anything off by itself: losing the controller
 // leaves running VMs alone (Requirement 2.3), and stopping run() leaves the
@@ -132,6 +135,7 @@ struct DaemonStats {
     std::uint64_t hold_reports_dropped{0};  // undecodable, or of a kind a hold role never sends
     std::uint64_t volume_keys{0};           // opened and kept (KeyStore::put_attachment_key)
     std::uint64_t volume_keys_refused{0};   // did not open, stale, or too many
+    std::uint64_t blk_configs_refused{0};   // a storage role refused a network volume's config
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -237,6 +241,8 @@ private:
             -> std::expected<void, LinkError> override;
         auto rewrap_volume(const oar::RewrapVolume& request)
             -> std::expected<void, LinkError> override;
+        auto replica_config(std::span<const std::byte> frame)
+            -> std::expected<void, LinkError> override;
 
     private:
         SlotState* _slot;
@@ -260,6 +266,8 @@ private:
     auto apply_map(MapFrame& map) -> void;
     // Block volumes: to every attached hold role.
     [[nodiscard]] static auto is_hold(const SlotState& slot) -> bool;
+    [[nodiscard]] static auto is_blk(const SlotState& slot) -> bool;
+    auto count_blk_refusal(const std::expected<void, LinkError>& r) -> void;
     auto forward_config(ConfigFrame& config) -> void;
     auto forward_op(const OpFrame& op) -> void;
     auto forward_grant(const proto::LeaseGrant& grant) -> void;

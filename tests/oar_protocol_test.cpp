@@ -122,6 +122,24 @@ BOOST_AUTO_TEST_CASE(prepare_blk_and_gpu_round_trip) {
     BOOST_TEST(body->size() == blk_body_size);
     BOOST_TEST((oar::decode_prepare_function(*body).value() == blk));
 
+    // A network volume's attachment (block-volume-service task 12).
+    auto net = blk;
+    net.config = oar::BlkConfig{.volume_id = sample_volume, .attachment_id = 77, .generation = 3};
+    body = oar::encode_prepare_function(net);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == blk_body_size);
+    BOOST_TEST((oar::decode_prepare_function(*body).value() == net));
+    BOOST_TEST(std::get<oar::BlkConfig>(net.config).network());
+    // Attachment and generation come together, and the tail is reserved.
+    auto tail = *body;
+    tail.back() = std::byte{1};
+    BOOST_TEST((oar::decode_prepare_function(tail).error() == BodyError::reserved_not_zero));
+    for (const auto& half : {oar::BlkConfig{.volume_id = sample_volume, .attachment_id = 77},
+                             oar::BlkConfig{.volume_id = sample_volume, .generation = 3}}) {
+        net.config = half;
+        BOOST_TEST((oar::encode_prepare_function(net).error() == BodyError::zero_id));
+    }
+
     const oar::PrepareFunction gpu{
         .fn = 1, .type = FunctionType::gpu_vf, .vm_id = sample_vm, .config = std::monostate{}};
     body = oar::encode_prepare_function(gpu);
@@ -181,7 +199,7 @@ BOOST_AUTO_TEST_CASE(prepare_decode_rejects_malformed) {
     // A blk type over a NIC-sized body has the wrong length for its type.
     b = good;
     b[type_offset] = std::byte{static_cast<std::uint8_t>(FunctionType::blk_fn)};
-    BOOST_TEST((oar::decode_prepare_function(b).error() == BodyError::trailing_bytes));
+    BOOST_TEST((oar::decode_prepare_function(b).error() == BodyError::truncated));
 }
 
 BOOST_AUTO_TEST_CASE(clean_function_round_trip_and_rejects) {

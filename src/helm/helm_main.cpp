@@ -97,6 +97,7 @@ auto make_daemon_config(const helm::HelmConfig& cfg) -> helm::DaemonConfig {
         }
         dc.slots.push_back({.slot = slot, .link = link});
     }
+    dc.router.server_id = cfg.server_id;
     if (cfg.command_timeout) {
         dc.router.command_timeout = *cfg.command_timeout;
     }

@@ -101,7 +101,8 @@ auto check_prepare(const PrepareFunction& p) noexcept -> std::expected<void, Bod
         return check_nic(*nic);
     }
     if (const auto* blk = std::get_if<BlkConfig>(&p.config);
-        blk != nullptr && blk->volume_id == 0) {
+        blk != nullptr &&
+        (blk->volume_id == 0 || (blk->attachment_id == 0) != (blk->generation == 0))) {
         return std::unexpected(BodyError::zero_id);
     }
     return {};
@@ -272,6 +273,9 @@ auto encode_prepare_function(const PrepareFunction& p)
         w.le16(zero16);
     } else if (const auto* blk = std::get_if<BlkConfig>(&p.config)) {
         w.le64(blk->volume_id);
+        w.le64(blk->attachment_id);
+        w.le32(blk->generation);
+        w.le32(zero32);
     }
     return out;
 }
@@ -309,7 +313,14 @@ auto decode_prepare_function(std::span<const std::byte> body) noexcept
         }
         p.config = nic;
     } else if (p.type == FunctionType::blk_fn) {
-        p.config = BlkConfig{.volume_id = r.le64().value_or(0)};
+        BlkConfig blk;
+        blk.volume_id = r.le64().value_or(0);
+        blk.attachment_id = r.le64().value_or(0);
+        blk.generation = r.le32().value_or(0);
+        if (r.le32().value_or(0) != 0) {
+            return std::unexpected(BodyError::reserved_not_zero);
+        }
+        p.config = blk;
     }
     if (auto ok = check_prepare(p); !ok) {
         return std::unexpected(ok.error());

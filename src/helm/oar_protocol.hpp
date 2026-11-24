@@ -18,7 +18,11 @@
 //   prepare_function    0  fn u16 | 2  type u8 | 3  reserved u8 | 4  reserved u32
 //                       8  vm_id u64 | 16 per-type config:
 //                         nic_vf: nic_id u64 | vni u32 | mac [6] | reserved u16  (20 bytes)
-//                         blk_fn: volume_id u64                                  (8 bytes)
+//                         blk_fn: volume_id u64 | attachment_id u64 | generation u32
+//                                 | reserved u32                               (24 bytes)
+//                                 (attachment_id and generation zero for a local or
+//                                 image volume; both non-zero for a network volume,
+//                                 whose ReplicaConfig the role already has)
 //                         gpu_whole, gpu_vf: nothing
 //   clean_function      0  fn u16 | 2  action u8 (CleaningAction) | 3  reserved u8
 //   deliver_key         0  fn u16 | 2  reserved u16 | 4  reserved u32 | 8  volume_id u64
@@ -167,7 +171,7 @@ inline constexpr std::size_t max_body_size = mctp::max_message_size - mctp::vend
 
 inline constexpr std::size_t prepare_head_size = 16;
 inline constexpr std::size_t nic_config_size = 20;
-inline constexpr std::size_t blk_config_size = 8;
+inline constexpr std::size_t blk_config_size = 24;
 inline constexpr std::size_t clean_function_size = 4;
 inline constexpr std::size_t deliver_key_size = 16 + volume_key_size;
 inline constexpr std::size_t drop_key_size = 16;
@@ -295,6 +299,12 @@ struct NicConfig {
 
 struct BlkConfig {
     VolumeId volume_id{0};
+    // A network volume's attachment (block-volume-service task 12): both
+    // zero for a volume on the role's own media.
+    std::uint64_t attachment_id{0};
+    std::uint32_t generation{0};
+
+    [[nodiscard]] auto network() const noexcept -> bool { return attachment_id != 0; }
 
     friend auto operator==(const BlkConfig&, const BlkConfig&) -> bool = default;
 };

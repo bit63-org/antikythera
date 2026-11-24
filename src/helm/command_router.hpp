@@ -68,6 +68,26 @@
 // persist_volumes deletes the VM's image volumes too. REWRAP_VOLUME is
 // unsupported until encrypted images give them a key to rewrap (task 15).
 //
+// Network volumes (.kiro/specs/block-volume-service/ task 12). The
+// controller owns them: there is no CREATE_VOLUME, and helm learns of one
+// from its ReplicaConfig (on_replica_config keeps the newest per volume
+// whose attachments name this server) and its key from a VolumeKey
+// (KeyStore::put_attachment_key). helm does not know the owning VM; hull
+// checks the signed command, and helm remembers the VM that attached.
+//
+//   ATTACH_VOLUME  prepare: the config must list exactly one attachment
+//                  for this server, and the KeyStore must hold its key at
+//                  that generation; reserve the blk function, hand the
+//                  config to that slot (replica_config), then
+//                  prepare_function with the attachment, which opens the
+//                  role's session to the primary; commit: open the key in
+//                  the secure element and deliver it.
+//   DETACH_VOLUME  only by the VM that attached; commit: release the
+//                  function (cleaning closes the session) and forget the
+//                  attachment's key.
+//   DELETE_VOLUME, REWRAP_VOLUME are the controller's (no mailbox command):
+//                  unknown_volume, as for any volume helm does not hold.
+//
 // A media step that fails after commit (delete or rewrap) cannot be undone
 // either: it is counted in storage_failures. A failed delete leaves only
 // ciphertext whose key is gone; a failed rewrap leaves the old wrapped key
@@ -126,9 +146,13 @@
 #include "helm/oar_link.hpp"
 #include "helm/oar_protocol.hpp"
 #include "proto/envelope.hpp"
+#include "proto/replica_config.hpp"
 #include "proto/report.hpp"
 
 namespace ak::helm {
+
+// Network volumes the router keeps configs for at once.
+inline constexpr std::size_t max_network_volumes = 4096;
 
 // helm's side of the mailbox as the router uses it (MailboxDevice
 // implements it). post_command writes the slot completely, then rings
@@ -180,6 +204,12 @@ public:
         return std::unexpected(
             LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported});
     }
+    // A network volume's ReplicaConfig, to the storage role that attaches it.
+    virtual auto replica_config(std::span<const std::byte> /*frame*/)
+        -> std::expected<void, LinkError> {
+        return std::unexpected(
+            LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported});
+    }
 };
 
 class OarLinkPort final : public OarPort {
@@ -198,6 +228,8 @@ public:
     auto rewrap_volume(const oar::RewrapVolume& request) -> std::expected<void, LinkError> override;
     auto group_policy(std::span<const std::byte> frame) -> std::expected<void, LinkError> override;
     auto group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError> override;
+    auto replica_config(std::span<const std::byte> frame)
+        -> std::expected<void, LinkError> override;
 
 private:
     OarLink* _link;
@@ -226,6 +258,9 @@ struct RouterConfig {
     std::chrono::milliseconds release_timeout{std::chrono::seconds{60}};
     // How long a GPU function may wait in `cleaning` for SCRUB_DONE.
     std::chrono::milliseconds clean_timeout{std::chrono::minutes{10}};
+    // This server (the ControllerSession's): network volume attachments
+    // naming it are the ones it serves.
+    std::uint64_t server_id{0};
     // Envelopes waiting for the mailbox; more are refused.
     std::size_t max_queued{64};
     // Finished outcomes kept for answering retries.
@@ -268,6 +303,14 @@ public:
     auto on_envelope(const proto::Envelope& envelope) -> void;
     // A slot hull wrote: RSP_SLOT (a response) or EVT_SLOT (an event).
     auto on_host_slot(const mailbox::Slot& slot) -> void;
+    // A ReplicaConfig from the controller (frame as received). Kept, newest
+    // epoch per volume, when one of its attachments names this server;
+    // returns whether it was (the daemon then hands it to the storage
+    // roles, which follow epoch changes on live attachments).
+    auto on_replica_config(std::span<const std::byte> frame) -> bool;
+    // The newest kept ReplicaConfig of every network volume, for a storage
+    // role whose sideband (re)opened.
+    [[nodiscard]] auto network_configs() const -> std::vector<std::span<const std::byte>>;
     // oar-net applied a mapping version (reported and kept for inventory).
     auto on_map_applied(std::uint32_t vni, std::uint64_t map_version) -> void;
     // Expires command, release and cleaning deadlines. Call it at least as
@@ -307,6 +350,15 @@ private:
         std::uint32_t memory_mib{0};
     };
 
+    // A network volume as this server attaches it.
+    struct NetworkVolume {
+        std::uint64_t epoch{0};
+        std::vector<std::byte> frame;  // the newest ReplicaConfig
+        VmId attached_by{0};           // while attached
+        AttachmentId attachment{0};    // while attached
+        std::uint32_t generation{0};   // while attached
+    };
+
     struct Volume {
         VmId owner{0};
         std::uint32_t size_gib{0};
@@ -331,6 +383,15 @@ private:
     // A volume's owner: the KeyStore's for a disk volume, ours for an image volume.
     [[nodiscard]] auto volume_owner(VolumeId volume) const -> std::optional<VmId>;
     [[nodiscard]] auto is_image_volume(VolumeId volume) const -> bool;
+    // A network volume's attachment for this server in its newest config.
+    [[nodiscard]] auto network_attachment(VolumeId volume) const
+        -> std::expected<proto::VolumeAttachment, mailbox::Status>;
+    auto prepare_network_attach(const mailbox::AttachVolume& attach, Undo& undo)
+        -> std::expected<void, mailbox::Status>;
+    // Detached: the key goes (the controller retires the generation).
+    auto forget_attachment(NetworkVolume& net) -> void;
+    // Forgets a detached network volume whose config no longer lists this server.
+    auto drop_unattached(VolumeId volume) -> void;
     [[nodiscard]] auto storage_slot() const -> std::optional<std::uint8_t>;
     auto finish(std::uint64_t seq, mailbox::Type command, mailbox::Status status,
                 std::span<const std::byte> payload = {}) -> void;
@@ -368,7 +429,8 @@ private:
     std::map<FunctionId, Clock::time_point> _deadlines;  // releasing / GPU cleaning
     std::map<VmId, Vm> _vms;
     std::map<VolumeId, Volume> _volumes;
-    std::map<VolumeId, FunctionId> _attached;          // volume -> blk function serving it
+    std::map<VolumeId, FunctionId> _attached;  // volume -> blk function serving it
+    std::map<VolumeId, NetworkVolume> _network;
     std::map<std::uint32_t, std::uint64_t> _networks;  // vni -> applied map version
 
     RouterStats _stats;

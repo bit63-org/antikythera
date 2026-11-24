@@ -98,6 +98,14 @@ auto HelmDaemon::SlotPort::rewrap_volume(const oar::RewrapVolume& request)
     return _slot->link->rewrap_volume(request);
 }
 
+auto HelmDaemon::SlotPort::replica_config(std::span<const std::byte> frame)
+    -> std::expected<void, LinkError> {
+    if (!_slot->link) {
+        return disconnected();
+    }
+    return _slot->link->replica_config(frame);
+}
+
 // ---- HelmDaemon ---------------------------------------------------------------
 
 HelmDaemon::HelmDaemon(DaemonConfig config, KeyStore& keys, AuditLog& audit, HostPort& host,
@@ -304,10 +312,26 @@ auto HelmDaemon::forward_config(ConfigFrame& config) -> void {
         return;
     }
     it->second = std::move(config);
+    // A network volume attached (or attachable) here goes to the storage
+    // roles too, so a live attachment follows its epochs.
+    const bool attached_here = _router.on_replica_config(it->second.frame);
     for (auto& [n, slot] : _slots) {
         if (is_hold(*slot)) {
             count_refusal(slot->link->replica_config(it->second.frame));
+        } else if (attached_here && is_blk(*slot)) {
+            count_blk_refusal(slot->link->replica_config(it->second.frame));
         }
+    }
+}
+
+auto HelmDaemon::is_blk(const SlotState& slot) -> bool {
+    return slot.link && slot.inventory && slot.inventory->role == oar::Role::blk;
+}
+
+auto HelmDaemon::count_blk_refusal(const std::expected<void, LinkError>& r) -> void {
+    if (!r) {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.blk_configs_refused;
     }
 }
 
@@ -425,6 +449,11 @@ auto HelmDaemon::attach(SlotState& slot) -> bool {
         return true;
     }
     _router.add_slot(slot.number, slot.port, *inv);
+    if (is_blk(slot)) {
+        for (const auto frame : _router.network_configs()) {
+            count_blk_refusal(slot.link->replica_config(frame));
+        }
+    }
     return true;
 }
 

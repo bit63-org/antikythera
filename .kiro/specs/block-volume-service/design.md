@@ -486,6 +486,23 @@ own function, so the limit in practice is the number of functions a
 server's oar-blk boards expose, which inventory already reports. Network
 volumes and local volumes draw on the same pool.
 
+As built (task 12): helm's `CommandRouter` keeps the newest
+`ReplicaConfig` per volume whose attachments name this server, and
+forwards every config it keeps to the oar-blk slots (replayed when an
+oar-blk attaches). `ATTACH_VOLUME` for such a volume needs exactly one
+attachment for this server and its `VolumeKey` already in the KeyStore
+at that generation; prepare sends `BlkConfig{volume_id, attachment_id,
+generation}` (24 bytes, a zero attachment and generation meaning a local
+volume), and commit delivers the key opened from the KeyStore. Only the
+attaching VM may detach; detach and VM destroy release the function and
+drop the key. oar-blk verifies each config itself (controller signature,
+`server_id`), keeps the newest per volume, and re-routes a live
+attachment's `NetworkVolumeBackend` when the epoch moves; it takes
+`--server-id`, `--controller-key ID:HEX` and `--storage-ca/-cert/-key`,
+all or none, and refuses network attachments without them. Geometry
+comes from the config (`capacity_blocks`, `block_size`; an `ro`
+attachment is read-only). Initiator faults are not yet reported to helm.
+
 ### Detach blocked while mounted
 
 Hot-unplug through the VMM (ACPI eject on Cloud Hypervisor) does not let

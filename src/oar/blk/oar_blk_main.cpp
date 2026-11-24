@@ -9,6 +9,8 @@
 //              --eid E --helm-eid E --function SOCKET [--function SOCKET ...]
 //              [--queues N]
 //              [--image-cache DIR [--image-cache-bytes N] --image-store ID=PATH ...]
+//              [--server-id N --controller-key ID:HEX [--controller-key ID:HEX ...]
+//               --storage-ca FILE --storage-cert FILE --storage-key FILE]
 //
 // Function i is the i-th --function: L0 QEMU attaches to its socket with
 // vfio-user-pci when the L1 host boots, and the L1 host binds it to
@@ -29,13 +31,22 @@
 // nothing survives the process), --image-cache-bytes its budget (default
 // 1 GiB). Overlays go in the volume directory, also as unlinked files.
 //
+// Network volumes (block-volume-service task 12): --server-id is this
+// server, each --controller-key a controller key ID and its Ed25519 public
+// key in 64 hex digits (a volume's ReplicaConfig must verify under one),
+// and --storage-ca/--storage-cert/--storage-key the storage certificate
+// (carrying urn:antikythera:server:N) the role presents to hold roles.
+// All of them or none: without them the role takes no network volumes.
+//
 // Volume keys arrive only over the sideband and live only in each
 // function's locked key slot; the process disables core dumps and ptrace
 // before it starts serving.
 
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -58,6 +69,7 @@
 
 #include "helm/oar_link.hpp"
 #include "helm/sideband_binding.hpp"
+#include "hull/signature_verifier.hpp"
 #include "oar/blk/blk_role.hpp"
 #include "oar/blk/chunk_cache.hpp"
 #include "oar/blk/fetcher.hpp"
@@ -82,6 +94,13 @@ constexpr std::string_view arg_queues = "--queues";
 constexpr std::string_view arg_image_cache = "--image-cache";
 constexpr std::string_view arg_image_cache_bytes = "--image-cache-bytes";
 constexpr std::string_view arg_image_store = "--image-store";
+constexpr std::string_view arg_server_id = "--server-id";
+constexpr std::string_view arg_controller_key = "--controller-key";
+constexpr std::string_view arg_storage_ca = "--storage-ca";
+constexpr std::string_view arg_storage_cert = "--storage-cert";
+constexpr std::string_view arg_storage_key = "--storage-key";
+constexpr std::size_t key_hex_digits = 2 * ak::hull::ed25519_public_key_size;
+constexpr int base_hex = 16;
 constexpr std::uint64_t default_image_cache_bytes = std::uint64_t{1} << 30U;
 constexpr std::uint64_t max_store_id = 0xFFFF;
 constexpr mode_t group_other_bits = 077;
@@ -98,10 +117,12 @@ constexpr auto no_wait = std::chrono::milliseconds{0};
 auto usage() -> int {
     std::println(stderr,
                  "usage: {} {} DIR {} PATH {} A {} A {} E {} E {} SOCKET [{} SOCKET ...] [{} N]\n"
-                 "       [{} DIR [{} N] {} ID=PATH ...]",
+                 "       [{} DIR [{} N] {} ID=PATH ...]\n"
+                 "       [{} N {} ID:HEX [{} ID:HEX ...] {} FILE {} FILE {} FILE]",
                  log_name, arg_volumes, arg_sideband, arg_addr, arg_helm_addr, arg_eid,
                  arg_helm_eid, arg_function, arg_function, arg_queues, arg_image_cache,
-                 arg_image_cache_bytes, arg_image_store);
+                 arg_image_cache_bytes, arg_image_store, arg_server_id, arg_controller_key,
+                 arg_controller_key, arg_storage_ca, arg_storage_cert, arg_storage_key);
     return exit_usage;
 }
 
@@ -157,6 +178,38 @@ auto remove_stale_socket(const std::string& path) -> void {
     }
 }
 
+// ID:HEX, the key in 64 hex digits.
+auto parse_controller_key(std::string_view s) -> std::optional<ak::hull::ControllerKey> {
+    const auto colon = s.find(':');
+    if (colon == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const auto id = parse_u64(s.substr(0, colon), UINT16_MAX);
+    const std::string_view hex = s.substr(colon + 1);
+    if (!id || hex.size() != key_hex_digits) {
+        return std::nullopt;
+    }
+    ak::hull::ControllerKey key{.id = static_cast<ak::hull::KeyId>(*id), .key = {}};
+    for (std::size_t i = 0; i < key.key.size(); ++i) {
+        const std::string_view pair = hex.substr(2 * i, 2);
+        std::uint8_t b = 0;
+        const auto [p, ec] = std::from_chars(pair.data(), pair.data() + pair.size(), b, base_hex);
+        if (ec != std::errc{} || p != pair.data() + pair.size()) {
+            return std::nullopt;
+        }
+        key.key[i] = std::byte{b};
+    }
+    return key;
+}
+
+auto read_text(const std::string& path) -> std::optional<std::string> {
+    std::ifstream in{path, std::ios::binary};
+    if (!in) {
+        return std::nullopt;
+    }
+    return std::string{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
+
 struct Options {
     std::string volumes;
     std::string sideband;
@@ -169,6 +222,11 @@ struct Options {
     std::string image_cache;
     std::uint64_t image_cache_bytes{default_image_cache_bytes};
     std::map<std::uint16_t, std::string> image_stores;
+    std::optional<std::uint64_t> server_id;
+    std::vector<ak::hull::ControllerKey> keys;
+    std::string storage_ca;
+    std::string storage_cert;
+    std::string storage_key;
 };
 
 auto parse(int argc, char** argv) -> std::optional<Options> {
@@ -215,12 +273,38 @@ auto parse(int argc, char** argv) -> std::optional<Options> {
                      .second) {
                 return std::nullopt;
             }
+        } else if (arg == arg_server_id) {
+            auto id = parse_u64(value, UINT64_MAX);
+            if (!id || *id == 0) {
+                return std::nullopt;
+            }
+            o.server_id = id;
+        } else if (arg == arg_controller_key) {
+            auto key = parse_controller_key(value);
+            if (!key) {
+                return std::nullopt;
+            }
+            o.keys.push_back(*key);
+        } else if (arg == arg_storage_ca) {
+            o.storage_ca = value;
+        } else if (arg == arg_storage_cert) {
+            o.storage_cert = value;
+        } else if (arg == arg_storage_key) {
+            o.storage_key = value;
         } else {
             return std::nullopt;
         }
     }
     if (o.volumes.empty() || o.sideband.empty() || o.functions.empty() || !o.addr || !o.helm_addr ||
         !o.eid || !o.helm_eid || o.image_stores.empty() != o.image_cache.empty()) {
+        return std::nullopt;
+    }
+    // Network volumes: every one of these, or none.
+    const bool any = o.server_id || !o.keys.empty() || !o.storage_ca.empty() ||
+                     !o.storage_cert.empty() || !o.storage_key.empty();
+    const bool all = o.server_id && !o.keys.empty() && !o.storage_ca.empty() &&
+                     !o.storage_cert.empty() && !o.storage_key.empty();
+    if (any != all) {
         return std::nullopt;
     }
     return o;
@@ -307,6 +391,37 @@ auto main(int argc, char** argv) -> int {
                 .store = l.store.get(), .fetcher = l.fetcher.get(), .prefix = l.prefix};
         }
     }
+    // Network volumes.
+    std::function<bool(std::span<const std::byte>, std::span<const std::byte, 64>, std::uint16_t)>
+        verify;
+    std::optional<ak::tls::Config> storage_tls;
+    if (opts->server_id) {
+        auto keys = ak::hull::SignatureVerifier::create(opts->keys);
+        if (!keys) {
+            std::println(stderr, "{}: controller keys: {}", log_name,
+                         ak::hull::to_string(keys.error()));
+            return exit_usage;
+        }
+        auto verifier = std::make_shared<ak::hull::SignatureVerifier>(std::move(*keys));
+        verify = [verifier](std::span<const std::byte> msg, std::span<const std::byte, 64> sig,
+                            std::uint16_t key_id) {
+            return verifier->verify(msg, sig, key_id).has_value();
+        };
+        const auto ca = read_text(opts->storage_ca);
+        const auto cert = read_text(opts->storage_cert);
+        const auto key = read_text(opts->storage_key);
+        if (!ca || !cert || !key) {
+            std::println(stderr, "{}: cannot read the storage CA, certificate or key", log_name);
+            return EXIT_FAILURE;
+        }
+        storage_tls = ak::tls::Config{.role = ak::tls::Role::client,
+                                      .ca_pem = *ca,
+                                      .cert_pem = *cert,
+                                      .key_pem = *key,
+                                      .peer_name = {}};
+        // A hold that hangs up mid-write must not end the process.
+        static_cast<void>(std::signal(SIGPIPE, SIG_IGN));
+    }
     const blk::RoleConfig defaults;
     auto role =
         blk::BlkRole::create({.volume_dir = opts->volumes,
@@ -322,6 +437,10 @@ auto main(int argc, char** argv) -> int {
                               .max_readahead_chunks = defaults.max_readahead_chunks,
                               .image_max_in_flight = defaults.image_max_in_flight,
                               .manifest_deadline = defaults.manifest_deadline,
+                              .server_id = opts->server_id.value_or(0),
+                              .verify_config = std::move(verify),
+                              .storage_tls = std::move(storage_tls),
+                              .initiator = defaults.initiator,
                               .clock = {}},
                              raw);
     if (!role) {

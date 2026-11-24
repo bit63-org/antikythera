@@ -54,7 +54,7 @@ ak_add_test(virtio_blk_function_test SOURCES virtio_blk_function_test.cpp LIBS a
 ak_add_test(virtio_blk_async_test    SOURCES virtio_blk_async_test.cpp    LIBS ak::oar_blk)
 ak_add_test(file_backend_test        SOURCES file_backend_test.cpp        LIBS ak::oar_blk)
 ak_add_test(net_role_test            SOURCES net_role_test.cpp            LIBS ak::oar_net_role ak::hull)
-ak_add_test(blk_role_test            SOURCES blk_role_test.cpp            LIBS ak::oar_blk_role)
+ak_add_test(blk_role_test            SOURCES blk_role_test.cpp            LIBS ak::oar_blk_role ak::hold_server)
 ak_add_test(image_manifest_test      SOURCES image_manifest_test.cpp      LIBS ak::oar_blk_image)
 ak_add_test(image_volume_test        SOURCES image_volume_test.cpp        LIBS ak::oar_blk_image)
 ak_add_test(image_pack_test          SOURCES image_pack_test.cpp          LIBS ak::oar_blk_image)

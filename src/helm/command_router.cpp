@@ -90,6 +90,11 @@ auto OarLinkPort::clean_function(const oar::CleanFunction& request)
     return _link->clean_function(request);
 }
 
+auto OarLinkPort::replica_config(std::span<const std::byte> frame)
+    -> std::expected<void, LinkError> {
+    return _link->replica_config(frame);
+}
+
 auto OarLinkPort::group_policy(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
     return _link->group_policy(frame);
 }
@@ -451,6 +456,9 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
 
     if (const auto* a = std::get_if<mailbox::AttachVolume>(&body)) {
         const auto owner = volume_owner(a->volume_id);
+        if (!owner && _network.contains(a->volume_id)) {
+            return prepare_network_attach(*a, undo);
+        }
         if (!owner) {
             return std::unexpected(Status::unknown_volume);
         }
@@ -480,8 +488,13 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
     }
 
     if (const auto* d = std::get_if<mailbox::DetachVolume>(&body)) {
-        if (!volume_owner(d->volume_id)) {
+        const auto net = _network.find(d->volume_id);
+        const bool network = net != _network.end() && net->second.attached_by != 0;
+        if (!network && !volume_owner(d->volume_id)) {
             return std::unexpected(Status::unknown_volume);
+        }
+        if (network && net->second.attached_by != d->vm_id) {
+            return std::unexpected(Status::conflict);
         }
         const auto id = function_id(d->device);
         const auto it = _attached.find(d->volume_id);
@@ -552,6 +565,17 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body, const U
         }
         std::erase_if(_attached,
                       [&](const auto& entry) { return volume_owner(entry.first) == d->vm_id; });
+        std::vector<VolumeId> detached;
+        for (auto& [volume, net] : _network) {
+            if (net.attached_by == d->vm_id) {
+                _attached.erase(volume);
+                forget_attachment(net);
+                detached.push_back(volume);
+            }
+        }
+        for (const auto volume : detached) {
+            drop_unattached(volume);
+        }
         if (!d->persist_volumes) {
             // Image volumes have no key to erase: only their descriptors go.
             std::vector<VolumeId> images;
@@ -602,12 +626,24 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body, const U
         _volumes.erase(dv->volume_id);
     } else if (const auto* av = std::get_if<mailbox::AttachVolume>(&body)) {
         _attached[av->volume_id] = function_id(av->device);
+        if (const auto net = _network.find(av->volume_id);
+            net != _network.end() && !volume_owner(av->volume_id)) {
+            if (const auto att = network_attachment(av->volume_id)) {
+                net->second.attached_by = av->vm_id;
+                net->second.attachment = att->attachment_id;
+                net->second.generation = att->generation;
+            }
+        }
         deliver_volume_key(seq, *av);
     } else if (const auto* xv = std::get_if<mailbox::DetachVolume>(&body)) {
         if (!release(function_id(xv->device), xv->vm_id)) {
             ++_stats.inconsistencies;
         }
         _attached.erase(xv->volume_id);
+        if (const auto net = _network.find(xv->volume_id); net != _network.end()) {
+            forget_attachment(net->second);
+        }
+        drop_unattached(xv->volume_id);
     } else if (const auto* r = std::get_if<mailbox::RewrapVolume>(&body)) {
         if (_keys->rewrap(r->volume_id, r->to_vm)) {
             audit(AuditRecord::of(AuditEvent::volume_key_rewrapped)
@@ -640,8 +676,12 @@ auto CommandRouter::deliver_volume_key(std::uint64_t seq, const mailbox::AttachV
     -> void {
     const auto id = function_id(attach.device);
     auto* port = port_for(attach.device.slot);
-    // An image volume's key exists only for this attachment.
-    auto key = is_image_volume(attach.volume_id)
+    // An image volume's key exists only for this attachment; a network
+    // volume's is the controller's, opened for this attachment.
+    const auto net = _network.find(attach.volume_id);
+    auto key = net != _network.end() && net->second.attached_by == attach.vm_id
+                   ? _keys->open_attachment_key(net->second.attachment, net->second.generation)
+               : is_image_volume(attach.volume_id)
                    ? _keys->create_ephemeral_key()
                    : _keys->unwrap_volume_key(attach.volume_id, attach.vm_id);
     bool delivered = false;
@@ -669,6 +709,121 @@ auto CommandRouter::volume_owner(VolumeId volume) const -> std::optional<VmId> {
         return it->second.owner;
     }
     return _keys->owner(volume);
+}
+
+auto CommandRouter::on_replica_config(std::span<const std::byte> frame) -> bool {
+    const auto c = proto::decode_replica_config(frame);
+    if (!c) {
+        return false;
+    }
+    const bool ours = std::ranges::any_of(c->attachments, [&](const proto::VolumeAttachment& a) {
+        return a.server_id == _config.server_id;
+    });
+    auto it = _network.find(c->volume_id);
+    if (it == _network.end()) {
+        if (!ours || _network.size() >= max_network_volumes) {
+            return false;
+        }
+        it = _network.try_emplace(c->volume_id).first;
+    } else if (c->epoch < it->second.epoch) {
+        return false;  // the roles refuse it too
+    }
+    it->second.epoch = c->epoch;
+    it->second.frame.assign(frame.begin(), frame.end());
+    // A volume no longer attached here is forgotten once it is detached;
+    // until then the role must see the config that fences it.
+    if (!ours && it->second.attached_by == 0) {
+        _network.erase(it);
+    }
+    return true;
+}
+
+auto CommandRouter::network_configs() const -> std::vector<std::span<const std::byte>> {
+    std::vector<std::span<const std::byte>> out;
+    out.reserve(_network.size());
+    for (const auto& [volume, net] : _network) {
+        out.emplace_back(net.frame);
+    }
+    return out;
+}
+
+auto CommandRouter::network_attachment(VolumeId volume) const
+    -> std::expected<proto::VolumeAttachment, mailbox::Status> {
+    const auto it = _network.find(volume);
+    if (it == _network.end()) {
+        return std::unexpected(mailbox::Status::unknown_volume);
+    }
+    const auto c = proto::decode_replica_config(it->second.frame);
+    if (!c) {
+        return std::unexpected(mailbox::Status::internal_error);
+    }
+    std::optional<proto::VolumeAttachment> found;
+    for (const auto& a : c->attachments) {
+        if (a.server_id != _config.server_id) {
+            continue;
+        }
+        if (found) {
+            return std::unexpected(mailbox::Status::conflict);  // two here: which one?
+        }
+        found = a;
+    }
+    if (!found) {
+        return std::unexpected(mailbox::Status::unknown_volume);
+    }
+    return *found;
+}
+
+auto CommandRouter::prepare_network_attach(const mailbox::AttachVolume& attach, Undo& undo)
+    -> std::expected<void, mailbox::Status> {
+    using mailbox::Status;
+    if (_attached.contains(attach.volume_id)) {
+        return std::unexpected(Status::conflict);
+    }
+    const auto att = network_attachment(attach.volume_id);
+    if (!att) {
+        return std::unexpected(att.error());
+    }
+    // The key must be here before the attach: it is delivered on commit.
+    const auto key = _keys->attachment_key(att->attachment_id);
+    if (!key || key->generation != att->generation || key->volume_id != attach.volume_id) {
+        return std::unexpected(Status::unknown_volume);
+    }
+    auto reserved = reserve(attach.vm_id, attach.device, undo);
+    if (!reserved) {
+        return std::unexpected(reserved.error());
+    }
+    auto* port = port_for(attach.device.slot);
+    if (auto ok = port->replica_config(_network.at(attach.volume_id).frame); !ok) {
+        return std::unexpected(link_status(ok.error()));
+    }
+    auto ok = port->prepare_function({.fn = attach.device.function,
+                                      .type = FunctionType::blk_fn,
+                                      .vm_id = attach.vm_id,
+                                      .config = oar::BlkConfig{.volume_id = attach.volume_id,
+                                                               .attachment_id = att->attachment_id,
+                                                               .generation = att->generation}});
+    if (!ok) {
+        return std::unexpected(link_status(ok.error()));
+    }
+    return {};
+}
+
+auto CommandRouter::drop_unattached(VolumeId volume) -> void {
+    const auto it = _network.find(volume);
+    if (it != _network.end() && it->second.attached_by == 0 &&
+        network_attachment(volume).error_or(mailbox::Status::ok) ==
+            mailbox::Status::unknown_volume) {
+        _network.erase(it);
+    }
+}
+
+auto CommandRouter::forget_attachment(NetworkVolume& net) -> void {
+    if (net.attachment != 0) {
+        _keys->drop_attachment_key(net.attachment);
+    }
+    net.attached_by = 0;
+    net.attachment = 0;
+    net.generation = 0;
 }
 
 auto CommandRouter::is_image_volume(VolumeId volume) const -> bool {

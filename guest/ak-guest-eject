@@ -1,0 +1,234 @@
+#!/bin/bash
+# Copyright (c) 2026 Clark Rawlins
+# SPDX-License-Identifier: Apache-2.0
+
+# ak-guest-eject: release antikythera disks the host asks to detach.
+#
+# Usage: ak-guest-eject [--once] [--interval SECONDS] [--dry-run]
+#
+#   --once            look at every disk once and exit (udev, tests)
+#   --interval S      seconds between looks while running (default 1)
+#   --dry-run         log what would be released, release nothing
+#
+# Cooperative detach (.kiro/specs/block-volume-service/ Requirement 3.4,
+# design "Detach blocked while mounted"). A detach of an antikythera
+# volume reaches the guest as a flag, not as a hot-unplug: the oar-blk
+# function sets eject_requested in a vendor-data virtio PCI capability and
+# raises a configuration-change interrupt, which no standard driver acts
+# on. This helper polls that capability through sysfs and, when a detach is
+# requested, releases the disk the way an administrator would, with
+# `echo 1 > /sys/bus/pci/devices/<bdf>/remove`, but only if nothing uses
+# it: no mounted filesystem on the disk or a partition, no holder (LVM, MD,
+# dm-crypt), no active swap and no process holding it open. Otherwise it
+# leaves the disk alone and logs why, once per request; the host then
+# reports the detach `busy` and the disk keeps working. Unmount (or stop
+# whatever holds it) and the next look releases it.
+#
+# The capability, in PCI config space (all little-endian):
+#
+#   0  cap_vndr 0x09 | cap_next | cap_len 16 | cfg_type 9 (vendor data)
+#   4  vendor_id 0x1af4 | version 1 | reserved
+#   8  magic "AKVD"
+#   12 flags: bit 0 eject_requested
+#
+# It only reads config space and writes a device's `remove`, so it needs
+# root (unprivileged reads of config stop at 64 bytes). The roots below
+# can be moved for tests: AK_SYSFS (default /sys), AK_PROC (/proc).
+
+set -euo pipefail
+
+readonly sysfs="${AK_SYSFS:-/sys}"
+readonly procfs="${AK_PROC:-/proc}"
+readonly tag="ak-guest-eject"
+
+readonly pci_vendor_virtio="0x1af4"
+readonly pci_status=6          # status register (le16)
+readonly pci_status_caps=16    # bit 4: capability list present
+readonly pci_cap_pointer=52    # 0x34
+readonly cap_id_vendor=9
+readonly cfg_type_vendor=9
+readonly cap_len_min=16
+readonly cap_walk_max=48       # a loop in the list must not hang us
+readonly flag_eject_requested=1
+
+once=0
+dry_run=0
+interval=1
+
+log() {
+    if command -v logger >/dev/null 2>&1; then
+        logger -t "$tag" -- "$*" 2>/dev/null || true
+    fi
+    printf '%s: %s\n' "$tag" "$*" >&2
+}
+
+usage() {
+    sed -n '/^# Usage:/,/^#   --dry-run/s/^# \{0,1\}//p' "$0"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --once) once=1 ;;
+        --dry-run) dry_run=1 ;;
+        --interval)
+            [ $# -ge 2 ] || { usage >&2; exit 2; }
+            interval="$2"
+            shift
+            ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+case "$interval" in
+    ''|*[!0-9.]*) log "bad interval: $interval"; exit 2 ;;
+esac
+
+# byte FILE OFFSET COUNT: COUNT unsigned bytes, space separated.
+bytes() {
+    od -An -v -tu1 -j "$2" -N "$3" "$1" 2>/dev/null | tr -s ' \n' '  ' | sed 's/^ //; s/ $//'
+}
+
+# le FILE OFFSET COUNT: a COUNT-byte little-endian number (decimal).
+le() {
+    local v=0 shift_bits=0 b
+    for b in $(bytes "$1" "$2" "$3"); do
+        v=$(( v | (b << shift_bits) ))
+        shift_bits=$(( shift_bits + 8 ))
+    done
+    echo "$v"
+}
+
+# vendor_cap DEVICE_DIR: the config-space offset of the antikythera
+# capability, or nothing.
+vendor_cap() {
+    local config="$1/config" ptr n=0 id next len type magic
+    [ -r "$config" ] || return 0
+    [ $(( $(le "$config" "$pci_status" 2) & pci_status_caps )) -ne 0 ] || return 0
+    ptr=$(( $(le "$config" "$pci_cap_pointer" 1) & 0xfc ))
+    while [ "$ptr" -ge 64 ] && [ "$n" -lt "$cap_walk_max" ]; do
+        read -r id next len type <<<"$(bytes "$config" "$ptr" 4)"
+        [ -n "${type:-}" ] || return 0  # config shorter than the list says
+        if [ "$id" -eq "$cap_id_vendor" ] && [ "$len" -ge "$cap_len_min" ] &&
+            [ "$type" -eq "$cfg_type_vendor" ] &&
+            [ "$(le "$config" $(( ptr + 4 )) 2)" -eq $(( pci_vendor_virtio )) ] &&
+            [ "$(le "$config" $(( ptr + 6 )) 1)" -eq 1 ]; then
+            magic=$(bytes "$config" $(( ptr + 8 )) 4)
+            if [ "$magic" = "65 75 86 68" ]; then  # "AKVD"
+                echo "$ptr"
+                return 0
+            fi
+        fi
+        ptr=$(( next & 0xfc ))
+        n=$(( n + 1 ))
+    done
+    return 0
+}
+
+# disks DEVICE_DIR: the block devices (vda, ...) the function's driver made.
+disks() {
+    local b
+    for b in "$1"/virtio*/block/*; do
+        if [ -e "$b" ]; then
+            basename "$b"
+        fi
+    done
+    return 0
+}
+
+# in_use DISK: why DISK cannot be released, or nothing.
+in_use() {
+    local disk="$1" blk="$sysfs/block/$1" part name devs=() names=() h fd target
+    devs+=("$(cat "$blk/dev" 2>/dev/null)")
+    names+=("$disk")
+    for part in "$blk"/"$disk"*; do
+        [ -e "$part/partition" ] || continue
+        name=$(basename "$part")
+        devs+=("$(cat "$part/dev" 2>/dev/null)")
+        names+=("$name")
+        for h in "$part"/holders/*; do
+            [ -e "$h" ] && { echo "partition $name is held by $(basename "$h")"; return 0; }
+        done
+    done
+    for h in "$blk"/holders/*; do
+        [ -e "$h" ] && { echo "held by $(basename "$h")"; return 0; }
+    done
+    # mountinfo field 3 is major:minor.
+    local i
+    for i in "${!devs[@]}"; do
+        [ -n "${devs[$i]}" ] || continue
+        if awk -v d="${devs[$i]}" '$3 == d { found = 1 } END { exit !found }' \
+            "$procfs/self/mountinfo" 2>/dev/null; then
+            echo "${names[$i]} is mounted"
+            return 0
+        fi
+    done
+    if [ -r "$procfs/swaps" ]; then
+        for name in "${names[@]}"; do
+            if awk -v n="/dev/$name" 'NR > 1 && $1 == n { found = 1 } END { exit !found }' \
+                "$procfs/swaps"; then
+                echo "$name is swap"
+                return 0
+            fi
+        done
+    fi
+    for fd in "$procfs"/[0-9]*/fd/*; do
+        target=$(readlink "$fd" 2>/dev/null) || continue
+        for name in "${names[@]}"; do
+            if [ "$target" = "/dev/$name" ]; then
+                h=${fd#"$procfs"/}
+                echo "$name is open by pid ${h%%/*}"
+                return 0
+            fi
+        done
+    done
+    return 0
+}
+
+declare -A refused=()  # bdf -> the reason last logged for this request
+
+# look DEVICE_DIR: releases the function if asked and nothing uses it.
+look() {
+    local dev="$1" bdf cap flags disk why=""
+    bdf=$(basename "$dev")
+    [ "$(cat "$dev/vendor" 2>/dev/null)" = "$pci_vendor_virtio" ] || return 0
+    cap=$(vendor_cap "$dev")
+    [ -n "$cap" ] || return 0
+    flags=$(le "$dev/config" $(( cap + 12 )) 4)
+    if [ $(( flags & flag_eject_requested )) -eq 0 ]; then
+        unset 'refused[$bdf]'  # withdrawn: a new request logs again
+        return 0
+    fi
+    for disk in $(disks "$dev"); do
+        why=$(in_use "$disk")
+        if [ -n "$why" ]; then
+            why="$disk: $why"
+            break
+        fi
+    done
+    if [ -n "$why" ]; then
+        if [ "${refused[$bdf]:-}" != "$why" ]; then
+            log "$bdf: detach requested, not releasing ($why)"
+            refused[$bdf]="$why"
+        fi
+        return 0
+    fi
+    unset 'refused[$bdf]'
+    if [ "$dry_run" -eq 1 ]; then
+        log "$bdf: detach requested, would release"
+        return 0
+    fi
+    sync
+    log "$bdf: detach requested, releasing"
+    echo 1 >"$dev/remove" || log "$bdf: release failed"
+}
+
+while :; do
+    for dev in "$sysfs"/bus/pci/devices/*; do
+        [ -e "$dev" ] || continue
+        look "$dev" || true
+    done
+    [ "$once" -eq 0 ] || exit 0
+    sleep "$interval"
+done

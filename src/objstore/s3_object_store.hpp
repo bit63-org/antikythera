@@ -4,8 +4,10 @@
 #pragma once
 
 // An ObjectStore that speaks S3 (.kiro/specs/oar-blk-data-plane/
-// Requirements 8.2 and 8.9, design "Components"): HTTP/1.1 GETs over TCP
-// or TLS to any S3-compatible endpoint (AWS S3, MinIO, SeaweedFS, Ceph RGW).
+// Requirements 8.2 and 8.9, design "Components"): HTTP/1.1 GETs, HEADs and
+// PUTs over TCP or TLS to any S3-compatible endpoint (AWS S3, MinIO,
+// SeaweedFS, Ceph RGW). HEAD and PUT are hold's, for snapshot uploads
+// (.kiro/specs/block-volume-service/ task 20).
 //
 //   - Path-style URLs (http://host/bucket/key) by default, which every
 //     S3-compatible store accepts; virtual-host style as an option.
@@ -24,6 +26,13 @@
 // declared body. 404 and 416 are not_found, 401 and 403 denied, 429 and
 // 5xx io; anything else is bad_response. A connection that answered with
 // an error, or said "Connection: close", is not reused.
+//
+// A HEAD must answer 200 with a Content-Length (the object's size) and no
+// body. A PUT is signed over the SHA-256 of its body (x-amz-content-sha256
+// carries it, so the store refuses a body changed in transit) and sends a
+// Content-Length; it must answer 200, with a short body at most (S3 sends
+// none; anything up to 64 KiB is read and dropped so the connection can be
+// reused). A PUT replaces the object, so retrying one is safe.
 //
 // Connections are kept alive in a small pool shared by all callers, so the
 // fetcher's workers each reuse one. A pooled connection the server closed
@@ -96,6 +105,10 @@ public:
         -> std::expected<void, FetchError> override;
     [[nodiscard]] auto get(std::string_view key, std::size_t max_bytes, Clock::time_point deadline)
         -> std::expected<std::vector<std::byte>, FetchError> override;
+    [[nodiscard]] auto head(std::string_view key, Clock::time_point deadline)
+        -> std::expected<std::uint64_t, FetchError> override;
+    [[nodiscard]] auto put(std::string_view key, std::span<const std::byte> bytes,
+                           Clock::time_point deadline) -> std::expected<void, FetchError> override;
 
     [[nodiscard]] auto counters() const -> S3Counters;
 
@@ -113,15 +126,29 @@ private:
         std::vector<std::byte>* grow{nullptr};
         std::size_t max{0};
     };
+    enum class Method : std::uint8_t {
+        get,
+        head,
+        put,
+    };
+    // One request: GET (a range into `sink.fixed`, or the whole object
+    // into `sink.grow`), HEAD (the size into `size`) or PUT of `body`.
+    struct Call {
+        Method method{Method::get};
+        std::optional<Range> range;
+        Sink sink;
+        std::span<const std::byte> body;
+        std::uint64_t* size{nullptr};
+    };
 
     S3ObjectStore(S3Config config, std::unique_ptr<TlsContext> tls);
 
-    [[nodiscard]] auto request(std::string_view key, std::optional<Range> range, Sink sink,
-                               Clock::time_point deadline) -> std::expected<void, FetchError>;
-    [[nodiscard]] auto exchange(Connection& c, const std::string& text, std::optional<Range> range,
-                                Sink sink, Clock::time_point deadline, bool& reusable,
-                                bool& got_any) -> std::expected<void, FetchError>;
-    [[nodiscard]] auto build_request(std::string_view key, std::optional<Range> range) const
+    [[nodiscard]] auto request(std::string_view key, const Call& call, Clock::time_point deadline)
+        -> std::expected<void, FetchError>;
+    [[nodiscard]] auto exchange(Connection& c, const std::string& text, const Call& call,
+                                Clock::time_point deadline, bool& reusable, bool& got_any)
+        -> std::expected<void, FetchError>;
+    [[nodiscard]] auto build_request(std::string_view key, const Call& call) const
         -> std::expected<std::string, FetchError>;
     [[nodiscard]] auto take_connection(Clock::time_point deadline, bool& pooled)
         -> std::expected<std::unique_ptr<Connection>, FetchError>;

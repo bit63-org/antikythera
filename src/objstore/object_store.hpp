@@ -11,6 +11,11 @@
 // against the image name and chunks against the manifest. A store only has
 // to return exactly the bytes asked for, or fail.
 //
+// Snapshot uploads (block-volume-service task 20) also write: head() asks
+// whether a chunk object already exists, so a lineage's unchanged chunks
+// are never sent twice, and put() stores an object. Stores that only read
+// (oar-blk's) answer both with `denied`, as a read-only key would.
+//
 // Implementations must be safe to call from several threads at once: the
 // fetcher's workers share one store.
 
@@ -62,6 +67,17 @@ public:
     [[nodiscard]] virtual auto get(std::string_view key, std::size_t max_bytes,
                                    Clock::time_point deadline)
         -> std::expected<std::vector<std::byte>, FetchError> = 0;
+    // The object's size, or not_found if there is no such object.
+    [[nodiscard]] virtual auto head(std::string_view /*key*/, Clock::time_point /*deadline*/)
+        -> std::expected<std::uint64_t, FetchError> {
+        return std::unexpected(FetchError::denied);
+    }
+    // Stores `bytes` as the whole object, replacing any object of that key.
+    [[nodiscard]] virtual auto put(std::string_view /*key*/, std::span<const std::byte> /*bytes*/,
+                                   Clock::time_point /*deadline*/)
+        -> std::expected<void, FetchError> {
+        return std::unexpected(FetchError::denied);
+    }
 };
 
 // Object keys of an image: <prefix>/<name>/manifest and <prefix>/<name>/data,

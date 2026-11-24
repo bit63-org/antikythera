@@ -126,6 +126,7 @@ auto chunk_of(const std::vector<std::byte>& v, const objstore::ImageManifest& m,
 // A read-only store over the packed objects.
 class MemoryStore final : public objstore::ObjectStore {
 public:
+    using ObjectStore::put;  // the store's own put() stays visible
     auto put(const std::string& key, std::vector<std::byte> bytes) -> void {
         const std::scoped_lock lock{_mutex};
         _objects[key] = std::move(bytes);

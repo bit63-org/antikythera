@@ -85,6 +85,7 @@ struct Request {
     std::string target;
     std::map<std::string, std::string> headers;  // lowercase names
     std::string head;
+    std::string body;  // Content-Length bytes after the head
 };
 
 struct Reply {
@@ -226,8 +227,23 @@ private:
             }
             Request req;
             req.head = pending.substr(0, end + 4);
-            pending.erase(0, end + 4);
             parse(req);
+            const auto cl = req.headers.find("content-length");
+            const std::size_t body_len = cl == req.headers.end() ? 0 : std::stoul(cl->second);
+            bool closed = false;
+            while (pending.size() < end + 4 + body_len) {
+                const int m = rd(buf.data(), static_cast<int>(buf.size()));
+                if (m <= 0) {
+                    closed = true;
+                    break;
+                }
+                pending.append(buf.data(), static_cast<std::size_t>(m));
+            }
+            if (closed) {
+                break;
+            }
+            req.body = pending.substr(end + 4, body_len);
+            pending.erase(0, end + 4 + body_len);
             const Reply reply = _handler(req);
             if (reply.stall) {
                 std::this_thread::sleep_for(std::chrono::milliseconds{300});
@@ -283,6 +299,7 @@ public:
     std::map<std::string, std::string> objects;  // "/bucket/key" -> bytes
     std::atomic<int> requests{0};
     std::atomic<int> bad_signatures{0};
+    std::atomic<int> puts{0};
 
     [[nodiscard]] auto last_range() -> std::string {
         const std::scoped_lock lock{_mutex};
@@ -295,9 +312,19 @@ public:
             ++bad_signatures;
             return reply("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
         }
+        if (r.method == "PUT") {
+            const std::scoped_lock lock{_mutex};
+            objects[r.target] = r.body;
+            ++puts;
+            return reply("HTTP/1.1 200 OK\r\nETag: \"x\"\r\nContent-Length: 0\r\n\r\n");
+        }
         const auto it = objects.find(r.target);
-        if (r.method != "GET" || it == objects.end()) {
+        if ((r.method != "GET" && r.method != "HEAD") || it == objects.end()) {
             return reply("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        }
+        if (r.method == "HEAD") {
+            return reply("HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(it->second.size()) +
+                         "\r\n\r\n");
         }
         const std::string& obj = it->second;
         const auto range = r.headers.find("range");
@@ -340,17 +367,22 @@ private:
             }
         }
         const auto date = r.headers.find("x-amz-date");
-        if (date == r.headers.end()) {
+        const auto hash = r.headers.find("x-amz-content-sha256");
+        if (date == r.headers.end() || hash == r.headers.end()) {
             return false;
         }
-        const auto expect =
-            objstore::sigv4_authorization({.method = r.method,
-                                           .canonical_uri = r.target,
-                                           .headers = signed_headers,
-                                           .payload_hash = objstore::empty_payload_sha256,
-                                           .amz_date = date->second,
-                                           .region = "us-east-1"},
-                                          test_creds);
+        // As S3 does: the body must hash to what was signed.
+        const auto body_hash = objstore::sha256_hex(r.body);
+        if (!body_hash || *body_hash != hash->second) {
+            return false;
+        }
+        const auto expect = objstore::sigv4_authorization({.method = r.method,
+                                                           .canonical_uri = r.target,
+                                                           .headers = signed_headers,
+                                                           .payload_hash = hash->second,
+                                                           .amz_date = date->second,
+                                                           .region = "us-east-1"},
+                                                          test_creds);
         return expect && *expect == auth->second;
     }
 };
@@ -402,6 +434,70 @@ BOOST_AUTO_TEST_CASE(signed_range_gets, *boost::unit_test::timeout(unit_timeout_
     // well-formed, but its body was never read, so that one is dropped).
     BOOST_TEST(server.accepted() == 1);
     BOOST_TEST(store->counters().reused == 3U);
+}
+
+// block-volume-service task 20: what snapshot uploads need.
+BOOST_AUTO_TEST_CASE(heads_and_signed_puts, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Emulator emu;
+    MockServer server{std::ref(emu)};
+    auto store = plain_store(server.port());
+    const std::string chunk = pattern(70000);  // bigger than one socket read
+    const auto bytes = std::as_bytes(std::span{chunk});
+
+    BOOST_TEST(store->head("snaps/c1", soon()).error() == objstore::FetchError::not_found);
+    BOOST_REQUIRE(store->put("snaps/c1", bytes, soon()).has_value());
+    BOOST_TEST(emu.objects["/images/snaps/c1"] == chunk);
+    const auto size = store->head("snaps/c1", soon());
+    BOOST_REQUIRE(size.has_value());
+    BOOST_TEST(*size == chunk.size());
+    const auto back = store->get("snaps/c1", chunk.size(), soon());
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST(as_string(*back) == chunk);
+    // An empty object, and a replacement.
+    BOOST_REQUIRE(store->put("snaps/empty", {}, soon()).has_value());
+    BOOST_TEST(*store->head("snaps/empty", soon()) == 0U);
+    BOOST_REQUIRE(store->put("snaps/c1", std::as_bytes(std::span{std::string_view{"new"}}), soon())
+                      .has_value());
+    BOOST_TEST(*store->head("snaps/c1", soon()) == 3U);
+    // Every request was signed over its body. The 404 cost its connection
+    // (error answers are never reused); everything after shared one.
+    BOOST_TEST(emu.bad_signatures.load() == 0);
+    BOOST_TEST(emu.puts.load() == 3);
+    BOOST_TEST(server.accepted() == 2);
+}
+
+BOOST_AUTO_TEST_CASE(holds_head_and_put_answers_to_the_rules,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    std::string answer;
+    std::mutex m;
+    MockServer server{[&](const Request&) {
+        const std::scoped_lock lock{m};
+        return reply(answer);
+    }};
+    auto store = plain_store(server.port());
+    auto answer_with = [&](std::string a) {
+        const std::scoped_lock lock{m};
+        answer = std::move(a);
+    };
+    const auto body = std::as_bytes(std::span{std::string_view{"abc"}});
+    // A HEAD answer with a body, or without a size.
+    answer_with("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc");
+    BOOST_TEST(store->head("k", soon()).error() == objstore::FetchError::bad_response);
+    answer_with("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+    BOOST_TEST(store->head("k", soon()).error() == objstore::FetchError::bad_response);
+    answer_with("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+    BOOST_TEST(store->head("k", soon()).error() == objstore::FetchError::denied);
+    BOOST_TEST(store->put("k", body, soon()).error() == objstore::FetchError::denied);
+    // A PUT must answer 200; a short body is read and dropped.
+    answer_with("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+    BOOST_TEST(store->put("k", body, soon()).error() == objstore::FetchError::bad_response);
+    answer_with("HTTP/1.1 503 Slow Down\r\nContent-Length: 0\r\n\r\n");
+    BOOST_TEST(store->put("k", body, soon()).error() == objstore::FetchError::io);
+    answer_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n<ok/>");
+    BOOST_TEST(store->put("k", body, soon()).has_value());
+    BOOST_TEST(store->put("k", body, soon()).has_value());  // the connection was kept
+    answer_with("HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n");
+    BOOST_TEST(store->put("k", body, soon()).error() == objstore::FetchError::bad_response);
 }
 
 BOOST_AUTO_TEST_CASE(maps_statuses, *boost::unit_test::timeout(unit_timeout_seconds)) {
@@ -645,64 +741,13 @@ BOOST_AUTO_TEST_CASE(image_volume_over_s3, *boost::unit_test::timeout(unit_timeo
     BOOST_TEST(emu.bad_signatures.load() == 0);
 }
 
-// A signed PUT, only for seeding a real server in the test below.
-namespace {
-auto put_object(const std::string& host, std::uint16_t port, const std::string& bucket,
-                const objstore::SigV4Credentials& creds, const std::string& key,
-                const std::string& body) -> bool {
-    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
-        return false;
-    }
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    ::inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        ::close(fd);
-        return false;
-    }
-    const std::string uri = objstore::s3_uri_encode_path("/" + bucket + "/" + key);
-    const std::string date = objstore::amz_date(std::chrono::system_clock::now());
-    const std::string hash = *objstore::sha256_hex(body);
-    const std::string host_header = host + ":" + std::to_string(port);
-    std::vector<std::pair<std::string, std::string>> headers{
-        {"host", host_header}, {"x-amz-content-sha256", hash}, {"x-amz-date", date}};
-    const auto auth = objstore::sigv4_authorization({.method = "PUT",
-                                                     .canonical_uri = uri,
-                                                     .headers = headers,
-                                                     .payload_hash = hash,
-                                                     .amz_date = date,
-                                                     .region = "us-east-1"},
-                                                    creds);
-    std::string req = "PUT " + uri + " HTTP/1.1\r\nhost: " + host_header +
-                      "\r\nx-amz-content-sha256: " + hash + "\r\nx-amz-date: " + date +
-                      "\r\nauthorization: " + *auth +
-                      "\r\ncontent-length: " + std::to_string(body.size()) +
-                      "\r\nconnection: close\r\n\r\n" + body;
-    std::size_t sent = 0;
-    while (sent < req.size()) {
-        const ssize_t n = ::send(fd, req.data() + sent, req.size() - sent, MSG_NOSIGNAL);
-        if (n <= 0) {
-            ::close(fd);
-            return false;
-        }
-        sent += static_cast<std::size_t>(n);
-    }
-    std::array<char, 64> resp{};
-    const ssize_t n = ::recv(fd, resp.data(), resp.size(), 0);
-    ::close(fd);
-    return n > 12 && std::string_view{resp.data(), 12} == "HTTP/1.1 200";
-}
-}  // namespace
-
 BOOST_AUTO_TEST_CASE(real_s3_compatible_server, *boost::unit_test::timeout(120)) {
     const char* endpoint = std::getenv("AK_S3_TEST_ENDPOINT");
     if (endpoint == nullptr) {
         BOOST_TEST_MESSAGE("AK_S3_TEST_ENDPOINT not set: skipped");
         return;
     }
-    // http://host:port only: the test seeds over plain HTTP.
+    // http://host:port only: a local test server over plain HTTP.
     const std::string ep{endpoint};
     BOOST_REQUIRE(ep.starts_with("http://"));
     const auto colon = ep.rfind(':');
@@ -717,14 +762,16 @@ BOOST_AUTO_TEST_CASE(real_s3_compatible_server, *boost::unit_test::timeout(120))
                                            .secret_key = env("AK_S3_TEST_SECRET_KEY"),
                                            .session_token = ""};
     const std::string bucket = env("AK_S3_TEST_BUCKET");
+    auto store = objstore::S3ObjectStore::create(s3_config(host, port, bucket, creds));
+    BOOST_REQUIRE(store.has_value());
+    // Seeded with the store's own signed PUTs, each checked with a HEAD.
     std::string data;
     const auto name = publish_image(
         [&](const std::string& key, const std::string& bytes) {
-            BOOST_REQUIRE_MESSAGE(put_object(host, port, bucket, creds, key, bytes), key);
+            BOOST_REQUIRE_MESSAGE((*store)->put(key, std::as_bytes(std::span{bytes}), soon()), key);
+            BOOST_TEST(*(*store)->head(key, soon()) == bytes.size());
         },
         8, data);
-    auto store = objstore::S3ObjectStore::create(s3_config(host, port, bucket, creds));
-    BOOST_REQUIRE(store.has_value());
     boot_image(**store, name, data);
     std::vector<std::byte> out(16);
     BOOST_TEST((*store)->get_range("images/nope/data", 0, out, soon()).error() ==

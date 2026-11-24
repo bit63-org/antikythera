@@ -88,6 +88,7 @@ constexpr std::size_t half_key = 32;
 // A store in memory that counts requests and fails on demand.
 class MemoryStore final : public objstore::ObjectStore {
 public:
+    using ObjectStore::put;  // the store's own put() stays visible
     auto put(const std::string& key, std::vector<std::byte> bytes) -> void {
         const std::scoped_lock lock{_mutex};
         _objects[key] = std::move(bytes);

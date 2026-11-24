@@ -308,6 +308,7 @@ private:
 // (chunk fetches) wait for release(); whole-object reads (manifests) don't.
 class MemoryStore final : public objstore::ObjectStore {
 public:
+    using ObjectStore::put;  // the store's own put() stays visible
     auto put(const std::string& key, std::vector<std::byte> bytes) -> void {
         const std::scoped_lock lock{_mutex};
         _objects[key] = std::move(bytes);

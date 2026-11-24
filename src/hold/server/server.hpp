@@ -204,7 +204,7 @@ struct ServerConfig {
 enum class ConfigError : std::uint8_t {
     wrong_server,  // the config names another server
     stale,         // an epoch below the newest applied
-    mismatch,      // block size, capacity or lineage differ from the replica's
+    mismatch,      // block size or lineage differ, or the capacity shrank
     store,         // the replica could not be created, opened or updated
 };
 

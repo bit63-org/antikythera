@@ -403,9 +403,16 @@ auto BlkRole::replica_config(std::span<const std::byte> frame) -> oar::Status {
     } else if (c->epoch < it->second.epoch) {
         return oar::Status::failed;
     }
-    // A live attachment follows the new epoch: a new primary, or fencing.
+    // A live attachment follows the new epoch: a new primary, fencing, new
+    // QoS limits, or a larger capacity, which the guest then sees through
+    // a configuration-change interrupt (Requirement 10.3).
     if (Slot* s = slot_of_volume(c->volume_id); s != nullptr && s->network != nullptr) {
         if (!s->network->set_route(*c)) {
+            return oar::Status::failed;
+        }
+        const std::uint64_t sectors = s->network->size_bytes() / oar::sector_size;
+        if (s->active && !s->network->fenced() &&
+            sectors > s->active->geometry().capacity_sectors && !s->active->grow(sectors)) {
             return oar::Status::failed;
         }
     }

@@ -126,8 +126,9 @@ auto HoldServer::ensure_replica(Volume& v, const proto::ReplicaMember& me)
         return std::unexpected(ConfigError::store);
     }
     const auto& m = (*s)->meta();
+    // A smaller replica grows (apply_config); a larger one is another volume's.
     if (m.volume_id != c.volume_id || m.lineage_id != c.lineage_id ||
-        m.block_size != c.block_size || m.capacity_blocks != c.capacity_blocks) {
+        m.block_size != c.block_size || m.capacity_blocks > c.capacity_blocks) {
         return std::unexpected(ConfigError::mismatch);
     }
     if (m.epoch > c.epoch) {
@@ -152,9 +153,9 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
         if (c.epoch == old.epoch) {
             return {};
         }
-        // Growing a volume is a later task (design "Resize").
+        // Volumes only grow (design "QoS and elasticity").
         if (c.lineage_id != old.lineage_id || c.block_size != old.block_size ||
-            c.capacity_blocks != old.capacity_blocks) {
+            c.capacity_blocks < old.capacity_blocks) {
             return std::unexpected(ConfigError::mismatch);
         }
     }
@@ -203,6 +204,14 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
         if (auto r = ensure_replica(next, *me); !r) {
             restore();
             return r;
+        }
+        // A resize: the member's files grow before the epoch is recorded,
+        // so a replica at the new epoch always holds the new capacity.
+        if (next.store->meta().capacity_blocks < c.capacity_blocks &&
+            !next.store->grow(c.capacity_blocks)) {
+            next.store.reset();
+            restore();
+            return std::unexpected(ConfigError::store);
         }
         if (next.store->meta().epoch < c.epoch || next.store->meta().role != me->role) {
             if (!next.store->set_epoch(c.epoch, me->role)) {
@@ -1270,7 +1279,6 @@ auto HoldServer::start_repair(Volume& v, Request& r, std::vector<std::uint64_t> 
 auto HoldServer::finish_repair(Volume& v, Repair& rep, const proto::HoldFrame* f) -> void {
     const auto& h = rep.request.header;
     const std::uint32_t bs = rep.request.block_size;
-    const bool sourced = v.config.source.kind != proto::SourceKind::none;
     const auto* d = f != nullptr && f->header.status == HoldStatus::ok
                         ? std::get_if<proto::BlockData>(&f->payload)
                         : nullptr;
@@ -1279,7 +1287,8 @@ auto HoldServer::finish_repair(Volume& v, Repair& rep, const proto::HoldFrame* f
     for (std::size_t b = 0; good && b < h.blocks; ++b) {
         const auto block = d->data.subspan(b * bs, bs);
         const auto crc = proto::block_crc(*d, b);
-        good = crc32c::of(block) == crc || (crc == 0 && !sourced && all_zero(block));
+        good = crc32c::of(block) == crc ||
+               (crc == 0 && v.store->past_source(h.lba + b) && all_zero(block));
     }
     for (std::size_t i = 0; good && i < rep.bad.size(); ++i) {
         const auto b = rep.bad[i] - h.lba;

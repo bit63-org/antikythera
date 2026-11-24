@@ -17,7 +17,7 @@ namespace {
 
 constexpr std::size_t intent_crc_offset = 28;
 constexpr std::size_t reserved_after_chunk_shift = 3;
-constexpr std::size_t reserved_fields = meta_fields_size - 0x68;
+constexpr std::size_t reserved_fields = meta_fields_size - 0x70;
 
 auto sha256(std::span<const std::byte> in, std::span<std::byte, meta_digest_size> out) -> bool {
     unsigned int len = 0;
@@ -43,8 +43,11 @@ auto valid_fields(const ReplicaMeta& m) noexcept -> bool {
                                   m.source.kind == proto::SourceKind::image);
     const bool block_ok =
         m.block_size == proto::block_size_512 || m.block_size == proto::block_size_4096;
+    const bool limit_ok = m.source.kind == proto::SourceKind::none
+                              ? m.source_blocks == 0
+                              : m.source_blocks < m.capacity_blocks;
     return m.volume_id != 0 && m.lineage_id != 0 && m.replica_gen != 0 && m.header_seq != 0 &&
-           role_ok && source_ok && block_ok && m.capacity_blocks != 0 &&
+           limit_ok && role_ok && source_ok && block_ok && m.capacity_blocks != 0 &&
            m.capacity_blocks <= max_capacity_blocks && m.chunk_shift >= min_chunk_shift &&
            m.chunk_shift <= max_chunk_shift && (1ULL << m.chunk_shift) >= m.block_size;
 }
@@ -108,6 +111,7 @@ auto encode_replica_meta(const ReplicaMeta& m)
     w.le32(m.source.store_id);
     w.le32(m.source.hydrate_mib_per_s);
     w.bytes(m.source.manifest_name);
+    w.le64(m.source_blocks);
     v.resize(meta_fields_size);
     std::array<std::byte, meta_slot_size> out{};
     std::ranges::copy(v, out.begin());
@@ -153,6 +157,7 @@ auto decode_replica_meta(std::span<const std::byte> slot) -> std::expected<Repli
     m.source.hydrate_mib_per_s = r.le32().value_or(0);
     const auto name = r.bytes(proto::manifest_name_size).value_or(std::span<const std::byte>{});
     std::ranges::copy(name, m.source.manifest_name.begin());
+    m.source_blocks = r.le64().value_or(0);
     const auto rsvd2 = r.bytes(reserved_fields).value_or(std::span<const std::byte>{});
     if (!all_zero(rsvd1) || !all_zero(rsvd2) ||
         !all_zero(slot.subspan(meta_fields_size + meta_digest_size))) {

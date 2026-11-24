@@ -14,7 +14,11 @@
 // (the route's counterpart of VirtioBlkFunction::await_key); their
 // deadlines start when it arrives. Each later config moves
 // the epoch; a new primary, or a session the hold refused as stale, makes
-// target() name the session to open next.
+// target() name the session to open next. A config may raise the
+// capacity (an online grow, Requirement 10.3) and change the QoS limits
+// (10.4); capacity_bytes() follows at once, and the caller then grows the
+// VirtioBlkFunction in front (VirtioBlkFunction::grow). A smaller capacity
+// or another block size is refused.
 //
 // Requests. A read or write becomes one or more parts of at most
 // max_hold_blocks blocks and max_hold_data_bytes, each a hold request
@@ -84,7 +88,7 @@ enum class InitiatorFault : std::uint8_t {
 enum class RouteError : std::uint8_t {
     wrong_volume,  // a config for another volume than the first
     stale,         // an epoch below the newest applied
-    mismatch,      // block size or capacity changed (resize is a later task)
+    mismatch,      // block size changed, or capacity shrank
 };
 
 [[nodiscard]] auto to_string(RouteError e) noexcept -> const char*;

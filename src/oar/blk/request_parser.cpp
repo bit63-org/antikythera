@@ -140,6 +140,17 @@ auto RequestParser::create(const VolumeGeometry& geometry)
     return RequestParser{geometry};
 }
 
+auto RequestParser::grow(std::uint64_t capacity_sectors) noexcept
+    -> std::expected<void, GeometryError> {
+    const std::uint64_t sectors_per_block = _geometry.logical_block_size / sector_size;
+    if (capacity_sectors % sectors_per_block != 0 ||
+        capacity_sectors < _geometry.capacity_sectors) {
+        return std::unexpected(GeometryError::capacity_unaligned);
+    }
+    _geometry.capacity_sectors = capacity_sectors;
+    return {};
+}
+
 auto RequestParser::parse(std::span<const std::span<const std::byte>> readable,
                           std::span<const std::span<std::byte>> writable) const
     -> std::expected<Request, Rejection> {

@@ -68,7 +68,8 @@ auto InitiatorCore::set_route(const proto::ReplicaConfig& c, Clock::time_point n
         if (c.epoch == old.epoch) {
             return {};
         }
-        if (c.block_size != old.block_size || c.capacity_blocks != old.capacity_blocks) {
+        // A resize only grows the volume (design "QoS and elasticity").
+        if (c.block_size != old.block_size || c.capacity_blocks < old.capacity_blocks) {
             return std::unexpected(RouteError::mismatch);
         }
         if (const auto* p = proto::primary_member(old); p != nullptr) {

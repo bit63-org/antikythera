@@ -180,6 +180,7 @@ BOOST_AUTO_TEST_CASE(round_trips, *utf::timeout(ak::test::unit_timeout_seconds))
     m.role = proto::ReplicaRole::joining;
     m.header_seq = 17;
     m.replica_gen = 5;
+    m.source_blocks = 600;  // grown from 600 blocks
     const auto slot = encode_replica_meta(m);
     BOOST_TEST_REQUIRE(slot.has_value());
     BOOST_TEST(std::to_integer<int>((*slot)[0]) == 'A');
@@ -210,6 +211,16 @@ BOOST_AUTO_TEST_CASE(refuses_bad_fields, *utf::timeout(ak::test::unit_timeout_se
     BOOST_TEST(bad([](ReplicaMeta& m) { m.role = static_cast<proto::ReplicaRole>(5); }));
     BOOST_TEST(bad([](ReplicaMeta& m) { m.source.kind = static_cast<proto::SourceKind>(3); }));
     BOOST_TEST(bad([](ReplicaMeta& m) { m.source.store_id = 1; }));  // with kind none
+    BOOST_TEST(bad([](ReplicaMeta& m) { m.source_blocks = 8; }));    // with kind none
+    const auto sourced = make_meta(64, proto::block_size_512, 12, proto::SourceKind::image);
+    auto limit = [&](std::uint64_t n) {
+        auto m = sourced;
+        m.source_blocks = n;
+        return encode_replica_meta(m).has_value();
+    };
+    BOOST_TEST(limit(0));
+    BOOST_TEST(limit(63));
+    BOOST_TEST(!limit(64));  // a source that covers everything is recorded as 0
     BOOST_TEST(encode_replica_meta(good).has_value());
 }
 
@@ -640,6 +651,105 @@ BOOST_AUTO_TEST_CASE(hydrates_restored_blocks, *utf::timeout(ak::test::unit_time
     BOOST_TEST(!p->unhydrated(0).value());
 }
 
+BOOST_AUTO_TEST_CASE(grows_in_place, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    MemFiles files;
+    auto s = create(files, make_meta(64, proto::block_size_512, 12));  // 8 blocks a chunk
+    const auto a = content(1, 512, 2);
+    const auto b = content(2, 512, 1);
+    BOOST_TEST_REQUIRE(write_one(*s, 1, 7, a).has_value());      // chunks 0, 1
+    BOOST_TEST_REQUIRE(write_one(*s, 2, 63, b).has_value());     // chunk 7, the last
+    s->set_commit(1);                                            // seq 2 stays an intent
+    BOOST_TEST(s->grow(32).error() == StoreError::bad_request);  // never shrinks
+    BOOST_TEST(s->grow(max_capacity_blocks + 1).error() == StoreError::bad_request);
+    BOOST_TEST_REQUIRE(s->grow(64).has_value());  // the same: no-op
+    BOOST_TEST_REQUIRE(s->grow(200).has_value());
+    BOOST_TEST(s->meta().capacity_blocks == 200U);
+    BOOST_TEST(s->meta().header_seq == 2U);
+    BOOST_TEST(!files.exists(vdir / "meta.new"));
+    BOOST_TEST(files.contents(vdir / "data").size() == 200U * 512U);
+    BOOST_TEST(files.contents(vdir / "meta").size() == layout(s->meta()).end);
+    const auto check = [&](ReplicaStore& r) {
+        const auto old = read_blocks(r, 6, 3);
+        BOOST_TEST_REQUIRE(old.has_value());
+        BOOST_TEST(old->bad.empty());
+        BOOST_TEST((block_of(old->data, 512, 1) == block_of(a, 512, 0)));
+        BOOST_TEST((read_blocks(r, 63, 1)->data == b));
+        const auto fresh = read_blocks(r, 64, 136);  // the new blocks: never written
+        BOOST_TEST_REQUIRE(fresh.has_value());
+        BOOST_TEST(fresh->bad.empty());
+        BOOST_TEST((fresh->data == Bytes(136 * 512)));
+        BOOST_TEST((r.changed_chunks().value() == std::vector<std::uint64_t>{0, 1, 7}));
+    };
+    check(*s);
+    BOOST_TEST((s->intents() == std::vector<Intent>{{.seq = 2, .lba = 63, .blocks = 1}}));
+    // The new capacity takes writes, and everything survives a reopen.
+    const auto c = content(3, 512, 1);
+    BOOST_TEST_REQUIRE(write_one(*s, 3, 199, c).has_value());
+    BOOST_TEST(write_one(*s, 4, 200, c).error() == StoreError::bad_request);
+    BOOST_TEST_REQUIRE(s->flush().has_value());
+    s.reset();
+    s = reopen(files);
+    BOOST_TEST(s->meta().capacity_blocks == 200U);
+    BOOST_TEST((read_blocks(*s, 199, 1)->data == c));
+    BOOST_TEST(s->last_seq() == 3U);
+    BOOST_TEST((s->changed_chunks().value() == std::vector<std::uint64_t>{0, 1, 7, 24}));
+}
+
+BOOST_AUTO_TEST_CASE(grows_a_restored_volume, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    MemFiles files;
+    auto s = create(files, make_meta(21, proto::block_size_512, 12, proto::SourceKind::snapshot));
+    const auto src = content(100, 512, 8);
+    BOOST_TEST(s->hydrate(0, src, crcs_of(src, 512)).value() == 8U);
+    BOOST_TEST_REQUIRE(s->grow(40).has_value());
+    BOOST_TEST(s->meta().source_blocks == 21U);
+    BOOST_TEST_REQUIRE(s->grow(50).has_value());
+    BOOST_TEST(s->meta().source_blocks == 21U);  // still where the source ends
+    BOOST_TEST(!s->past_source(20));
+    BOOST_TEST(s->past_source(21));
+    // What awaited hydration still does; the added blocks are past the
+    // source, so they read as never written rather than unhydrated.
+    BOOST_TEST(!s->unhydrated(7).value());
+    BOOST_TEST(s->unhydrated(8).value());
+    BOOST_TEST(s->unhydrated(20).value());
+    BOOST_TEST(!s->unhydrated(21).value());
+    BOOST_TEST(s->chunk_state(2).value() == ChunkState::partial);  // blocks 16-20 of 16-23
+    BOOST_TEST(s->chunk_state(4).value() == ChunkState::hydrated);
+    BOOST_TEST((read_blocks(*s, 0, 8)->data == src));
+    const auto tail = read_blocks(*s, 21, 29);
+    BOOST_TEST_REQUIRE(tail.has_value());
+    BOOST_TEST(tail->bad.empty());
+    BOOST_TEST(read_blocks(*s, 20, 1).error() == StoreError::not_hydrated);
+    // A hydrated block of the source with zeros and no checksum is torn,
+    // not unwritten: the zeros past the source do not change that.
+    auto data = files.open(vdir / "data", false);
+    BOOST_TEST_REQUIRE((*data)->pwrite(0, Bytes(512)).has_value());
+    auto meta = files.open(vdir / "meta", false);
+    BOOST_TEST_REQUIRE((*meta)->pwrite(layout(s->meta()).checksums, Bytes(4)).has_value());
+    BOOST_TEST((read_blocks(*s, 0, 1)->bad == std::vector<std::uint64_t>{0}));
+}
+
+BOOST_AUTO_TEST_CASE(grows_on_a_real_filesystem, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    PosixFiles files;
+    const auto dir =
+        std::filesystem::temp_directory_path() / ("ak-hold-grow-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto rdir = dir / "vol-7.1";
+    {
+        auto s = ReplicaStore::create(files, rdir, make_meta(64, proto::block_size_4096));
+        BOOST_TEST_REQUIRE(s.has_value());
+        BOOST_TEST_REQUIRE(write_one(**s, 1, 63, content(1, 4096, 1)).has_value());
+        BOOST_TEST_REQUIRE((*s)->grow(1000).has_value());
+        BOOST_TEST(!std::filesystem::exists(rdir / "meta.new"));
+        BOOST_TEST(std::filesystem::file_size(rdir / "data") == 1000U * 4096U);
+    }
+    auto s = ReplicaStore::open(files, rdir);
+    BOOST_TEST_REQUIRE(s.has_value());
+    BOOST_TEST((*s)->meta().capacity_blocks == 1000U);
+    BOOST_TEST((read_blocks(**s, 63, 1)->data == content(1, 4096, 1)));
+    std::filesystem::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(detects_reflinks, *utf::timeout(ak::test::unit_timeout_seconds)) {
     MemFiles with{true};
     BOOST_TEST(create(with, make_meta(8))->reflink());
@@ -1007,6 +1117,55 @@ BOOST_AUTO_TEST_CASE(during_create, *utf::timeout(ak::test::unit_timeout_seconds
             for (std::uint64_t b = 0; b < m.capacity_blocks; ++b) {
                 BOOST_TEST((*s)->unhydrated(b).value());
             }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(during_grow, *utf::timeout(120)) {
+    const auto m = make_meta(40, proto::block_size_512, 12, proto::SourceKind::image);
+    const auto a = content(1, 512, 3);
+    const auto prepare = [&](MemFiles& files) {
+        auto s = create(files, m);
+        BOOST_TEST_REQUIRE(write_one(*s, 1, 5, a).has_value());
+        BOOST_TEST_REQUIRE(s->flush().has_value());
+        return s;
+    };
+    std::uint64_t base = 0;
+    std::uint64_t total = 0;
+    {
+        MemFiles files;
+        auto s = prepare(files);
+        base = files.ops();
+        BOOST_TEST_REQUIRE(s->grow(100).has_value());
+        total = files.ops() - base;
+    }
+    for (std::uint64_t k = 1; k <= total + 1; ++k) {
+        for (std::uint64_t seed = 1; seed <= 3; ++seed) {
+            MemFiles files;
+            auto s = prepare(files);
+            files.fail_after(k);
+            const bool grew = s->grow(100).has_value();
+            s.reset();
+            files.crash(seed);
+            BOOST_TEST_INFO("crash at grow op " << k << ", seed " << seed);
+            // The old replica or the grown one, whole either way.
+            auto r = ReplicaStore::open(files, vdir);
+            BOOST_TEST_REQUIRE(r.has_value());
+            const auto cap = (*r)->meta().capacity_blocks;
+            BOOST_TEST((cap == 40U || cap == 100U));
+            if (grew) {
+                BOOST_TEST(cap == 100U);
+            }
+            BOOST_TEST(!files.exists(vdir / "meta.new"));
+            BOOST_TEST(files.contents(vdir / "data").size() == cap * 512U);
+            BOOST_TEST((read_blocks(**r, 5, 3)->data == a));
+            BOOST_TEST((*r)->unhydrated(4).value());
+            BOOST_TEST((*r)->unhydrated(39).value());
+            if (cap == 100U) {
+                BOOST_TEST(!(*r)->unhydrated(40).value());
+                BOOST_TEST(read_blocks(**r, 40, 60)->bad.empty());
+            }
+            BOOST_TEST((*r)->grow(100).has_value());  // and it grows again
         }
     }
 }

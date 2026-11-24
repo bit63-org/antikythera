@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <system_error>
 #include <utility>
 
@@ -243,6 +244,14 @@ auto PosixFiles::sync_dir(const std::filesystem::path& dir) -> FileResult {
     return {};
 }
 
+auto PosixFiles::rename(const std::filesystem::path& from, const std::filesystem::path& to)
+    -> FileResult {
+    if (::rename(from.c_str(), to.c_str()) != 0) {
+        return std::unexpected(errno);
+    }
+    return {};
+}
+
 // ---- MemFiles --------------------------------------------------------------
 
 auto MemFiles::step() -> bool {
@@ -332,6 +341,21 @@ auto MemFiles::sync_dir(const std::filesystem::path& /*dir*/) -> FileResult {
     if (!step()) {
         return std::unexpected(EIO);
     }
+    return {};
+}
+
+auto MemFiles::rename(const std::filesystem::path& from, const std::filesystem::path& to)
+    -> FileResult {
+    const auto src = _files.find(key(from));
+    if (src == _files.end()) {
+        return std::unexpected(ENOENT);
+    }
+    if (!step()) {
+        return std::unexpected(EIO);
+    }
+    auto state = src->second;
+    _files.erase(src);
+    _files.insert_or_assign(key(to), std::move(state));
     return {};
 }
 

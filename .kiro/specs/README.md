@@ -7,7 +7,7 @@ Steering that applies to all of them is in `../steering/`.
 | Spec | Piece | Status |
 |---|---|---|
 | [helm-control-plane](helm-control-plane/) | Control-plane role: mailbox, device pool, keys, sideband, power sequencing | 11/13 |
-| [hull-host-agent](hull-host-agent/) | Minimal host image and agent: VFIO, jailed Cloud Hypervisor, lifecycle | 6/11 |
+| [hull-host-agent](hull-host-agent/) | Minimal host image and agent: VFIO, jailed Cloud Hypervisor, lifecycle | 7/11 |
 | [oar-net-data-plane](oar-net-data-plane/) | virtio-net, VPC switching, Geneve VTEP with NIC IDs, WireGuard | 16/22 |
 | [oar-blk-data-plane](oar-blk-data-plane/) | virtio-blk with transparent per-VM AES-XTS, crypto-erase, lazy S3 image volumes | 12/16 |
 | [block-volume-service](block-volume-service/) | hold: replicated network volumes for VM guests (EBS-like), failover, rebuild, live moves, snapshots | 13/24 |

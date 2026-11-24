@@ -83,8 +83,8 @@ auto frame_of(const proto::ReplicaConfig& c) -> Bytes {
     return *b;
 }
 
-auto op(std::uint64_t server = me,
-        proto::VolumeOpArgs args = proto::DeleteReplica{.replica_gen = 1}) -> proto::VolumeOp {
+auto op(std::uint64_t server = me, proto::VolumeOpArgs args = proto::SnapshotAbort{.cut_id = 5})
+    -> proto::VolumeOp {
     proto::VolumeOp o{.key_id = good_key,
                       .server_id = server,
                       .volume_id = vol,
@@ -200,8 +200,55 @@ BOOST_AUTO_TEST_CASE(verified_ops_are_answered_unsupported_for_now) {
     const auto* out = std::get_if<proto::OpOutcome>(&rep->body);
     BOOST_REQUIRE(out != nullptr);
     BOOST_TEST(out->op_id == 44U);
-    BOOST_TEST((out->kind == proto::VolumeOpKind::delete_replica));
+    BOOST_TEST((out->kind == proto::VolumeOpKind::snapshot_abort));
     BOOST_TEST((out->status == proto::OpStatus::unsupported));
+}
+
+// The outcome of the newest op, from the reports the role queued.
+auto last_outcome(HoldRole& role, std::uint64_t& ack, Clock::time_point now)
+    -> std::optional<proto::OpOutcome> {
+    role.pump(now);
+    std::optional<proto::OpOutcome> out;
+    while (auto rep = next_report(role, ack)) {
+        if (const auto* o = std::get_if<proto::OpOutcome>(&rep->body)) {
+            out = *o;
+        }
+    }
+    return out;
+}
+
+BOOST_AUTO_TEST_CASE(a_delete_op_removes_a_replica_that_left_the_set) {
+    Rig r;
+    std::uint64_t ack = 0;
+    const auto del = frame_of(op(me, proto::DeleteReplica{.replica_gen = 1}));
+    BOOST_REQUIRE(r.role.replica_config(frame_of(config(1))) == oar::Status::ok);
+    BOOST_REQUIRE(r.server.replica_on_disk(vol, 1));
+    // Still a member here: this server is behind the controller.
+    BOOST_TEST(r.role.volume_op(del) == oar::Status::ok);
+    auto out = last_outcome(r.role, ack, r.now);
+    BOOST_REQUIRE(out.has_value());
+    BOOST_TEST((out->kind == proto::VolumeOpKind::delete_replica));
+    BOOST_TEST((out->status == proto::OpStatus::stale_epoch));
+    BOOST_TEST(r.server.replica_on_disk(vol, 1));
+
+    // The epoch that moved the replica elsewhere arrives: now it goes.
+    auto moved = config(2);
+    moved.members.front().server_id = me + 1;
+    BOOST_REQUIRE(r.role.replica_config(frame_of(moved)) == oar::Status::ok);
+    BOOST_TEST(r.role.volume_op(del) == oar::Status::ok);
+    out = last_outcome(r.role, ack, r.now);
+    BOOST_REQUIRE(out.has_value());
+    BOOST_TEST((out->status == proto::OpStatus::ok));
+    BOOST_TEST(!r.server.replica_on_disk(vol, 1));
+    BOOST_TEST(r.server.stats().deleted == 1U);
+    BOOST_TEST(r.server.replica(vol) == nullptr);
+
+    // A resend, and a replica never here, are answered ok.
+    BOOST_TEST(r.role.volume_op(del) == oar::Status::ok);
+    out = last_outcome(r.role, ack, r.now);
+    BOOST_REQUIRE(out.has_value());
+    BOOST_TEST((out->status == proto::OpStatus::ok));
+    BOOST_TEST(r.server.stats().deleted == 1U);
 }
 
 BOOST_AUTO_TEST_CASE(a_scrub_op_runs_on_the_server) {

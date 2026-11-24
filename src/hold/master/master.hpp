@@ -16,6 +16,9 @@
 //                 or flags commits epoch + 1 and publishes one
 //                 ReplicaConfig per recipient server, members first, then
 //                 the attachments' servers (6.2).
+//   keys          each attach sends the volume key to the attaching
+//                 server alone, per attachment and generation, and
+//                 key_allowed() answers no once it detaches (4.4).
 //   generations   each attach takes a new generation; detach retires it,
 //                 and generation_fenced() says when the primary has
 //                 applied the epoch without it (6.4, 6.9).
@@ -95,6 +98,18 @@ namespace ak::hold::master {
 
 using Time = std::chrono::milliseconds;  // controller monotonic clock
 
+// One attachment's claim to the lineage key (Requirement 4.4): the
+// transport has kythira KMS wrap it to `server`'s helm transport key and
+// sends the VolumeKey on that server's controller link.
+struct KeyGrant {
+    std::uint64_t server_id{0};
+    std::uint64_t volume_id{0};
+    std::uint64_t lineage_id{0};
+    std::uint64_t attachment_id{0};
+    std::uint32_t generation{0};
+    friend auto operator==(const KeyGrant&, const KeyGrant&) -> bool = default;
+};
+
 // What the master sends. One ReplicaConfig per recipient (server_id
 // inside); VolumeOps likewise.
 class Transport {
@@ -118,6 +133,10 @@ public:
         -> void = 0;
     // The lineage's last volume and snapshot are gone: destroy its KMS key.
     virtual auto destroy_lineage_key(std::uint64_t lineage) -> void = 0;
+    // Deliver the volume key for one new attachment, to its own server
+    // only; called before the config that names the attachment goes out,
+    // so the key waits at helm rather than the route waiting for it.
+    virtual auto send_volume_key(const KeyGrant& grant) -> void = 0;
 };
 
 struct Timing {
@@ -304,6 +323,13 @@ public:
     // True once the primary has applied an epoch without `generation`:
     // a forced detach may unplug, another server may attach (6.9).
     [[nodiscard]] auto generation_fenced(std::uint64_t volume, std::uint32_t generation) const
+        -> bool;
+    // Whether `server` may hold `volume`'s key for `attachment_id` at
+    // `generation`: the volume lists that attachment, on that server, at
+    // that generation (Requirement 4.4). A transport resending a key, or
+    // helm asking for one again after a restart, checks this first.
+    [[nodiscard]] auto key_allowed(std::uint64_t server, std::uint64_t volume,
+                                   std::uint64_t attachment_id, std::uint32_t generation) const
         -> bool;
     [[nodiscard]] auto resize(std::uint64_t volume, std::uint64_t capacity_blocks, Time now)
         -> std::expected<void, Error>;

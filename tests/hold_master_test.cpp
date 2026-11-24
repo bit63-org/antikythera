@@ -91,6 +91,17 @@ public:
     auto destroy_lineage_key(std::uint64_t lineage) -> void override {
         destroyed.push_back(lineage);
     }
+    auto send_volume_key(const m::KeyGrant& grant) -> void override {
+        // The key goes out before any config naming the attachment.
+        BOOST_TEST(std::ranges::none_of(configs, [&](const proto::ReplicaConfig& c) {
+            return c.volume_id == grant.volume_id &&
+                   std::ranges::any_of(c.attachments, [&](const proto::VolumeAttachment& a) {
+                       return a.attachment_id == grant.attachment_id &&
+                              a.generation == grant.generation;
+                   });
+        }));
+        keys.push_back(grant);
+    }
 
     auto clear() -> void {
         configs.clear();
@@ -111,6 +122,7 @@ public:
     std::vector<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>> leases;
     std::vector<std::pair<std::uint64_t, std::vector<proto::ManifestName>>> sweeps;
     std::vector<std::uint64_t> destroyed;
+    std::vector<m::KeyGrant> keys;
 
 private:
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t> _epochs;
@@ -388,6 +400,48 @@ BOOST_AUTO_TEST_CASE(attachment_rules, *boost::unit_test::timeout(unit_timeout_s
     rig.create(11, m::provisioned_class(), 0, true);
     BOOST_TEST(rig.master.attach(11, 1, compute, proto::AttachMode::rw, rig.now).has_value());
     BOOST_TEST(rig.master.attach(11, 2, compute + 1, proto::AttachMode::rw, rig.now).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(each_attachment_gets_the_key_on_its_own_server,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // Requirement 4.4: one key per attachment, to the attaching server
+    // only, never to a storage server, and none once it detaches.
+    Rig rig{{1, 2, 3}};
+    rig.create(10, m::provisioned_class(), 0, true);
+    BOOST_TEST(rig.t.keys.empty());
+    const auto g1 = rig.master.attach(10, 0xA1, compute, proto::AttachMode::rw, rig.now);
+    const auto g2 = rig.master.attach(10, 0xA2, compute + 1, proto::AttachMode::rw, rig.now);
+    const auto g3 = rig.master.attach(10, 0xA3, compute + 2, proto::AttachMode::ro, rig.now);
+    BOOST_REQUIRE((g1 && g2 && g3));
+    BOOST_REQUIRE(rig.t.keys.size() == 3U);
+    BOOST_TEST((rig.t.keys[0] == m::KeyGrant{.server_id = compute,
+                                             .volume_id = 10,
+                                             .lineage_id = rig.vol(10).spec.lineage_id,
+                                             .attachment_id = 0xA1,
+                                             .generation = *g1}));
+    BOOST_TEST(rig.t.keys[1].server_id == compute + 1);
+    BOOST_TEST(rig.t.keys[2].server_id == compute + 2);
+    BOOST_TEST(rig.t.keys[2].generation == *g3);
+    BOOST_TEST(rig.master.key_allowed(compute + 1, 10, 0xA2, *g2));
+    BOOST_TEST(!rig.master.key_allowed(compute, 10, 0xA2, *g2));      // another server
+    BOOST_TEST(!rig.master.key_allowed(compute + 1, 10, 0xA2, *g1));  // another generation
+    BOOST_TEST(!rig.master.key_allowed(rig.primary(10), 10, 0xA1, *g1));
+    BOOST_TEST(!rig.master.key_allowed(compute, 11, 0xA1, *g1));  // no such volume
+    // A refused attach sends nothing.
+    BOOST_TEST(!rig.master.attach(10, 0xA1, compute + 3, proto::AttachMode::rw, rig.now));
+    BOOST_TEST(rig.t.keys.size() == 3U);
+
+    BOOST_REQUIRE(rig.master.detach(10, 0xA2, rig.now).has_value());
+    BOOST_TEST(!rig.master.key_allowed(compute + 1, 10, 0xA2, *g2));
+    BOOST_TEST(rig.master.key_allowed(compute, 10, 0xA1, *g1));  // the others keep theirs
+    BOOST_TEST(rig.master.key_allowed(compute + 2, 10, 0xA3, *g3));
+    BOOST_TEST(rig.t.keys.size() == 3U);
+    // Attaching again, on the same server, is a new generation and a new key.
+    const auto again = rig.master.attach(10, 0xA2, compute + 1, proto::AttachMode::rw, rig.now);
+    BOOST_REQUIRE(again.has_value());
+    BOOST_REQUIRE(rig.t.keys.size() == 4U);
+    BOOST_TEST(rig.t.keys[3].generation == *again);
+    BOOST_TEST(*again != *g2);
 }
 
 BOOST_AUTO_TEST_CASE(detach_retires_the_generation_until_fenced,
@@ -668,6 +722,28 @@ BOOST_AUTO_TEST_CASE(a_secondary_moves_without_dropping_the_count,
     BOOST_REQUIRE(deletes.size() == 1U);
     BOOST_TEST(deletes[0].server_id == s);
     BOOST_TEST(!rig.vol(10).move.has_value());
+}
+
+BOOST_AUTO_TEST_CASE(a_delete_is_resent_until_the_source_applied_its_removal,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{{1, 2, 3}};
+    rig.create(10);
+    const std::uint64_t s = rig.with_role(10, ReplicaRole::secondary).front();
+    const std::uint64_t target = 6 - s - rig.primary(10);
+    BOOST_REQUIRE(rig.master.move_replica(10, s, target, rig.now).has_value());
+    rig.status(target, 10, 0, proto::ReplicaState::in_sync);
+    auto deletes = rig.t.ops_of<proto::DeleteReplica>();
+    BOOST_REQUIRE(deletes.size() == 1U);
+    // The source has not applied the epoch without it yet.
+    rig.outcome(deletes[0], proto::OpStatus::stale_epoch);
+    BOOST_TEST(rig.master.pending_ops() == 1U);
+    rig.t.clear();
+    rig.advance(m::Timing{}.retry);
+    deletes = rig.t.ops_of<proto::DeleteReplica>();
+    BOOST_REQUIRE(deletes.size() == 1U);
+    BOOST_TEST(deletes[0].server_id == s);
+    rig.outcome(deletes[0]);
+    BOOST_TEST(rig.master.pending_ops() == 0U);
 }
 
 BOOST_AUTO_TEST_CASE(the_primary_hands_over_on_confirmed_demotion,

@@ -116,6 +116,10 @@ ak_add_test(proto_link_test       SOURCES proto_link_test.cpp       LIBS ak::pro
 ak_add_test(proto_volume_test     SOURCES proto_volume_test.cpp     LIBS ak::proto)
 ak_add_test(hold_master_test      SOURCES hold_master_test.cpp      LIBS ak::hold_master)
 ak_add_test(hold_store_test       SOURCES hold_store_test.cpp       LIBS ak::hold_store)
+# The crash suite replays every step of several workloads: under the
+# sanitizers it takes about a minute even before the simulation entries
+# share the runner's four CPUs with it.
+set_tests_properties(hold_store_test PROPERTIES TIMEOUT 180)
 ak_add_test(hold_server_test      SOURCES hold_server_test.cpp      LIBS ak::hold_server)
 ak_add_test(hold_replication_test SOURCES hold_replication_test.cpp LIBS ak::hold_server)
 ak_add_test(hold_role_test        SOURCES hold_role_test.cpp        LIBS ak::hold_role)
@@ -123,7 +127,18 @@ ak_add_test(hold_role_test        SOURCES hold_role_test.cpp        LIBS ak::hol
 # run, and a long one under `ctest -C Nightly -L nightly`.
 ak_add_test(hold_sim_test SOURCES hold_sim_test.cpp
             LIBS ak::hold_server ak::hold_master ak::oar_blk_volume
-            ARGS --run_test=!long_sweep)
+            ARGS --run_test=!long_sweep,movement,multi_attach)
+# Under the sanitizers on a 4-CPU runner, sharing it with the other
+# entries, the base sweep takes about 90 s and the movement suite about
+# 60 s; each case keeps its own 30 s limit against a hang, so these are
+# only ceilings for a slow runner.
+set_tests_properties(hold_sim_test PROPERTIES TIMEOUT 180)
+# Tasks 17-18's suites as entries of their own.
+foreach(_suite movement multi_attach)
+  add_test(NAME hold_sim_${_suite}
+           COMMAND hold_sim_test --log_level=test_suite --run_test=${_suite})
+  set_tests_properties(hold_sim_${_suite} PROPERTIES TIMEOUT 180)
+endforeach()
 add_test(NAME hold_sim_nightly COMMAND hold_sim_test --run_test=long_sweep CONFIGURATIONS Nightly)
 set_tests_properties(hold_sim_nightly PROPERTIES LABELS nightly TIMEOUT 7200)
 ak_add_test(hold_node_test        SOURCES hold_node_test.cpp        LIBS ak::hold_server OpenSSL::Crypto)

@@ -27,6 +27,18 @@
 // two-replica class and back, so a replica leaves and is rebuilt while
 // I/O goes on.
 //
+// Movement and multi-attach (tasks 17-18): a scenario may run more
+// storage servers than replicas and, mid-workload, move the primary
+// (a planned handover) or a secondary to another server, or drain servers
+// until the controller reports them empty and their replicas deleted.
+// Throughout, the controller's set keeps at least three replicas in sync
+// (the new one joins before the old leaves) and no guest operation fails
+// or waits as long as a second. It may also attach several guests on
+// different compute servers, read-write and read-only, whose operations
+// must together be linearizable per block; a read-only guest's writes
+// fail, and one guest may be cut off from its controller and detached,
+// after which its writes fail without disturbing the others.
+//
 // AK_SIM_SEED=<n> reruns one seed; AK_SIM_SEEDS=<n> sets how many seeds
 // the run covers. ctest runs a short sweep; `ctest -C Nightly -L nightly`
 // runs the long one.
@@ -73,7 +85,7 @@ using Clock = ak::hold::Clock;
 using Bytes = std::vector<std::byte>;
 using ak::hold::SessionId;
 
-constexpr std::uint64_t compute = 100;  // the initiator's server
+constexpr std::uint64_t compute = 100;  // the first guest's server; guests' are this and above
 constexpr std::uint64_t vol = 7;
 constexpr std::uint64_t att = 70;
 constexpr std::uint32_t bs = 4096;
@@ -121,8 +133,40 @@ struct Params {
 
 constexpr std::chrono::seconds scrub_interval{2};
 
+// A guest: one attachment of the volume, on its own compute server.
+struct GuestSpec {
+    std::uint64_t server{compute};
+    std::uint64_t attachment{att};
+    proto::AttachMode mode{proto::AttachMode::rw};
+};
+
+// Something the operator does at a point of the workload (tasks 17-18).
+enum class ActionKind : std::uint8_t {
+    move_primary,    // move the primary's replica to a server the master picks
+    move_secondary,  // likewise a secondary's
+    drain_primary,   // drain the primary's server
+    drain_secondary,
+    detach_guest,  // cut the guest off from the controller, then detach it
+};
+
+struct Action {
+    Clock::duration at{};
+    ActionKind kind{ActionKind::move_primary};
+    std::size_t guest{0};  // detach_guest
+};
+
+// What tasks 17-18 add on top of Params.
+struct Scenario {
+    std::uint64_t holds{3};
+    bool multi_attach{false};
+    std::vector<GuestSpec> guests{GuestSpec{}};
+    std::vector<Action> actions;
+};
+
 // One guest operation and what it saw.
 struct Op {
+    std::size_t guest{0};
+    bool expect_failure{false};  // a read-only guest's write, a detached guest's I/O
     bool write{false};
     std::uint64_t lba{0};
     std::uint64_t n{0};
@@ -196,11 +240,12 @@ struct Hold {
 class World final : public m::Transport {
     std::mt19937_64 _rng;
     Params _p;
+    Scenario _sc;
 
 public:
-    World(std::uint64_t seed, Params p)
-        : _rng{seed}, _p{p}, master{*this, timing(p)}, core{{.attachment_id = att}} {
-        for (std::uint64_t id = 1; id <= 3; ++id) {
+    World(std::uint64_t seed, Params p, Scenario sc = {})
+        : _rng{seed}, _p{p}, _sc{std::move(sc)}, master{*this, timing(p)} {
+        for (std::uint64_t id = 1; id <= _sc.holds; ++id) {
             auto& h = _holds[id];
             h.id = id;
             start(h);
@@ -222,12 +267,17 @@ public:
                                                .capacity_blocks = capacity,
                                                .block_size = bs,
                                                .volume_class = cls,
-                                               .multi_attach = false,
+                                               .multi_attach = _sc.multi_attach,
                                                .source = {}},
                                               mnow())
                                .has_value());
-        BOOST_TEST_REQUIRE(
-            master.attach(vol, att, compute, proto::AttachMode::rw, mnow()).has_value());
+        for (const auto& g : _sc.guests) {
+            auto& guest = _guests.emplace_back(std::make_unique<Guest>(g));
+            const auto gen = master.attach(vol, g.attachment, g.server, g.mode, mnow());
+            BOOST_TEST_REQUIRE(gen.has_value());
+            guest->generation = *gen;
+        }
+        _pending = _sc.actions;
     }
     World(const World&) = delete;
     auto operator=(const World&) -> World& = delete;
@@ -248,10 +298,18 @@ public:
     }
     auto sweep_lineage(std::uint64_t, std::span<const proto::ManifestName>) -> void override {}
     auto destroy_lineage_key(std::uint64_t) -> void override {}
+    auto send_volume_key(const m::KeyGrant& g) -> void override {
+        // Requirement 4.4: to the attaching guest's own server only.
+        BOOST_TEST(g.volume_id == vol);
+        BOOST_TEST(std::ranges::any_of(_sc.guests, [&](const GuestSpec& s) {
+            return s.server == g.server_id && s.attachment == g.attachment_id;
+        }));
+        _keys.push_back(g);
+    }
 
     // ---- the network, from the holds' sinks ------------------------------
     struct End {
-        std::uint64_t node{0};  // a hold's server ID, or `compute`
+        std::uint64_t node{0};  // a hold's server ID, or a guest's (`compute` and up)
         std::uint32_t incarnation{0};
         SessionId session{0};
         friend auto operator<=>(const End&, const End&) = default;
@@ -310,6 +368,9 @@ public:
                     ++reclass;
                 }
             }
+            if (working) {
+                act();
+            }
             if (working && _p.corrupt_every && now >= next_corrupt) {
                 corrupt();
                 next_corrupt = now + *_p.corrupt_every;
@@ -318,9 +379,10 @@ public:
                 fault();
                 next_fault = now + std::chrono::milliseconds{200 + _rng() % 2000};
             }
-            if (working && now >= next_op) {
-                if (outstanding() < max_outstanding) {
-                    submit();
+            if (working && now >= next_op && !_guests.empty()) {
+                const auto g = _rng() % _guests.size();
+                if (_guests[g]->active && _guests[g]->outstanding < max_outstanding) {
+                    submit(g);
                 }
                 next_op = now + std::chrono::microseconds{_rng() % 3000};
             }
@@ -336,7 +398,9 @@ public:
             // The next moment anything wants to happen.
             auto wake = next_tick;
             if (working) {
-                wake = std::min(wake, next_op);
+                if (!_guests.empty()) {
+                    wake = std::min(wake, next_op);  // with no guest it never moves on
+                }
                 if (_p.faults) {
                     wake = std::min(wake, next_fault);
                 }
@@ -349,12 +413,17 @@ public:
                 if (_p.corrupt_every) {
                     wake = std::min(wake, next_corrupt);
                 }
+                for (const auto& a : _pending) {
+                    wake = std::min(wake, t0 + a.at);
+                }
             }
             if (!_events.empty()) {
                 wake = std::min(wake, _events.begin()->first.first);
             }
-            if (const auto w = core.next_wake(now)) {
-                wake = std::min(wake, *w);
+            for (const auto& g : _guests) {
+                if (const auto w = g->core.next_wake(now)) {
+                    wake = std::min(wake, *w);
+                }
             }
             for (auto& [id, h] : _holds) {
                 if (h.up) {
@@ -373,16 +442,66 @@ public:
     // ---- checks -----------------------------------------------------------
     auto check() -> void {
         for (const auto& [id, op] : _ops) {
-            BOOST_TEST_INFO("op " << id << (op.write ? " write" : " read") << " lba " << op.lba);
+            BOOST_TEST_INFO("op " << id << (op.write ? " write" : " read") << " lba " << op.lba
+                                  << " guest " << op.guest);
             BOOST_TEST_REQUIRE(op.result.has_value());  // nothing left hanging
-            BOOST_TEST(op.result->has_value());         // and nothing failed
+            // and nothing failed, but what had to
+            BOOST_TEST(op.result->has_value() == !op.expect_failure);
         }
         check_reads();
         check_replicas();
     }
 
     [[nodiscard]] auto ops() const -> std::size_t { return _ops.size(); }
-    // Guest operations that touched blocks at or past `lba`.
+    [[nodiscard]] auto core(std::size_t guest = 0) -> blk::InitiatorCore& {
+        return _guests.at(guest)->core;
+    }
+    // Operations that succeeded, by guest; and how many were expected to fail.
+    [[nodiscard]] auto succeeded(std::size_t guest, bool writes) const -> std::size_t {
+        return static_cast<std::size_t>(std::ranges::count_if(_ops, [&](const auto& kv) {
+            const auto& o = kv.second;
+            return o.guest == guest && o.write == writes && o.result && o.result->has_value();
+        }));
+    }
+    [[nodiscard]] auto expected_failures() const -> std::size_t {
+        return static_cast<std::size_t>(
+            std::ranges::count_if(_ops, [](const auto& kv) { return kv.second.expect_failure; }));
+    }
+    // The longest any guest operation that succeeded took.
+    [[nodiscard]] auto longest_op() const -> Clock::duration {
+        Clock::duration out{};
+        for (const auto& [id, op] : _ops) {
+            if (op.result && op.result->has_value()) {
+                out = std::max(out, *op.completed - op.invoked);
+            }
+        }
+        return out;
+    }
+    // The fewest in-sync replicas (primary, secondary, or a primary
+    // handing over) the controller's set had at any instant.
+    [[nodiscard]] auto min_in_sync() const -> std::size_t { return _min_in_sync; }
+    [[nodiscard]] auto keys() const -> const std::vector<m::KeyGrant>& { return _keys; }
+    [[nodiscard]] auto members() const -> std::vector<std::uint64_t> {
+        std::vector<std::uint64_t> out;
+        for (const auto& mem : master.volume(vol)->members) {
+            out.push_back(mem.server_id);
+        }
+        return out;
+    }
+    [[nodiscard]] auto first_primary() const -> std::uint64_t { return _first_primary; }
+    // The servers drained, and whether a hold still keeps any replica dir.
+    [[nodiscard]] auto drained_servers() const -> const std::vector<std::uint64_t>& {
+        return _drains;
+    }
+    [[nodiscard]] auto holds_replica(std::uint64_t server) const -> bool {
+        const auto& h = _holds.at(server);
+        for (std::uint32_t gen = 1; gen < 16; ++gen) {
+            if (h.server && h.server->replica_on_disk(vol, gen)) {
+                return true;
+            }
+        }
+        return false;
+    }  // Guest operations that touched blocks at or past `lba`.
     [[nodiscard]] auto ops_past(std::uint64_t lba) const -> std::size_t {
         return static_cast<std::size_t>(std::ranges::count_if(
             _ops, [&](const auto& kv) { return kv.second.lba + kv.second.n > lba; }));
@@ -418,10 +537,19 @@ public:
     }
 
     m::Master master;
-    blk::InitiatorCore core;
     Clock::time_point now{t0};
 
 private:
+    struct Guest {
+        explicit Guest(const GuestSpec& s) : spec{s}, core{{.attachment_id = s.attachment}} {}
+        GuestSpec spec;
+        blk::InitiatorCore core;
+        std::optional<End> end;  // its session, if any
+        std::size_t outstanding{0};
+        std::uint32_t generation{0};
+        bool active{true};        // submits new operations
+        bool partitioned{false};  // configs from the controller no longer reach it
+    };
     struct Frame {
         End to;
         Bytes bytes;
@@ -511,6 +639,75 @@ private:
     }
 
     // Everything due now, then the roles, until nothing more happens now.
+    [[nodiscard]] auto guest_on(std::uint64_t server) -> Guest* {
+        for (auto& g : _guests) {
+            if (g->spec.server == server) {
+                return g.get();
+            }
+        }
+        return nullptr;
+    }
+    static auto is_guest(std::uint64_t node) -> bool { return node >= compute; }
+
+    // The operator's actions (tasks 17-18). A move the master refuses as
+    // busy (another still running) is tried again later.
+    auto act() -> void {
+        for (auto it = _pending.begin(); it != _pending.end();) {
+            if (now < t0 + it->at || !do_action(*it)) {
+                ++it;
+            } else {
+                it = _pending.erase(it);
+            }
+        }
+        // A detach waits for the guest's last operation, then cuts it off
+        // from the controller (a partitioned compute server) and detaches
+        // it; once the primary has fenced it, its I/O must fail.
+        for (std::size_t i = 0; i < _guests.size(); ++i) {
+            auto& g = *_guests[i];
+            if (!g.active && !g.partitioned && g.outstanding == 0) {
+                g.partitioned = true;
+                BOOST_TEST_REQUIRE(master.detach(vol, g.spec.attachment, mnow()).has_value());
+            }
+            if (g.partitioned && !_fenced_tried.contains(i) &&
+                master.generation_fenced(vol, g.generation)) {
+                _fenced_tried.insert(i);
+                submit(i, true, true);
+                submit(i, false, true);
+            }
+        }
+    }
+
+    auto do_action(const Action& a) -> bool {
+        const auto secondary = [&] {
+            for (const auto& mem : master.volume(vol)->members) {
+                if (mem.role == proto::ReplicaRole::secondary) {
+                    return mem.server_id;
+                }
+            }
+            return std::uint64_t{0};
+        };
+        switch (a.kind) {
+            case ActionKind::move_primary:
+                return master.move_replica(vol, primary(), 0, mnow()).has_value();
+            case ActionKind::move_secondary:
+                return master.move_replica(vol, secondary(), 0, mnow()).has_value();
+            case ActionKind::drain_primary:
+            case ActionKind::drain_secondary: {
+                if (master.volume(vol)->move) {
+                    return false;  // one at a time, so each drains a distinct server
+                }
+                const auto server = a.kind == ActionKind::drain_primary ? primary() : secondary();
+                BOOST_TEST_REQUIRE(master.drain(server).has_value());
+                _drains.push_back(server);
+                return true;
+            }
+            case ActionKind::detach_guest:
+                _guests.at(a.guest)->active = false;
+                return true;
+        }
+        return true;
+    }
+
     auto settle() -> void {
         for (int guard = 0; guard < 100000; ++guard) {
             bool moved = false;
@@ -529,8 +726,10 @@ private:
                 deliver(std::move(e));
                 moved = true;
             }
-            core.tick(now);
-            moved = initiator_io() || moved;
+            for (auto& g : _guests) {
+                g->core.tick(now);
+                moved = initiator_io(*g) || moved;
+            }
             int leases = 0;
             for (auto& [id, h] : _holds) {
                 if (h.up) {
@@ -542,9 +741,15 @@ private:
                 }
             }
             BOOST_TEST_REQUIRE(leases <= 1);  // never two primaries serving reads
+            _min_in_sync = std::min(_min_in_sync, in_sync_or_leaving());
+            if (_first_primary == 0) {
+                _first_primary = primary();
+            }
             // The controller learns of a lost primary from its members;
             // initiators' reports take another path, not modelled here.
-            static_cast<void>(core.take_faults());
+            for (auto& g : _guests) {
+                static_cast<void>(g->core.take_faults());
+            }
             if (!moved && (_events.empty() || _events.begin()->first.first > now)) {
                 return;
             }
@@ -559,13 +764,13 @@ private:
             }
             const auto frame = proto::decode_hold_frame(f->bytes);
             BOOST_TEST_REQUIRE(frame.has_value());
-            if (f->to.node == compute) {
-                core.on_frame(f->to.session, *frame, now);
+            if (is_guest(f->to.node)) {
+                guest_on(f->to.node)->core.on_frame(f->to.session, *frame, now);
             } else if (auto* h = running(f->to)) {
                 h->server->on_frame(f->to.session, *frame, now);
             }
         } else if (auto* d = std::get_if<Dial>(&e)) {
-            if (d->from.node != compute && running(d->from) == nullptr) {
+            if (!is_guest(d->from.node) && running(d->from) == nullptr) {
                 return;  // the dialler crashed meanwhile
             }
             auto& target = _holds.at(d->to);
@@ -577,8 +782,8 @@ private:
                             .incarnation = target.incarnation,
                             .session = target.server->open_session(d->from.node)};
             link(d->from, there);
-            if (d->from.node == compute) {
-                core.connected(d->from.session, now);
+            if (is_guest(d->from.node)) {
+                guest_on(d->from.node)->core.connected(d->from.session, now);
             } else {
                 running(d->from)->server->connected(d->from.session, now);
             }
@@ -589,20 +794,29 @@ private:
             master.on_report(
                 {.server_id = up->server, .report_seq = 0, .body = std::move(up->body)}, mnow());
         } else if (auto* o = std::get_if<DeliverOp>(&e)) {
-            // helm hands the hold role a scrub; other ops are not modelled.
+            // helm hands the hold role scrubs and deletes; other ops are
+            // not modelled.
             auto& h = _holds.at(o->op.server_id);
             if (const auto* sc = std::get_if<proto::ScrubVolume>(&o->op.args);
                 sc != nullptr && h.up) {
                 h.server->start_scrub(o->op.volume_id, o->op.op_id, o->op.epoch, sc->mib_per_s,
                                       now);
+            } else if (const auto* del = std::get_if<proto::DeleteReplica>(&o->op.args);
+                       del != nullptr && h.up) {
+                h.server->delete_replica(o->op.volume_id, o->op.op_id, o->op.epoch,
+                                         del->replica_gen, now);
             }
         } else if (auto* g = std::get_if<Grant>(&e)) {
             if (auto& h = _holds.at(g->server); h.up) {
                 h.server->grant_lease(g->volume, g->epoch, now);
             }
         } else if (auto* cfg = std::get_if<Deliver>(&e)) {
-            if (cfg->server == compute) {
-                static_cast<void>(core.set_route(cfg->config, now));
+            if (is_guest(cfg->server)) {
+                // A config for a detached guest's server still goes there,
+                // unless that server is cut off.
+                if (auto* guest = guest_on(cfg->server); guest != nullptr && !guest->partitioned) {
+                    static_cast<void>(guest->core.set_route(cfg->config, now));
+                }
                 return;
             }
             auto& h = _holds.at(cfg->server);
@@ -622,8 +836,8 @@ private:
     }
 
     auto closed(End e) -> void {
-        if (e.node == compute) {
-            core.disconnected(e.session, now);
+        if (is_guest(e.node)) {
+            guest_on(e.node)->core.disconnected(e.session, now);
         } else if (auto* h = running(e)) {
             h->server->close_session(e.session);
         }
@@ -631,24 +845,24 @@ private:
 
     // The initiator's side of the network: the session it wants, and its
     // frames.
-    auto initiator_io() -> bool {
+    auto initiator_io(Guest& g) -> bool {
         bool moved = false;
-        const auto t = core.target(now);
-        if (_initiator && (!t || t->session != _initiator->session)) {
-            hang_up(*_initiator);
-            _initiator.reset();
+        const auto t = g.core.target(now);
+        if (g.end && (!t || t->session != g.end->session)) {
+            hang_up(*g.end);
+            g.end.reset();
             moved = true;
         }
-        if (t && !_initiator) {
-            _initiator = End{.node = compute, .incarnation = 0, .session = t->session};
+        if (t && !g.end) {
+            g.end = End{.node = g.spec.server, .incarnation = 0, .session = t->session};
             BOOST_TEST((t->endpoint == endpoint(t->server_id)));
-            dial(*_initiator, t->server_id);
+            dial(*g.end, t->server_id);
             moved = true;
         }
-        for (auto& f : core.take_output()) {
+        for (auto& f : g.core.take_output()) {
             moved = true;
-            if (_initiator) {
-                send(*_initiator, std::move(f));
+            if (g.end) {
+                send(*g.end, std::move(f));
             }
         }
         return moved;
@@ -671,6 +885,12 @@ private:
         const auto* v = master.volume(vol);
         return _restart.empty() && !v->failover && in_sync() >= 2 &&
                std::ranges::all_of(_holds, [](const auto& kv) { return kv.second.up; });
+    }
+
+    [[nodiscard]] auto in_sync_or_leaving() const -> std::size_t {
+        return static_cast<std::size_t>(std::ranges::count_if(
+            master.volume(vol)->members,
+            [](const auto& mem) { return mem.role != proto::ReplicaRole::joining; }));
     }
 
     [[nodiscard]] auto in_sync() const -> std::size_t {
@@ -715,7 +935,8 @@ private:
 
     auto fault() -> void {
         if (_rng() % 2 == 0 && may_crash()) {
-            crash(_holds.at(1 + (_rng() % 3)), std::chrono::milliseconds{300 + _rng() % 3000});
+            crash(_holds.at(1 + (_rng() % _sc.holds)),
+                  std::chrono::milliseconds{300 + _rng() % 3000});
         } else if (!_peer.empty()) {
             // Cut one session.
             auto it = _peer.begin();
@@ -764,6 +985,11 @@ private:
         if (!_restart.empty()) {
             return false;
         }
+        if (!_pending.empty() || master.volume(vol)->move ||
+            !std::ranges::all_of(_drains, [&](std::uint64_t s) { return master.drained(s); }) ||
+            master.pending_ops() != 0) {
+            return false;
+        }
         const auto p = primary();
         const auto& h = _holds.at(p);
         return in_sync() == 3 && h.up && h.server->replicating(vol) == 0 &&
@@ -774,12 +1000,24 @@ private:
     }
 
     // ---- the guest ----------------------------------------------------------
-    [[nodiscard]] auto outstanding() const -> std::size_t { return _outstanding; }
+    [[nodiscard]] auto outstanding() const -> std::size_t {
+        std::size_t n = 0;
+        for (const auto& g : _guests) {
+            n += g->outstanding;
+        }
+        return n;
+    }
 
-    auto submit() -> void {
+    // One guest operation; `fenced`: a detached guest's, which must fail.
+    auto submit(std::size_t guest, std::optional<bool> write = std::nullopt, bool fenced = false)
+        -> void {
+        auto& g = *_guests.at(guest);
+        auto& core = g.core;
         const auto id = _next_op++;
         auto& op = _ops[id];
-        op.write = _rng() % 2 == 0;
+        op.guest = guest;
+        op.write = write.value_or(_rng() % 2 == 0);
+        op.expect_failure = fenced || (op.write && g.spec.mode == proto::AttachMode::ro);
         // Once the initiator has the grown capacity, half the I/O goes
         // across the old end.
         const bool across = core.capacity_bytes() >= grown_capacity * bs && _rng() % 2 == 0;
@@ -788,10 +1026,10 @@ private:
         op.n = std::min<std::uint64_t>(1 + (_rng() % 4), base + blocks - op.lba);
         op.buf.resize(op.n * bs);
         op.invoked = now;
-        ++_outstanding;
-        auto done = [this, id](blk::BackendResult r) {
+        ++g.outstanding;
+        auto done = [this, id, guest](blk::BackendResult r) {
             auto& o = _ops.at(id);
-            --_outstanding;
+            --_guests.at(guest)->outstanding;
             o.result = r;
             o.completed = now;
         };
@@ -817,7 +1055,9 @@ private:
         std::map<std::uint64_t, std::vector<W>> writes;  // by block
         std::map<std::uint64_t, W> by_id;
         for (const auto& [id, op] : _ops) {
-            if (op.write) {
+            // A write that failed must have left no trace: a read that
+            // returns its data finds no writer below.
+            if (op.write && op.result && op.result->has_value()) {
                 for (std::uint64_t b = op.lba; b < op.lba + op.n; ++b) {
                     const W w{.id = id, .begin = op.invoked, .end = *op.completed};
                     writes[b].push_back(w);
@@ -892,9 +1132,14 @@ private:
     std::map<End, End> _peer;
     std::map<End, Clock::time_point> _pipe_last;
     std::map<std::uint64_t, Clock::time_point> _restart;
-    std::optional<End> _initiator;
+    std::vector<std::unique_ptr<Guest>> _guests;
+    std::vector<Action> _pending;
+    std::set<std::size_t> _fenced_tried;
+    std::vector<std::uint64_t> _drains;
+    std::vector<m::KeyGrant> _keys;
+    std::size_t _min_in_sync{SIZE_MAX};
+    std::uint64_t _first_primary{0};
     std::map<std::uint64_t, Op> _ops;
-    std::size_t _outstanding = 0;
     std::uint64_t _next_op{1};
     std::size_t _crashes{0};
     std::size_t _primary_crashes{0};
@@ -979,7 +1224,7 @@ BOOST_AUTO_TEST_CASE(grows_and_changes_class_under_load,
     w.run();
     w.check();
     BOOST_TEST(w.master.volume(vol)->spec.capacity_blocks == grown_capacity);
-    BOOST_TEST(w.core.capacity_bytes() == grown_capacity * bs);
+    BOOST_TEST(w.core().capacity_bytes() == grown_capacity * bs);
     BOOST_TEST(w.master.volume(vol)->spec.volume_class.replicas == 3U);
     BOOST_TEST(w.copied() > 0U);  // the third replica was rebuilt
     BOOST_TEST(w.ops_past(capacity) > 0U);
@@ -1039,6 +1284,189 @@ BOOST_AUTO_TEST_CASE(fails_over_a_lost_primary, *utf::timeout(ak::test::unit_tim
     BOOST_TEST(w.primary_crashes() == 1U);
     BOOST_TEST(w.epoch() >= 3U);
 }
+
+// ---- tasks 17-18 ---------------------------------------------------------
+
+auto quiet_params(Clock::duration workload) -> Params {
+    return {.workload = workload,
+            .settle = 60s,
+            .max_latency = 2ms,
+            .faults = false,
+            .crash_primary = {},
+            .grow_at = {},
+            .reclass_at = {},
+            .corrupt_every = {}};
+}
+
+// What every live move must keep (Requirements 8.1, 8.2, 8.5).
+auto check_moves(World& w) -> void {
+    BOOST_TEST(w.min_in_sync() >= 3U);  // the new replica joins before the old leaves
+    BOOST_TEST(w.longest_op() < Clock::duration{1s});  // the guest saw a pause, never an error
+    BOOST_TEST(w.master.pending_ops() == 0U);          // every delete answered
+}
+
+// Each suite runs as its own ctest entry (tests/CMakeLists.txt), so each
+// stays inside ctest's per-test timeout under the sanitizers.
+BOOST_AUTO_TEST_SUITE(movement)
+
+BOOST_AUTO_TEST_CASE(moves_the_primary_and_a_secondary_under_load,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    // Four servers, three replicas: the primary hands over to a fresh
+    // replica on the fourth (Requirement 8.2), then a secondary moves to
+    // the server the primary left (8.1). Each source's replica is deleted.
+    const auto seed = env_number("AK_SIM_SEED").value_or(31);
+    World w{seed,
+            quiet_params(8s),
+            {.holds = 4,
+             .multi_attach = false,
+             .guests = {GuestSpec{}},
+             .actions = {{.at = 1500ms, .kind = ActionKind::move_primary, .guest = 0},
+                         {.at = 4s, .kind = ActionKind::move_secondary, .guest = 0}}}};
+    w.run();
+    w.check();
+    check_moves(w);
+    const auto first = w.first_primary();
+    BOOST_TEST(w.primary_now() != first);
+    const auto members = w.members();
+    BOOST_TEST(members.size() == 3U);
+    for (std::uint64_t s = 1; s <= 4; ++s) {
+        const bool member = std::ranges::find(members, s) != members.end();
+        BOOST_TEST_INFO("server " << s);
+        BOOST_TEST(w.holds_replica(s) == member);  // left replicas are deleted
+    }
+    BOOST_TEST(w.copied() > 0U);  // the targets were rebuilt
+    BOOST_TEST_MESSAGE(
+        "moves: " << w.ops() << " ops, longest "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(w.longest_op()).count()
+                  << " ms, epoch " << w.epoch());
+}
+
+BOOST_AUTO_TEST_CASE(moves_on_many_seeds, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    for (std::uint64_t seed = 300; seed < 300 + env_number("AK_SIM_SEEDS").value_or(2); ++seed) {
+        BOOST_TEST_CONTEXT("seed " << seed) {
+            World w{
+                seed,
+                quiet_params(6s),
+                {.holds = 4,
+                 .multi_attach = false,
+                 .guests = {GuestSpec{}},
+                 .actions = {
+                     {.at = std::chrono::milliseconds{500 + (seed % 7) * 300},
+                      .kind = seed % 2 == 0 ? ActionKind::move_primary : ActionKind::move_secondary,
+                      .guest = 0},
+                     {.at = 3s,
+                      .kind = seed % 2 == 0 ? ActionKind::move_secondary : ActionKind::move_primary,
+                      .guest = 0}}}};
+            w.run();
+            w.check();
+            check_moves(w);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(drains_two_servers_under_load, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    // Five servers: drain the primary's and a secondary's (Requirement
+    // 8.4). The controller moves each replica off, one at a time, keeps
+    // three in sync throughout, and reports both servers empty once their
+    // replicas are deleted.
+    World w{env_number("AK_SIM_SEED").value_or(41),
+            quiet_params(8s),
+            {.holds = 5,
+             .multi_attach = false,
+             .guests = {GuestSpec{}},
+             .actions = {{.at = 1s, .kind = ActionKind::drain_primary, .guest = 0},
+                         {.at = 1s, .kind = ActionKind::drain_secondary, .guest = 0}}}};
+    w.run();
+    w.check();
+    check_moves(w);
+    BOOST_REQUIRE(w.drained_servers().size() == 2U);
+    for (const auto s : w.drained_servers()) {
+        BOOST_TEST_INFO("server " << s);
+        BOOST_TEST(w.master.drained(s));
+        BOOST_TEST(!w.holds_replica(s));
+        const auto members = w.members();
+        BOOST_TEST((std::ranges::find(members, s) == members.end()));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(moves_while_unattached, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    // Requirement 8.3: the same mechanism with no guest attached.
+    World w{51,
+            quiet_params(4s),
+            {.holds = 4,
+             .multi_attach = false,
+             .guests = {},
+             .actions = {{.at = 500ms, .kind = ActionKind::move_primary, .guest = 0}}}};
+    w.run();
+    w.check();
+    BOOST_TEST(w.min_in_sync() >= 3U);
+    BOOST_TEST(w.primary_now() != w.first_primary());
+    BOOST_TEST(w.master.pending_ops() == 0U);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_AUTO_TEST_SUITE(multi_attach)
+
+// Three guests on three compute servers, two read-write and one
+// read-only, sharing one multi-attach volume (Requirement 4).
+auto three_guests() -> std::vector<GuestSpec> {
+    return {GuestSpec{.server = compute, .attachment = att, .mode = proto::AttachMode::rw},
+            GuestSpec{.server = compute + 1, .attachment = att + 1, .mode = proto::AttachMode::rw},
+            GuestSpec{.server = compute + 2, .attachment = att + 2, .mode = proto::AttachMode::ro}};
+}
+
+BOOST_AUTO_TEST_CASE(guests_on_three_servers_share_a_volume,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    // Overlapping reads and writes from every guest are linearizable per
+    // block (4.2); the read-only guest's writes fail and leave nothing
+    // (4.3); each attachment got the key on its own server (4.4); and a
+    // guest cut off from the controller and detached is fenced while the
+    // others carry on without an error (4.5, 6.9).
+    World w{env_number("AK_SIM_SEED").value_or(61),
+            quiet_params(6s),
+            {.holds = 3,
+             .multi_attach = true,
+             .guests = three_guests(),
+             .actions = {{.at = 3s, .kind = ActionKind::detach_guest, .guest = 1}}}};
+    w.run();
+    w.check();
+    for (std::size_t g = 0; g < 3; ++g) {
+        BOOST_TEST_INFO("guest " << g);
+        BOOST_TEST(w.succeeded(g, false) > 0U);
+    }
+    BOOST_TEST(w.succeeded(0, true) > 0U);
+    BOOST_TEST(w.succeeded(1, true) > 0U);
+    BOOST_TEST(w.succeeded(2, true) == 0U);
+    BOOST_TEST(w.expected_failures() > 2U);  // ro writes, and the fenced pair
+    BOOST_REQUIRE(w.keys().size() == 3U);
+    for (std::size_t g = 0; g < 3; ++g) {
+        BOOST_TEST(w.keys()[g].server_id == compute + g);
+        BOOST_TEST(w.keys()[g].attachment_id == att + g);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(guests_share_a_volume_through_crashes_and_moves,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    // The same three guests while holds crash and sessions are cut, and
+    // the primary moves: still one order of writes per block.
+    for (std::uint64_t seed = 400; seed < 400 + env_number("AK_SIM_SEEDS").value_or(3); ++seed) {
+        BOOST_TEST_CONTEXT("seed " << seed) {
+            auto p = quiet_params(5s);
+            p.faults = true;
+            World w{seed,
+                    p,
+                    {.holds = 4,
+                     .multi_attach = true,
+                     .guests = three_guests(),
+                     .actions = {{.at = 2s, .kind = ActionKind::move_primary, .guest = 0}}}};
+            w.run();
+            w.check();
+        }
+    }
+}
+
+BOOST_AUTO_TEST_SUITE_END()
 
 // The nightly sweep (ctest -C Nightly -L nightly): many more seeds.
 BOOST_AUTO_TEST_CASE(long_sweep, *utf::disabled()) {

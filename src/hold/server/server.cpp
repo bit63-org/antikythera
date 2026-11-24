@@ -1889,6 +1889,48 @@ auto HoldServer::reconciling(std::uint64_t volume_id) const -> bool {
 
 // ---- scrubbing -------------------------------------------------------------
 
+auto HoldServer::replica_on_disk(std::uint64_t volume_id, std::uint32_t replica_gen) const -> bool {
+    return _files->exists(_config.data_dir / store::replica_dir_name(volume_id, replica_gen));
+}
+
+auto HoldServer::delete_replica(std::uint64_t volume_id, std::uint64_t op_id, std::uint64_t epoch,
+                                std::uint32_t replica_gen, Clock::time_point now) -> void {
+    _now = now;
+    const auto answer = [&](proto::OpStatus status) {
+        _reports.emplace_back(proto::OpOutcome{.volume_id = volume_id,
+                                               .op_id = op_id,
+                                               .epoch = epoch,
+                                               .detail = 0,
+                                               .kind = proto::VolumeOpKind::delete_replica,
+                                               .status = status,
+                                               .slot = 0});
+    };
+    if (const auto it = _volumes.find(volume_id); it != _volumes.end()) {
+        const auto* me = find_member(it->second.config, _config.server_id);
+        if (me != nullptr && me->replica_gen == replica_gen) {
+            // Still a member as far as this server knows: it has not
+            // applied the epoch without it yet.
+            answer(proto::OpStatus::stale_epoch);
+            return;
+        }
+        // Not this volume's live replica (apply_config dropped the store
+        // when the member left), so nothing has it open.
+        if (it->second.store && it->second.store->meta().replica_gen == replica_gen) {
+            answer(proto::OpStatus::stale_epoch);
+            return;
+        }
+    }
+    const auto dir = _config.data_dir / store::replica_dir_name(volume_id, replica_gen);
+    if (_files->exists(dir)) {
+        if (!_files->remove_all(dir) || !_files->sync_dir(_config.data_dir)) {
+            answer(proto::OpStatus::io_error);
+            return;
+        }
+        ++_stats.deleted;
+    }
+    answer(proto::OpStatus::ok);
+}
+
 auto HoldServer::start_scrub(std::uint64_t volume_id, std::uint64_t op_id, std::uint64_t epoch,
                              std::uint32_t mib_per_s, Clock::time_point now) -> void {
     _now = now;

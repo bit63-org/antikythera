@@ -55,6 +55,17 @@ everything above them.
 2. Network data-plane slots SHALL provide an uplink path (front-panel or
    midplane Ethernet) to the datacenter network.
 3. Storage slots SHALL accommodate U.2/E3.S drives or storage boards.
+4. Every storage-capable data-plane slot (one that can host an oar-blk
+   initiator or a hold role, block-volume-service Requirement 13) SHALL
+   provide a management-fabric Ethernet port of its own, separate from
+   the control-plane slot's management port (Requirement 3.2), wired to
+   the server's management uplink. Storage traffic and object-store
+   access from that slot SHALL use only this port; it SHALL NOT be
+   bridged to helm's port on the board or the backplane.
+5. On a storage server the management uplink SHALL be at least 25 GbE,
+   sized for about `replicas` × guest write bandwidth plus reads plus
+   the rebuild budget (block-volume-service design "Storage traffic on
+   the management fabric").
 
 ### Requirement 5: GPU provisions
 
@@ -75,3 +86,45 @@ everything above them.
    possible later.
 2. PCIe IDE and TDISP support in the switch SHALL NOT be required in the
    first revision; a later revision MAY add it.
+
+### Requirement 7: Management fabric segments and traffic classes
+
+**User Story:** As the operator, I want storage traffic from untrusted
+data-plane boards to share the management fabric without reaching the
+control plane or starving it.
+
+#### Acceptance Criteria
+
+1. The management fabric SHALL carry at least two segments, each a VLAN
+   with its own address range: the **control segment** (helm's
+   controller link, Requirement 3.2, controller-interface Requirement 2)
+   and the **storage segment** (initiator, hold and object-store
+   traffic, Requirement 4.4).
+2. Data-plane management ports SHALL be access ports on the storage
+   segment only; the control-plane slot's port SHALL be an access port
+   on the control segment only. No board SHALL be able to choose its
+   VLAN by tagging.
+3. The top-of-rack switches (or the first routed hop) SHALL refuse
+   traffic from the storage segment to helm and controller addresses,
+   and from the control segment's helm addresses to the storage
+   segment, so a compromised data-plane board can reach other storage
+   roles but never the control plane (block-volume-service
+   Requirement 13.5). The object store SHALL be reachable from the
+   storage segment.
+4. The fabric SHALL honour three traffic classes, marked by the sender
+   in DSCP and, on tagged links, 802.1p:
+
+   | Class | Traffic | DSCP | 802.1p | Scheduling |
+   |---|---|---|---|---|
+   | control | controller link, lease requests and grants and reports through helm | CS6 (48) | 6 | strict priority, policed to 10 % of the link |
+   | storage I/O | initiator to primary, replication (`REPL_WRITE`/`REPL_ACK`) | AF41 (34) | 4 | weighted, 75 % of the remainder |
+   | background | rebuild, resync, hydration, scrub, snapshot upload | AF11 (10) | 1 | weighted, 25 % of the remainder, may borrow when idle |
+
+   Ports on the storage segment SHALL re-mark any frame claiming the
+   control class to background (an untrusted board cannot promote
+   itself); the control segment trusts helm's marking.
+5. A saturated storage segment SHALL NOT delay the control class beyond
+   its own queueing: lease renewals ride the control class, so storage
+   load cannot cost a healthy primary its lease (block-volume-service
+   Requirement 13.6).
+

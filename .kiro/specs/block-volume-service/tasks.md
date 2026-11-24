@@ -1,6 +1,6 @@
 # Implementation Plan — hold: the fault-tolerant block volume service
 
-## Status: 13/24 tasks complete
+## Status: 14/24 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -87,13 +87,20 @@ repository. Prerequisites outside this spec: oar-blk task 14
   request stays set until the guest releases, a forced detach, or the
   VM goes); hull's own `vm.remove-device` path (hull task 9) and the
   harbor run with a real guest (task 15).
-- [ ] 14. controller-interface and backplane spec updates: a
+- [x] 14. controller-interface and backplane spec updates: a
   management-fabric port on storage-capable data-plane slots, the storage
   VLAN and traffic classes (backplane), and EC2 mapping of
   Requirement 14 (`CreateVolume` types, `ModifyVolume`, snapshots,
   `CopyVolumes`, `EnableFastSnapshotRestores`, `EnableVolumeIO`, status
   checks, `busy`), replacing controller Requirement 6.2's server-local
   rule for network volumes. _Requirements: 13.5-13.6, 14_ (cloud, docs)
+  Done: backplane Requirement 4.4-4.5 (per-slot storage port, 25 GbE
+  floor) and Requirement 7 (control and storage VLANs, ACLs, DSCP/802.1p
+  classes CS6, AF41, AF11, re-marking), design "Management fabric",
+  task 6; controller-interface Requirement 2.4, 6.2 rewritten (network
+  volumes do not pin an instance; local volumes do), Requirement 9 and
+  design "Network volumes in EC2" (parameters, volume and attachment
+  states, status checks, operations).
 - [ ] 15. harbor: storage topology (two compute, three storage servers,
   storage VLAN on the management bridge, refused from helm
   addresses), `ak-volctl` test controller on `ak_hold_master`; boot

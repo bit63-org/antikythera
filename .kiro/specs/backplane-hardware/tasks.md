@@ -13,3 +13,7 @@
   _Requirements: 2.1, 2.3_
 - [ ] 5. Schematic and layout (after decisions in design.md).
   _Requirements: 1–5_
+- [ ] 6. Management fabric: per-slot storage ports, control and storage
+  VLANs, switch ACLs and the three DSCP/802.1p classes, validated on the
+  bench switch with a saturated storage segment and lease traffic.
+  _Requirements: 4.4-4.5, 7_

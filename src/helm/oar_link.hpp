@@ -135,6 +135,18 @@ public:
     // (nic_id, attachment) order. A page that disagrees with the first
     // page's total, or a role that never finishes, is a bad_response.
     auto group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError>;
+    // Block volumes, to a hold role: one controller ReplicaConfig or
+    // VolumeOp frame unmodified, and a lease acknowledgement.
+    auto replica_config(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
+    auto volume_op(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
+    auto lease_grant(const oar::LeaseGrant& grant) -> std::expected<void, LinkError>;
+    // Takes up to `max` whole reports the hold role queued (encoded
+    // proto::Reports, not yet decoded), oldest first; each is acknowledged
+    // with the next request. A chunk that does not continue its report is
+    // a bad_response, and the report is read again from the start next
+    // time.
+    auto hold_reports(std::size_t max)
+        -> std::expected<std::vector<std::vector<std::byte>>, LinkError>;
 
     [[nodiscard]] auto stats() const noexcept -> const LinkStats& { return _stats; }
 
@@ -156,6 +168,7 @@ private:
     mctp::Assembler _assembler;
     std::uint8_t _next_tag{0};
     LinkStats _stats;
+    std::uint64_t _report_ack{0};  // the last hold report read whole
 };
 
 // What a data-plane role implements to answer OarLink. Each call returns the
@@ -216,6 +229,22 @@ public:
     // A whole, reassembled TunnelPeers frame, not yet decoded or verified.
     virtual auto tunnel_peers(std::span<const std::byte> /*frame*/) -> oar::Status {
         return oar::Status::unsupported;
+    }
+    // Block volumes, which only the hold role keeps. The frames are not yet
+    // decoded or verified and are valid only during the call; a role
+    // answers hold_reports through an oar::ReportQueue.
+    virtual auto replica_config(std::span<const std::byte> /*frame*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    virtual auto volume_op(std::span<const std::byte> /*frame*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    virtual auto lease_grant(const oar::LeaseGrant& /*grant*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    virtual auto hold_reports(const oar::ReportRequest& /*request*/)
+        -> std::expected<oar::ReportChunk, oar::Status> {
+        return std::unexpected(oar::Status::unsupported);
     }
 };
 

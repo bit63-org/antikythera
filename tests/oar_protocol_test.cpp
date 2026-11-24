@@ -20,7 +20,9 @@
 #include "helm/oar_protocol.hpp"
 #include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
+#include "proto/replica_config.hpp"
 #include "proto/report.hpp"
+#include "proto/volume_op.hpp"
 #include "proto/tunnel_peers.hpp"
 #include "test_support.hpp"
 
@@ -610,6 +612,107 @@ BOOST_AUTO_TEST_CASE(group_policy_frame_and_usage_request) {
     BOOST_TEST(
         (oar::decode_usage_request(bytes_of(0, 0, 1, 0)).error() == BodyError::reserved_not_zero));
     BOOST_TEST((oar::decode_usage_request(bytes_of(0, 0)).error() == BodyError::truncated));
+}
+
+BOOST_AUTO_TEST_CASE(hold_mirrors_match_proto) {
+    BOOST_TEST(oar::min_replica_config_frame == ak::proto::replica_config_size(1, 0));
+    BOOST_TEST(oar::max_replica_config_frame == ak::proto::max_replica_config_size);
+    BOOST_TEST(oar::volume_op_frame_size == ak::proto::volume_op_size);
+    BOOST_TEST(oar::max_role_report >= ak::proto::max_report_size);
+    BOOST_TEST(oar::max_replica_config_frame <= oar::max_body_size);
+    BOOST_TEST(oar::response_head_size + oar::report_chunk_head_size + oar::max_report_chunk ==
+               oar::max_body_size);
+}
+
+BOOST_AUTO_TEST_CASE(hold_frames_lease_grant_and_report_request) {
+    const std::vector<std::byte> config(oar::min_replica_config_frame + 32, std::byte{4});
+    BOOST_TEST(oar::decode_replica_config_frame(oar::encode_replica_config_frame(config).value())
+                   .value()
+                   .size() == config.size());
+    BOOST_TEST(
+        (oar::decode_replica_config_frame(std::vector<std::byte>(oar::min_replica_config_frame - 1))
+             .error() == BodyError::truncated));
+    BOOST_TEST(
+        (oar::encode_replica_config_frame(std::vector<std::byte>(oar::max_replica_config_frame + 1))
+             .error() == BodyError::trailing_bytes));
+    const std::vector<std::byte> op(oar::volume_op_frame_size, std::byte{5});
+    BOOST_TEST(
+        oar::decode_volume_op_frame(oar::encode_volume_op_frame(op).value()).value().size() ==
+        op.size());
+    BOOST_TEST(
+        (oar::decode_volume_op_frame(std::span{op}.first(10)).error() == BodyError::truncated));
+
+    const oar::LeaseGrant g{.volume_id = 0x0102, .epoch = 7};
+    const auto gb = oar::encode_lease_grant(g).value();
+    BOOST_TEST((gb == bytes_of(0x02, 0x01, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0)));
+    BOOST_TEST((oar::decode_lease_grant(gb).value() == g));
+    BOOST_TEST(
+        (oar::encode_lease_grant({.volume_id = 0, .epoch = 7}).error() == BodyError::zero_id));
+    BOOST_TEST((oar::decode_lease_grant(std::vector<std::byte>(16)).error() == BodyError::zero_id));
+    BOOST_TEST((oar::decode_lease_grant(std::span{gb}.first(15)).error() == BodyError::truncated));
+
+    const oar::ReportRequest req{.ack = 9, .offset = 4000};
+    const auto rb = oar::encode_report_request(req).value();
+    BOOST_TEST(rb.size() == oar::report_request_size);
+    BOOST_TEST((oar::decode_report_request(rb).value() == req));
+    auto reserved = rb;
+    reserved.back() = std::byte{1};
+    BOOST_TEST((oar::decode_report_request(reserved).error() == BodyError::reserved_not_zero));
+    BOOST_TEST((oar::encode_report_request(
+                    {.ack = 0, .offset = static_cast<std::uint32_t>(oar::max_role_report)})
+                    .error() == BodyError::bad_chunk));
+}
+
+BOOST_AUTO_TEST_CASE(report_chunk_round_trip_and_rules) {
+    const std::vector<std::byte> bytes(100, std::byte{6});
+    const oar::ReportChunk c{.report_seq = 3, .total = 300, .offset = 200, .chunk = bytes};
+    const auto b = oar::encode_report_chunk(c).value();
+    BOOST_TEST(b.size() == oar::report_chunk_head_size + bytes.size());
+    const auto back = oar::decode_report_chunk(b).value();
+    BOOST_TEST(back.report_seq == 3U);
+    BOOST_TEST(back.total == 300U);
+    BOOST_TEST(back.offset == 200U);
+    BOOST_TEST(std::ranges::equal(back.chunk, bytes));
+    // Nothing to report: all zero.
+    const auto none = oar::encode_report_chunk({}).value();
+    BOOST_TEST(none.size() == oar::report_chunk_head_size);
+    BOOST_TEST(oar::decode_report_chunk(none).value().total == 0U);
+    for (const auto& bad : {
+             oar::ReportChunk{.report_seq = 3, .total = 0, .offset = 0, .chunk = {}},
+             oar::ReportChunk{.report_seq = 0, .total = 300, .offset = 0, .chunk = bytes},
+             oar::ReportChunk{.report_seq = 3, .total = 300, .offset = 250, .chunk = bytes},
+             oar::ReportChunk{.report_seq = 3, .total = 300, .offset = 300, .chunk = bytes},
+             oar::ReportChunk{.report_seq = 3, .total = 300, .offset = 0, .chunk = {}},
+         }) {
+        BOOST_TEST(!oar::encode_report_chunk(bad).has_value());
+    }
+    BOOST_TEST((oar::decode_report_chunk(std::span{b}.first(15)).error() == BodyError::truncated));
+}
+
+BOOST_AUTO_TEST_CASE(report_queue_serves_and_acknowledges) {
+    oar::ReportQueue q{2};
+    BOOST_TEST(oar::encode_report_chunk(q.serve({}).value()).has_value());
+    BOOST_TEST(q.serve({}).value().total == 0U);
+    BOOST_TEST(!q.serve({.ack = 0, .offset = 1}).has_value());  // nothing to continue
+    BOOST_TEST(!q.push(0, {std::byte{1}}));
+    BOOST_TEST(!q.push(5, {}));
+    const std::vector<std::byte> big(oar::max_report_chunk + 10, std::byte{7});
+    BOOST_TEST(q.push(5, big));
+    BOOST_TEST(q.push(6, {std::byte{8}}));
+    BOOST_TEST(q.push(7, {std::byte{9}}));  // the oldest goes
+    BOOST_TEST(q.dropped() == 1U);
+    BOOST_TEST(q.serve({}).value().report_seq == 6U);
+    BOOST_TEST(q.push(8, big));
+    // An ack for another report drops nothing.
+    BOOST_TEST(q.serve({.ack = 99, .offset = 0}).value().report_seq == 7U);
+    auto c = q.serve({.ack = 7, .offset = 0}).value();
+    BOOST_TEST(c.report_seq == 8U);
+    BOOST_TEST(c.chunk.size() == oar::max_report_chunk);
+    c = q.serve({.ack = 7, .offset = static_cast<std::uint32_t>(oar::max_report_chunk)}).value();
+    BOOST_TEST(c.chunk.size() == 10U);
+    BOOST_TEST(!q.serve({.ack = 7, .offset = static_cast<std::uint32_t>(big.size())}).has_value());
+    BOOST_TEST(q.serve({.ack = 8, .offset = 0}).value().total == 0U);
+    BOOST_TEST(q.size() == 0U);
 }
 
 BOOST_AUTO_TEST_CASE(usage_page_round_trip_and_rules) {

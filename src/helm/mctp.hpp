@@ -252,6 +252,10 @@ enum class VendorType : std::uint8_t {
     group_policy = 0x0E,
     group_usage = 0x0F,
     tunnel_peers = 0x10,
+    replica_config = 0x11,
+    volume_op = 0x12,
+    lease_grant = 0x13,
+    hold_reports = 0x14,
 };
 
 struct VendorHeader {

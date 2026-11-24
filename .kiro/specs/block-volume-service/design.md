@@ -146,8 +146,20 @@ ReplicaConfig {
 Rules checked by the decoder: exactly one primary unless `io_suspended`;
 `joining` and `leaving` members are never primary; at most 5 members;
 attachment IDs unique; read-write attachments beyond one only with
-`multi_attach`. helm verifies the signature with the controller keys it
-already holds for `MapUpdate`; each role re-checks the epoch order.
+`multi_attach`. The hold role verifies the signature itself, with the
+controller keys it is started with, as oar-net does for `MapUpdate`; helm
+relays the frame byte for byte without checking it (task 12: a helm that
+cannot forge a config is one less component to trust). The same holds
+for `VolumeOp`. Each role re-checks the epoch order.
+
+On helm's sideband the frames travel as OarLink requests `replica_config`
+and `volume_op`; the controller's lease grants (an unsigned 24-byte
+`lease_grant` record on the controller link, `server_id | volume_id |
+epoch`) as `lease_grant`. helm keeps the newest config per volume and
+replays them to a hold role that restarts. Reports go the other way:
+helm polls `hold_reports`, which returns one encoded report (in chunks
+when large) and drops the one before when the request acknowledges it,
+so each report goes up once and none is lost while helm restarts.
 
 ### VolumeOp (controller → helm → hold)
 

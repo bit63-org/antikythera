@@ -98,7 +98,7 @@ BOOST_AUTO_TEST_CASE(oversized_record_fails_before_its_payload_arrives) {
 BOOST_AUTO_TEST_CASE(bad_type_and_reserved_break_the_stream) {
     for (const auto& [bytes, want] :
          {std::pair{bytes_of(0, 0, 0, 0, 0, 0, 0, 0), DecodeError::bad_record_type},
-          std::pair{bytes_of(0, 0, 0, 0, 8, 0, 0, 0), DecodeError::bad_record_type},
+          std::pair{bytes_of(0, 0, 0, 0, 12, 0, 0, 0), DecodeError::bad_record_type},
           std::pair{bytes_of(0, 0, 0, 0, 1, 0, 0, 1), DecodeError::reserved_not_zero}}) {
         proto::RecordDecoder d;
         d.feed(bytes);
@@ -114,7 +114,7 @@ BOOST_AUTO_TEST_CASE(largest_tunnel_peer_set_fits_a_record) {
 }
 
 BOOST_AUTO_TEST_CASE(encode_refuses_what_decode_would) {
-    auto bad_type = proto::encode_record(static_cast<RecordType>(9), {});
+    auto bad_type = proto::encode_record(static_cast<RecordType>(12), {});
     BOOST_REQUIRE(!bad_type.has_value());
     BOOST_TEST((bad_type.error() == DecodeError::bad_record_type));
     const std::vector<std::byte> huge(proto::max_record_payload + 1);
@@ -176,3 +176,42 @@ BOOST_AUTO_TEST_CASE(hello_round_trips_and_is_strict) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_AUTO_TEST_CASE(lease_grant_round_trips_and_is_strict) {
+    const proto::LeaseGrant g{.server_id = 0x0102'0304'0506'0708, .volume_id = 7, .epoch = 3};
+    auto b = proto::encode_lease_grant(g);
+    BOOST_REQUIRE(b.has_value());
+    BOOST_TEST(b->size() == proto::lease_grant_size);
+    BOOST_TEST((*b == bytes_of(0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x07, 0, 0, 0, 0, 0,
+                               0, 0, 0x03, 0, 0, 0, 0, 0, 0, 0)));
+    auto back = proto::decode_lease_grant(*b);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST((*back == g));
+    for (std::size_t n = 0; n < b->size(); ++n) {
+        BOOST_TEST(
+            (proto::decode_lease_grant(std::span{*b}.first(n)).error() == DecodeError::truncated));
+    }
+    auto longer = *b;
+    longer.push_back(std::byte{0});
+    BOOST_TEST((proto::decode_lease_grant(longer).error() == DecodeError::trailing_bytes));
+    BOOST_TEST((proto::encode_lease_grant({.server_id = 0, .volume_id = 7, .epoch = 3}).error() ==
+                DecodeError::bad_server_id));
+    BOOST_TEST((proto::encode_lease_grant({.server_id = 1, .volume_id = 0, .epoch = 3}).error() ==
+                DecodeError::bad_id));
+    BOOST_TEST((proto::encode_lease_grant({.server_id = 1, .volume_id = 7, .epoch = 0}).error() ==
+                DecodeError::bad_epoch));
+    auto zero_epoch = *b;
+    std::ranges::fill(std::span{zero_epoch}.subspan(16), std::byte{0});
+    BOOST_TEST((proto::decode_lease_grant(zero_epoch).error() == DecodeError::bad_epoch));
+}
+
+BOOST_AUTO_TEST_CASE(block_volume_frames_fit_a_record) {
+    BOOST_TEST(proto::max_record_payload >= proto::max_replica_config_size);
+    BOOST_TEST(proto::max_record_payload >= proto::volume_op_size);
+    BOOST_TEST(proto::max_record_payload >= proto::volume_key_size);
+    for (const auto t : {RecordType::replica_config, RecordType::volume_op, RecordType::volume_key,
+                         RecordType::lease_grant}) {
+        BOOST_TEST(proto::encode_record(t, std::vector<std::byte>(4)).has_value());
+    }
+    BOOST_TEST(!proto::encode_record(static_cast<RecordType>(12), {}).has_value());
+}

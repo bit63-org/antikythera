@@ -4,20 +4,34 @@
 // ak-hold: the storage role (.kiro/specs/block-volume-service/ task 6).
 //
 //   ak-hold --server-id N --listen HOST:PORT --data-dir DIR
-//           --ca FILE --cert FILE --key FILE --configs DIR
+//           --ca FILE --cert FILE --key FILE
+//           ( --sideband PATH --addr A --helm-addr A --eid E --helm-eid E
+//             --controller-key ID:HEX [--controller-key ID:HEX ...]
+//           | --configs DIR )
 //
 // Listens for TLS sessions from initiators and peers on HOST:PORT (an
 // address on the storage segment; IPv6 literals in brackets), keeps its
 // replicas under --data-dir, and presents --cert (from the controller's
 // CA, carrying urn:antikythera:server:N) with --key, trusting --ca.
 //
-// helm sideband stub: until helm relays ReplicaConfigs over this role's
-// sideband (task 12), they come from --configs, a directory of encoded
-// ReplicaConfig frames (*.rcfg) that helm has already verified. It is read
-// at start and rescanned every second; a frame is applied when its epoch
-// is new. SIGINT or SIGTERM stops the role.
+// helm's sideband (task 12): the process listens on PATH (SOCK_SEQPACKET;
+// a stale socket there is removed) and serves one helm connection at a
+// time with HoldRole (hold_role.hpp), listening again if helm goes away.
+// --addr/--eid are this board's bus address and EID, --helm-addr/--helm-eid
+// helm's, as in helm's `slot` directive. Configs and ops must verify under
+// one of the --controller-key keys (a key ID and its Ed25519 public key in
+// 64 hex digits). The controller grants leases, so a primary serves reads
+// only while it holds one.
+//
+// --configs DIR instead stands in for helm when there is no controller: a
+// directory of encoded ReplicaConfig frames (*.rcfg), trusted as they are
+// (no signature check) and without leases. It is read at start and
+// rescanned every second; a frame is applied when its epoch is new.
+// SIGINT or SIGTERM stops the role.
 
+#include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -26,6 +40,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <optional>
 #include <print>
 #include <set>
@@ -35,8 +50,15 @@
 #include <system_error>
 #include <vector>
 
+#include <openssl/rand.h>
+#include <sys/stat.h>
+
+#include "helm/oar_link.hpp"
+#include "helm/sideband_binding.hpp"
+#include "hold/server/hold_role.hpp"
 #include "hold/server/node.hpp"
 #include "hold/store/file_layer.hpp"
+#include "hull/signature_verifier.hpp"
 #include "proto/replica_config.hpp"
 
 namespace {
@@ -56,12 +78,26 @@ struct Options {
     std::filesystem::path cert;
     std::filesystem::path key;
     std::filesystem::path configs;
+    std::string sideband;
+    std::optional<std::uint64_t> addr;
+    std::optional<std::uint64_t> helm_addr;
+    std::optional<std::uint64_t> eid;
+    std::optional<std::uint64_t> helm_eid;
+    std::vector<ak::hull::ControllerKey> keys;
 };
+
+constexpr std::uint64_t max_bus_addr = 0x7F;
+constexpr std::uint64_t max_eid = 0xFE;
+constexpr std::size_t key_hex_digits = 2 * ak::hull::ed25519_public_key_size;
+constexpr int base_hex = 16;
 
 auto usage() -> int {
     std::println(stderr,
                  "usage: ak-hold --server-id N --listen HOST:PORT --data-dir DIR\n"
-                 "               --ca FILE --cert FILE --key FILE --configs DIR");
+                 "               --ca FILE --cert FILE --key FILE\n"
+                 "               ( --sideband PATH --addr A --helm-addr A --eid E --helm-eid E\n"
+                 "                 --controller-key ID:HEX [--controller-key ID:HEX ...]\n"
+                 "               | --configs DIR )");
     return 2;
 }
 
@@ -85,6 +121,38 @@ auto parse_u64(std::string_view s) -> std::optional<std::uint64_t> {
         v = (v * 10) + static_cast<std::uint64_t>(ch - '0');
     }
     return v;
+}
+
+auto parse_bounded(std::string_view s, std::uint64_t max) -> std::optional<std::uint64_t> {
+    const auto v = parse_u64(s);
+    if (!v || *v > max) {
+        return std::nullopt;
+    }
+    return v;
+}
+
+// ID:HEX, the key in 64 hex digits.
+auto parse_controller_key(std::string_view s) -> std::optional<ak::hull::ControllerKey> {
+    const auto colon = s.find(':');
+    if (colon == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const auto id = parse_bounded(s.substr(0, colon), UINT16_MAX);
+    const std::string_view hex = s.substr(colon + 1);
+    if (!id || hex.size() != key_hex_digits) {
+        return std::nullopt;
+    }
+    ak::hull::ControllerKey key{.id = static_cast<ak::hull::KeyId>(*id), .key = {}};
+    for (std::size_t i = 0; i < key.key.size(); ++i) {
+        const std::string_view pair = hex.substr(2 * i, 2);
+        std::uint8_t b = 0;
+        const auto [p, ec] = std::from_chars(pair.data(), pair.data() + pair.size(), b, base_hex);
+        if (ec != std::errc{} || p != pair.data() + pair.size()) {
+            return std::nullopt;
+        }
+        key.key[i] = std::byte{b};
+    }
+    return key;
 }
 
 // HOST:PORT, [V6]:PORT.
@@ -135,12 +203,38 @@ auto parse(int argc, char** argv) -> std::optional<Options> {
             o.key = value;
         } else if (flag == "--configs") {
             o.configs = value;
+        } else if (flag == "--sideband") {
+            o.sideband = value;
+        } else if (flag == "--addr") {
+            o.addr = parse_bounded(value, max_bus_addr);
+        } else if (flag == "--helm-addr") {
+            o.helm_addr = parse_bounded(value, max_bus_addr);
+        } else if (flag == "--eid") {
+            o.eid = parse_bounded(value, max_eid);
+        } else if (flag == "--helm-eid") {
+            o.helm_eid = parse_bounded(value, max_eid);
+        } else if (flag == "--controller-key") {
+            auto key = parse_controller_key(value);
+            if (!key) {
+                return std::nullopt;
+            }
+            o.keys.push_back(*key);
         } else {
             return std::nullopt;
         }
     }
     if (o.server_id == 0 || o.host.empty() || o.data_dir.empty() || o.ca.empty() ||
-        o.cert.empty() || o.key.empty() || o.configs.empty()) {
+        o.cert.empty() || o.key.empty()) {
+        return std::nullopt;
+    }
+    // Exactly one source of configs: helm's sideband or the directory.
+    const bool sideband =
+        !o.sideband.empty() || o.addr || o.helm_addr || o.eid || o.helm_eid || !o.keys.empty();
+    if (sideband == !o.configs.empty()) {
+        return std::nullopt;
+    }
+    if (sideband && (o.sideband.empty() || !o.addr || !o.helm_addr || !o.eid || !o.helm_eid ||
+                     o.keys.empty())) {
         return std::nullopt;
     }
     return o;
@@ -190,6 +284,69 @@ private:
     std::set<std::filesystem::path> _bad;
 };
 
+// A stale socket from an earlier run may be removed; anything else at the
+// path is left alone and refused by SocketListener::bind.
+auto remove_stale_socket(const std::string& path) -> void {
+    struct stat st{};
+    if (::lstat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode)) {
+        std::filesystem::remove(path);
+    }
+}
+
+auto random_seq() -> std::uint64_t {
+    std::array<unsigned char, sizeof(std::uint64_t)> b{};
+    std::uint64_t v = 0;
+    if (RAND_bytes(b.data(), static_cast<int>(b.size())) == 1) {
+        for (const auto x : b) {
+            v = (v << 8U) | x;
+        }
+    }
+    return v == 0 ? 1 : v;
+}
+
+// helm's sideband: one helm connection at a time, served with HoldRole.
+class Sideband {
+public:
+    Sideband(std::unique_ptr<ak::helm::SocketListener> listener, ak::helm::LinkConfig link,
+             ak::hold::HoldRole& role)
+        : _listener{std::move(listener)}, _link{link}, _role{role} {}
+
+    [[nodiscard]] auto fd() const -> int { return _socket ? _socket->fd() : _listener->fd(); }
+
+    // fd() is readable (or hung up).
+    auto serve() -> void {
+        constexpr auto no_wait = std::chrono::milliseconds{0};
+        if (!_socket) {
+            auto accepted = _listener->accept(no_wait);
+            if (accepted) {
+                _socket = std::move(*accepted);
+                _endpoint = std::make_unique<ak::helm::OarEndpoint>(*_socket, _link);
+                std::println(stderr, "ak-hold: helm connected");
+            }
+            return;
+        }
+        for (;;) {  // each call takes one packet
+            auto r = _endpoint->serve_one(_role, no_wait);
+            if (r) {
+                continue;
+            }
+            if (r.error() != ak::helm::BindingError::timed_out) {
+                std::println(stderr, "ak-hold: helm sideband: {}", ak::helm::to_string(r.error()));
+                _endpoint.reset();
+                _socket.reset();
+            }
+            return;
+        }
+    }
+
+private:
+    std::unique_ptr<ak::helm::SocketListener> _listener;
+    ak::helm::LinkConfig _link;
+    ak::hold::HoldRole& _role;
+    std::unique_ptr<ak::helm::SocketBinding> _socket;
+    std::unique_ptr<ak::helm::OarEndpoint> _endpoint;
+};
+
 }  // namespace
 
 auto main(int argc, char** argv) -> int {
@@ -215,9 +372,11 @@ auto main(int argc, char** argv) -> int {
                 .cert_pem = *cert,
                 .key_pem = *key,
                 .peer_name = {}},
-        // No helm sideband yet (configs come from --configs), so no
-        // controller grants leases: the primary serves reads without one.
-        .server = {.server_id = opts->server_id, .data_dir = opts->data_dir, .leases = false},
+        // With --configs there is no controller to grant leases: the
+        // primary serves reads without one.
+        .server = {.server_id = opts->server_id,
+                   .data_dir = opts->data_dir,
+                   .leases = opts->configs.empty()},
     };
     auto node = ak::hold::Node::create(files, std::move(config));
     if (!node) {
@@ -229,14 +388,52 @@ auto main(int argc, char** argv) -> int {
     std::signal(SIGTERM, on_signal);
     std::signal(SIGPIPE, SIG_IGN);
     std::println("ak-hold: server {} listening on port {}", opts->server_id, (*node)->port());
-    ConfigDir configs{opts->configs};
-    auto next_scan = ak::hold::Clock::now();
-    while (!g_stop.load()) {
-        if (ak::hold::Clock::now() >= next_scan) {
-            configs.scan((*node)->server());
-            next_scan = ak::hold::Clock::now() + std::chrono::seconds{1};
+    if (!opts->configs.empty()) {
+        ConfigDir configs{opts->configs};
+        auto next_scan = ak::hold::Clock::now();
+        while (!g_stop.load()) {
+            if (ak::hold::Clock::now() >= next_scan) {
+                configs.scan((*node)->server());
+                next_scan = ak::hold::Clock::now() + std::chrono::seconds{1};
+            }
+            (*node)->run_once(std::chrono::milliseconds{200});
         }
-        (*node)->run_once(std::chrono::milliseconds{200});
+        return 0;
+    }
+
+    auto keys = ak::hull::SignatureVerifier::create(opts->keys);
+    if (!keys) {
+        std::println(stderr, "ak-hold: controller keys: {}", ak::hull::to_string(keys.error()));
+        return 2;
+    }
+    auto verifier = std::make_shared<ak::hull::SignatureVerifier>(std::move(*keys));
+    ak::hold::HoldRole role{
+        (*node)->server(), opts->server_id,
+        [verifier](std::span<const std::byte> msg, std::span<const std::byte, 64> sig,
+                   std::uint16_t key_id) { return verifier->verify(msg, sig, key_id).has_value(); },
+        random_seq()};
+    remove_stale_socket(opts->sideband);
+    auto listener = ak::helm::SocketListener::bind(opts->sideband);
+    if (!listener) {
+        std::println(stderr, "ak-hold: listen on {}: {}", opts->sideband,
+                     ak::helm::to_string(listener.error()));
+        return 1;
+    }
+    Sideband sideband{std::move(*listener),
+                      {.address = {.local_addr = static_cast<std::uint8_t>(*opts->addr),
+                                   .peer_addr = static_cast<std::uint8_t>(*opts->helm_addr),
+                                   .local_eid = static_cast<std::uint8_t>(*opts->eid),
+                                   .peer_eid = static_cast<std::uint8_t>(*opts->helm_eid)},
+                       .mtu = ak::helm::mctp::baseline_mtu,
+                       .timeout = {}},
+                      role};
+    std::println("ak-hold: sideband {}", opts->sideband);
+    while (!g_stop.load()) {
+        // Short waits so reports reach helm promptly between sideband polls.
+        if ((*node)->run_once(std::chrono::milliseconds{100}, sideband.fd())) {
+            sideband.serve();
+        }
+        role.pump(ak::hold::Clock::now());
     }
     return 0;
 }

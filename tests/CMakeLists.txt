@@ -103,6 +103,7 @@ ak_add_test(hold_master_test      SOURCES hold_master_test.cpp      LIBS ak::hol
 ak_add_test(hold_store_test       SOURCES hold_store_test.cpp       LIBS ak::hold_store)
 ak_add_test(hold_server_test      SOURCES hold_server_test.cpp      LIBS ak::hold_server)
 ak_add_test(hold_replication_test SOURCES hold_replication_test.cpp LIBS ak::hold_server)
+ak_add_test(hold_role_test        SOURCES hold_role_test.cpp        LIBS ak::hold_role)
 # The simulation (block-volume-service task 9): a short seed sweep in every
 # run, and a long one under `ctest -C Nightly -L nightly`.
 ak_add_test(hold_sim_test SOURCES hold_sim_test.cpp

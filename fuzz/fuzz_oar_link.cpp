@@ -85,6 +85,21 @@ auto decoders(std::span<const std::byte> body) -> void {
     if (auto c = oar::decode_usage_request(body)) {
         same(body, oar::encode_usage_request(*c));
     }
+    if (auto f = oar::decode_replica_config_frame(body)) {
+        same(body, oar::encode_replica_config_frame(*f));
+    }
+    if (auto f = oar::decode_volume_op_frame(body)) {
+        same(body, oar::encode_volume_op_frame(*f));
+    }
+    if (auto g = oar::decode_lease_grant(body)) {
+        same(body, oar::encode_lease_grant(*g));
+    }
+    if (auto r = oar::decode_report_request(body)) {
+        same(body, oar::encode_report_request(*r));
+    }
+    if (auto c = oar::decode_report_chunk(body)) {
+        same(body, oar::encode_report_chunk(*c));
+    }
     // A usage page is checked against the cursor it answers: try the first
     // page and one further in.
     for (const std::uint16_t cursor : {std::uint16_t{0}, std::uint16_t{oar::max_usage_page}}) {

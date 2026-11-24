@@ -44,6 +44,13 @@ auto to_vpc_config(const proto::VpcConfigFrame& f) -> VpcConfig {
     if (f.has_ipv6) {
         c.ipv6_prefix = f.ipv6_prefix;
     }
+    c.routes.reserve(f.routes.size());
+    for (const auto& r : f.routes) {
+        c.routes.push_back({.ipv6 = r.family == proto::RouteFamily::ipv6,
+                            .prefix = r.prefix,
+                            .length = r.length,
+                            .target = geneve::NicId{r.target_nic}});
+    }
     return c;
 }
 
@@ -51,8 +58,10 @@ auto to_map_update(const proto::MapUpdate& u) -> MapUpdate {
     MapUpdate out{.vni = u.vni, .version = u.map_version, .entries = {}};
     out.entries.reserve(u.entries.size());
     for (const auto& e : u.entries) {
-        out.entries.push_back(
-            {.nic_id = geneve::NicId{e.nic_id}, .mac = e.mac, .owner_vtep = e.owner_vtep});
+        out.entries.push_back({.nic_id = geneve::NicId{e.nic_id},
+                               .mac = e.mac,
+                               .owner_vtep = e.owner_vtep,
+                               .source_dest_check = e.source_dest_check});
     }
     return out;
 }
@@ -278,10 +287,7 @@ auto NetRole::vpc_config(std::span<const std::byte> frame) -> oar::Status {
             return oar::Status::failed;
         }
     }
-    // Routes need the source/destination opt-out (task 22). Refusing the
-    // whole frame keeps the previous config rather than applying a VPC
-    // whose route table is silently missing.
-    if (!config->routes.empty() || !_vswitch->set_vpc_config(config->vni, to_vpc_config(*config))) {
+    if (!_vswitch->set_vpc_config(config->vni, to_vpc_config(*config))) {
         ++_counters.vpc_rejected;
         return oar::Status::failed;
     }

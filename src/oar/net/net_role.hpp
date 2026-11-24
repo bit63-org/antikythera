@@ -81,9 +81,8 @@
 // must name this server and verify under a controller key. Each VNI keeps
 // the version last applied; re-delivery of that version answers ok without
 // touching the VSwitch (helm resends every kept config when the sideband
-// reopens), an older one answers failed. A frame the VSwitch refuses, or
-// one with routes (applied only once routing exists, task 22), leaves the
-// previous config in place: a config is never half applied.
+// reopens), an older one answers failed. A frame the VSwitch refuses
+// leaves the previous config in place: a config is never half applied.
 //
 // Not thread-safe: the sideband, the transports and the underlay share one
 // thread, as the VSwitch and Vtep require.

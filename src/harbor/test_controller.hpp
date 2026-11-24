@@ -42,9 +42,10 @@
 //   rewrap-volume VOLUME FROM_VM TO_VM
 //   create-network VNI
 //   delete-network VNI
-//   map-update VNI VERSION [NIC,MAC,VTEP[,GUEST_IP ...] ...]
+//   map-update VNI VERSION [NIC,MAC,VTEP[,GUEST_IP ...][,nocheck] ...]
 //                        e.g. 0x10,02:00:00:00:00:10,fd00::1,10.0.0.5,fd12::5
-//                        (guest IPs are what the ARP/ND proxy answers for)
+//                        (guest IPs are what the ARP/ND proxy answers for;
+//                        nocheck turns the NIC's source/destination check off)
 //   group-policy VNI VERSION drop
 //   group-policy VNI VERSION multicast RATE_FRAMES BURST_FRAMES RATE_BYTES BURST_BYTES
 //                MAX_REMOTE_VTEPS [MAX_GROUPS_PER_NIC]

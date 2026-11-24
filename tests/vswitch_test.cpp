@@ -1788,3 +1788,233 @@ BOOST_AUTO_TEST_CASE(injected_replies_checked, *boost::unit_test::timeout(unit_t
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// Requirement 11.10 and 12.7 (oar-net task 22): NICs whose mapping turns
+// the source/destination check off, and VpcConfig routes that send
+// packets for the gateway to them.
+BOOST_FIXTURE_TEST_SUITE(routing, Fixture)
+
+namespace {
+
+constexpr std::size_t ip_at = ethernet_header_size;
+constexpr std::size_t ttl_at = ip_at + 8;
+constexpr std::size_t hop_limit_at = ip_at + 7;
+
+auto addr4(std::uint8_t a, std::uint8_t b, std::uint8_t c, std::uint8_t d) -> nb::Ipv4Address {
+    return {std::byte{a}, std::byte{b}, std::byte{c}, std::byte{d}};
+}
+
+auto route4(const nb::Ipv4Address& prefix, std::uint8_t length, NicId target) -> net::VpcRoute {
+    net::VpcRoute r{.ipv6 = false, .prefix = {}, .length = length, .target = target};
+    std::ranges::copy(prefix, r.prefix.begin());
+    return r;
+}
+
+// fd99::/16
+auto far6() -> net::Ipv6Address {
+    net::Ipv6Address a{};
+    a[0] = ula_prefix;
+    a[1] = std::byte{0x99};
+    return a;
+}
+
+// gateway::config() with a default route to b, 192.168.0.0/16 to c and
+// fd99::/16 to b.
+auto routed_config() -> net::VpcConfig {
+    auto c = gateway::config();
+    c.routes = {route4({}, 0, nic_b),
+                route4(addr4(192, 168, 0, 0), 16, nic_c),
+                {.ipv6 = true, .prefix = far6(), .length = 16, .target = nic_b}};
+    return c;
+}
+
+auto valid_ipv4_checksum(const std::vector<std::byte>& f) -> bool {
+    return fr::ipv4_header_checksum(std::span{f}.subspan(ip_at, pk::ipv4_min_header_size)) == 0;
+}
+
+}  // namespace
+
+struct Routing : Fixture {
+    // Version 2 of the map: b (local) and c (remote) have the check off.
+    Routing() {
+        auto b = entry(nic_b, self_tail);
+        b.source_dest_check = false;
+        auto c = entry(nic_c, peer_tail);
+        c.source_dest_check = false;
+        BOOST_REQUIRE(
+            table.apply({.vni = vpc,
+                         .version = 2,
+                         .entries = {entry(nic_a, self_tail), b, c, entry(nic_d, third_tail),
+                                     entry(nic_e, peer_tail)}}));
+    }
+};
+
+BOOST_AUTO_TEST_CASE(route_validation, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    using net::VpcConfigError;
+    auto c = routed_config();
+    c.routes.push_back(route4(addr4(10, 1, 0, 1), 16, nic_c));  // host bits
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_route));
+    c = routed_config();
+    c.routes.push_back(route4({}, 33, nic_c));
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_route));
+    c = routed_config();
+    c.routes.push_back(route4({}, 0, nic_c));  // the same prefix twice
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_route));
+    c = routed_config();
+    c.routes.push_back(route4(addr4(172, 16, 0, 0), 12, geneve::nic_invalid));
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_route));
+    c = routed_config();
+    c.routes.push_back(route4(addr4(172, 16, 0, 0), 12, geneve::nic_broadcast));
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_route));
+    c = routed_config();
+    for (std::size_t i = c.routes.size(); i <= net::max_vpc_routes; ++i) {
+        c.routes.push_back(route4(addr4(100, static_cast<std::uint8_t>(i), 0, 0), 16, nic_b));
+    }
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::too_many_routes));
+    // The same prefix in the other family is a different route.
+    c = routed_config();
+    c.routes.push_back({.ipv6 = true, .prefix = {}, .length = 0, .target = nic_c});
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
+    BOOST_TEST((*sw.vpc_config(vpc) == c));
+}
+
+BOOST_FIXTURE_TEST_CASE(routed_to_local_and_remote_targets, Routing,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, routed_config()));
+    // The default route: a local target.
+    send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8)));
+    BOOST_REQUIRE(port_b.frames.size() == 1);
+    const auto& local = port_b.frames[0];
+    BOOST_TEST(std::ranges::equal(std::span{local}.first(mac_size), mac_of(nic_b)));
+    BOOST_TEST(std::ranges::equal(std::span{local}.subspan(mac_size, mac_size), mac_of(nic_a)));
+    BOOST_TEST(std::to_integer<int>(local[ttl_at]) == fr::default_ttl - 1);
+    BOOST_TEST(valid_ipv4_checksum(local));
+
+    // The longer prefix wins: a remote target, tunnelled to its VTEP.
+    send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(192, 168, 7, 9)));
+    BOOST_REQUIRE(underlay.sent.size() == 1);
+    const Sent& s = underlay.sent[0];
+    BOOST_TEST((s.vtep == vtep(peer_tail)));
+    BOOST_TEST((s.nics == geneve::NicPair{.src = nic_a, .dst = nic_c}));
+    BOOST_TEST(std::ranges::equal(std::span{s.frame}.first(mac_size), mac_of(nic_c)));
+    BOOST_TEST(std::to_integer<int>(s.frame[ttl_at]) == fr::default_ttl - 1);
+    BOOST_TEST(valid_ipv4_checksum(s.frame));
+
+    // IPv6: the hop limit drops by one.
+    auto far = far6();
+    far[ipv6_last] = std::byte{1};
+    send(nic_a, udp6(gateway::gw_mac(), mac_of(nic_a), ip6(11), far));
+    BOOST_REQUIRE(port_b.frames.size() == 2);
+    BOOST_TEST(std::to_integer<int>(port_b.frames[1][hop_limit_at]) == fr::default_ttl - 1);
+
+    BOOST_TEST(sw.counters().tx_routed == 3);
+    BOOST_TEST(sw.counters().tx_local == 2);
+    BOOST_TEST(sw.counters().tx_remote == 1);
+    BOOST_TEST(port_a.frames.empty());
+}
+
+BOOST_FIXTURE_TEST_CASE(unroutable_packets_dropped, Routing,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // No VpcConfig: no gateway, so its MAC is just an unknown destination.
+    send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8)));
+    BOOST_TEST(sw.counters().tx_drop_no_route == 0);
+
+    auto c = gateway::config();
+    c.routes = {route4(addr4(192, 168, 0, 0), 16, nic_c)};
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
+    // No matching route, and no IPv6 routes at all.
+    send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8)));
+    send(nic_a, udp6(gateway::gw_mac(), mac_of(nic_a), ip6(11), far6()));
+    // Broadcast and multicast destinations are never routed.
+    c.routes = {route4({}, 0, nic_b)};
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
+    send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(255, 255, 255, 255)));
+    send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(239, 0, 0, 1)));
+    BOOST_TEST(sw.counters().tx_drop_no_route == 4);
+
+    // A target this VTEP does not map, or one in another VPC.
+    c.routes = {route4({}, 0, nic_unmapped)};
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
+    send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8)));
+    c.routes = {route4({}, 0, nic_x)};
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
+    send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8)));
+    BOOST_TEST(sw.counters().tx_drop_route_target == 2);
+
+    // A target that keeps its check refuses addresses it does not own.
+    c.routes = {route4({}, 0, nic_d)};
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
+    send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8)));
+    BOOST_TEST(sw.counters().tx_drop_ip_dst == 1);
+
+    // The target sending to its own route.
+    c.routes = {route4({}, 0, nic_b)};
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
+    send(nic_b, udp4(gateway::gw_mac(), mac_of(nic_b), ip4(22), addr4(8, 8, 8, 8)));
+    BOOST_TEST(sw.counters().tx_drop_hairpin == 1);
+
+    // A packet with one hop left.
+    auto last_hop = udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8));
+    last_hop[ttl_at] = std::byte{1};
+    last_hop[ip_at + fr::ipv4_checksum_offset] = std::byte{0};
+    last_hop[ip_at + fr::ipv4_checksum_offset + 1] = std::byte{0};
+    const auto sum =
+        fr::ipv4_header_checksum(std::span{last_hop}.subspan(ip_at, pk::ipv4_min_header_size));
+    last_hop[ip_at + fr::ipv4_checksum_offset] = static_cast<std::byte>(sum >> 8U);
+    last_hop[ip_at + fr::ipv4_checksum_offset + 1] = static_cast<std::byte>(sum & 0xFFU);
+    send(nic_a, last_hop);
+    c.routes.push_back({.ipv6 = true, .prefix = far6(), .length = 16, .target = nic_b});
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
+    send(nic_a, fr::ipv6(gateway::gw_mac(), mac_of(nic_a), ip6(11), far6(), pk::ipproto_udp,
+                         fr::udp(test_port, test_port, {}), 1));
+    BOOST_TEST(sw.counters().tx_drop_ttl == 2);
+    BOOST_TEST(sw.counters().tx_routed == 0);
+    BOOST_TEST(nothing_delivered());
+}
+
+BOOST_FIXTURE_TEST_CASE(check_off_on_transmit, Routing,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // b sends from an address it does not own, locally and remotely.
+    send(nic_b, udp4(mac_of(nic_a), mac_of(nic_b), addr4(8, 8, 8, 8), ip4(11)));
+    send(nic_b, udp4(mac_of(nic_d), mac_of(nic_b), addr4(8, 8, 8, 8), ip4(44)));
+    BOOST_TEST(port_a.frames.size() == 1);
+    BOOST_TEST(underlay.sent.size() == 1);
+    // a sends b and c packets for addresses they do not own.
+    send(nic_a, udp4(mac_of(nic_b), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8)));
+    send(nic_a, udp4(mac_of(nic_c), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8)));
+    BOOST_TEST(port_b.frames.size() == 1);
+    BOOST_TEST(underlay.sent.size() == 2);
+    BOOST_TEST(sw.counters().tx_drop_ip_spoofed == 0);
+    BOOST_TEST(sw.counters().tx_drop_ip_dst == 0);
+    // The others keep theirs: a cannot spoof, d does not take foreign packets.
+    send(nic_a, udp4(mac_of(nic_b), mac_of(nic_a), addr4(8, 8, 8, 8), ip4(22)));
+    send(nic_a, udp4(mac_of(nic_d), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8)));
+    BOOST_TEST(sw.counters().tx_drop_ip_spoofed == 1);
+    BOOST_TEST(sw.counters().tx_drop_ip_dst == 1);
+}
+
+BOOST_FIXTURE_TEST_CASE(check_off_on_receive, Routing,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // c's packets from foreign addresses come in, judged by this VTEP's map.
+    const Inbound from_c{nic_c, nic_a, vpc,
+                         udp4(mac_of(nic_a), mac_of(nic_c), addr4(8, 8, 8, 8), ip4(11))};
+    BOOST_TEST(sw.receive(from_c.packet, vtep(peer_tail)).has_value());
+    // b takes packets for foreign addresses.
+    const Inbound to_b{nic_e, nic_b, vpc,
+                       udp4(mac_of(nic_b), mac_of(nic_e), ip4(55), addr4(8, 8, 8, 8))};
+    BOOST_TEST(sw.receive(to_b.packet, vtep(peer_tail)).has_value());
+    BOOST_TEST(port_a.frames.size() == 1);
+    BOOST_TEST(port_b.frames.size() == 1);
+    // e keeps its check, and so does a.
+    const Inbound from_e{nic_e, nic_a, vpc,
+                         udp4(mac_of(nic_a), mac_of(nic_e), addr4(8, 8, 8, 8), ip4(11))};
+    BOOST_TEST(sw.receive(from_e.packet, vtep(peer_tail)).has_value());  // dropped inside
+    const Inbound to_a{nic_e, nic_a, vpc,
+                       udp4(mac_of(nic_a), mac_of(nic_e), ip4(55), addr4(8, 8, 8, 8))};
+    BOOST_TEST(sw.receive(to_a.packet, vtep(peer_tail)).has_value());
+    BOOST_TEST(sw.counters().rx_drop_ip_spoofed == 1);
+    BOOST_TEST(sw.counters().rx_drop_ip_dst == 1);
+    BOOST_TEST(port_a.frames.size() == 1);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

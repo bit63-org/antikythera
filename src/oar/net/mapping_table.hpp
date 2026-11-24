@@ -45,6 +45,7 @@ struct MapEntry {
     geneve::NicId nic_id{};
     MacAddress mac{};
     Ipv6Address owner_vtep{};
+    bool source_dest_check{true};  // false: may send and receive for others (Requirement 11.10)
     friend auto operator==(const MapEntry&, const MapEntry&) -> bool = default;
 };
 

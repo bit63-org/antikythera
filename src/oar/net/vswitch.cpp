@@ -191,6 +191,48 @@ auto valid_dns6(const Ipv6Address& a) noexcept -> bool {
     return !packet::is_unspecified(a) && !packet::is_ipv6_multicast(a);
 }
 
+// No bit set past `length` in `prefix` (whose first `bytes` bytes are the
+// address; the rest must be zero too).
+auto host_bits_clear(const Ipv6Address& prefix, std::size_t length) noexcept -> bool {
+    constexpr std::size_t byte_bits = 8;
+    for (std::size_t i = 0; i < prefix.size(); ++i) {
+        const auto b = std::to_integer<unsigned>(prefix.at(i));
+        const std::size_t first = i * byte_bits;
+        const unsigned keep = first >= length ? 0U
+                              : first + byte_bits <= length
+                                  ? 0xFFU
+                                  : (0xFFU << (byte_bits - (length - first))) & 0xFFU;
+        if ((b & ~keep) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto valid_route(const VpcRoute& r) noexcept -> bool {
+    constexpr std::size_t ipv4_bits = 32;
+    constexpr std::size_t ipv6_bits = 128;
+    if (r.target == geneve::nic_invalid || r.target == geneve::nic_broadcast) {
+        return false;
+    }
+    return r.length <= (r.ipv6 ? ipv6_bits : ipv4_bits) && host_bits_clear(r.prefix, r.length);
+}
+
+// Whether the first `length` bits of `a` equal `prefix`'s.
+auto matches(std::span<const std::byte> a, const Ipv6Address& prefix, std::size_t length) noexcept
+    -> bool {
+    constexpr std::size_t byte_bits = 8;
+    for (std::size_t i = 0; i * byte_bits < length; ++i) {
+        const std::size_t bits = std::min(byte_bits, length - (i * byte_bits));
+        const unsigned mask = (0xFFU << (byte_bits - bits)) & 0xFFU;
+        if (((std::to_integer<unsigned>(a[i]) ^ std::to_integer<unsigned>(prefix.at(i))) & mask) !=
+            0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 auto validate(const VpcConfig& c) -> std::expected<void, VpcConfigError> {
     const MacAddress& m = c.gateway_mac;
     if (all_zero(m) || (m[0] & group_bit) == group_bit || (m[0] & mac_local_bit) != mac_local_bit) {
@@ -226,7 +268,33 @@ auto validate(const VpcConfig& c) -> std::expected<void, VpcConfigError> {
     if (c.lease_seconds < min_lease_seconds || c.lease_seconds > max_lease_seconds) {
         return std::unexpected(VpcConfigError::bad_lease);
     }
+    if (c.routes.size() > max_vpc_routes) {
+        return std::unexpected(VpcConfigError::too_many_routes);
+    }
+    for (auto it = c.routes.begin(); it != c.routes.end(); ++it) {
+        const bool twice = std::any_of(c.routes.begin(), it, [&](const VpcRoute& r) {
+            return r.ipv6 == it->ipv6 && r.length == it->length && r.prefix == it->prefix;
+        });
+        if (!valid_route(*it) || twice) {
+            return std::unexpected(VpcConfigError::bad_route);
+        }
+    }
     return {};
+}
+
+// The longest-prefix route for a packet's destination, if any.
+auto lookup_route(const VpcConfig& cfg, const packet::ParsedPacket& p) noexcept -> const VpcRoute* {
+    const bool v6 = p.family == packet::IpFamily::ipv6;
+    const std::span<const std::byte> dst =
+        v6 ? std::span<const std::byte>{p.dst6} : std::span<const std::byte>{p.dst4};
+    const VpcRoute* best = nullptr;
+    for (const VpcRoute& r : cfg.routes) {
+        if (r.ipv6 == v6 && (best == nullptr || r.length > best->length) &&
+            matches(dst, r.prefix, r.length)) {
+            best = &r;
+        }
+    }
+    return best;
 }
 
 // A DHCPv4 client message for this VNI's server (Requirement 12.3): UDP
@@ -358,6 +426,10 @@ auto to_string(VpcConfigError e) noexcept -> const char* {
             return "bad_domain";
         case VpcConfigError::bad_lease:
             return "bad_lease";
+        case VpcConfigError::too_many_routes:
+            return "too_many_routes";
+        case VpcConfigError::bad_route:
+            return "bad_route";
     }
     return "unknown";
 }
@@ -940,7 +1012,7 @@ auto VSwitch::transmit(const TxFrame& tx) -> void {
         return;
     }
     const bool local_only = local_only_source(*pkt);
-    if (!local_only && owner(binding->vni, *pkt, true) != tx.source) {
+    if (!local_only && binding->source_dest_check && owner(binding->vni, *pkt, true) != tx.source) {
         ++_counters.tx_drop_ip_spoofed;
         return;
     }
@@ -981,7 +1053,7 @@ auto VSwitch::transmit(const TxFrame& tx) -> void {
         if (metadata_destination(*pkt)) {
             handle_metadata(tx.source, *pkt);
         } else {
-            ++_counters.tx_drop_no_route;
+            route(*snap, tx.source, *binding, *cfg, tx.frame, *pkt);
         }
         return;
     }
@@ -1034,27 +1106,93 @@ auto VSwitch::forward(const MappingSnapshot& snap, geneve::NicId src, const NicB
         ++_counters.tx_drop_hairpin;
         return;
     }
-    if (ip != nullptr && owner(binding.vni, *ip, false) != *dst) {
+    // find_by_mac only returns mapped NICs. A NIC with its check off takes
+    // packets for any destination (Requirement 11.10).
+    if (ip != nullptr && snap.lookup(*dst)->source_dest_check &&
+        owner(binding.vni, *ip, false) != *dst) {
         ++_counters.tx_drop_ip_dst;
         return;
     }
-    if (snap.is_local(*dst)) {
-        RxPort* const p = port(*dst);
+    static_cast<void>(send_unicast(snap, src, binding.vni, *dst, frame));
+}
+
+auto VSwitch::send_unicast(const MappingSnapshot& snap, geneve::NicId src, std::uint32_t vni,
+                           geneve::NicId dst, std::span<const std::byte> frame) -> bool {
+    if (snap.is_local(dst)) {
+        RxPort* const p = port(dst);
         if (p == nullptr) {
             ++_counters.tx_drop_unattached;
-            return;
+            return false;
         }
-        if (deliver_to(*p, frame)) {
-            ++_counters.tx_local;
+        if (!deliver_to(*p, frame)) {
+            return false;
         }
+        ++_counters.tx_local;
+        return true;
+    }
+    const auto remote = snap.lookup(dst);
+    _underlay->send(
+        {.vtep = remote->owner_vtep, .vni = vni, .nics = {.src = src, .dst = dst}, .frame = frame});
+    ++_counters.tx_remote;
+    return true;
+}
+
+auto VSwitch::route(const MappingSnapshot& snap, geneve::NicId src, const NicBinding& binding,
+                    const VpcConfig& cfg, std::span<const std::byte> frame,
+                    const packet::ParsedPacket& p) -> void {
+    constexpr std::size_t ipv4_ttl_offset = 8;
+    constexpr std::size_t ipv4_checksum_offset = 10;
+    constexpr std::size_t ipv6_hop_limit_offset = 7;
+    constexpr neighbor::Ipv4Address broadcast{std::byte{255}, std::byte{255}, std::byte{255},
+                                              std::byte{255}};
+    const bool v6 = is_ipv6(p);
+    const VpcRoute* const r = ip_multicast_destination(p) || (!v6 && p.dst4 == broadcast)
+                                  ? nullptr
+                                  : lookup_route(cfg, p);
+    if (r == nullptr) {
+        ++_counters.tx_drop_no_route;
         return;
     }
-    const auto remote = snap.lookup(*dst);  // find_by_mac only returns mapped NICs
-    _underlay->send({.vtep = remote->owner_vtep,
-                     .vni = binding.vni,
-                     .nics = {.src = src, .dst = *dst},
-                     .frame = frame});
-    ++_counters.tx_remote;
+    const auto target = snap.lookup(r->target);
+    if (!target || target->vni != binding.vni) {
+        ++_counters.tx_drop_route_target;
+        return;
+    }
+    if (r->target == src) {
+        ++_counters.tx_drop_hairpin;
+        return;
+    }
+    if (target->source_dest_check && owner(binding.vni, p, false) != r->target) {
+        ++_counters.tx_drop_ip_dst;
+        return;
+    }
+    if (p.hop_limit <= 1) {
+        ++_counters.tx_drop_ttl;
+        return;
+    }
+    // A router's rewrite: the target's MAC, one hop fewer. The source MAC
+    // stays the sender's (see the header).
+    std::vector<std::byte> out{frame.begin(), frame.end()};
+    std::copy(target->mac.begin(), target->mac.end(), out.begin());
+    const auto ip_at = static_cast<std::size_t>(p.ip.data() - frame.data());
+    if (v6) {
+        out[ip_at + ipv6_hop_limit_offset] = std::byte(p.hop_limit - 1);
+    } else {
+        // RFC 1624 incremental update: TTL is the high byte of its 16-bit word.
+        out[ip_at + ipv4_ttl_offset] = std::byte(p.hop_limit - 1);
+        const std::size_t c = ip_at + ipv4_checksum_offset;
+        std::uint32_t sum = (std::to_integer<std::uint32_t>(out[c]) << 8U) |
+                            std::to_integer<std::uint32_t>(out[c + 1]);
+        sum = (~sum & 0xFFFFU) + (~0x0100U & 0xFFFFU);  // HC' = ~(~HC + ~m + m'), m - m' = 0x0100
+        sum = (sum & 0xFFFFU) + (sum >> 16U);
+        sum = (sum & 0xFFFFU) + (sum >> 16U);
+        const auto updated = static_cast<std::uint16_t>(~sum);
+        out[c] = std::byte(updated >> 8U);
+        out[c + 1] = std::byte(updated & 0xFFU);
+    }
+    if (send_unicast(snap, src, binding.vni, r->target, out)) {
+        ++_counters.tx_routed;
+    }
 }
 
 auto VSwitch::handle_arp(const MappingSnapshot& snap, geneve::NicId src, const NicBinding& binding,
@@ -1240,12 +1378,21 @@ auto VSwitch::inner_allowed(const geneve::Packet& packet, geneve::NicId dst) -> 
     }
     // No local-only sources here: link-local and unspecified sources are
     // never forwarded (Requirement 11.4), so a peer sending one is wrong.
-    if (owner(packet.vni, *pkt, true) != packet.nics->src) {
+    // A NIC whose mapping turns its check off may send from, and receive
+    // for, addresses it does not own (Requirement 11.10); judged by this
+    // VTEP's own mapping, like everything else here.
+    const auto snap = _mappings->snapshot();
+    const auto src_binding = snap->lookup(packet.nics->src);
+    const bool src_checked = !src_binding || src_binding->source_dest_check;
+    if (src_checked && owner(packet.vni, *pkt, true) != packet.nics->src) {
         ++_counters.rx_drop_ip_spoofed;
         return false;
     }
+    const auto dst_binding = dst == geneve::nic_broadcast ? std::nullopt : snap->lookup(dst);
     const bool dst_ok = dst == geneve::nic_broadcast ? ip_multicast_destination(*pkt)
-                                                     : owner(packet.vni, *pkt, false) == dst;
+                        : dst_binding && !dst_binding->source_dest_check
+                            ? true
+                            : owner(packet.vni, *pkt, false) == dst;
     if (!dst_ok) {
         ++_counters.rx_drop_ip_dst;
         return false;

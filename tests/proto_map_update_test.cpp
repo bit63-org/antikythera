@@ -141,7 +141,7 @@ BOOST_AUTO_TEST_CASE(layout) {
     const auto b = encoded(m);
     BOOST_REQUIRE_EQUAL(b.size(), proto::map_update_size(1, 1, 1));
     const auto header = ak::test::bytes_of(
-        'A', 'K', 'M', 'U', 0x02, 0x00, 0x0B, 0x0A, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+        'A', 'K', 'M', 'U', 0x03, 0x00, 0x0B, 0x0A, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
         0xEF, 0xCD, 0xAB, 0x00, 0x01, 0x00, 0x01, 0x00, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
         0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
     BOOST_TEST(std::ranges::equal(std::span{b}.first(proto::map_update_header_size), header));
@@ -267,7 +267,7 @@ BOOST_AUTO_TEST_CASE(header_fields_are_checked) {
     b[0] = std::byte{0};
     BOOST_TEST((decode_error(b) == DecodeError::bad_magic));
 
-    for (const auto v : {1, 3}) {  // version 1 had no guest addresses
+    for (const auto v : {1, 2, 4}) {  // 1 had no guest addresses, 2 no NIC flags
         b = encoded();
         b[4] = std::byte(v);
         BOOST_TEST((decode_error(b) == DecodeError::bad_version));
@@ -315,11 +315,28 @@ BOOST_AUTO_TEST_CASE(header_fields_are_checked) {
 }
 
 BOOST_AUTO_TEST_CASE(entry_padding_must_be_zero) {
-    for (std::size_t i = 0; i < 2; ++i) {
+    // The flags byte defines only bit 0; the byte after it is padding.
+    for (const auto& [off, value] : {std::pair<std::size_t, int>{0, 0x02}, {0, 0x80}, {1, 0x01}}) {
         auto b = encoded();
-        b[entry_at(1) + entry_pad + i] = std::byte{1};
+        b[entry_at(1) + entry_pad + off] = std::byte(value);
         BOOST_TEST((decode_error(b) == DecodeError::reserved_not_zero));
     }
+}
+
+// Version 3: bit 0 of an entry's flags turns its source/destination check
+// off (oar-net Requirement 11.10), and round-trips both ways.
+BOOST_AUTO_TEST_CASE(the_source_dest_check_flag_round_trips) {
+    auto m = sample();
+    BOOST_TEST(m.entries[1].source_dest_check);
+    m.entries[1].source_dest_check = false;
+    const auto b = encoded(m);
+    BOOST_TEST(std::to_integer<int>(b[entry_at(1) + entry_pad]) == 1);
+    BOOST_TEST(std::to_integer<int>(b[entry_at(0) + entry_pad]) == 0);
+    auto back = proto::decode_map_update(b);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST(!back->entries[1].source_dest_check);
+    BOOST_TEST(back->entries[0].source_dest_check);
+    BOOST_TEST((*back == m));
 }
 
 BOOST_AUTO_TEST_CASE(nic_ids_are_non_zero_and_strictly_ascending) {

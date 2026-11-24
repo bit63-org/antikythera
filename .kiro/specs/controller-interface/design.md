@@ -23,7 +23,8 @@ Envelope {
 }
 MapUpdate {
   server_id u64, key_id u16, vni u32, map_version u64,
-  entries [] { nic_id u64, mac [6], owner_vtep [16] },
+  entries [] { nic_id u64, mac [6], flags u8, owner_vtep [16] },
+                            // flags bit 0: no source/destination check (v3)
   ipv4 [] { nic_id u64, address [4] },     // guest addresses (format v2)
   ipv6 [] { nic_id u64, address [16] },
   signature [64]            // Ed25519 over everything above

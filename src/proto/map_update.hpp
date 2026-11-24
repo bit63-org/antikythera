@@ -15,7 +15,7 @@
 //
 // Layout (little-endian):
 //   0x00  magic        u32  'AKMU'
-//   0x04  version      u16  frame format version (2)
+//   0x04  version      u16  frame format version (3)
 //   0x06  key_id       u16  controller key that signed it; non-zero
 //   0x08  server_id    u64  target server; non-zero
 //   0x10  vni          u32  VPC's 24-bit Geneve VNI; non-zero
@@ -25,7 +25,8 @@
 //   0x20  ipv6_count   u16  at most max_guest_addresses
 //   0x22  reserved     6 bytes, zero
 //   0x28  entries      entry_count x 32 bytes, NIC IDs strictly ascending:
-//           +0x00 nic_id u64 (non-zero) | +0x08 mac [6] | +0x0E reserved [2]
+//           +0x00 nic_id u64 (non-zero) | +0x08 mac [6] | +0x0E flags u8
+//           (bit 0: source/destination check off) | +0x0F reserved u8
 //           +0x10 owner_vtep [16] (IPv6 underlay address, network order)
 //   then  ipv4         ipv4_count x 16 bytes, addresses strictly ascending:
 //           +0x00 nic_id u64 | +0x08 address [4] (network order) | +0x0C reserved [4]
@@ -39,8 +40,16 @@
 // a NIC listed in the same frame, so the proxy can never answer for a NIC
 // the mapping does not know, and an address appears at most once (sorted,
 // so canonical). Addresses must be unicast: IPv4 not 0.0.0.0 and below
-// 224.0.0.0, IPv6 neither unspecified nor multicast. Nothing spoke version
-// 1 outside this repository, so decode accepts version 2 only.
+// 224.0.0.0, IPv6 neither unspecified nor multicast.
+//
+// Version 3 added per-NIC flags in what was entry padding. Bit 0 turns the
+// NIC's source/destination check off (oar-net Requirement 11.10, like EC2
+// `SourceDestCheck=false`): it may send from addresses it does not own and
+// receive traffic addressed to others, so it can be a route target
+// (proto::VpcConfigFrame routes). The flag is in the signed mapping, not a
+// separate frame, so every VTEP judges the NIC's traffic by the same
+// record. Nothing spoke versions 1 or 2 outside this repository, so decode
+// accepts version 3 only.
 //
 // Unlike the envelope, key_id and server_id are inside the signed bytes:
 // nothing else carries them, so a mapping cannot be replayed to another
@@ -65,7 +74,8 @@
 namespace ak::proto {
 
 inline constexpr std::uint32_t map_update_magic = 0x554D'4B41;  // "AKMU" as little-endian bytes
-inline constexpr std::uint16_t map_update_version = 2;
+inline constexpr std::uint16_t map_update_version = 3;
+inline constexpr std::uint8_t map_entry_no_source_dest_check = 0x01;
 inline constexpr std::size_t map_update_header_size = 0x28;
 inline constexpr std::size_t map_update_reserved_offset = 0x22;
 inline constexpr std::size_t map_entry_size = 0x20;
@@ -96,6 +106,7 @@ struct MapEntry {
     std::uint64_t nic_id{0};
     Mac mac{};
     VtepAddress owner_vtep{};
+    bool source_dest_check{true};  // false: the NIC may send and receive for others
 
     friend auto operator==(const MapEntry&, const MapEntry&) -> bool = default;
 };
@@ -299,12 +310,14 @@ template<typename Guest>
         MapEntry e{};
         e.nic_id = r.le64().value_or(0);
         std::ranges::copy(r.bytes(mac_size).value_or(std::span<const std::byte>{}), e.mac.begin());
-        const auto pad = r.bytes(2).value_or(std::span<const std::byte>{});
+        const auto flags = r.u8().value_or(0);
+        const auto pad = r.u8().value_or(0);
         std::ranges::copy(r.bytes(vtep_address_size).value_or(std::span<const std::byte>{}),
                           e.owner_vtep.begin());
-        if (!detail::all_zero(pad)) {
+        if (pad != 0 || (flags & ~map_entry_no_source_dest_check) != 0) {
             return std::unexpected(DecodeError::reserved_not_zero);
         }
+        e.source_dest_check = (flags & map_entry_no_source_dest_check) == 0;
         if (auto ok = detail::check_map_entry(e, prev); !ok) {
             return std::unexpected(ok.error());
         }
@@ -378,10 +391,10 @@ template<typename Guest>
     w.le16(static_cast<std::uint16_t>(m.ipv6.size()));
     w.bytes(std::array<std::byte, map_update_header_size - map_update_reserved_offset>{});
     for (const auto& e : m.entries) {
-        constexpr std::array<std::byte, 2> pad{};
         w.le64(e.nic_id);
         w.bytes(e.mac);
-        w.bytes(pad);
+        w.u8(e.source_dest_check ? std::uint8_t{0} : map_entry_no_source_dest_check);
+        w.u8(0);
         w.bytes(e.owner_vtep);
     }
     for (const auto& g : m.ipv4) {

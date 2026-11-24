@@ -1,13 +1,13 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-#include "oar/blk/fetcher.hpp"
+#include "objstore/fetcher.hpp"
 
 #include <algorithm>
 #include <iterator>
 #include <random>
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 auto Fetcher::create(ObjectStore& store, FetcherConfig config) -> std::unique_ptr<Fetcher> {
     config.workers = std::max<std::size_t>(config.workers, 1);
@@ -225,4 +225,4 @@ auto Fetcher::finish(const std::shared_ptr<Job>& job, std::expected<ChunkBytes, 
     return std::exchange(job->callbacks, {});
 }
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

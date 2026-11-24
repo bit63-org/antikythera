@@ -47,7 +47,7 @@
 #include "hold/store/file_layer.hpp"
 #include "oar/blk/blk_role.hpp"
 #include "oar/blk/file_backend.hpp"
-#include "oar/blk/image_manifest.hpp"
+#include "objstore/image_manifest.hpp"
 #include "oar/blk/image_pack.hpp"
 #include "proto/replica_config.hpp"
 #include "proto/server_identity.hpp"
@@ -64,6 +64,7 @@ auto boost_test_print_type(std::ostream& os, std::byte b) -> std::ostream& {
 }  // namespace std
 
 namespace blk = ak::oar::blk;
+namespace objstore = ak::objstore;
 namespace oar = ak::helm::oar;
 namespace vio = ak::oar::virtio;
 using ak::test::Buffer;
@@ -305,7 +306,7 @@ private:
 
 // An object store in memory, for image volumes. While held, range reads
 // (chunk fetches) wait for release(); whole-object reads (manifests) don't.
-class MemoryStore final : public blk::ObjectStore {
+class MemoryStore final : public objstore::ObjectStore {
 public:
     auto put(const std::string& key, std::vector<std::byte> bytes) -> void {
         const std::scoped_lock lock{_mutex};
@@ -324,27 +325,27 @@ public:
     }
     auto get_range(std::string_view key, std::uint64_t offset, std::span<std::byte> out,
                    Clock::time_point /*deadline*/)
-        -> std::expected<void, blk::FetchError> override {
+        -> std::expected<void, objstore::FetchError> override {
         std::unique_lock lock{_mutex};
         _released.wait(lock, [this] { return !_held; });
         const auto it = _objects.find(std::string{key});
         if (it == _objects.end() || offset > it->second.size() ||
             out.size() > it->second.size() - offset) {
-            return std::unexpected(blk::FetchError::not_found);
+            return std::unexpected(objstore::FetchError::not_found);
         }
         std::copy_n(it->second.begin() + static_cast<std::ptrdiff_t>(offset), out.size(),
                     out.begin());
         return {};
     }
     auto get(std::string_view key, std::size_t max_bytes, Clock::time_point /*deadline*/)
-        -> std::expected<std::vector<std::byte>, blk::FetchError> override {
+        -> std::expected<std::vector<std::byte>, objstore::FetchError> override {
         const std::scoped_lock lock{_mutex};
         const auto it = _objects.find(std::string{key});
         if (it == _objects.end()) {
-            return std::unexpected(blk::FetchError::not_found);
+            return std::unexpected(objstore::FetchError::not_found);
         }
         if (it->second.size() > max_bytes) {
-            return std::unexpected(blk::FetchError::too_large);
+            return std::unexpected(objstore::FetchError::too_large);
         }
         return it->second;
     }
@@ -506,8 +507,8 @@ struct Rig {
     FakeTransport t0{ram0};
     FakeTransport t1{ram1};
     MemoryStore store;
-    std::unique_ptr<blk::ChunkCache> cache;
-    std::unique_ptr<blk::Fetcher> fetcher;
+    std::unique_ptr<objstore::ChunkCache> cache;
+    std::unique_ptr<objstore::Fetcher> fetcher;
     std::uint64_t network_server{compute_id};
     // A stand-in for Ed25519: every signature byte good_sig, the known key.
     std::function<bool(std::span<const std::byte>, std::span<const std::byte, 64>, std::uint16_t)>
@@ -529,14 +530,14 @@ struct Rig {
         }
         std::map<std::uint16_t, blk::ImageStore> stores;
         if (images) {
-            auto c = blk::ChunkCache::create(dir.path, std::uint64_t{16} << 20U);
+            auto c = objstore::ChunkCache::create(dir.path, std::uint64_t{16} << 20U);
             BOOST_REQUIRE(c.has_value());
             cache = std::move(*c);
-            fetcher = blk::Fetcher::create(store, {.workers = 2,
-                                                   .deadline = std::chrono::milliseconds{2000},
-                                                   .attempts = 2,
-                                                   .backoff = std::chrono::milliseconds{1},
-                                                   .max_queued_prefetch = 8});
+            fetcher = objstore::Fetcher::create(store, {.workers = 2,
+                                                        .deadline = std::chrono::milliseconds{2000},
+                                                        .attempts = 2,
+                                                        .backoff = std::chrono::milliseconds{1},
+                                                        .max_queued_prefetch = 8});
             stores[image_store_id] = {
                 .store = &store, .fetcher = fetcher.get(), .prefix = std::string{image_prefix}};
         }
@@ -571,7 +572,7 @@ struct Rig {
         BOOST_REQUIRE(in >= 0 && data >= 0);
         BOOST_REQUIRE(::write(in, raw.data(), raw.size()) == static_cast<ssize_t>(raw.size()));
         blk::PackOptions o{.logical_block_size = blk::sector_size,
-                           .chunk_shift = blk::min_chunk_shift,
+                           .chunk_shift = objstore::min_chunk_shift,
                            .image_key = image_key,
                            .key_id = {}};
         if (image_key) {
@@ -584,9 +585,9 @@ struct Rig {
                       static_cast<ssize_t>(stored.size()));
         ::close(in);
         ::close(data);
-        const auto hex = blk::image_name_hex(packed->name);
-        store.put(blk::image_manifest_key(image_prefix, hex), packed->manifest_bytes);
-        store.put(blk::image_data_key(image_prefix, hex), std::move(stored));
+        const auto hex = objstore::image_name_hex(packed->name);
+        store.put(objstore::image_manifest_key(image_prefix, hex), packed->manifest_bytes);
+        store.put(objstore::image_data_key(image_prefix, hex), std::move(stored));
         return packed->name;
     }
 
@@ -985,8 +986,8 @@ BOOST_AUTO_TEST_CASE(image_volume_serves_the_image_and_forgets_writes) {
     BOOST_TEST(g.read(3) == mine, boost::test_tools::per_element());
     BOOST_TEST(g.read(far_sector) == mine, boost::test_tools::per_element());
     // ...never reaching the object store or the volume file.
-    const auto stored =
-        rig.store.get(blk::image_data_key(image_prefix, blk::image_name_hex(name)), 1U << 20U, {});
+    const auto stored = rig.store.get(
+        objstore::image_data_key(image_prefix, objstore::image_name_hex(name)), 1U << 20U, {});
     BOOST_TEST(!contains(*stored, mine));
     BOOST_TEST(std::filesystem::file_size(rig.role->volume_path(vol_one)) ==
                blk::metadata_block_size);
@@ -1077,8 +1078,9 @@ BOOST_AUTO_TEST_CASE(image_volume_refuses_a_missing_or_wrong_image) {
     other[0] = std::byte{0x77};
     const auto other_name = rig.publish(other);
     const auto other_manifest = rig.store.get(
-        blk::image_manifest_key(image_prefix, blk::image_name_hex(other_name)), 1U << 26U, {});
-    rig.store.put(blk::image_manifest_key(image_prefix, blk::image_name_hex(missing)),
+        objstore::image_manifest_key(image_prefix, objstore::image_name_hex(other_name)), 1U << 26U,
+        {});
+    rig.store.put(objstore::image_manifest_key(image_prefix, objstore::image_name_hex(missing)),
                   *other_manifest);
     BOOST_TEST((rig.prepare(fn0, vm_one, vol_one) == oar::Status::failed));
 

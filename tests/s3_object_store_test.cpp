@@ -45,34 +45,35 @@
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 
-#include "oar/blk/chunk_cache.hpp"
-#include "oar/blk/fetcher.hpp"
-#include "oar/blk/image_manifest.hpp"
+#include "objstore/chunk_cache.hpp"
+#include "objstore/fetcher.hpp"
+#include "objstore/image_manifest.hpp"
 #include "oar/blk/lazy_image_backend.hpp"
-#include "oar/blk/s3_object_store.hpp"
-#include "oar/blk/sigv4.hpp"
+#include "objstore/s3_object_store.hpp"
+#include "objstore/sigv4.hpp"
 #include "oar/blk/xts_cipher.hpp"
 #include "test_support.hpp"
 #include "tls_test_support.hpp"
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 auto operator<<(std::ostream& os, FetchError e) -> std::ostream& {
     return os << to_string(e);
 }
 auto operator<<(std::ostream& os, S3ConfigError e) -> std::ostream& {
     return os << to_string(e);
 }
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore
 
 namespace blk = ak::oar::blk;
+namespace objstore = ak::objstore;
 using ak::test::unit_timeout_seconds;
-using blk::FetchError;
-using Clock = blk::ObjectStore::Clock;
+using objstore::FetchError;
+using Clock = objstore::ObjectStore::Clock;
 
 namespace {
 
 constexpr std::chrono::seconds io_deadline{5};
-const blk::SigV4Credentials test_creds{
+const objstore::SigV4Credentials test_creds{
     .access_key = "AKTESTREADER", .secret_key = "testsecretkey0123456789", .session_token = ""};
 
 auto soon() -> Clock::time_point {
@@ -97,9 +98,9 @@ auto reply(std::string bytes) -> Reply {
 }
 
 auto s3_config(std::string host, std::uint16_t port, std::string bucket,
-               std::optional<blk::SigV4Credentials> creds, bool tls = false,
-               std::string ca_file = {}) -> blk::S3Config {
-    blk::S3Config c;
+               std::optional<objstore::SigV4Credentials> creds, bool tls = false,
+               std::string ca_file = {}) -> objstore::S3Config {
+    objstore::S3Config c;
     c.tls = tls;
     c.host = std::move(host);
     c.port = port;
@@ -342,20 +343,22 @@ private:
         if (date == r.headers.end()) {
             return false;
         }
-        const auto expect = blk::sigv4_authorization({.method = r.method,
-                                                      .canonical_uri = r.target,
-                                                      .headers = signed_headers,
-                                                      .payload_hash = blk::empty_payload_sha256,
-                                                      .amz_date = date->second,
-                                                      .region = "us-east-1"},
-                                                     test_creds);
+        const auto expect =
+            objstore::sigv4_authorization({.method = r.method,
+                                           .canonical_uri = r.target,
+                                           .headers = signed_headers,
+                                           .payload_hash = objstore::empty_payload_sha256,
+                                           .amz_date = date->second,
+                                           .region = "us-east-1"},
+                                          test_creds);
         return expect && *expect == auth->second;
     }
 };
 
-auto plain_store(std::uint16_t port, std::optional<blk::SigV4Credentials> creds = test_creds)
-    -> std::unique_ptr<blk::S3ObjectStore> {
-    auto s = blk::S3ObjectStore::create(s3_config("127.0.0.1", port, "images", std::move(creds)));
+auto plain_store(std::uint16_t port, std::optional<objstore::SigV4Credentials> creds = test_creds)
+    -> std::unique_ptr<objstore::S3ObjectStore> {
+    auto s =
+        objstore::S3ObjectStore::create(s3_config("127.0.0.1", port, "images", std::move(creds)));
     BOOST_REQUIRE(s.has_value());
     return std::move(*s);
 }
@@ -393,7 +396,7 @@ BOOST_AUTO_TEST_CASE(signed_range_gets, *boost::unit_test::timeout(unit_timeout_
     const auto whole = store->get("a/data", 4096, soon());
     BOOST_REQUIRE(whole.has_value());
     BOOST_TEST(as_string(*whole) == pattern(1000));
-    BOOST_TEST(store->get("a/data", 999, soon()).error() == FetchError::too_large);
+    BOOST_TEST(store->get("a/data", 999, soon()).error() == objstore::FetchError::too_large);
     BOOST_TEST(emu.bad_signatures.load() == 0);
     // One connection, kept alive (the too_large answer was complete and
     // well-formed, but its body was never read, so that one is dropped).
@@ -407,14 +410,17 @@ BOOST_AUTO_TEST_CASE(maps_statuses, *boost::unit_test::timeout(unit_timeout_seco
     MockServer server{std::ref(emu)};
     auto store = plain_store(server.port());
     std::vector<std::byte> out(5);
-    BOOST_TEST(store->get_range("missing/data", 0, out, soon()).error() == FetchError::not_found);
-    BOOST_TEST(store->get_range("a/data", 20, out, soon()).error() == FetchError::not_found);
-    auto wrong = plain_store(server.port(), blk::SigV4Credentials{.access_key = "AKTESTREADER",
-                                                                  .secret_key = "wrong",
-                                                                  .session_token = ""});
-    BOOST_TEST(wrong->get_range("a/data", 0, out, soon()).error() == FetchError::denied);
+    BOOST_TEST(store->get_range("missing/data", 0, out, soon()).error() ==
+               objstore::FetchError::not_found);
+    BOOST_TEST(store->get_range("a/data", 20, out, soon()).error() ==
+               objstore::FetchError::not_found);
+    auto wrong = plain_store(server.port(), objstore::SigV4Credentials{.access_key = "AKTESTREADER",
+                                                                       .secret_key = "wrong",
+                                                                       .session_token = ""});
+    BOOST_TEST(wrong->get_range("a/data", 0, out, soon()).error() == objstore::FetchError::denied);
     auto anonymous = plain_store(server.port(), std::nullopt);
-    BOOST_TEST(anonymous->get_range("a/data", 0, out, soon()).error() == FetchError::denied);
+    BOOST_TEST(anonymous->get_range("a/data", 0, out, soon()).error() ==
+               objstore::FetchError::denied);
 }
 
 BOOST_AUTO_TEST_CASE(holds_responses_to_the_request,
@@ -434,7 +440,7 @@ BOOST_AUTO_TEST_CASE(holds_responses_to_the_request,
     auto store = plain_store(server.port());
     std::vector<std::byte> out(4);
     bool closing = false;
-    auto expect = [&](const std::string& reply, FetchError e) {
+    auto expect = [&](const std::string& reply, objstore::FetchError e) {
         set(reply, closing);
         BOOST_TEST_CONTEXT(reply) {
             BOOST_TEST(store->get_range("k", 10, out, soon()).error() == e);
@@ -442,25 +448,25 @@ BOOST_AUTO_TEST_CASE(holds_responses_to_the_request,
     };
     // Wrong range, wrong length, unknown length, full object, chunked.
     expect("HTTP/1.1 206 P\r\nContent-Range: bytes 11-14/100\r\nContent-Length: 4\r\n\r\nabcd",
-           FetchError::bad_response);
+           objstore::FetchError::bad_response);
     expect("HTTP/1.1 206 P\r\nContent-Range: bytes 10-13/100\r\nContent-Length: 5\r\n\r\nabcde",
-           FetchError::bad_response);
+           objstore::FetchError::bad_response);
     expect("HTTP/1.1 206 P\r\nContent-Range: bytes 10-13/100\r\n\r\nabcd",
-           FetchError::bad_response);
-    expect("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd", FetchError::bad_response);
+           objstore::FetchError::bad_response);
+    expect("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd", objstore::FetchError::bad_response);
     expect("HTTP/1.1 206 P\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n0\r\n\r\n",
-           FetchError::bad_response);
-    expect("HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n", FetchError::bad_response);
-    expect("HTTP/1.1 503 Slow Down\r\nContent-Length: 0\r\n\r\n", FetchError::io);
-    expect("HTTP/1.1 429 Too Many\r\nContent-Length: 0\r\n\r\n", FetchError::io);
-    expect("garbage\r\n\r\n", FetchError::bad_response);
+           objstore::FetchError::bad_response);
+    expect("HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n", objstore::FetchError::bad_response);
+    expect("HTTP/1.1 503 Slow Down\r\nContent-Length: 0\r\n\r\n", objstore::FetchError::io);
+    expect("HTTP/1.1 429 Too Many\r\nContent-Length: 0\r\n\r\n", objstore::FetchError::io);
+    expect("garbage\r\n\r\n", objstore::FetchError::bad_response);
     // More bytes than declared in the same packet.
     expect("HTTP/1.1 206 P\r\nContent-Range: bytes 10-13/100\r\nContent-Length: 4\r\n\r\nabcdEXTRA",
-           FetchError::bad_response);
+           objstore::FetchError::bad_response);
     // A short body: the server closes mid-body.
     closing = true;
     expect("HTTP/1.1 206 P\r\nContent-Range: bytes 10-13/100\r\nContent-Length: 4\r\n\r\nab",
-           FetchError::bad_response);
+           objstore::FetchError::bad_response);
     // And the right answer works.
     set("HTTP/1.1 206 P\r\nContent-Range: bytes 10-13/*\r\nContent-Length: 4\r\n\r\nabcd", true);
     BOOST_REQUIRE(store->get_range("k", 10, out, soon()).has_value());
@@ -479,12 +485,12 @@ BOOST_AUTO_TEST_CASE(gives_up_at_the_deadline, *boost::unit_test::timeout(unit_t
     const auto start = Clock::now();
     const auto r = store->get_range("k", 0, out, Clock::now() + std::chrono::milliseconds{100});
     BOOST_REQUIRE(!r.has_value());
-    BOOST_TEST(r.error() == FetchError::timed_out);
+    BOOST_TEST(r.error() == objstore::FetchError::timed_out);
     BOOST_TEST((Clock::now() - start < std::chrono::seconds{2}));
     // Nothing listening: a connection error, not a hang.
     const std::uint16_t port = server.port();
     auto none = plain_store(static_cast<std::uint16_t>(port == 1 ? 2 : 1));
-    BOOST_TEST(none->get_range("k", 0, out, soon()).error() == FetchError::io);
+    BOOST_TEST(none->get_range("k", 0, out, soon()).error() == objstore::FetchError::io);
 }
 
 BOOST_AUTO_TEST_CASE(replaces_idle_closed_connections,
@@ -519,7 +525,7 @@ BOOST_AUTO_TEST_CASE(tls_verifies_the_server, *boost::unit_test::timeout(unit_ti
         std::fwrite(pem.data(), 1, pem.size(), f);
         std::fclose(f);
     }
-    auto store = blk::S3ObjectStore::create(
+    auto store = objstore::S3ObjectStore::create(
         s3_config("127.0.0.1", server.port(), "images", test_creds, true, dir.string()));
     BOOST_REQUIRE(store.has_value());
     std::vector<std::byte> out(10);
@@ -534,24 +540,26 @@ BOOST_AUTO_TEST_CASE(tls_verifies_the_server, *boost::unit_test::timeout(unit_ti
         std::fwrite(pem.data(), 1, pem.size(), f);
         std::fclose(f);
     }
-    auto untrusting = blk::S3ObjectStore::create(
+    auto untrusting = objstore::S3ObjectStore::create(
         s3_config("127.0.0.1", server.port(), "images", test_creds, true, dir.string()));
     BOOST_REQUIRE(untrusting.has_value());
-    BOOST_TEST((*untrusting)->get_range("a/data", 0, out, soon()).error() == FetchError::denied);
+    BOOST_TEST((*untrusting)->get_range("a/data", 0, out, soon()).error() ==
+               objstore::FetchError::denied);
     std::filesystem::remove(dir);
-    BOOST_TEST(blk::S3ObjectStore::create(
+    BOOST_TEST(objstore::S3ObjectStore::create(
                    s3_config("127.0.0.1", 0, "images", std::nullopt, true, dir.string()))
-                   .error() == blk::S3ConfigError::bad_ca_file);
+                   .error() == objstore::S3ConfigError::bad_ca_file);
 }
 
 BOOST_AUTO_TEST_CASE(refuses_bad_configs, *boost::unit_test::timeout(unit_timeout_seconds)) {
-    BOOST_TEST(blk::S3ObjectStore::create(s3_config("", 0, "b", std::nullopt)).error() ==
-               blk::S3ConfigError::no_host);
-    BOOST_TEST(blk::S3ObjectStore::create(s3_config("h", 0, "", std::nullopt)).error() ==
-               blk::S3ConfigError::no_bucket);
+    BOOST_TEST(objstore::S3ObjectStore::create(s3_config("", 0, "b", std::nullopt)).error() ==
+               objstore::S3ConfigError::no_host);
+    BOOST_TEST(objstore::S3ObjectStore::create(s3_config("h", 0, "", std::nullopt)).error() ==
+               objstore::S3ConfigError::no_bucket);
     auto vhost = s3_config("h", 0, "Bad_Bucket", std::nullopt);
     vhost.path_style = false;
-    BOOST_TEST(blk::S3ObjectStore::create(vhost).error() == blk::S3ConfigError::no_bucket);
+    BOOST_TEST(objstore::S3ObjectStore::create(vhost).error() ==
+               objstore::S3ConfigError::no_bucket);
 }
 
 namespace {
@@ -559,42 +567,42 @@ namespace {
 // Builds an image of `chunks` 64 KiB chunks; returns its name and puts the
 // manifest and data through `put(key, bytes)`.
 auto publish_image(const std::function<void(const std::string&, const std::string&)>& put,
-                   std::uint32_t chunks, std::string& data) -> blk::ImageDigest {
+                   std::uint32_t chunks, std::string& data) -> objstore::ImageDigest {
     constexpr std::uint64_t chunk = 64ULL * 1024;
     data = pattern(chunks * chunk);
-    blk::ImageManifest m;
-    m.chunk_shift = blk::min_chunk_shift;
+    objstore::ImageManifest m;
+    m.chunk_shift = objstore::min_chunk_shift;
     m.image_bytes = data.size();
     for (std::uint32_t c = 0; c < chunks; ++c) {
         const auto piece = std::string_view{data}.substr(c * chunk, chunk);
         m.chunks.push_back(
-            *blk::sha256_digest(std::as_bytes(std::span{piece.data(), piece.size()})));
+            *objstore::sha256_digest(std::as_bytes(std::span{piece.data(), piece.size()})));
     }
-    const auto bytes = blk::encode_manifest(m);
+    const auto bytes = objstore::encode_manifest(m);
     BOOST_REQUIRE(bytes.has_value());
-    const auto name = *blk::sha256_digest(*bytes);
-    const auto hex = blk::image_name_hex(name);
-    put(blk::image_manifest_key("images", hex), as_string(*bytes));
-    put(blk::image_data_key("images", hex), data);
+    const auto name = *objstore::sha256_digest(*bytes);
+    const auto hex = objstore::image_name_hex(name);
+    put(objstore::image_manifest_key("images", hex), as_string(*bytes));
+    put(objstore::image_data_key("images", hex), data);
     return name;
 }
 
-auto boot_image(blk::ObjectStore& store, const blk::ImageDigest& name, const std::string& data)
-    -> void {
-    const auto hex = blk::image_name_hex(name);
-    const auto raw = store.get(blk::image_manifest_key("images", hex),
-                               blk::manifest_header_size + (32ULL << 20U), soon());
+auto boot_image(objstore::ObjectStore& store, const objstore::ImageDigest& name,
+                const std::string& data) -> void {
+    const auto hex = objstore::image_name_hex(name);
+    const auto raw = store.get(objstore::image_manifest_key("images", hex),
+                               objstore::manifest_header_size + (32ULL << 20U), soon());
     BOOST_REQUIRE(raw.has_value());
-    const auto manifest = blk::decode_named_manifest(*raw, name);
+    const auto manifest = objstore::decode_named_manifest(*raw, name);
     BOOST_REQUIRE(manifest.has_value());
     std::string tmpl = (std::filesystem::temp_directory_path() / "ak-s3img-XXXXXX").string();
     BOOST_REQUIRE(::mkdtemp(tmpl.data()) != nullptr);
     const std::filesystem::path dir{tmpl};
     {
-        auto cache = blk::ChunkCache::create(dir, 1ULL << 22U);
+        auto cache = objstore::ChunkCache::create(dir, 1ULL << 22U);
         BOOST_REQUIRE(cache.has_value());
-        auto fetcher = blk::Fetcher::create(store, {});
-        auto image = (*cache)->open_image(name, *manifest, blk::image_data_key("images", hex));
+        auto fetcher = objstore::Fetcher::create(store, {});
+        auto image = (*cache)->open_image(name, *manifest, objstore::image_data_key("images", hex));
         BOOST_REQUIRE(image.has_value());
         auto backend = blk::LazyImageBackend::create({.image = *image,
                                                       .fetcher = fetcher.get(),
@@ -640,8 +648,8 @@ BOOST_AUTO_TEST_CASE(image_volume_over_s3, *boost::unit_test::timeout(unit_timeo
 // A signed PUT, only for seeding a real server in the test below.
 namespace {
 auto put_object(const std::string& host, std::uint16_t port, const std::string& bucket,
-                const blk::SigV4Credentials& creds, const std::string& key, const std::string& body)
-    -> bool {
+                const objstore::SigV4Credentials& creds, const std::string& key,
+                const std::string& body) -> bool {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         return false;
@@ -654,19 +662,19 @@ auto put_object(const std::string& host, std::uint16_t port, const std::string& 
         ::close(fd);
         return false;
     }
-    const std::string uri = blk::s3_uri_encode_path("/" + bucket + "/" + key);
-    const std::string date = blk::amz_date(std::chrono::system_clock::now());
-    const std::string hash = *blk::sha256_hex(body);
+    const std::string uri = objstore::s3_uri_encode_path("/" + bucket + "/" + key);
+    const std::string date = objstore::amz_date(std::chrono::system_clock::now());
+    const std::string hash = *objstore::sha256_hex(body);
     const std::string host_header = host + ":" + std::to_string(port);
     std::vector<std::pair<std::string, std::string>> headers{
         {"host", host_header}, {"x-amz-content-sha256", hash}, {"x-amz-date", date}};
-    const auto auth = blk::sigv4_authorization({.method = "PUT",
-                                                .canonical_uri = uri,
-                                                .headers = headers,
-                                                .payload_hash = hash,
-                                                .amz_date = date,
-                                                .region = "us-east-1"},
-                                               creds);
+    const auto auth = objstore::sigv4_authorization({.method = "PUT",
+                                                     .canonical_uri = uri,
+                                                     .headers = headers,
+                                                     .payload_hash = hash,
+                                                     .amz_date = date,
+                                                     .region = "us-east-1"},
+                                                    creds);
     std::string req = "PUT " + uri + " HTTP/1.1\r\nhost: " + host_header +
                       "\r\nx-amz-content-sha256: " + hash + "\r\nx-amz-date: " + date +
                       "\r\nauthorization: " + *auth +
@@ -705,9 +713,9 @@ BOOST_AUTO_TEST_CASE(real_s3_compatible_server, *boost::unit_test::timeout(120))
         BOOST_REQUIRE_MESSAGE(v != nullptr, n);
         return std::string{v};
     };
-    const blk::SigV4Credentials creds{.access_key = env("AK_S3_TEST_ACCESS_KEY"),
-                                      .secret_key = env("AK_S3_TEST_SECRET_KEY"),
-                                      .session_token = ""};
+    const objstore::SigV4Credentials creds{.access_key = env("AK_S3_TEST_ACCESS_KEY"),
+                                           .secret_key = env("AK_S3_TEST_SECRET_KEY"),
+                                           .session_token = ""};
     const std::string bucket = env("AK_S3_TEST_BUCKET");
     std::string data;
     const auto name = publish_image(
@@ -715,10 +723,10 @@ BOOST_AUTO_TEST_CASE(real_s3_compatible_server, *boost::unit_test::timeout(120))
             BOOST_REQUIRE_MESSAGE(put_object(host, port, bucket, creds, key, bytes), key);
         },
         8, data);
-    auto store = blk::S3ObjectStore::create(s3_config(host, port, bucket, creds));
+    auto store = objstore::S3ObjectStore::create(s3_config(host, port, bucket, creds));
     BOOST_REQUIRE(store.has_value());
     boot_image(**store, name, data);
     std::vector<std::byte> out(16);
     BOOST_TEST((*store)->get_range("images/nope/data", 0, out, soon()).error() ==
-               FetchError::not_found);
+               objstore::FetchError::not_found);
 }

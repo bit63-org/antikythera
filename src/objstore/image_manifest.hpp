@@ -44,7 +44,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 inline constexpr std::size_t image_digest_size = 32;  // SHA-256
 using ImageDigest = std::array<std::byte, image_digest_size>;
@@ -121,4 +121,4 @@ enum class ManifestError : std::uint8_t {
 [[nodiscard]] auto image_name_hex(const ImageDigest& name) -> std::string;
 [[nodiscard]] auto parse_image_name(std::string_view hex) -> std::optional<ImageDigest>;
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

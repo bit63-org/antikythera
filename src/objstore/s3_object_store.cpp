@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-#include "oar/blk/s3_object_store.hpp"
+#include "objstore/s3_object_store.hpp"
 
 #include <algorithm>
 #include <array>
@@ -21,9 +21,9 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
-#include "oar/blk/http_response.hpp"
+#include "objstore/http_response.hpp"
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 namespace {
 
@@ -562,4 +562,4 @@ auto S3ObjectStore::give_back(std::unique_ptr<Connection> c) -> void {
     }
 }
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

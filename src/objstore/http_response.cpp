@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-#include "oar/blk/http_response.hpp"
+#include "objstore/http_response.hpp"
 
 #include <algorithm>
 #include <array>
@@ -9,7 +9,7 @@
 
 #include "common/wire.hpp"
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 namespace {
 
@@ -213,4 +213,4 @@ auto parse_response_head(std::span<const std::byte> bytes)
     return head;
 }
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

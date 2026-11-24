@@ -12,15 +12,15 @@
 #include <span>
 #include <string_view>
 
-#include "oar/blk/http_response.hpp"
+#include "objstore/http_response.hpp"
 
-namespace blk = ak::oar::blk;
+namespace objstore = ak::objstore;
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
     const auto raw = std::as_bytes(std::span{data, size});
-    const auto head = blk::parse_response_head(raw);
+    const auto head = objstore::parse_response_head(raw);
     if (head) {
-        if (head->head_bytes > size || head->head_bytes > blk::max_response_head ||
+        if (head->head_bytes > size || head->head_bytes > objstore::max_response_head ||
             head->status < 100 || head->status > 999) {
             std::abort();
         }
@@ -30,6 +30,6 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
             std::abort();
         }
     }
-    static_cast<void>(blk::parse_content_range({reinterpret_cast<const char*>(data), size}));
+    static_cast<void>(objstore::parse_content_range({reinterpret_cast<const char*>(data), size}));
     return 0;
 }

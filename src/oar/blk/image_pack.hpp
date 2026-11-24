@@ -24,16 +24,16 @@
 #include <optional>
 #include <vector>
 
-#include "oar/blk/image_manifest.hpp"
+#include "objstore/image_manifest.hpp"
 #include "oar/blk/xts_cipher.hpp"
 
 namespace ak::oar::blk {
 
 struct PackOptions {
     std::uint32_t logical_block_size{512};  // 512 or 4096
-    std::uint8_t chunk_shift{default_chunk_shift};
+    std::uint8_t chunk_shift{objstore::default_chunk_shift};
     std::optional<XtsKey> image_key;  // encrypt under this key when set
-    ImageKeyId key_id{};              // non-zero exactly when image_key is set
+    objstore::ImageKeyId key_id{};    // non-zero exactly when image_key is set
 };
 
 enum class PackError : std::uint8_t {
@@ -48,9 +48,9 @@ enum class PackError : std::uint8_t {
 [[nodiscard]] auto to_string(PackError e) noexcept -> const char*;
 
 struct PackedImage {
-    ImageManifest manifest;
+    objstore::ImageManifest manifest;
     std::vector<std::byte> manifest_bytes;  // the manifest object
-    ImageDigest name{};                     // SHA-256 of manifest_bytes
+    objstore::ImageDigest name{};           // SHA-256 of manifest_bytes
     std::uint32_t stored_chunks{0};         // chunks that are not holes
 };
 

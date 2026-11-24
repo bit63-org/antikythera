@@ -45,10 +45,10 @@
 #include <string_view>
 #include <vector>
 
-#include "oar/blk/object_store.hpp"
-#include "oar/blk/sigv4.hpp"
+#include "objstore/object_store.hpp"
+#include "objstore/sigv4.hpp"
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 struct S3Config {
     bool tls{true};
@@ -135,4 +135,4 @@ private:
     S3Counters _counters;
 };
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

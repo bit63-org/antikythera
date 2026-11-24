@@ -1,9 +1,9 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-#include "oar/blk/object_store.hpp"
+#include "objstore/object_store.hpp"
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 auto to_string(FetchError e) noexcept -> const char* {
     switch (e) {
@@ -53,4 +53,4 @@ auto image_data_key(std::string_view prefix, std::string_view name_hex) -> std::
     return image_key(prefix, name_hex, "data");
 }
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

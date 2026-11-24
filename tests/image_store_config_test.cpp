@@ -12,14 +12,14 @@
 #include <string>
 #include <string_view>
 
-#include "oar/blk/image_store_config.hpp"
+#include "objstore/image_store_config.hpp"
 
-namespace blk = ak::oar::blk;
+namespace objstore = ak::objstore;
 
 BOOST_AUTO_TEST_SUITE(image_store_config)
 
 BOOST_AUTO_TEST_CASE(parses_every_key) {
-    const auto c = blk::parse_image_store_config(
+    const auto c = objstore::parse_image_store_config(
         "# the base images\n"
         "endpoint = https://minio.example:9000\n"
         "\n"
@@ -45,7 +45,7 @@ BOOST_AUTO_TEST_CASE(parses_every_key) {
 }
 
 BOOST_AUTO_TEST_CASE(defaults_and_endpoint_forms) {
-    auto c = blk::parse_image_store_config("endpoint = http://10.0.0.5\nbucket = b\n");
+    auto c = objstore::parse_image_store_config("endpoint = http://10.0.0.5\nbucket = b\n");
     BOOST_REQUIRE(c.has_value());
     BOOST_TEST(!c->s3.tls);
     BOOST_TEST(c->s3.host == "10.0.0.5");
@@ -55,7 +55,7 @@ BOOST_AUTO_TEST_CASE(defaults_and_endpoint_forms) {
     BOOST_TEST(c->prefix.empty());
     BOOST_TEST(!c->s3.credentials.has_value());  // anonymous
 
-    c = blk::parse_image_store_config("endpoint = https://[fd00::5]:8333\r\nbucket = b\r\n");
+    c = objstore::parse_image_store_config("endpoint = https://[fd00::5]:8333\r\nbucket = b\r\n");
     BOOST_REQUIRE(c.has_value());
     BOOST_TEST(c->s3.host == "fd00::5");
     BOOST_TEST(c->s3.port == 8333);
@@ -63,7 +63,7 @@ BOOST_AUTO_TEST_CASE(defaults_and_endpoint_forms) {
 
 BOOST_AUTO_TEST_CASE(refuses_mistakes) {
     const auto error = [](std::string_view text) {
-        const auto c = blk::parse_image_store_config(text);
+        const auto c = objstore::parse_image_store_config(text);
         BOOST_REQUIRE(!c.has_value());
         return c.error();
     };

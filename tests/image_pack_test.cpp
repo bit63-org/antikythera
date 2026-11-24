@@ -30,13 +30,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "oar/blk/chunk_cache.hpp"
-#include "oar/blk/fetcher.hpp"
-#include "oar/blk/file_io.hpp"
-#include "oar/blk/image_manifest.hpp"
+#include "objstore/chunk_cache.hpp"
+#include "objstore/fetcher.hpp"
+#include "objstore/file_io.hpp"
+#include "objstore/image_manifest.hpp"
 #include "oar/blk/image_pack.hpp"
 #include "oar/blk/lazy_image_backend.hpp"
-#include "oar/blk/object_store.hpp"
+#include "objstore/object_store.hpp"
 #include "oar/blk/xts_cipher.hpp"
 #include "test_support.hpp"
 
@@ -47,12 +47,13 @@ auto operator<<(std::ostream& os, PackError e) -> std::ostream& {
 }  // namespace ak::oar::blk
 
 namespace blk = ak::oar::blk;
+namespace objstore = ak::objstore;
 using ak::test::unit_timeout_seconds;
-using Clock = blk::ObjectStore::Clock;
+using Clock = objstore::ObjectStore::Clock;
 
 namespace {
 
-constexpr std::uint8_t shift = blk::min_chunk_shift;
+constexpr std::uint8_t shift = objstore::min_chunk_shift;
 constexpr std::uint64_t chunk_bytes = std::uint64_t{1} << shift;
 constexpr std::size_t half_key = 32;
 
@@ -61,7 +62,7 @@ class MemFile {
 public:
     MemFile() : _fd{::memfd_create("ak-image-pack-test", MFD_CLOEXEC)} { BOOST_REQUIRE(_fd >= 0); }
     explicit MemFile(std::span<const std::byte> bytes) : MemFile() {
-        BOOST_REQUIRE(blk::file_io::pwrite_all(_fd, bytes, 0).has_value());
+        BOOST_REQUIRE(objstore::file_io::pwrite_all(_fd, bytes, 0).has_value());
     }
     MemFile(const MemFile&) = delete;
     auto operator=(const MemFile&) -> MemFile& = delete;
@@ -74,7 +75,7 @@ public:
         struct stat st{};
         BOOST_REQUIRE(::fstat(_fd, &st) == 0);
         std::vector<std::byte> out(static_cast<std::size_t>(st.st_size));
-        BOOST_REQUIRE(blk::file_io::pread_all(_fd, out, 0).has_value());
+        BOOST_REQUIRE(objstore::file_io::pread_all(_fd, out, 0).has_value());
         return out;
     }
 
@@ -90,8 +91,8 @@ auto make_key(std::uint8_t seed) -> std::array<std::byte, blk::xts_key_size> {
     return key;
 }
 
-auto key_id(std::uint8_t first) -> blk::ImageKeyId {
-    blk::ImageKeyId id{};
+auto key_id(std::uint8_t first) -> objstore::ImageKeyId {
+    objstore::ImageKeyId id{};
     id[0] = std::byte{first};
     return id;
 }
@@ -117,13 +118,13 @@ auto plain_options() -> blk::PackOptions {
     return {.logical_block_size = 512, .chunk_shift = shift, .image_key = {}, .key_id = {}};
 }
 
-auto chunk_of(const std::vector<std::byte>& v, const blk::ImageManifest& m, std::uint32_t c)
+auto chunk_of(const std::vector<std::byte>& v, const objstore::ImageManifest& m, std::uint32_t c)
     -> std::span<const std::byte> {
     return std::span{v}.subspan(m.chunk_offset(c), m.chunk_length(c));
 }
 
 // A read-only store over the packed objects.
-class MemoryStore final : public blk::ObjectStore {
+class MemoryStore final : public objstore::ObjectStore {
 public:
     auto put(const std::string& key, std::vector<std::byte> bytes) -> void {
         const std::scoped_lock lock{_mutex};
@@ -131,26 +132,26 @@ public:
     }
     auto get_range(std::string_view key, std::uint64_t offset, std::span<std::byte> out,
                    Clock::time_point /*deadline*/)
-        -> std::expected<void, blk::FetchError> override {
+        -> std::expected<void, objstore::FetchError> override {
         const std::scoped_lock lock{_mutex};
         const auto it = _objects.find(std::string{key});
         if (it == _objects.end() || offset > it->second.size() ||
             out.size() > it->second.size() - offset) {
-            return std::unexpected(blk::FetchError::not_found);
+            return std::unexpected(objstore::FetchError::not_found);
         }
         std::copy_n(it->second.begin() + static_cast<std::ptrdiff_t>(offset), out.size(),
                     out.begin());
         return {};
     }
     auto get(std::string_view key, std::size_t max_bytes, Clock::time_point /*deadline*/)
-        -> std::expected<std::vector<std::byte>, blk::FetchError> override {
+        -> std::expected<std::vector<std::byte>, objstore::FetchError> override {
         const std::scoped_lock lock{_mutex};
         const auto it = _objects.find(std::string{key});
         if (it == _objects.end()) {
-            return std::unexpected(blk::FetchError::not_found);
+            return std::unexpected(objstore::FetchError::not_found);
         }
         if (it->second.size() > max_bytes) {
-            return std::unexpected(blk::FetchError::too_large);
+            return std::unexpected(objstore::FetchError::too_large);
         }
         return it->second;
     }
@@ -191,24 +192,25 @@ auto read_back(const std::vector<std::byte>& raw, const blk::PackOptions& option
     BOOST_REQUIRE(packed.has_value());
 
     MemoryStore store;
-    const auto hex = blk::image_name_hex(packed->name);
-    store.put(blk::image_manifest_key("images", hex), packed->manifest_bytes);
-    store.put(blk::image_data_key("images", hex), data.contents());
-    const auto manifest_bytes = store.get(blk::image_manifest_key("images", hex), 1U << 26U,
+    const auto hex = objstore::image_name_hex(packed->name);
+    store.put(objstore::image_manifest_key("images", hex), packed->manifest_bytes);
+    store.put(objstore::image_data_key("images", hex), data.contents());
+    const auto manifest_bytes = store.get(objstore::image_manifest_key("images", hex), 1U << 26U,
                                           Clock::now() + std::chrono::seconds{1});
     BOOST_REQUIRE(manifest_bytes.has_value());
-    const auto manifest = blk::decode_named_manifest(*manifest_bytes, packed->name);
+    const auto manifest = objstore::decode_named_manifest(*manifest_bytes, packed->name);
     BOOST_REQUIRE(manifest.has_value());
 
     const TempDir dir;
-    auto cache = blk::ChunkCache::create(dir.path(), 16 * chunk_bytes);
+    auto cache = objstore::ChunkCache::create(dir.path(), 16 * chunk_bytes);
     BOOST_REQUIRE(cache.has_value());
-    auto fetcher = blk::Fetcher::create(store, {.workers = 2,
-                                                .deadline = std::chrono::milliseconds{2000},
-                                                .attempts = 3,
-                                                .backoff = std::chrono::milliseconds{1},
-                                                .max_queued_prefetch = 8});
-    auto image = (*cache)->open_image(packed->name, *manifest, blk::image_data_key("images", hex));
+    auto fetcher = objstore::Fetcher::create(store, {.workers = 2,
+                                                     .deadline = std::chrono::milliseconds{2000},
+                                                     .attempts = 3,
+                                                     .backoff = std::chrono::milliseconds{1},
+                                                     .max_queued_prefetch = 8});
+    auto image =
+        (*cache)->open_image(packed->name, *manifest, objstore::image_data_key("images", hex));
     BOOST_REQUIRE(image.has_value());
     auto backend = blk::LazyImageBackend::create({.image = *image,
                                                   .fetcher = fetcher.get(),
@@ -250,7 +252,7 @@ BOOST_AUTO_TEST_CASE(packs_a_plain_image_with_holes,
     BOOST_TEST(m.is_hole(1));
     BOOST_TEST(m.is_hole(3));
     // The manifest bytes decode to the manifest, and name it.
-    const auto decoded = blk::decode_named_manifest(packed->manifest_bytes, packed->name);
+    const auto decoded = objstore::decode_named_manifest(packed->manifest_bytes, packed->name);
     BOOST_REQUIRE(decoded.has_value());
     BOOST_TEST((*decoded == m));
     // The data object is the image, byte for byte, and every stored chunk
@@ -258,7 +260,7 @@ BOOST_AUTO_TEST_CASE(packs_a_plain_image_with_holes,
     const auto stored = data.contents();
     BOOST_TEST((stored == raw));
     for (std::uint32_t c = 0; c < m.chunk_count(); ++c) {
-        BOOST_TEST(blk::chunk_matches(m, c, chunk_of(stored, m, c)) == !m.is_hole(c));
+        BOOST_TEST(objstore::chunk_matches(m, c, chunk_of(stored, m, c)) == !m.is_hole(c));
     }
 }
 
@@ -304,7 +306,7 @@ BOOST_AUTO_TEST_CASE(encrypts_under_the_image_key,
     for (const std::uint32_t chunk : {0U, 1U, 3U}) {
         const auto piece = chunk_of(stored, m, chunk);
         BOOST_TEST(!std::ranges::equal(piece, chunk_of(raw, m, chunk)));
-        BOOST_TEST(blk::chunk_matches(m, chunk, piece));
+        BOOST_TEST(objstore::chunk_matches(m, chunk, piece));
         std::vector<std::byte> plain(piece.size());
         BOOST_REQUIRE(c->decrypt(m.chunk_offset(chunk) / 512, piece, plain).has_value());
         BOOST_TEST(std::ranges::equal(plain, chunk_of(raw, m, chunk)));
@@ -361,9 +363,9 @@ BOOST_AUTO_TEST_CASE(refuses_bad_options_and_sizes,
     o.logical_block_size = 1024;
     BOOST_TEST(pack(raw.size(), o).error() == blk::PackError::bad_options);
     o = plain_options();
-    o.chunk_shift = blk::min_chunk_shift - 1;
+    o.chunk_shift = objstore::min_chunk_shift - 1;
     BOOST_TEST(pack(raw.size(), o).error() == blk::PackError::bad_options);
-    o.chunk_shift = blk::max_chunk_shift + 1;
+    o.chunk_shift = objstore::max_chunk_shift + 1;
     BOOST_TEST(pack(raw.size(), o).error() == blk::PackError::bad_options);
     // A key needs a key ID, and a key ID needs a key.
     const auto key = make_key(0x33);
@@ -380,9 +382,8 @@ BOOST_AUTO_TEST_CASE(refuses_bad_options_and_sizes,
     o.logical_block_size = 4096;
     BOOST_TEST(pack(raw.size() - 512, o).error() == blk::PackError::bad_image_size);
     // Checked before anything is read, so the size need not be real.
-    BOOST_TEST(
-        pack((std::uint64_t{blk::max_image_chunks} + 1) * chunk_bytes, plain_options()).error() ==
-        blk::PackError::too_many_chunks);
+    BOOST_TEST(pack((std::uint64_t{objstore::max_image_chunks} + 1) * chunk_bytes, plain_options())
+                   .error() == blk::PackError::too_many_chunks);
     // An image shorter than its stated size.
     BOOST_TEST(pack(raw.size() + chunk_bytes, plain_options()).error() ==
                blk::PackError::read_failed);

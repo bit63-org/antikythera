@@ -8,7 +8,7 @@
 #include <utility>
 
 #include "oar/blk/file_backend.hpp"
-#include "oar/blk/image_manifest.hpp"
+#include "objstore/image_manifest.hpp"
 
 namespace ak::oar::blk {
 
@@ -54,7 +54,8 @@ auto on_flr(VirtioBlkFunction& f, LazyImageBackend* image = nullptr) -> std::fun
 
 // Largest manifest: the header and 2^20 chunk digests (32 MiB).
 constexpr std::size_t max_manifest_bytes =
-    manifest_header_size + (std::size_t{max_image_chunks} * image_digest_size);
+    objstore::manifest_header_size +
+    (std::size_t{objstore::max_image_chunks} * objstore::image_digest_size);
 
 }  // namespace
 
@@ -171,15 +172,15 @@ auto BlkRole::open_image_volume(const VolumeMetadata& m)
         return std::unexpected(std::format("no image store {}", m.image->store_id));
     }
     const ImageStore& is = store->second;
-    const std::string hex = image_name_hex(m.image->name);
-    const auto deadline = ObjectStore::Clock::now() + _config.manifest_deadline;
+    const std::string hex = objstore::image_name_hex(m.image->name);
+    const auto deadline = objstore::ObjectStore::Clock::now() + _config.manifest_deadline;
     const auto bytes =
-        is.store->get(image_manifest_key(is.prefix, hex), max_manifest_bytes, deadline);
+        is.store->get(objstore::image_manifest_key(is.prefix, hex), max_manifest_bytes, deadline);
     if (!bytes) {
         return std::unexpected(std::format("manifest {}: {}", hex, to_string(bytes.error())));
     }
     // The name pins the manifest: a store that returns another one is caught here.
-    const auto manifest = decode_named_manifest(*bytes, m.image->name);
+    const auto manifest = objstore::decode_named_manifest(*bytes, m.image->name);
     if (!manifest) {
         return std::unexpected(std::format("manifest {}: {}", hex, to_string(manifest.error())));
     }
@@ -187,8 +188,8 @@ auto BlkRole::open_image_volume(const VolumeMetadata& m)
         // Needs the image key from helm (task 15).
         return std::unexpected(std::format("image {} is encrypted", hex));
     }
-    auto image =
-        _config.image_cache->open_image(m.image->name, *manifest, image_data_key(is.prefix, hex));
+    auto image = _config.image_cache->open_image(m.image->name, *manifest,
+                                                 objstore::image_data_key(is.prefix, hex));
     if (!image) {
         return std::unexpected(std::format("image {}: cache errno {}", hex, image.error()));
     }

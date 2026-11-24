@@ -42,10 +42,10 @@
 #include <utility>
 #include <vector>
 
-#include "oar/blk/chunk_cache.hpp"
-#include "oar/blk/object_store.hpp"
+#include "objstore/chunk_cache.hpp"
+#include "objstore/object_store.hpp"
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 struct FetcherConfig {
     std::size_t workers{4};
@@ -136,4 +136,4 @@ private:
     std::vector<std::thread> _workers;
 };
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

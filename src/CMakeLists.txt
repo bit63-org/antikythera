@@ -220,20 +220,31 @@ target_link_libraries(ak_oar_net_role
   PUBLIC ak::oar_net ak::helm ak::proto
   PRIVATE ak::warnings ak::hardening)
 
+# Images and snapshots in object storage, shared by oar-blk image volumes
+# and hold's snapshots and hydration (.kiro/specs/block-volume-service/
+# task 20): the image manifest (versions 1 and 2), the ObjectStore seam,
+# the chunk Fetcher and the local ChunkCache. Nothing here depends on the
+# virtio data path.
+add_library(ak_objstore
+  objstore/chunk_cache.cpp
+  objstore/fetcher.cpp
+  objstore/image_manifest.cpp
+  objstore/object_store.cpp)
+add_library(ak::objstore ALIAS ak_objstore)
+find_package(Threads REQUIRED)
+target_link_libraries(ak_objstore
+  PUBLIC ak::common Threads::Threads OpenSSL::Crypto
+  PRIVATE ak::warnings ak::hardening)
+
 # oar-blk image volumes: a read-only base image in object storage under an
 # ephemeral overlay (.kiro/specs/oar-blk-data-plane/ Requirement 8).
 add_library(ak_oar_blk_image
-  oar/blk/chunk_cache.cpp
-  oar/blk/fetcher.cpp
-  oar/blk/image_manifest.cpp
   oar/blk/image_pack.cpp
   oar/blk/lazy_image_backend.cpp
-  oar/blk/object_store.cpp
   oar/blk/overlay.cpp)
 add_library(ak::oar_blk_image ALIAS ak_oar_blk_image)
-find_package(Threads REQUIRED)
 target_link_libraries(ak_oar_blk_image
-  PUBLIC ak::oar_blk Threads::Threads
+  PUBLIC ak::oar_blk ak::objstore Threads::Threads
   PRIVATE ak::warnings ak::hardening)
 
 # oar-blk network volumes (.kiro/specs/block-volume-service/ task 7): the
@@ -254,16 +265,17 @@ target_link_libraries(ak-image-pack
   PRIVATE ak::oar_blk_image OpenSSL::Crypto ak::warnings ak::hardening)
 install(TARGETS ak-image-pack RUNTIME DESTINATION bin)
 
-# The S3 client behind image volumes: HTTP/1.1 range GETs over TCP or TLS
-# with Signature V4 (oar-blk task 11).
-add_library(ak_oar_blk_s3
-  oar/blk/http_response.cpp
-  oar/blk/image_store_config.cpp
-  oar/blk/s3_object_store.cpp
-  oar/blk/sigv4.cpp)
-add_library(ak::oar_blk_s3 ALIAS ak_oar_blk_s3)
-target_link_libraries(ak_oar_blk_s3
-  PUBLIC ak::oar_blk_image OpenSSL::SSL OpenSSL::Crypto
+# The S3 client behind image volumes and snapshots: HTTP/1.1 range GETs,
+# HEADs and PUTs over TCP or TLS with Signature V4 (oar-blk task 11,
+# block-volume-service task 20).
+add_library(ak_objstore_s3
+  objstore/http_response.cpp
+  objstore/image_store_config.cpp
+  objstore/s3_object_store.cpp
+  objstore/sigv4.cpp)
+add_library(ak::objstore_s3 ALIAS ak_objstore_s3)
+target_link_libraries(ak_objstore_s3
+  PUBLIC ak::objstore OpenSSL::SSL OpenSSL::Crypto
   PRIVATE ak::warnings ak::hardening)
 
 # The storage role as helm drives it over the sideband: volume files and
@@ -371,7 +383,7 @@ if(LIBVFIO_USER_FOUND)
 
   add_executable(ak-oar-blk oar/blk/oar_blk_main.cpp)
   target_link_libraries(ak-oar-blk
-    PRIVATE ak::vfu_virtio ak::oar_blk_role ak::oar_blk_s3 ak::hull ak::warnings ak::hardening)
+    PRIVATE ak::vfu_virtio ak::oar_blk_role ak::objstore_s3 ak::hull ak::warnings ak::hardening)
   install(TARGETS ak-oar-blk RUNTIME DESTINATION bin)
 elseif(_ak_vfio_user_required)
   message(FATAL_ERROR

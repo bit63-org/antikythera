@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 struct SigV4Credentials {
     std::string access_key;
@@ -67,4 +67,4 @@ inline constexpr std::string_view empty_payload_sha256 =
 // (A-Z a-z 0-9 - . _ ~) and '/' as %XX, uppercase hex.
 [[nodiscard]] auto s3_uri_encode_path(std::string_view path) -> std::string;
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

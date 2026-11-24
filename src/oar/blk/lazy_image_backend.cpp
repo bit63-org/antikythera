@@ -46,7 +46,7 @@ auto LazyImageBackend::create(LazyImageParams params)
     if (!params.image || params.fetcher == nullptr) {
         return std::unexpected(LazyImageError::no_image);
     }
-    const ImageManifest& m = params.image->manifest();
+    const objstore::ImageManifest& m = params.image->manifest();
     const std::uint32_t lbs = params.logical_block_size;
     if ((lbs != data_unit_512 && lbs != data_unit_4k) || m.image_bytes % lbs != 0 ||
         (m.encrypted && lbs != m.logical_block_size)) {
@@ -96,7 +96,7 @@ auto LazyImageBackend::load_keys(XtsKey ephemeral, std::optional<XtsKey> image_k
     if (_eph) {
         return std::unexpected(ImageKeyError::occupied);
     }
-    const ImageManifest& m = _params.image->manifest();
+    const objstore::ImageManifest& m = _params.image->manifest();
     if (m.encrypted && !image_key) {
         return std::unexpected(ImageKeyError::missing_image_key);
     }
@@ -186,7 +186,7 @@ auto LazyImageBackend::submit_read(std::uint64_t offset, std::span<std::byte> ou
         // May run at once on this thread (a failure); the inbox takes it
         // either way, and poll() completes the read.
         _params.fetcher->fetch_async(
-            _params.image, chunk, [inbox = _inbox, id, chunk](FetchResult r) {
+            _params.image, chunk, [inbox = _inbox, id, chunk](objstore::FetchResult r) {
                 inbox->post({.read = id, .chunk = chunk, .result = std::move(r)});
             });
     }
@@ -223,7 +223,7 @@ auto LazyImageBackend::poll() -> bool {
 
 auto LazyImageBackend::misses(std::uint64_t offset, std::uint64_t end) const
     -> std::vector<std::uint32_t> {
-    const ImageManifest& m = _params.image->manifest();
+    const objstore::ImageManifest& m = _params.image->manifest();
     const std::uint32_t lbs = _params.logical_block_size;
     std::vector<std::uint32_t> out;
     for (std::uint64_t at = offset; at < end; at += lbs) {
@@ -299,7 +299,7 @@ auto LazyImageBackend::write(std::uint64_t offset, std::span<const std::byte> in
 
 auto LazyImageBackend::read_image(std::uint64_t offset, std::span<std::byte> out,
                                   const Fetched* fetched) -> std::expected<void, BackendError> {
-    const ImageManifest& m = _params.image->manifest();
+    const objstore::ImageManifest& m = _params.image->manifest();
     std::size_t pos = 0;
     while (pos < out.size()) {
         const std::uint64_t at = offset + pos;
@@ -337,7 +337,7 @@ auto LazyImageBackend::read_image(std::uint64_t offset, std::span<std::byte> out
 }
 
 auto LazyImageBackend::readahead(std::uint64_t offset, std::uint64_t end) -> void {
-    const ImageManifest& m = _params.image->manifest();
+    const objstore::ImageManifest& m = _params.image->manifest();
     const std::uint64_t this_chunk = offset >> m.chunk_shift;
     bool sequential = false;
     if (_last_end) {

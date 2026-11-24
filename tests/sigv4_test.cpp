@@ -48,6 +48,36 @@ BOOST_AUTO_TEST_CASE(aws_documented_get_object_example,
                "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41");
 }
 
+// AWS's documented PUT Object example: a signed payload hash instead of
+// the empty one (block-volume-service task 20, snapshot uploads).
+BOOST_AUTO_TEST_CASE(aws_documented_put_object_example,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const objstore::SigV4Credentials creds{.access_key = "AKIAIOSFODNN7EXAMPLE",
+                                           .secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                                           .session_token = ""};
+    const auto hash = objstore::sha256_hex("Welcome to Amazon S3.");
+    BOOST_REQUIRE(hash.has_value());
+    BOOST_TEST(*hash == "44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072");
+    const auto auth = objstore::sigv4_authorization(
+        {.method = "PUT",
+         .canonical_uri = objstore::s3_uri_encode_path("/test$file.text"),
+         .headers = {{"host", "examplebucket.s3.amazonaws.com"},
+                     {"date", "Fri, 24 May 2013 00:00:00 GMT"},
+                     {"x-amz-date", "20130524T000000Z"},
+                     {"x-amz-storage-class", "REDUCED_REDUNDANCY"},
+                     {"x-amz-content-sha256", *hash}},
+         .payload_hash = *hash,
+         .amz_date = "20130524T000000Z",
+         .region = "us-east-1"},
+        creds);
+    BOOST_REQUIRE(auth.has_value());
+    BOOST_TEST(*auth ==
+               "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/"
+               "aws4_request, "
+               "SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class, "
+               "Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd");
+}
+
 BOOST_AUTO_TEST_CASE(refuses_incomplete_requests,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
     const objstore::SigV4Credentials creds{

@@ -38,6 +38,12 @@ constexpr unsigned status_range_not_satisfiable = 416;
 constexpr unsigned status_too_many = 429;
 constexpr unsigned status_server_error = 500;
 constexpr std::size_t read_chunk = 64U * 1024U;
+// The most of a PUT answer's body read and dropped (S3 sends none).
+constexpr std::size_t max_put_reply = 64U * 1024U;
+
+auto as_chars(std::span<const std::byte> b) -> std::string_view {
+    return {reinterpret_cast<const char*>(b.data()), b.size()};
+}
 
 auto remaining_ms(ObjectStore::Clock::time_point deadline) -> int {
     const auto left =
@@ -275,23 +281,66 @@ auto S3ObjectStore::get_range(std::string_view key, std::uint64_t offset, std::s
     if (out.empty()) {
         return {};
     }
-    return request(key, Range{.offset = offset, .length = out.size()},
-                   Sink{.fixed = out, .grow = nullptr, .max = 0}, deadline);
+    return request(key,
+                   {.method = Method::get,
+                    .range = Range{.offset = offset, .length = out.size()},
+                    .sink = Sink{.fixed = out, .grow = nullptr, .max = 0},
+                    .body = {},
+                    .size = nullptr},
+                   deadline);
 }
 
 auto S3ObjectStore::get(std::string_view key, std::size_t max_bytes, Clock::time_point deadline)
     -> std::expected<std::vector<std::byte>, FetchError> {
     std::vector<std::byte> out;
-    if (auto r =
-            request(key, std::nullopt, Sink{.fixed = {}, .grow = &out, .max = max_bytes}, deadline);
+    if (auto r = request(key,
+                         {.method = Method::get,
+                          .range = std::nullopt,
+                          .sink = Sink{.fixed = {}, .grow = &out, .max = max_bytes},
+                          .body = {},
+                          .size = nullptr},
+                         deadline);
         !r) {
         return std::unexpected(r.error());
     }
     return out;
 }
 
-auto S3ObjectStore::build_request(std::string_view key, std::optional<Range> range) const
+auto S3ObjectStore::head(std::string_view key, Clock::time_point deadline)
+    -> std::expected<std::uint64_t, FetchError> {
+    std::uint64_t size = 0;
+    if (auto r = request(
+            key, {.method = Method::head, .range = {}, .sink = {}, .body = {}, .size = &size},
+            deadline);
+        !r) {
+        return std::unexpected(r.error());
+    }
+    return size;
+}
+
+auto S3ObjectStore::put(std::string_view key, std::span<const std::byte> bytes,
+                        Clock::time_point deadline) -> std::expected<void, FetchError> {
+    return request(key,
+                   {.method = Method::put, .range = {}, .sink = {}, .body = bytes, .size = nullptr},
+                   deadline);
+}
+
+auto S3ObjectStore::build_request(std::string_view key, const Call& call) const
     -> std::expected<std::string, FetchError> {
+    const auto& range = call.range;
+    std::string_view method = "GET";
+    std::string payload_hash{empty_payload_sha256};
+    if (call.method == Method::head) {
+        method = "HEAD";
+    } else if (call.method == Method::put) {
+        method = "PUT";
+        // Signed, so the store refuses a body that does not match it.
+        auto hash = sha256_hex(as_chars(call.body));
+        if (!hash) {
+            return std::unexpected(FetchError::io);
+        }
+        payload_hash = std::move(*hash);
+    }
     std::string path = "/";
     if (_config.path_style) {
         path.append(_config.bucket).append("/");
@@ -301,25 +350,28 @@ auto S3ObjectStore::build_request(std::string_view key, std::optional<Range> ran
     const std::string date = amz_date(_config.clock());
     std::vector<std::pair<std::string, std::string>> headers{
         {"host", _host_header},
-        {"x-amz-content-sha256", std::string{empty_payload_sha256}},
+        {"x-amz-content-sha256", payload_hash},
         {"x-amz-date", date},
     };
     if (range) {
         headers.emplace_back("range", "bytes=" + std::to_string(range->offset) + "-" +
                                           std::to_string(range->offset + range->length - 1));
     }
+    if (call.method == Method::put) {
+        headers.emplace_back("content-length", std::to_string(call.body.size()));
+    }
     if (_config.credentials && !_config.credentials->session_token.empty()) {
         headers.emplace_back("x-amz-security-token", _config.credentials->session_token);
     }
-    std::string text = "GET " + uri + " HTTP/1.1\r\n";
+    std::string text = std::string{method} + " " + uri + " HTTP/1.1\r\n";
     for (const auto& [name, value] : headers) {
         text.append(name).append(": ").append(value).append("\r\n");
     }
     if (_config.credentials) {
-        const auto auth = sigv4_authorization({.method = "GET",
+        const auto auth = sigv4_authorization({.method = method,
                                                .canonical_uri = uri,
                                                .headers = headers,
-                                               .payload_hash = empty_payload_sha256,
+                                               .payload_hash = payload_hash,
                                                .amz_date = date,
                                                .region = _config.region},
                                               *_config.credentials);
@@ -332,9 +384,9 @@ auto S3ObjectStore::build_request(std::string_view key, std::optional<Range> ran
     return text;
 }
 
-auto S3ObjectStore::request(std::string_view key, std::optional<Range> range, Sink sink,
-                            Clock::time_point deadline) -> std::expected<void, FetchError> {
-    const auto text = build_request(key, range);
+auto S3ObjectStore::request(std::string_view key, const Call& call, Clock::time_point deadline)
+    -> std::expected<void, FetchError> {
+    const auto text = build_request(key, call);
     if (!text) {
         return std::unexpected(text.error());
     }
@@ -352,7 +404,7 @@ auto S3ObjectStore::request(std::string_view key, std::optional<Range> range, Si
         }
         bool reusable = false;
         bool got_any = false;
-        auto r = exchange(**c, *text, range, sink, deadline, reusable, got_any);
+        auto r = exchange(**c, *text, call, deadline, reusable, got_any);
         if (r || !pooled || got_any || r.error() != FetchError::io) {
             if (reusable) {
                 give_back(std::move(*c));
@@ -365,10 +417,15 @@ auto S3ObjectStore::request(std::string_view key, std::optional<Range> range, Si
     return std::unexpected(FetchError::io);
 }
 
-auto S3ObjectStore::exchange(Connection& c, const std::string& text, std::optional<Range> range,
-                             Sink sink, Clock::time_point deadline, bool& reusable, bool& got_any)
+auto S3ObjectStore::exchange(Connection& c, const std::string& text, const Call& call,
+                             Clock::time_point deadline, bool& reusable, bool& got_any)
     -> std::expected<void, FetchError> {
+    const auto& range = call.range;
+    Sink sink = call.sink;
     if (auto w = c.write_all(text, deadline); !w) {
+        return w;
+    }
+    if (auto w = c.write_all(as_chars(call.body), deadline); !w) {
         return w;
     }
     std::vector<std::byte> buf(read_chunk);
@@ -412,8 +469,25 @@ auto S3ObjectStore::exchange(Connection& c, const std::string& text, std::option
         return std::unexpected(FetchError::bad_response);
     }
     const std::uint64_t length = *head->content_length;
+    const std::size_t extra = have - head->head_bytes;
+    if (call.method == Method::head) {
+        // The size of the object; no body follows a HEAD answer.
+        if (status != status_ok || head->content_range || extra != 0) {
+            return std::unexpected(FetchError::bad_response);
+        }
+        *call.size = length;
+        reusable = !head->close;
+        return {};
+    }
+    std::vector<std::byte> dropped;
     std::span<std::byte> target;
-    if (range) {
+    if (call.method == Method::put) {
+        if (status != status_ok || head->content_range || length > max_put_reply) {
+            return std::unexpected(FetchError::bad_response);
+        }
+        dropped.resize(length);  // read below, then dropped
+        target = dropped;
+    } else if (range) {
         const bool exact_206 = status == status_partial && head->content_range &&
                                head->content_range->first == range->offset &&
                                head->content_range->last == range->offset + range->length - 1 &&
@@ -435,7 +509,6 @@ auto S3ObjectStore::exchange(Connection& c, const std::string& text, std::option
         target = *sink.grow;
     }
     // The body: what came with the head, then the rest.
-    const std::size_t extra = have - head->head_bytes;
     if (extra > target.size()) {
         return std::unexpected(FetchError::bad_response);  // more than declared
     }

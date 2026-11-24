@@ -123,10 +123,25 @@ repository. Prerequisites outside this spec: oar-blk task 14
 
 ### Phase F: snapshots and restore
 
-- [ ] 20. Image manifest version 2 (chunked, lineage, parent) in the
+- [x] 20. Image manifest version 2 (chunked, lineage, parent) in the
   manifest codec; extract `Fetcher`, `ChunkCache`, `S3ObjectStore` into a
   shared library; S3 `PUT`/`HEAD` with payload-hash SigV4.
-  _Requirements: 11.3_ (cloud)
+  _Requirements: 11.3_ (cloud) — the manifest codec, `ObjectStore`,
+  `Fetcher`, `ChunkCache` and the S3 client moved to `src/objstore/`
+  (namespace `ak::objstore`, libraries `ak_objstore` and
+  `ak_objstore_s3`, neither linking the virtio data path). Version 2 adds
+  a 40-byte header tail (lineage ID, parent manifest name) and flag bit 1
+  `chunked`; the flag is set exactly in version 2, which must be
+  encrypted with a non-zero lineage (`ManifestError::bad_lineage`).
+  `lineage_chunks_prefix`, `chunk_key` and `snapshot_manifest_key` spell
+  the object keys, the lineage ID as 16 hex digits. A chunked image's
+  `CachedImage` data key is its chunks prefix and the `Fetcher` reads
+  each chunk as its own object, so restores (task 22) can reuse it as
+  is. `ObjectStore` gains `head()` and `put()` (read-only stores answer
+  `denied`); `S3ObjectStore` signs each PUT over its body's SHA-256
+  (checked against AWS's documented PUT Object example) and holds HEAD
+  and PUT answers to strict rules. oar-blk refuses a chunked manifest as
+  an image volume.
 - [ ] 21. Snapshots: single-volume cut, multi-volume prepare/commit cut,
   `FICLONE` freeze, incremental upload, deletion with lineage
   mark-and-sweep GC; tests against the loopback S3 emulator and

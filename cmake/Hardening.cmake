@@ -8,8 +8,16 @@ add_library(ak::hardening ALIAS ak_hardening)
 target_compile_options(ak_hardening INTERFACE
   -fstack-protector-strong
   -fstack-clash-protection
-  -fcf-protection=full
   -fPIE)
+
+# Control-flow integrity: Intel CET on x86-64, pointer authentication plus
+# branch target identification on 64-bit Arm. GCC rejects
+# -fcf-protection=full outright when targeting aarch64.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+  target_compile_options(ak_hardening INTERFACE -mbranch-protection=standard)
+else()
+  target_compile_options(ak_hardening INTERFACE -fcf-protection=full)
+endif()
 
 # _FORTIFY_SOURCE needs optimization and conflicts with ASan.
 if(NOT AK_SANITIZE)

@@ -593,6 +593,47 @@ regardless, and the function is cleaned. The mailbox gets a third
 Requirement 7.2 is amended to say that under `wait` it never ejects
 before helm reports the release.
 
+As built (task 13, helm and guest side):
+
+- **Mailbox.** `DetachPolicy::wait = 3` is valid on `DETACH_VOLUME` only;
+  `DETACH_DEVICE` refuses it as malformed (NICs and GPUs have no
+  cooperative release). A new status `busy = 14` (also
+  `CommandStatus::busy` in reports) is helm's answer when the guest did
+  not release in time; hull never sends it.
+- **helm holds the command, not hull.** The CommandRouter prepares the
+  detach as usual, then sends `eject(request)` and keeps the command,
+  unrelayed, while it polls `eject(query)` every 500 ms. The mailbox
+  stays held meanwhile, exactly as it would be while hull waited on a
+  guest eject: a later command relayed first would leave this one's
+  sequence number below hull's floor (hull Requirement 4.3), so nothing
+  passes it. On `released` the slot goes to hull unmodified and runs as
+  any command; at `timeout_s` without it, helm answers `busy` and frees
+  the mailbox. The request stays set, helm keeps polling a busy function,
+  and a later release is audited and, for a network volume, reported as
+  `attachment_status released`; the controller then sends
+  `DETACH_VOLUME` again, which relays at once because the role already
+  answers `released`. A forced detach replaces a busy one. There is no
+  mailbox command to withdraw a pending request yet; it ends with the
+  release, the forced detach or the VM.
+- **Reports.** Network volumes report `attachment_status`
+  `eject_requested`, `busy` and `released` with their attachment and
+  generation. Local and image volumes have no attachment ID for that
+  report, so the command's outcome is theirs.
+- **Fencing check.** helm refuses `force` and `destroy_vm` on a network
+  volume with `conflict` while its newest ReplicaConfig still grants this
+  server the attachment's generation: the controller must fence first.
+  helm only sees the published config; waiting until the primary applied
+  it (`Master::generation_fenced`) is the controller's part.
+- **Guest helper.** `guest/ak-guest-eject` (bash, shellchecked in CI)
+  walks each virtio function's capability list in
+  `/sys/bus/pci/devices/*/config`, and when `eject_requested` is set on
+  an `AKVD` capability, releases the function with sysfs `remove` unless
+  the disk or a partition is mounted, held (`holders/`: LVM, MD,
+  dm-crypt), active swap or open by any process; a refusal is logged once
+  per request. `guest/90-ak-guest-eject.rules` starts
+  `ak-guest-eject.service` when a virtio disk appears. A ctest
+  (`guest_eject_test`) runs it against a fake sysfs and procfs.
+
 ## Multi-attach
 
 - Up to 16 attachments in one ReplicaConfig, any mix of servers, each

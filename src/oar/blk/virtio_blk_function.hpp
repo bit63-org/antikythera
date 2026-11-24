@@ -88,6 +88,15 @@
 // changes device_status again and starts the wait over. The request
 // survives FLR; only cancel_eject() or a new function clears it.
 //
+// Online grow (.kiro/specs/block-volume-service/ design "QoS and
+// elasticity", Requirement 10.3). grow() takes a capacity the backend
+// already holds: the parser's bound moves first, then
+// virtio_blk_config.capacity, and the configuration-change interrupt
+// with a new config_generation tells the driver, which re-reads the
+// capacity (Linux and Windows resize the disk online). Requests already
+// parsed keep the bound they were checked against; none can be past the
+// old end. Shrinking is refused.
+//
 // Not thread-safe: the transport serializes every call.
 
 #include <array>
@@ -311,6 +320,10 @@ public:
     [[nodiscard]] auto geometry() const noexcept -> const VolumeGeometry& {
         return _parser.geometry();
     }
+    // Raises the capacity to `capacity_sectors` (above). The same capacity
+    // again is a no-op; a smaller or unaligned one bad_geometry, one the
+    // backend does not hold backend_too_small.
+    [[nodiscard]] auto grow(std::uint64_t capacity_sectors) -> std::expected<void, BlkConfigError>;
     [[nodiscard]] auto counters() const noexcept -> const BlkCounters& { return _counters; }
     // Requests submitted to the backend and not yet completed.
     [[nodiscard]] auto in_flight() const noexcept -> std::size_t { return _in_flight; }

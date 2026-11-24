@@ -822,6 +822,42 @@ BOOST_AUTO_TEST_CASE(lets_completions_submit_again, *utf::timeout(ak::test::unit
     BOOST_TEST(std::ranges::equal(out, data));
 }
 
+BOOST_AUTO_TEST_CASE(follows_a_resize_and_new_limits,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Rig rig;
+    rig.apply(config(1));
+    const auto data = blocks_of(19, 2);
+    Done before;
+    rig.write(capacity, data, before);
+    BOOST_TEST(before.failed(BackendError::out_of_range));
+    // The resize epoch reaches the members first, then the initiator
+    // (Requirement 10.3), with new QoS limits in the same config (10.4).
+    auto grown = config(2);
+    grown.capacity_blocks = 2 * capacity;
+    grown.qos = {.iops = 100, .mib_per_s = 1000, .burst_iops = 10, .burst_mib = 1000};
+    rig.apply(grown);
+    BOOST_TEST(rig.core.capacity_bytes() == 2 * capacity * bs);
+    Done after;
+    rig.write(capacity, data, after);
+    BOOST_TEST(after.ok());
+    Bytes out(data.size());
+    Done r;
+    rig.read(capacity, out, r);
+    BOOST_TEST(r.ok());
+    BOOST_TEST(std::ranges::equal(out, data));
+    // The tighter limits apply from the new epoch on.
+    const auto one = blocks_of(20, 1);
+    std::vector<Done> done(30);
+    const auto sent = rig.count(HoldOpcode::write);
+    for (std::size_t i = 0; i < done.size(); ++i) {
+        rig.core.submit_write(i * bs, one, done[i].fn(), rig.now);
+    }
+    rig.step();
+    BOOST_TEST(rig.count(HoldOpcode::write) - sent <= 11U);
+    rig.run_for(1s);
+    BOOST_TEST(std::ranges::all_of(done, &Done::ok));
+}
+
 BOOST_AUTO_TEST_CASE(refuses_routes_it_cannot_follow,
                      *utf::timeout(ak::test::unit_timeout_seconds)) {
     Rig rig;
@@ -830,9 +866,12 @@ BOOST_AUTO_TEST_CASE(refuses_routes_it_cannot_follow,
     other.volume_id = vol + 1;
     BOOST_TEST((rig.core.set_route(other, rig.now).error() == RouteError::wrong_volume));
     BOOST_TEST((rig.core.set_route(config(1), rig.now).error() == RouteError::stale));
-    auto bigger = config(3);
-    bigger.capacity_blocks *= 2;
-    BOOST_TEST((rig.core.set_route(bigger, rig.now).error() == RouteError::mismatch));
+    auto smaller = config(3);
+    smaller.capacity_blocks /= 2;
+    BOOST_TEST((rig.core.set_route(smaller, rig.now).error() == RouteError::mismatch));
+    auto reblocked = config(3);
+    reblocked.block_size = proto::block_size_4096;
+    BOOST_TEST((rig.core.set_route(reblocked, rig.now).error() == RouteError::mismatch));
     BOOST_TEST(rig.core.set_route(config(2), rig.now).has_value());  // the same epoch again
     BOOST_TEST(!rig.core.fenced());
     BOOST_TEST(rig.connects == 1U);

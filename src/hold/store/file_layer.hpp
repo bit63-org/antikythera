@@ -11,7 +11,9 @@
 //
 // Reads past the end of a file return zeros (files are sparse); sync() is
 // fdatasync; clone() is FICLONE (a reflink copy), which fails with
-// EOPNOTSUPP or EXDEV where the filesystem has none.
+// EOPNOTSUPP or EXDEV where the filesystem has none; rename() replaces
+// `to` atomically (rename(2)), made durable by sync_dir() of the
+// directory.
 
 #include <cstddef>
 #include <cstdint>
@@ -66,6 +68,10 @@ public:
                                      const std::filesystem::path& to) -> FileResult = 0;
     // Makes a directory's entries (new files, removals) durable.
     [[nodiscard]] virtual auto sync_dir(const std::filesystem::path& dir) -> FileResult = 0;
+    // Moves `from` over `to` in one step: a reader sees the old `to` or
+    // the new one, never neither.
+    [[nodiscard]] virtual auto rename(const std::filesystem::path& from,
+                                      const std::filesystem::path& to) -> FileResult = 0;
 };
 
 class PosixFiles final : public FileLayer {
@@ -78,6 +84,8 @@ public:
     auto clone(const std::filesystem::path& from, const std::filesystem::path& to)
         -> FileResult override;
     auto sync_dir(const std::filesystem::path& dir) -> FileResult override;
+    auto rename(const std::filesystem::path& from, const std::filesystem::path& to)
+        -> FileResult override;
 };
 
 // Files in memory with a crash model. Each file keeps what is durable and
@@ -85,7 +93,10 @@ public:
 // unsynced writes (each possibly torn at 512-byte sectors), drops the rest
 // and makes the result the new durable state, as power loss can. With
 // fail_after(n), the n-th mutating operation from now and every later one
-// fail with EIO without taking effect: the moment of the crash.
+// fail with EIO without taking effect: the moment of the crash. Directory
+// entries are not modelled: a created, removed or renamed name is durable
+// at once (sync_dir only counts as an operation), so a rename carries the
+// file's own unsynced writes with it.
 class MemFiles final : public FileLayer {
 public:
     explicit MemFiles(bool reflink = true) : _reflink{reflink} {}
@@ -98,6 +109,8 @@ public:
     auto clone(const std::filesystem::path& from, const std::filesystem::path& to)
         -> FileResult override;
     auto sync_dir(const std::filesystem::path& dir) -> FileResult override;
+    auto rename(const std::filesystem::path& from, const std::filesystem::path& to)
+        -> FileResult override;
 
     auto fail_after(std::uint64_t ops) -> void { _fail_in = ops; }
     // Power loss: see above. Clears fail_after. Open File handles keep

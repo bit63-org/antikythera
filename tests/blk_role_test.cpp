@@ -1132,6 +1132,19 @@ BOOST_AUTO_TEST_CASE(network_volume_serves_the_guest_through_hold) {
     BOOST_TEST((rig.role->replica_config(frame_of(net_config(compute_id, hold.port(), 2))) ==
                 oar::Status::ok));
     BOOST_TEST(g.read(marker_sector) == plain, boost::test_tools::per_element());
+    BOOST_TEST(rig.role->function(fn0)->geometry().capacity_sectors == volume_sectors);
+
+    // A resize epoch grows the guest's disk online (Requirement 10.3): the
+    // hold first, then the function, whose capacity the guest can re-read.
+    auto grown = net_config(hold_id, hold.port(), 3);
+    grown.capacity_blocks = 2 * volume_sectors;
+    BOOST_REQUIRE(hold.apply(grown));
+    grown.server_id = compute_id;
+    BOOST_TEST((rig.role->replica_config(frame_of(grown)) == oar::Status::ok));
+    BOOST_TEST(rig.role->function(fn0)->geometry().capacity_sectors == 2 * volume_sectors);
+    BOOST_TEST(*rig.role->function(fn0)->read_config(blk::blk_cfg::capacity, 8) ==
+               2 * volume_sectors);
+    BOOST_TEST(g.read(marker_sector) == plain, boost::test_tools::per_element());
 
     // Detach closes the session and frees the function.
     BOOST_REQUIRE(rig.clean(fn0) == oar::Status::ok);

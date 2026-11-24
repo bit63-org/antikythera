@@ -50,7 +50,9 @@
 // with an attachment then serves the volume with a NetworkVolumeBackend
 // (network_volume_backend.hpp) routed by that config, which opens its TLS
 // session to the primary with the storage certificate; a later config for
-// the volume re-routes the live attachment (a new primary, or fencing).
+// the volume re-routes the live attachment (a new primary, or fencing) and
+// carries resizes and QoS changes to it: a larger capacity grows the
+// function (VirtioBlkFunction::grow), so the guest sees it online.
 // The geometry comes from the config, read-only for an ro attachment. The
 // key helm delivers is the attachment's, opened in its secure element.
 // Without verify_config the role takes no network volumes. Enrollment

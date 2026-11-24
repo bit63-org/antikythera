@@ -727,9 +727,12 @@ BOOST_AUTO_TEST_CASE(refuses_configs_it_cannot_apply,
     rig.apply(config(2));
     BOOST_TEST(rig.server().apply_config(config(1), t0).error() == ConfigError::stale);
     BOOST_TEST(rig.server().apply_config(config(2), t0).has_value());  // again: a no-op
-    auto grown = config(3);
-    grown.capacity_blocks = 128;
-    BOOST_TEST(rig.server().apply_config(grown, t0).error() == ConfigError::mismatch);
+    auto shrunk = config(3);
+    shrunk.capacity_blocks = 32;
+    BOOST_TEST(rig.server().apply_config(shrunk, t0).error() == ConfigError::mismatch);
+    auto relined = config(3);
+    relined.lineage_id = 10;
+    BOOST_TEST(rig.server().apply_config(relined, t0).error() == ConfigError::mismatch);
     BOOST_TEST(rig.server().epoch(vol).value() == 2U);
     // Not a member: no replica of its own, but the config still redirects.
     Rig other_rig;
@@ -739,6 +742,52 @@ BOOST_AUTO_TEST_CASE(refuses_configs_it_cannot_apply,
     BOOST_TEST(other_rig.server().replica(vol) == nullptr);
     BOOST_TEST((other_rig.hello(other_rig.server().open_session(compute)).header.opcode ==
                 HoldOpcode::redirect));
+}
+
+BOOST_AUTO_TEST_CASE(grows_while_attached, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Rig rig;
+    rig.apply(config(1));
+    const auto s = rig.session(1);
+    const auto d = blocks_of(1, 2);
+    BOOST_TEST(rig.write(s, 62, d) == HoldStatus::ok);
+    rig.run();
+    BOOST_TEST(rig.read(s, 64, 1) == HoldStatus::range);  // past the old capacity
+    // The resize epoch: the replica grows first, then serves the new range
+    // to requests of that epoch (Requirement 10.3).
+    auto grown = config(2);
+    grown.capacity_blocks = 200;
+    rig.apply(grown);
+    BOOST_TEST(rig.server().replica(vol)->meta().capacity_blocks == 200U);
+    BOOST_TEST(rig.server().replica(vol)->meta().epoch == 2U);
+    BOOST_TEST(rig.read(s, 64, 1) == HoldStatus::stale_epoch);  // the old epoch still fenced
+    const auto e = blocks_of(2, 3);
+    BOOST_TEST(rig.write(s, 197, e, 2) == HoldStatus::ok);
+    BOOST_TEST(rig.read(s, 62, 2, 2) == HoldStatus::ok);
+    rig.run();
+    BOOST_TEST(rig.read(s, 197, 3, 2) == HoldStatus::ok);
+    rig.run();
+    BOOST_TEST((rig.read_data() == e));
+    BOOST_TEST(rig.read(s, 199, 2, 2) == HoldStatus::range);
+    // A replica created after the resize starts at the new size, and one
+    // found smaller on disk (a member that missed the resize) grows.
+    Rig fresh;
+    fresh.apply(grown);
+    BOOST_TEST(fresh.server().replica(vol)->meta().capacity_blocks == 200U);
+    ak::hold::store::MemFiles files;
+    Sink sink;
+    ServerConfig cfg{.server_id = me, .data_dir = "/srv/hold"};
+    cfg.leases = false;
+    {
+        HoldServer server{files, cfg, sink};
+        BOOST_TEST_REQUIRE(server.apply_config(config(1), t0).has_value());
+    }
+    HoldServer server{files, cfg, sink};
+    BOOST_TEST_REQUIRE(server.apply_config(grown, t0).has_value());
+    BOOST_TEST(server.replica(vol)->meta().capacity_blocks == 200U);
+    auto smaller = config(3);
+    smaller.capacity_blocks = 64;
+    HoldServer again{files, cfg, sink};
+    BOOST_TEST(again.apply_config(smaller, t0).error() == ConfigError::mismatch);
 }
 
 BOOST_AUTO_TEST_CASE(survives_a_restart, *utf::timeout(ak::test::unit_timeout_seconds)) {

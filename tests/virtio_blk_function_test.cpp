@@ -578,6 +578,39 @@ BOOST_AUTO_TEST_CASE(bad_requests_fail_without_io,
     BOOST_TEST((rig.status() & vio::status_device_needs_reset) == 0);
 }
 
+BOOST_AUTO_TEST_CASE(grows_online, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{params(block_4k)};
+    rig.deliver_key();
+    auto& fn = rig.fn();
+    const auto plain = pattern(volume_sectors, block_4k);
+    BOOST_TEST(rig.write(volume_sectors, plain).status == ioerr());  // past the end
+    const auto generation =
+        *rig.driver().common_read(vio::common_cfg::config_generation, ak::test::width8);
+    // The backend must hold the new capacity first.
+    constexpr std::uint64_t grown = 4 * volume_sectors;
+    BOOST_TEST(fn.grow(grown).error() == BlkConfigError::backend_too_small);
+    rig.backend().data.resize((grown + sectors_per_4k) * blk::sector_size);
+    BOOST_TEST(fn.grow(volume_sectors - sectors_per_4k).error() == BlkConfigError::bad_geometry);
+    BOOST_TEST(fn.grow(grown + 1).error() == BlkConfigError::bad_geometry);  // not whole blocks
+    BOOST_TEST(*fn.read_config(blk::blk_cfg::capacity, 8) == volume_sectors);
+    rig.irq().raised.clear();
+    BOOST_TEST_REQUIRE(fn.grow(grown).has_value());
+    // The driver sees a new capacity, a new generation and the config
+    // interrupt (virtio 1.2 4.1.4.3.1); Linux resizes the disk from there.
+    BOOST_TEST(*fn.read_config(blk::blk_cfg::capacity, 8) == grown);
+    BOOST_TEST(fn.geometry().capacity_sectors == grown);
+    BOOST_TEST(*rig.driver().common_read(vio::common_cfg::config_generation, ak::test::width8) ==
+               generation + 1);
+    BOOST_TEST((rig.irq().raised == std::vector<std::uint16_t>{1}));
+    // The new range takes requests; the end has moved with it.
+    BOOST_TEST(rig.write(volume_sectors, plain).status == ok());
+    BOOST_TEST(rig.read(volume_sectors, block_4k).data == plain, boost::test_tools::per_element());
+    BOOST_TEST(rig.write(grown, plain).status == ioerr());
+    BOOST_TEST_REQUIRE(fn.grow(grown).has_value());  // the same again: nothing changes
+    BOOST_TEST(*rig.driver().common_read(vio::common_cfg::config_generation, ak::test::width8) ==
+               generation + 1);
+}
+
 BOOST_AUTO_TEST_CASE(read_only_volume, *boost::unit_test::timeout(unit_timeout_seconds)) {
     auto p = params();
     p.geometry.read_only = true;

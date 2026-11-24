@@ -72,7 +72,9 @@ enum class Status : std::uint8_t {
     unsupp = 2,  // VIRTIO_BLK_S_UNSUPP
 };
 
-// What the device advertises for one attachment, fixed while it is attached.
+// What the device advertises for one attachment, fixed while it is
+// attached except for the capacity, which an online grow raises
+// (RequestParser::grow).
 struct VolumeGeometry {
     std::uint64_t capacity_sectors{0};      // virtio_blk_config.capacity, 512-byte units
     std::uint32_t logical_block_size{512};  // virtio_blk_config.blk_size: 512 or 4096
@@ -149,6 +151,13 @@ public:
         -> std::expected<Request, Rejection>;
 
     [[nodiscard]] auto geometry() const noexcept -> const VolumeGeometry& { return _geometry; }
+
+    // An online grow (.kiro/specs/block-volume-service/ Requirement 10.3):
+    // requests up to `capacity_sectors` pass from now on. A smaller
+    // capacity, or one not a whole number of logical blocks, is refused
+    // and changes nothing.
+    [[nodiscard]] auto grow(std::uint64_t capacity_sectors) noexcept
+        -> std::expected<void, GeometryError>;
 
 private:
     explicit RequestParser(const VolumeGeometry& geometry) noexcept : _geometry{geometry} {}

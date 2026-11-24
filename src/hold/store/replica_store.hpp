@@ -38,8 +38,20 @@
 //
 // reflink() reports whether `data` can be cloned (FICLONE) for snapshot
 // freezes and clones, detected at create and open. Not thread-safe: the
-// replica's owner serializes calls. Growing a replica (resize) is a later
-// task: the meta regions move with the capacity.
+// replica's owner serializes calls.
+//
+// grow() raises the capacity (task 19, design "QoS and elasticity").
+// The meta regions after the checksums move with the capacity, so it
+// builds the new `meta` aside as `meta.new` (the header with the new
+// capacity, every region copied to its new place, the new blocks neither
+// written nor awaiting hydration, and source_blocks recording where a
+// source ends), syncs it, extends `data` and syncs it,
+// then renames `meta.new` over `meta` and syncs the directory. A crash
+// before the rename leaves the old replica whole: open() removes a
+// leftover `meta.new` and cuts `data` back to the old capacity (nothing
+// was ever written past it). It copies the checksum array, so it costs a
+// read of 4 bytes per block (1 GiB for a 1 TiB volume of 4 KiB blocks),
+// skipping what was never written when writing.
 
 #include <cstddef>
 #include <cstdint>
@@ -126,10 +138,12 @@ public:
     // intents().
     [[nodiscard]] auto rewrite(std::span<const Write> batch) -> std::expected<void, StoreError>;
     // Reads blocks [lba, lba + out/block_size) and their stored CRC32Cs;
-    // returns the LBAs whose data does not match (empty: all good). On a
-    // volume without a source, a block never written reads as zeros with a
-    // stored CRC of 0, which is not a mismatch (the CRC32C of a zero block
-    // is not 0); on one with a source, such a block is unhydrated.
+    // returns the LBAs whose data does not match (empty: all good). A block
+    // never written reads as zeros with a stored CRC of 0, which is not a
+    // mismatch (the CRC32C of a zero block is not 0). On a volume with a
+    // source that holds only past the source (past_source); a block the
+    // source covers is unhydrated until a write or hydration stores its
+    // checksum, so zeros with CRC 0 there are a torn write.
     [[nodiscard]] auto read(std::uint64_t lba, std::span<std::byte> out,
                             std::span<std::uint32_t> crcs)
         -> std::expected<std::vector<std::uint64_t>, StoreError>;
@@ -141,8 +155,7 @@ public:
     // replica (checksum repair, Requirement 5.4): data, sync, checksum,
     // sync. No intent: a crash in between leaves a block that is still
     // bad, or already good, and the next read repairs it again. A
-    // never-written copy (zeros with CRC 0) is accepted on a volume
-    // without a source.
+    // never-written copy (zeros with CRC 0) is accepted past the source.
     [[nodiscard]] auto repair(std::uint64_t lba, std::span<const std::byte> block,
                               std::uint32_t crc) -> std::expected<void, StoreError>;
     // Resync and rebuild (task 11). copy() stores blocks as another
@@ -167,10 +180,16 @@ public:
     [[nodiscard]] auto clear_changed() -> std::expected<void, StoreError>;
     // Makes everything written so far durable (FLUSH, close).
     [[nodiscard]] auto flush() -> std::expected<void, StoreError>;
+    // Whether a never-written block may sit at `lba`: always without a
+    // source, and in the capacity a grow() added past one.
+    [[nodiscard]] auto past_source(std::uint64_t lba) const noexcept -> bool;
+    // Raises the capacity to `capacity_blocks` (see above); the same
+    // capacity again is a no-op, a smaller one bad_request.
+    [[nodiscard]] auto grow(std::uint64_t capacity_blocks) -> std::expected<void, StoreError>;
 
 private:
-    ReplicaStore(ReplicaMeta meta, std::unique_ptr<File> data,
-                 std::unique_ptr<File> meta_file) noexcept;
+    ReplicaStore(FileLayer& files, std::filesystem::path dir, ReplicaMeta meta,
+                 std::unique_ptr<File> data, std::unique_ptr<File> meta_file) noexcept;
 
     [[nodiscard]] auto write_header(ReplicaMeta next) -> std::expected<void, StoreError>;
     [[nodiscard]] auto check_range(std::uint64_t lba, std::size_t bytes) const noexcept -> bool;
@@ -187,6 +206,8 @@ private:
     [[nodiscard]] auto recover() -> std::expected<void, StoreError>;
     [[nodiscard]] auto sync_meta() -> std::expected<void, StoreError>;
 
+    FileLayer* _files;
+    std::filesystem::path _dir;
     ReplicaMeta _meta;
     MetaLayout _layout;
     std::unique_ptr<File> _data;

@@ -615,6 +615,25 @@ auto VirtioBlkFunction::do_get_id(const Request& req) -> std::uint32_t {
     return static_cast<std::uint32_t>(at);
 }
 
+auto VirtioBlkFunction::grow(std::uint64_t capacity_sectors)
+    -> std::expected<void, BlkConfigError> {
+    if (capacity_sectors == _parser.geometry().capacity_sectors) {
+        return {};
+    }
+    if (_backend->size_bytes() / sector_size < capacity_sectors) {
+        return std::unexpected(BlkConfigError::backend_too_small);
+    }
+    if (!_parser.grow(capacity_sectors)) {
+        return std::unexpected(BlkConfigError::bad_geometry);
+    }
+    std::vector<std::byte> le;
+    wire::Writer w{le};
+    w.le64(capacity_sectors);
+    std::ranges::copy(le, _device_config.begin() + blk_cfg::capacity);
+    _pci->config_changed();  // a new generation and the config interrupt
+    return {};
+}
+
 auto VirtioBlkFunction::cancel_eject() -> void {
     _pci->cancel_eject();
     _quiet_since.reset();

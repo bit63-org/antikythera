@@ -20,7 +20,13 @@
 //   0x30 header_seq u64               0x38 replica_gen u32
 //   0x3C chunk_shift u8, rsvd[3]      0x40 source store_id u32,
 //   0x44 hydrate_mib_per_s u32        0x48 manifest_name [32]
-//   0x68 reserved, zero, to 0xE0      0xE0 SHA-256 over [0, 0xE0)
+//   0x68 source_blocks u64            0x70 reserved, zero, to 0xE0
+//   0xE0 SHA-256 over [0, 0xE0)
+//
+// source_blocks is 0 unless a volume with a source grew (grow() in
+// replica_store.hpp): then the blocks the source covers, below the
+// capacity. Blocks from there on never await hydration, so one that was
+// never written reads as zeros there, as on a volume without a source.
 //   0x100 zero to the end of the slot
 //
 // After the slots, each region 4 KiB-aligned (layout() computes them):
@@ -65,6 +71,7 @@ struct ReplicaMeta {
     std::uint8_t chunk_shift{20};  // 1 MiB: hydration and changed-chunk granularity
     proto::VolumeSource source{};
     std::uint64_t header_seq{1};
+    std::uint64_t source_blocks{0};  // 0: the source covers the whole capacity
     friend auto operator==(const ReplicaMeta&, const ReplicaMeta&) -> bool = default;
 };
 

@@ -18,6 +18,7 @@ constexpr std::size_t crc_size = sizeof(std::uint32_t);
 constexpr std::size_t fill_chunk = 64 * 1024;
 constexpr char data_name[] = "data";
 constexpr char meta_name[] = "meta";
+constexpr char meta_new_name[] = "meta.new";  // grow(): the next meta, until renamed
 constexpr char probe_name[] = ".reflink-probe";
 
 auto le32_at(std::span<const std::byte> b, std::size_t i) noexcept -> std::uint32_t {
@@ -79,9 +80,11 @@ auto replica_dir_name(std::uint64_t volume_id, std::uint32_t replica_gen) -> std
     return "vol-" + std::to_string(volume_id) + "." + std::to_string(replica_gen);
 }
 
-ReplicaStore::ReplicaStore(ReplicaMeta meta, std::unique_ptr<File> data,
-                           std::unique_ptr<File> meta_file) noexcept
-    : _meta{meta},
+ReplicaStore::ReplicaStore(FileLayer& files, std::filesystem::path dir, ReplicaMeta meta,
+                           std::unique_ptr<File> data, std::unique_ptr<File> meta_file) noexcept
+    : _files{&files},
+      _dir{std::move(dir)},
+      _meta{meta},
       _layout{layout(meta)},
       _data{std::move(data)},
       _meta_file{std::move(meta_file)},
@@ -132,13 +135,19 @@ auto ReplicaStore::create(FileLayer& files, const std::filesystem::path& dir, Re
         !files.sync_dir(dir) || !files.sync_dir(dir.parent_path())) {
         return std::unexpected(StoreError::io);
     }
-    std::unique_ptr<ReplicaStore> s{new ReplicaStore(meta, std::move(*data), std::move(*mf))};
+    std::unique_ptr<ReplicaStore> s{
+        new ReplicaStore(files, dir, meta, std::move(*data), std::move(*mf))};
     s->_reflink = detect_reflink(files, dir);
     return s;
 }
 
 auto ReplicaStore::open(FileLayer& files, const std::filesystem::path& dir)
     -> std::expected<std::unique_ptr<ReplicaStore>, StoreError> {
+    // A grow that did not reach its rename: the old meta stands.
+    if (files.exists(dir / meta_new_name) &&
+        (!files.remove_all(dir / meta_new_name) || !files.sync_dir(dir))) {
+        return std::unexpected(StoreError::io);
+    }
     auto data = files.open(dir / data_name, false);
     auto mf = files.open(dir / meta_name, false);
     if (!data || !mf) {
@@ -154,11 +163,17 @@ auto ReplicaStore::open(FileLayer& files, const std::filesystem::path& dir)
     }
     const auto msize = (*mf)->size();
     const auto dsize = (*data)->size();
-    if (!msize || !dsize || *msize < layout(*meta).end ||
-        *dsize != meta->capacity_blocks * meta->block_size) {
+    const std::uint64_t want = meta->capacity_blocks * meta->block_size;
+    if (!msize || !dsize || *msize < layout(*meta).end || *dsize < want) {
         return std::unexpected(StoreError::bad_meta);
     }
-    std::unique_ptr<ReplicaStore> s{new ReplicaStore(*meta, std::move(*data), std::move(*mf))};
+    // Extended by a grow that did not reach its rename: nothing past the
+    // old capacity was ever written, so the tail goes.
+    if (*dsize > want && (!(*data)->truncate(want) || !(*data)->sync())) {
+        return std::unexpected(StoreError::io);
+    }
+    std::unique_ptr<ReplicaStore> s{
+        new ReplicaStore(files, dir, *meta, std::move(*data), std::move(*mf))};
     if (auto r = s->recover(); !r) {
         return std::unexpected(r.error());
     }
@@ -422,7 +437,6 @@ auto ReplicaStore::read(std::uint64_t lba, std::span<std::byte> out, std::span<s
             return std::unexpected(StoreError::not_hydrated);
         }
     }
-    const bool sourced = _meta.source.kind != proto::SourceKind::none;
     std::vector<std::byte> stored(crcs.size() * crc_size);
     if (!_data->pread(lba * bs, out) ||
         !_meta_file->pread(_layout.checksums + (lba * crc_size), stored)) {
@@ -432,7 +446,7 @@ auto ReplicaStore::read(std::uint64_t lba, std::span<std::byte> out, std::span<s
     for (std::size_t b = 0; b < crcs.size(); ++b) {
         crcs[b] = le32_at(stored, b);
         const auto block = out.subspan(b * bs, bs);
-        const bool unwritten = crcs[b] == 0 && !sourced && all_zero(block);
+        const bool unwritten = crcs[b] == 0 && past_source(lba + b) && all_zero(block);
         if (crc32c::of(block) != crcs[b] && !unwritten) {
             bad.push_back(lba + b);
         }
@@ -537,8 +551,7 @@ auto ReplicaStore::repair(std::uint64_t lba, std::span<const std::byte> block, s
     if (!check_range(lba, block.size()) || block.size() != bs) {
         return std::unexpected(StoreError::bad_request);
     }
-    const bool unwritten =
-        crc == 0 && _meta.source.kind == proto::SourceKind::none && all_zero(block);
+    const bool unwritten = crc == 0 && past_source(lba) && all_zero(block);
     if (!unwritten && crc32c::of(block) != crc) {
         return std::unexpected(StoreError::bad_crc);
     }
@@ -654,6 +667,76 @@ auto ReplicaStore::flush() -> std::expected<void, StoreError> {
         return r;
     }
     _meta_synced_seq = _last_seq;
+    return {};
+}
+
+auto ReplicaStore::past_source(std::uint64_t lba) const noexcept -> bool {
+    return _meta.source.kind == proto::SourceKind::none ||
+           (_meta.source_blocks != 0 && lba >= _meta.source_blocks);
+}
+
+auto ReplicaStore::grow(std::uint64_t capacity_blocks) -> std::expected<void, StoreError> {
+    if (capacity_blocks == _meta.capacity_blocks) {
+        return {};
+    }
+    ReplicaMeta next = _meta;
+    next.capacity_blocks = capacity_blocks;
+    if (_meta.source.kind != proto::SourceKind::none && _meta.source_blocks == 0) {
+        next.source_blocks = _meta.capacity_blocks;  // the source ends where it did
+    }
+    ++next.header_seq;
+    const auto slot = encode_replica_meta(next);
+    if (capacity_blocks < _meta.capacity_blocks || !slot) {
+        return std::unexpected(StoreError::bad_request);
+    }
+    const MetaLayout to = layout(next);
+    const auto path = _dir / meta_new_name;
+    if (_files->exists(path) && !_files->remove_all(path)) {
+        return std::unexpected(StoreError::io);
+    }
+    auto mf = _files->open(path, true);
+    if (!mf || !(*mf)->truncate(to.end)) {
+        return std::unexpected(StoreError::io);
+    }
+    // Each region to its new place; the new file is sparse, so runs of
+    // zeros (never written, not awaiting hydration, unchanged) are skipped.
+    std::vector<std::byte> buf(fill_chunk);
+    const auto move = [&](std::uint64_t from, std::uint64_t at, std::uint64_t bytes) -> bool {
+        for (std::uint64_t done = 0; done < bytes; done += buf.size()) {
+            const auto n =
+                static_cast<std::size_t>(std::min<std::uint64_t>(buf.size(), bytes - done));
+            const auto part = std::span{buf}.first(n);
+            if (!_meta_file->pread(from + done, part)) {
+                return false;
+            }
+            if (!all_zero(part) && !(*mf)->pwrite(at + done, part)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const std::uint64_t old_blocks = _meta.capacity_blocks;
+    if (!move(_layout.checksums, to.checksums, old_blocks * crc_size) ||
+        !move(_layout.unhydrated, to.unhydrated, (old_blocks + 7) / 8) ||
+        !move(_layout.changed, to.changed, (_layout.chunks + 7) / 8) ||
+        !move(_layout.intents, to.intents, intent_ring_entries * intent_entry_size)) {
+        return std::unexpected(StoreError::io);
+    }
+    // The header in the slot its header_seq picks; the other stays zero.
+    const std::uint64_t at = ((next.header_seq - 1) % 2) * meta_slot_size;
+    if (!(*mf)->pwrite(at, *slot) || !(*mf)->sync()) {
+        return std::unexpected(StoreError::io);
+    }
+    if (!_data->truncate(capacity_blocks * _meta.block_size) || !_data->sync()) {
+        return std::unexpected(StoreError::io);
+    }
+    if (!_files->rename(path, _dir / meta_name) || !_files->sync_dir(_dir)) {
+        return std::unexpected(StoreError::io);
+    }
+    _meta_file = std::move(*mf);
+    _meta = next;
+    _layout = to;
+    _meta_synced_seq = _last_seq;  // the new file was synced whole
     return {};
 }
 

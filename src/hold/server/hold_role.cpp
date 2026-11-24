@@ -113,6 +113,11 @@ auto HoldRole::volume_op(std::span<const std::byte> frame) -> oar::Status {
         return oar::Status::failed;
     }
     ++_stats.ops;
+    if (const auto* scrub = std::get_if<proto::ScrubVolume>(&op->args); scrub != nullptr) {
+        // The outcome goes up with the server's reports when it finishes.
+        _server.start_scrub(op->volume_id, op->op_id, op->epoch, scrub->mib_per_s, _clock());
+        return oar::Status::ok;
+    }
     queue(proto::OpOutcome{.volume_id = op->volume_id,
                            .op_id = op->op_id,
                            .epoch = op->epoch,

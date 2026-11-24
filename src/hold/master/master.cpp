@@ -336,7 +336,7 @@ auto Master::commit(Volume& v, Time now, const std::vector<std::uint64_t>& also)
 }
 
 auto Master::send_op(const Volume& v, std::uint64_t server, proto::VolumeOpArgs args, Time now)
-    -> void {
+    -> std::uint64_t {
     proto::VolumeOp op{.key_id = proto::no_key_id,
                        .server_id = server,
                        .volume_id = v.spec.volume_id,
@@ -346,6 +346,7 @@ auto Master::send_op(const Volume& v, std::uint64_t server, proto::VolumeOpArgs 
                        .signature = {}};
     _ops.emplace(op.op_id, PendingOp{.op = op, .sent = now});
     _transport->send_op(op);
+    return op.op_id;
 }
 
 auto Master::delete_replica(const Volume& v, std::uint64_t server, std::uint32_t replica_gen,
@@ -1149,6 +1150,23 @@ auto Master::on_outcome(std::uint64_t /*server*/, const proto::OpOutcome& o, Tim
     }
     const proto::VolumeOp op = it->second.op;
     _ops.erase(it);
+    if (std::holds_alternative<proto::ScrubVolume>(op.args)) {
+        Volume* v = find(o.volume_id);
+        if (v == nullptr) {
+            return;
+        }
+        for (auto& [key, plan] : v->scrubs) {
+            if (plan.op_id == o.op_id) {
+                plan.op_id = 0;
+                // io_error: read in full, with blocks no one could mend,
+                // which its checksum_unrepairable fault deals with.
+                const bool done =
+                    o.status == proto::OpStatus::ok || o.status == proto::OpStatus::io_error;
+                plan.due = now + (done ? _timing.scrub_interval : _timing.scrub_retry);
+            }
+        }
+        return;
+    }
     if (const auto* prep = std::get_if<proto::SnapshotPrepare>(&op.args)) {
         const auto s = _snapshots.find(prep->cut_id);
         if (s == _snapshots.end() || s->second.status != SnapshotStatus::preparing) {
@@ -1486,7 +1504,42 @@ auto Master::tick(Time now) -> void {
     }
     schedule_drains(now);
     schedule_rebuilds(now);
+    schedule_scrubs(now);
     run_gc();
+}
+
+auto Master::schedule_scrubs(Time now) -> void {
+    std::map<std::uint64_t, std::size_t> running;  // by server
+    for (const auto& [id, v] : _volumes) {
+        for (const auto& [key, plan] : v.scrubs) {
+            if (plan.op_id != 0) {
+                ++running[key.first];
+            }
+        }
+    }
+    for (auto& [id, v] : _volumes) {
+        std::erase_if(v.scrubs, [&](const auto& kv) {
+            const Member* m = member_on(v, kv.first.first);
+            return m == nullptr || m->replica_gen != kv.first.second;
+        });
+        for (const auto& m : v.members) {
+            if (m.role != ReplicaRole::primary && m.role != ReplicaRole::secondary) {
+                continue;  // a joining replica is being copied, a leaving one goes
+            }
+            auto [it, added] = v.scrubs.try_emplace({m.server_id, m.replica_gen});
+            ScrubPlan& plan = it->second;
+            if (added) {
+                plan.due = now + _timing.scrub_interval;
+            }
+            if (plan.op_id != 0 || now < plan.due || !server_up(m.server_id) ||
+                running[m.server_id] >= _limits.scrubs_per_server) {
+                continue;
+            }
+            plan.op_id = send_op(v, m.server_id,
+                                 proto::ScrubVolume{.mib_per_s = _timing.scrub_mib_per_s}, now);
+            ++running[m.server_id];
+        }
+    }
 }
 
 }  // namespace ak::hold::master

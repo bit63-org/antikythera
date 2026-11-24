@@ -358,6 +358,33 @@ guest write ─► VirtioBlkFunction: encrypt (K_vol, tweak = LBA)
   no member has a good copy the read fails with IOERR and a
   `checksum_unrepairable` fault (Requirement 5.4).
 
+As built (task 24): a repair asks the member for the span of the bad
+blocks only; the member answers with its copy as it holds it, stored
+checksums included, without waiting for a lease (members hold none), and
+the primary checks and mends each bad block on its own, answering the
+read with its own copy, mended. Scrubbing (Requirement 5.5) is a `scrub`
+VolumeOp per replica: the controller sends one to every primary and
+secondary `scrub_interval` (7 days) after it first sees the replica and
+after each scrub that finishes, at most `scrubs_per_server` (1) at once
+per server, and resends it until the outcome arrives. The hold role reads
+its replica region by region, paced by the op's MiB/s and a role-wide
+budget, only while the volume has no tenant request queued, skipping
+regions never written and blocks awaiting hydration. The primary repairs
+a bad block as a read would (a block under a write its members have not
+acknowledged waits, since their copy may be older). A secondary `READ`s
+the block from its primary over the session the primary opened to it;
+the primary serves it like an initiator's read (behind overlapping
+unacknowledged writes, repairing its own copy first from another member
+if that is bad too), and the secondary writes it back only if it came
+on the primary's newest session at the current epoch, so the copy is
+never older than what the secondary holds. The outcome carries the bad
+blocks found; any block no one could mend, or still unmended
+`scrub_timeout` after the walk, makes it `io_error` and raises a
+`checksum_unrepairable` fault naming the scrubbing server, which the
+controller answers by replacing that replica (a secondary) or failing
+over (the primary). `replica_status` carries each replica's
+`checksum_errors` and `checksum_repairs`.
+
 ## Epochs, leases and fencing
 
 Three numbers fence everything:

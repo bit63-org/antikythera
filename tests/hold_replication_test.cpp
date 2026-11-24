@@ -11,6 +11,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -652,6 +653,27 @@ BOOST_AUTO_TEST_CASE(repairs_a_bad_block_from_a_member,
     BOOST_TEST(net.hold(1).stats().unrepairable == 1U);
 }
 
+BOOST_AUTO_TEST_CASE(repairs_under_leases_one_block_at_a_time,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net{ServerConfig{}};  // leases on: the members hold none
+    net.apply(config(1));
+    net.step();
+    static_cast<void>(net.hold(1).take_reports(net.now));  // the lease request
+    net.hold(1).grant_lease(vol, 1, net.now);
+    const auto s = net.initiator();
+    const auto data = blocks_of(11, 4);
+    BOOST_TEST_REQUIRE((net.status(s, net.write(s, 40, data)) == HoldStatus::ok));
+    // Bad here at 40 and 42; the member asked is bad at 41, in between.
+    net.corrupt(1, 40);
+    net.corrupt(1, 42);
+    net.corrupt(2, 41);
+    net.corrupt(3, 41);
+    const auto r = net.read(s, 40, 4);
+    BOOST_TEST(net.read_data(s, r) == data);
+    BOOST_TEST(net.hold(1).stats().repaired == 2U);
+    BOOST_TEST(net.stored(1, 40, 4) == data);
+}
+
 BOOST_AUTO_TEST_CASE(fails_a_read_with_no_member_to_ask,
                      *utf::timeout(ak::test::unit_timeout_seconds)) {
     Net net;
@@ -1147,4 +1169,192 @@ BOOST_AUTO_TEST_CASE(a_joining_member_takes_up_a_lower_stream,
     BOOST_TEST(net.hold(3).replica(vol)->last_seq() == net.hold(2).replica(vol)->last_seq());
     BOOST_TEST(net.stored(3, 9, 1) == b);  // taken, not mistaken for a resend
     BOOST_TEST(net.stored(3, 1, 1) == a);  // copied
+}
+
+// ---- scrubbing (task 24) ---------------------------------------------------
+
+namespace {
+
+struct ScrubReports {
+    std::vector<proto::OpOutcome> outcomes;
+    std::vector<proto::VolumeFault> faults;
+    std::optional<proto::ReplicaStatusEntry> status;
+};
+
+auto scrub_reports(HoldServer& hold, Clock::time_point now) -> ScrubReports {
+    ScrubReports out;
+    for (auto& r : hold.take_reports(now)) {
+        if (const auto* o = std::get_if<proto::OpOutcome>(&r)) {
+            out.outcomes.push_back(*o);
+        } else if (const auto* f = std::get_if<proto::VolumeFault>(&r);
+                   f != nullptr && f->kind == proto::VolumeFaultKind::checksum_unrepairable) {
+            out.faults.push_back(*f);  // not the timeouts a cut session brings
+        } else if (const auto* s = std::get_if<proto::ReplicaStatus>(&r);
+                   s != nullptr && !s->entries.empty()) {
+            out.status = s->entries.front();
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(scrubs_repair_every_replica, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net{small_regions()};
+    net.apply(config(1));
+    net.step();
+    const auto s = net.initiator();
+    const auto a = blocks_of(1, 4);
+    const auto b = blocks_of(2, 2);
+    BOOST_TEST_REQUIRE((net.status(s, net.write(s, 40, a)) == HoldStatus::ok));
+    BOOST_TEST_REQUIRE((net.status(s, net.write(s, 200, b)) == HoldStatus::ok));
+    net.corrupt(1, 41);
+    net.corrupt(2, 201);
+    net.corrupt(3, 40);
+    net.corrupt(3, 43);
+    for (std::uint64_t id = 1; id <= 3; ++id) {
+        static_cast<void>(scrub_reports(net.hold(id), net.now));
+        net.hold(id).start_scrub(vol, 10 + id, 1, 0, net.now);
+        BOOST_TEST(net.hold(id).scrubbing(vol));
+    }
+    net.run_for(2s);
+    const std::array<std::uint64_t, 3> found{1, 1, 2};
+    for (std::uint64_t id = 1; id <= 3; ++id) {
+        BOOST_TEST(!net.hold(id).scrubbing(vol));
+        BOOST_TEST(net.stored(id, 40, 4) == a);
+        BOOST_TEST(net.stored(id, 200, 2) == b);
+        net.now += 1s;
+        const auto r = scrub_reports(net.hold(id), net.now);
+        BOOST_TEST_REQUIRE(r.outcomes.size() == 1U);
+        BOOST_TEST(r.outcomes[0].op_id == 10 + id);
+        BOOST_TEST((r.outcomes[0].kind == proto::VolumeOpKind::scrub));
+        BOOST_TEST((r.outcomes[0].status == proto::OpStatus::ok));
+        BOOST_TEST(r.outcomes[0].detail == found.at(id - 1));
+        BOOST_TEST(r.faults.empty());
+        BOOST_TEST_REQUIRE(r.status.has_value());
+        BOOST_TEST(r.status->checksum_errors == found.at(id - 1));
+        BOOST_TEST(r.status->checksum_repairs == found.at(id - 1));
+    }
+    BOOST_TEST(net.hold(2).stats().scrubbed == 16U);  // the two regions written
+
+    // A resend of a finished op is answered again; a running one is not.
+    net.hold(2).start_scrub(vol, 12, 1, 0, net.now);
+    auto again = scrub_reports(net.hold(2), net.now);
+    BOOST_TEST_REQUIRE(again.outcomes.size() == 1U);
+    BOOST_TEST(again.outcomes[0].detail == 1U);
+    BOOST_TEST(!net.hold(2).scrubbing(vol));
+}
+
+BOOST_AUTO_TEST_CASE(scrubs_report_a_block_no_one_can_mend,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net;
+    net.apply(config(1));
+    net.step();
+    const auto s = net.initiator();
+    BOOST_TEST_REQUIRE((net.status(s, net.write(s, 8, blocks_of(3, 2))) == HoldStatus::ok));
+    for (std::uint64_t id = 1; id <= 3; ++id) {
+        net.corrupt(id, 9);
+    }
+    static_cast<void>(scrub_reports(net.hold(2), net.now));
+    net.hold(2).start_scrub(vol, 5, 1, 0, net.now);
+    net.run_for(1s);
+    const auto r = scrub_reports(net.hold(2), net.now);
+    BOOST_TEST_REQUIRE(r.outcomes.size() == 1U);
+    BOOST_TEST((r.outcomes[0].status == proto::OpStatus::io_error));
+    BOOST_TEST(r.outcomes[0].detail == 1U);
+    BOOST_TEST_REQUIRE(r.faults.size() == 1U);
+    BOOST_TEST((r.faults[0].kind == proto::VolumeFaultKind::checksum_unrepairable));
+    BOOST_TEST(r.faults[0].suspect == 2U);
+    BOOST_TEST(net.hold(2).stats().unrepairable == 1U);
+    BOOST_TEST(net.hold(1).stats().unrepairable == 1U);  // asked server 3 for it too
+}
+
+BOOST_AUTO_TEST_CASE(scrubs_give_up_on_an_unreachable_primary,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    ServerConfig cfg = no_leases();
+    cfg.scrub_timeout = 5s;
+    Net net{cfg};
+    net.apply(config(1));
+    net.step();
+    const auto s = net.initiator();
+    BOOST_TEST_REQUIRE((net.status(s, net.write(s, 8, blocks_of(4, 1))) == HoldStatus::ok));
+    net.corrupt(2, 8);
+    net.server(2).up = false;  // the primary cannot reach it
+    net.cut(2);
+    static_cast<void>(scrub_reports(net.hold(2), net.now));
+    net.hold(2).start_scrub(vol, 6, 1, 0, net.now);
+    net.run_for(4s);
+    BOOST_TEST(net.hold(2).scrubbing(vol));  // still asking
+    net.run_for(2s);
+    BOOST_TEST(!net.hold(2).scrubbing(vol));
+    const auto r = scrub_reports(net.hold(2), net.now);
+    BOOST_TEST_REQUIRE(r.outcomes.size() == 1U);
+    BOOST_TEST((r.outcomes[0].status == proto::OpStatus::io_error));
+    BOOST_TEST(r.faults.size() == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(scrubs_resume_their_asks_on_a_new_session,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net;
+    net.apply(config(1));
+    net.step();
+    const auto s = net.initiator();
+    const auto a = blocks_of(5, 1);
+    BOOST_TEST_REQUIRE((net.status(s, net.write(s, 8, a)) == HoldStatus::ok));
+    net.corrupt(3, 8);
+    net.server(1).mute = true;  // the ask is lost with its session
+    net.hold(3).start_scrub(vol, 7, 1, 0, net.now);
+    net.step();
+    BOOST_TEST(net.hold(3).scrubbing(vol));
+    net.server(1).mute = false;
+    net.cut(3);  // the primary redials; the ask goes again on the new session
+    net.run_for(2s);
+    BOOST_TEST(!net.hold(3).scrubbing(vol));
+    BOOST_TEST(net.stored(3, 8, 1) == a);
+}
+
+BOOST_AUTO_TEST_CASE(scrubs_end_when_the_replica_leaves,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net;
+    net.apply(config(1));
+    net.step();
+    const auto s = net.initiator();
+    BOOST_TEST_REQUIRE((net.status(s, net.write(s, 8, blocks_of(6, 1))) == HoldStatus::ok));
+    net.corrupt(3, 8);
+    net.server(1).mute = true;  // the ask stays unanswered
+    net.hold(3).start_scrub(vol, 8, 1, 0, net.now);
+    net.step();
+    static_cast<void>(scrub_reports(net.hold(3), net.now));
+    net.apply_to(3, config(2, {member(1, proto::ReplicaRole::primary),
+                               member(2, proto::ReplicaRole::secondary)}));
+    net.step();
+    BOOST_TEST(!net.hold(3).scrubbing(vol));
+    const auto r = scrub_reports(net.hold(3), net.now);
+    BOOST_TEST_REQUIRE(r.outcomes.size() == 1U);
+    BOOST_TEST((r.outcomes[0].status == proto::OpStatus::unknown_volume));
+    BOOST_TEST(r.faults.empty());
+}
+
+BOOST_AUTO_TEST_CASE(primary_scrubs_wait_behind_unanswered_writes,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net{small_regions()};
+    net.apply(config(1));
+    net.step();
+    const auto s = net.initiator();
+    const auto a = blocks_of(7, 1);
+    BOOST_TEST_REQUIRE((net.status(s, net.write(s, 41, a)) == HoldStatus::ok));
+    net.corrupt(1, 41);
+    net.server(3).mute = true;
+    const auto w = net.write(s, 42, blocks_of(8, 1));  // same region, unanswered
+    BOOST_TEST(!net.status(s, w).has_value());
+    net.hold(1).start_scrub(vol, 9, 1, 0, net.now);
+    net.step();
+    BOOST_TEST(net.hold(1).scrubbing(vol));
+    BOOST_TEST(net.hold(1).stats().scrubbed == 0U);
+    net.server(3).mute = false;
+    net.cut(3);  // resent on the next session, then answered
+    net.run_for(2s);
+    BOOST_TEST((net.status(s, w) == HoldStatus::ok));
+    BOOST_TEST(!net.hold(1).scrubbing(vol));
+    BOOST_TEST(net.stored(1, 41, 1) == a);
 }

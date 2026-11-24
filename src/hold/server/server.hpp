@@ -63,10 +63,13 @@
 // so a read never returns data that might still be rolled back, and stops
 // taking writes while max_replicating are unanswered. A read that finds a
 // block whose checksum does not match is repaired (Requirement 5.4): the
-// primary reads the range from an in-sync member over its peer session,
-// writes the good blocks back (ReplicaStore::repair) and answers with
-// them; writes that overlap a repair wait for it. With no member to ask,
-// or no good copy there, the read fails with io_error.
+// primary reads the bad blocks' span from an in-sync member over its peer
+// session (the member answers with its copy as it holds it, checksums
+// included, and needs no lease to), checks each bad block against its
+// checksum, writes the good ones back (ReplicaStore::repair) and answers
+// with its own copy, mended; writes that overlap a repair wait for it.
+// With no member to ask, or no good copy there of a block, the read fails
+// with io_error.
 //
 // Single replica (task 6): a lone primary commits locally and answers at
 // once.
@@ -118,6 +121,29 @@
 // wherever it is: on a session's first REPL_WRITE it rebases its replica
 // onto that seq. Blocks awaiting hydration are not copied (hydration
 // reaches members with the snapshot task).
+//
+// Scrubbing (task 24, Requirement 5.5). start_scrub() takes the
+// controller's scrub VolumeOp: this server reads its replica in full,
+// region by region, paced by the op's MiB/s and a budget for the role,
+// only while the volume has no tenant request waiting, skipping regions
+// never written and blocks still awaiting hydration. A bad block on the
+// primary is repaired as a read's would be (from an in-sync member);
+// one that a write still awaiting the members overlaps is looked at
+// again later. A secondary asks its primary for the good copy with a
+// READ over the session the primary opened to it; the primary serves it
+// like an initiator's read (held back behind overlapping writes not yet
+// answered, so the copy is never older than what the member holds, and
+// repaired itself first if its own copy is bad), and the member writes
+// it back (ReplicaStore::repair) only if it comes on the primary's
+// newest session at the current epoch. An op_id runs once: a resend of
+// the running one is ignored, of a finished one answered again. The
+// op's outcome reports the bad blocks found as `detail`, status ok, or
+// io_error if any stayed bad: no good copy, or none within
+// scrub_timeout of the walk's end. Each of those is also a
+// checksum_unrepairable fault naming this server, so the controller
+// replaces the replica. A scrub ends early (unknown_volume) when this
+// server stops being a member, its replica is replaced, or it starts
+// joining; a later op starts over.
 //
 // QoS (Requirement 10.2): each volume's requests wait in its queue until
 // its limiter (qos.hpp) admits them; run() serves the volumes round-robin,
@@ -199,6 +225,11 @@ struct ServerConfig {
     std::size_t copy_window{4};                           // SYNC_DATA regions in flight per member
     double copy_bytes_per_s{400.0 * 1024 * 1024};         // all copies of the role
     double copy_volume_bytes_per_s{200.0 * 1024 * 1024};  // each volume's copies
+    // Task 24.
+    double scrub_bytes_per_s{200.0 * 1024 * 1024};   // all scrubs of the role
+    std::chrono::milliseconds scrub_timeout{60000};  // repairs after the walk ends
+    std::chrono::milliseconds scrub_retry{1000};     // a secondary asks again
+    std::size_t scrub_asks{8};                       // a secondary's asks in flight
 };
 
 enum class ConfigError : std::uint8_t {
@@ -223,6 +254,7 @@ struct ServerStats {
     std::uint64_t unrepairable{0};  // bad blocks with no good copy to be had
     std::uint64_t reconciled{0};    // extents rewritten by promotions
     std::uint64_t copied{0};        // SYNC_DATA regions sent
+    std::uint64_t scrubbed{0};      // blocks read by scrubs
 };
 
 class HoldServer {
@@ -264,6 +296,12 @@ public:
     // A promotion is still collecting INTENTS.
     [[nodiscard]] auto reconciling(std::uint64_t volume_id) const -> bool;
 
+    // The controller's scrub VolumeOp (see above); the outcome goes up
+    // with take_reports(). mib_per_s 0: the default pace.
+    auto start_scrub(std::uint64_t volume_id, std::uint64_t op_id, std::uint64_t epoch,
+                     std::uint32_t mib_per_s, Clock::time_point now) -> void;
+    [[nodiscard]] auto scrubbing(std::uint64_t volume_id) const -> bool;
+
 private:
     struct Session {
         std::uint64_t peer{0};
@@ -283,6 +321,8 @@ private:
         std::uint32_t block_size{0};
         std::uint64_t seq{0};         // REPL_WRITE
         std::uint64_t commit_seq{0};  // REPL_WRITE
+        bool member{false};           // a member's READ to the primary (a scrub's)
+        bool scrub{false};            // session 0: the primary's own scrub repair
     };
     // A joining member's copy.
     struct Copy {
@@ -331,8 +371,29 @@ private:
     // A read waiting for a member's copy of its bad blocks.
     struct Repair {
         Request request;
-        std::vector<std::uint64_t> bad;  // LBAs
+        std::vector<std::uint64_t> bad;  // LBAs, ascending
         std::uint64_t member{0};         // server asked
+        std::uint64_t lba{0};            // the span asked for: the bad blocks'
+        std::uint32_t blocks{0};
+        std::vector<std::byte> data;  // the read's own copy, mended blocks put in
+        std::vector<std::uint32_t> crcs;
+    };
+    // A scrub VolumeOp running on this server's replica.
+    struct Scrub {
+        std::uint64_t op_id{0};
+        std::uint64_t epoch{0};  // the op's
+        std::uint32_t replica_gen{0};
+        TokenBucket budget;
+        std::uint64_t next{0};                        // the next region to read
+        std::optional<Clock::time_point> walked;      // every region read
+        bool blocked{false};                          // primary: behind an unanswered write
+        std::set<std::uint64_t> bad;                  // LBAs to repair
+        std::map<std::uint64_t, std::uint64_t> asks;  // secondary: request ID -> LBA
+        SessionId asked_on{0};                        // the session the asks went on
+        Clock::time_point ask_at{};                   // secondary: asking again
+        std::size_t repairing{0};                     // primary: repairs in flight
+        std::uint64_t found{0};
+        std::uint64_t unrepairable{0};
     };
     struct Volume {
         proto::ReplicaConfig config;
@@ -362,6 +423,12 @@ private:
         std::map<std::pair<std::uint64_t, std::uint32_t>, Dirty> dirty;  // by (server, gen)
         TokenBucket copy_budget;  // primary: this volume's copies
         SessionId synced{0};      // joining member: the primary session that completed its copy
+        // Task 24.
+        SessionId from_primary{0};  // member: the newest session the primary opened
+        std::optional<Scrub> scrub;
+        std::deque<proto::OpOutcome> scrubs_done;  // the latest outcomes, for resends
+        std::uint64_t checksum_errors{0};          // bad blocks found here (replica_status)
+        std::uint64_t checksum_repairs{0};         // and rewritten from a good copy
     };
     // The outcome of the fencing checks.
     struct Verdict {
@@ -403,13 +470,28 @@ private:
     auto advance(Volume& v) -> void;
     auto unpark(Volume& v) -> void;
     auto abandon(Volume& v) -> void;
-    auto start_repair(Volume& v, Request& r, std::vector<std::uint64_t> bad) -> bool;
+    // Asks an open in-sync member other than `except` for good copies.
+    // `data` and `crcs`: the read's own copy, answered with the mended
+    // blocks put in.
+    auto start_repair(Volume& v, Request& r, std::vector<std::uint64_t> bad,
+                      std::uint64_t except = 0, std::vector<std::byte> data = {},
+                      std::vector<std::uint32_t> crcs = {}) -> bool;
     auto finish_repair(Volume& v, Repair& rep, const proto::HoldFrame* f) -> void;
     auto commit_replicas(Volume& v, std::vector<Request>& batch) -> void;
     auto hello(SessionId id, Session& s, const proto::HoldFrame& f) -> void;
     auto serve(Volume& v, std::size_t budget, Clock::time_point now) -> std::size_t;
     auto commit(Volume& v, std::vector<Request>& batch) -> void;
     auto execute(Volume& v, Request& r) -> void;
+    // Task 24.
+    auto pump_scrub(Volume& v, Clock::time_point now) -> void;
+    // Reads blocks [lba, lba + blocks) for a scrub; false if the store failed.
+    auto scrub_range(Volume& v, std::uint64_t lba, std::uint64_t blocks) -> bool;
+    auto scrub_repair(Volume& v, Clock::time_point now) -> void;
+    auto scrub_ask(Volume& v, Clock::time_point now) -> void;
+    auto on_fill(Volume& v, const Session& s, SessionId id, const proto::HoldFrame& f) -> void;
+    auto member_read(Session& s, SessionId id, const proto::HoldFrame& f) -> void;
+    auto end_scrub(Volume& v, proto::OpStatus status) -> void;
+    [[nodiscard]] auto scrub_due(const Volume& v) const -> std::optional<Clock::time_point>;
 
     auto respond(SessionId id, const proto::HoldHeader& req, proto::HoldStatus status,
                  proto::HoldPayload payload = {}) -> void;
@@ -425,6 +507,7 @@ private:
     ServerStats _stats;
     std::vector<proto::ReportBody> _reports;
     TokenBucket _copy_budget;
+    TokenBucket _scrub_budget;
     Clock::time_point _now{};  // the latest time a caller gave
     std::optional<Clock::time_point> _next_status;
 };

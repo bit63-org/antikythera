@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <ranges>
 #include <utility>
 
 #include "common/crc32c.hpp"
@@ -97,7 +98,9 @@ HoldServer::HoldServer(store::FileLayer& files, ServerConfig config, SessionSink
       _config{std::move(config)},
       _sink{&sink},
       _copy_budget{_config.copy_bytes_per_s, copy_depth(_config.copy_bytes_per_s),
-                   Clock::time_point{}} {}
+                   Clock::time_point{}},
+      _scrub_budget{_config.scrub_bytes_per_s, copy_depth(_config.scrub_bytes_per_s),
+                    Clock::time_point{}} {}
 
 // ---- volumes ---------------------------------------------------------------
 
@@ -181,6 +184,11 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
         next.dirty = std::move(old.dirty);
         next.copy_budget = old.copy_budget;
         next.synced = old.synced;
+        next.from_primary = old.from_primary;
+        next.scrub = std::move(old.scrub);
+        next.scrubs_done = std::move(old.scrubs_done);
+        next.checksum_errors = old.checksum_errors;
+        next.checksum_repairs = old.checksum_repairs;
     } else {
         next.copy_budget = TokenBucket{_config.copy_volume_bytes_per_s,
                                        copy_depth(_config.copy_volume_bytes_per_s), now};
@@ -198,6 +206,8 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
             old.repairs = std::move(next.repairs);
             old.reconcile = std::move(next.reconcile);
             old.dirty = std::move(next.dirty);
+            old.scrub = std::move(next.scrub);
+            old.scrubs_done = std::move(next.scrubs_done);
         }
     };
     if (const auto* me = find_member(c, _config.server_id); me != nullptr) {
@@ -231,6 +241,14 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
         next.store->set_commit(next.store->last_seq());
     }
     auto& v = _volumes.insert_or_assign(c.volume_id, std::move(next)).first->second;
+    if (v.scrub) {
+        // Asked at the old epoch: asked again (run() ends a scrub this
+        // config makes moot).
+        v.scrub->bad.insert(std::views::values(v.scrub->asks).begin(),
+                            std::views::values(v.scrub->asks).end());
+        v.scrub->asks.clear();
+        v.scrub->asked_on = 0;
+    }
     if (is_primary(v)) {
         if (!was_primary) {
             v.lease_asked.reset();
@@ -300,6 +318,15 @@ auto HoldServer::open_session(std::uint64_t peer_server_id) -> SessionId {
 auto HoldServer::close_session(SessionId id) -> void {
     _sessions.erase(id);
     for (auto& [vid, v] : _volumes) {
+        if (v.from_primary == id) {
+            v.from_primary = 0;
+        }
+        if (v.scrub && v.scrub->asked_on == id) {
+            v.scrub->bad.insert(std::views::values(v.scrub->asks).begin(),
+                                std::views::values(v.scrub->asks).end());
+            v.scrub->asks.clear();
+            v.scrub->asked_on = 0;
+        }
         std::erase_if(v.queue, [id](const Request& r) { return r.session == id; });
         std::erase_if(v.parked, [id](const Request& r) { return r.session == id; });
         for (auto& [sid, l] : v.links) {
@@ -379,6 +406,21 @@ auto HoldServer::check(const Session& s, const proto::HoldHeader& h) const -> Ve
         if (h.opcode == HoldOpcode::hello || h.opcode == HoldOpcode::ping) {
             return {};
         }
+        if (s.outbound) {
+            // A member asking its primary for a good copy (a scrub's READ).
+            const auto* primary = proto::primary_member(c);
+            if (h.opcode != HoldOpcode::read || primary == nullptr ||
+                primary->server_id != _config.server_id) {
+                return {.status = HoldStatus::not_primary};
+            }
+            if (!v.store) {
+                return {.status = HoldStatus::io_error};
+            }
+            if (h.lba + h.blocks > c.capacity_blocks) {
+                return {.status = HoldStatus::range};
+            }
+            return {};
+        }
         // Replication and repair reads come from this epoch's primary only.
         const auto* primary = proto::primary_member(c);
         if (primary == nullptr || primary->server_id != s.peer ||
@@ -451,7 +493,11 @@ auto HoldServer::hello(SessionId id, Session& s, const proto::HoldFrame& f) -> v
     s.attachment_id = f.header.attachment_id;
     s.generation =
         s.role == proto::HoldPeerRole::initiator ? f.header.generation : hello->replica_gen;
-    const Volume& v = _volumes.at(s.volume_id);
+    Volume& v = _volumes.at(s.volume_id);
+    if (const auto* p = proto::primary_member(v.config);
+        s.role == proto::HoldPeerRole::peer && p != nullptr && p->server_id == s.peer) {
+        v.from_primary = id;  // a scrub's asks go on the newest
+    }
     respond(id, f.header, HoldStatus::ok,
             proto::HoldHelloOk{.block_size = v.config.block_size,
                                .capacity_blocks = v.config.capacity_blocks,
@@ -469,7 +515,14 @@ auto HoldServer::on_frame(SessionId id, const proto::HoldFrame& f, Clock::time_p
         return;
     }
     if (proto::is_response(f.header)) {
-        return;  // nothing is asked of a peer over an inbound session
+        // Only a scrub asks anything over an inbound session: its READs.
+        const Session& s = sit->second;
+        if (const auto vit = _volumes.find(s.volume_id);
+            vit != _volumes.end() && s.open && s.role == proto::HoldPeerRole::peer &&
+            (f.header.opcode == HoldOpcode::read || f.header.opcode == HoldOpcode::redirect)) {
+            on_fill(vit->second, s, id, f);
+        }
+        return;
     }
     ++_stats.requests;
     Session& s = sit->second;
@@ -623,6 +676,7 @@ auto HoldServer::run(Clock::time_point now) -> void {
     }
     for (auto* v : order) {
         pump_copies(*v, now);  // what tenant requests leave
+        pump_scrub(*v, now);
     }
 }
 
@@ -686,7 +740,7 @@ auto HoldServer::serve(Volume& v, std::size_t budget, Clock::time_point now) -> 
         // The primary already shaped what it replicates, and its own
         // reconcile writes are not the guest's.
         if (bytes != 0 && !repl && r.session != 0 && r.header.opcode != HoldOpcode::sync_data &&
-            !v.limiter.admit(bytes, now)) {
+            !r.member && !v.limiter.admit(bytes, now)) {
             break;
         }
         Request taken = std::move(r);
@@ -776,11 +830,27 @@ auto HoldServer::execute(Volume& v, Request& r) -> void {
             }
             if (!bad->empty()) {
                 _stats.checksum += bad->size();
-                if (start_repair(v, r, *bad)) {
+                v.checksum_errors += bad->size();
+                // Not from the member asking: its copy is the bad one.
+                std::uint64_t except = 0;
+                if (const auto sit = _sessions.find(r.session);
+                    r.member && sit != _sessions.end()) {
+                    except = sit->second.peer;
+                }
+                if (!is_primary(v)) {
+                    // The primary repairing from this copy: it checks each
+                    // block it needs against the stored checksums.
+                    respond(r.session, r.header, HoldStatus::ok,
+                            proto::BlockData{
+                                .block_size = r.block_size, .crcs = crc_bytes(crcs), .data = data});
+                    return;
+                }
+                if (start_repair(v, r, *bad, except, std::move(data), std::move(crcs))) {
                     return;
                 }
                 _stats.unrepairable += bad->size();
-                respond(r.session, r.header, HoldStatus::io_error);
+                respond(r.session, r.header,
+                        r.member ? HoldStatus::checksum : HoldStatus::io_error);
                 return;
             }
             const auto crc = crc_bytes(crcs);
@@ -849,6 +919,9 @@ auto HoldServer::next_wake(Clock::time_point now) const -> std::optional<Clock::
                                 [&](const auto& kv) { return copy_ready(v, kv.second); })) {
             at(now + std::max(_copy_budget.wait(), v.copy_budget.wait()));
         }
+        if (const auto t = scrub_due(v); t) {
+            at(std::max(now, *t));
+        }
     }
     if (_next_status) {
         at(std::max(now, *_next_status));  // the caller takes reports
@@ -863,7 +936,11 @@ auto HoldServer::held_back(const Volume& v, const Request& r, Clock::time_point 
     if (h.opcode == HoldOpcode::read) {
         // Not without a lease (another primary may be serving), nor before
         // an overlapping write is answered: it might still be rolled back.
-        return !lease_valid(v, now) ||
+        // Only a tenant's read needs the lease. A member's READ takes a
+        // copy only from the primary of its own epoch, and a primary's
+        // repair READ to a member finds no lease there (members hold
+        // none), so waiting for one would park it for good.
+        return (!r.member && is_primary(v) && !lease_valid(v, now)) ||
                std::ranges::any_of(v.replicating, [&](const Replicating& w) {
                    return overlaps(w.request.header, h);
                });
@@ -990,6 +1067,7 @@ auto HoldServer::send_repl(Volume& v, Link& l, const Replicating& w) -> void {
 auto HoldServer::on_link_frame(Session& s, SessionId id, const proto::HoldFrame& f,
                                Clock::time_point now) -> void {
     if (!proto::is_response(f.header)) {
+        member_read(s, id, f);
         return;
     }
     const auto vit = _volumes.find(s.volume_id);
@@ -1145,6 +1223,11 @@ auto HoldServer::abandon(Volume& v) -> void {
     v.lease_asked.reset();
     v.lease_until = {};
     for (auto& [id, rep] : v.repairs) {
+        if (rep.request.scrub && v.scrub) {
+            // Asked of the new primary instead.
+            v.scrub->bad.insert(rep.bad.begin(), rep.bad.end());
+            v.scrub->repairing -= std::min<std::size_t>(v.scrub->repairing, 1);
+        }
         respond(rep.request.session, rep.request.header, HoldStatus::io_error);
     }
     v.repairs.clear();
@@ -1253,25 +1336,34 @@ auto HoldServer::commit_replicas(Volume& v, std::vector<Request>& batch) -> void
     batch.clear();
 }
 
-auto HoldServer::start_repair(Volume& v, Request& r, std::vector<std::uint64_t> bad) -> bool {
-    if (!is_primary(v)) {
+auto HoldServer::start_repair(Volume& v, Request& r, std::vector<std::uint64_t> bad,
+                              std::uint64_t except, std::vector<std::byte> data,
+                              std::vector<std::uint32_t> crcs) -> bool {
+    if (!is_primary(v) || bad.empty()) {
         return false;
     }
-    const auto it = std::ranges::find_if(v.links, [](const auto& kv) {
-        return kv.second.state == Link::State::open && in_sync(kv.second.member.role);
+    const auto it = std::ranges::find_if(v.links, [except](const auto& kv) {
+        return kv.first != except && kv.second.state == Link::State::open &&
+               in_sync(kv.second.member.role);
     });
     if (it == v.links.end()) {
         return false;
     }
+    std::ranges::sort(bad);
     proto::HoldHeader h;
     h.opcode = HoldOpcode::read;
     h.request_id = v.next_request++;
     h.volume_id = v.config.volume_id;
     h.epoch = v.config.epoch;
-    h.lba = r.header.lba;
-    h.blocks = r.header.blocks;
-    v.repairs.emplace(h.request_id,
-                      Repair{.request = std::move(r), .bad = std::move(bad), .member = it->first});
+    h.lba = bad.front();  // only the span of the bad blocks
+    h.blocks = static_cast<std::uint32_t>(bad.back() - bad.front() + 1);
+    v.repairs.emplace(h.request_id, Repair{.request = std::move(r),
+                                           .bad = std::move(bad),
+                                           .member = it->first,
+                                           .lba = h.lba,
+                                           .blocks = h.blocks,
+                                           .data = std::move(data),
+                                           .crcs = std::move(crcs)});
     send_link(v, it->second, {.header = h, .payload = {}});
     return true;
 }
@@ -1282,34 +1374,61 @@ auto HoldServer::finish_repair(Volume& v, Repair& rep, const proto::HoldFrame* f
     const auto* d = f != nullptr && f->header.status == HoldStatus::ok
                         ? std::get_if<proto::BlockData>(&f->payload)
                         : nullptr;
-    bool good = d != nullptr && v.store && d->block_size == bs && f->header.blocks == h.blocks &&
-                d->data.size() == std::size_t{h.blocks} * bs;
-    for (std::size_t b = 0; good && b < h.blocks; ++b) {
+    const bool answered = d != nullptr && v.store && d->block_size == bs &&
+                          f->header.lba == rep.lba && f->header.blocks == rep.blocks &&
+                          d->data.size() == std::size_t{rep.blocks} * bs;
+    // Each bad block on its own: the member returns its copy as it holds
+    // it, and only the blocks asked for must be good there.
+    std::size_t mended = 0;
+    for (std::size_t i = 0; answered && v.store && i < rep.bad.size(); ++i) {
+        const auto b = rep.bad[i] - rep.lba;
         const auto block = d->data.subspan(b * bs, bs);
         const auto crc = proto::block_crc(*d, b);
-        good = crc32c::of(block) == crc ||
-               (crc == 0 && v.store->past_source(h.lba + b) && all_zero(block));
-    }
-    for (std::size_t i = 0; good && i < rep.bad.size(); ++i) {
-        const auto b = rep.bad[i] - h.lba;
-        auto r = v.store->repair(rep.bad[i], d->data.subspan(b * bs, bs), proto::block_crc(*d, b));
-        if (!r) {
-            good = false;
+        const bool unwritten = crc == 0 && v.store->past_source(rep.bad[i]) && all_zero(block);
+        if (crc32c::of(block) != crc && !unwritten) {
+            continue;  // bad there too
+        }
+        if (auto r = v.store->repair(rep.bad[i], block, crc); !r) {
             if (r.error() == store::StoreError::io) {
                 ++_stats.io_errors;
                 v.store.reset();
             }
+            continue;
         }
+        if (!rep.data.empty()) {
+            const auto at = rep.bad[i] - h.lba;
+            std::ranges::copy(block, rep.data.begin() + static_cast<std::ptrdiff_t>(at * bs));
+            rep.crcs[at] = crc;
+        }
+        ++mended;
     }
     unpark(v);  // writes held behind the repair go on
-    if (!good) {
-        _stats.unrepairable += rep.bad.size();
-        respond(rep.request.session, h, HoldStatus::io_error);
+    _stats.repaired += mended;
+    v.checksum_repairs += mended;
+    const std::size_t left = rep.bad.size() - mended;
+    if (rep.request.scrub && v.scrub) {
+        auto& sc = *v.scrub;
+        sc.repairing -= std::min<std::size_t>(sc.repairing, 1);
+        // Lost on the way, or refused for a reason other than the copy
+        // itself: asked again.
+        const bool retry = left != 0 && v.store && !answered &&
+                           (f == nullptr || (f->header.status != HoldStatus::checksum &&
+                                             f->header.status != HoldStatus::io_error));
+        if (retry) {
+            sc.bad.insert(rep.bad.begin(), rep.bad.end());
+            sc.ask_at = _now + _config.scrub_retry;
+            return;
+        }
+        sc.unrepairable += left;
+    }
+    if (left != 0) {
+        _stats.unrepairable += left;
+        respond(rep.request.session, h,
+                rep.request.member ? HoldStatus::checksum : HoldStatus::io_error);
         return;
     }
-    _stats.repaired += rep.bad.size();
     respond(rep.request.session, h, HoldStatus::ok,
-            proto::BlockData{.block_size = bs, .crcs = d->crcs, .data = d->data});
+            proto::BlockData{.block_size = bs, .crcs = crc_bytes(rep.crcs), .data = rep.data});
 }
 
 // ---- resync and rebuild ----------------------------------------------------
@@ -1702,8 +1821,8 @@ auto HoldServer::take_reports(Clock::time_point now) -> std::vector<proto::Repor
                  .total_bytes = 0,
                  .hydrated_bytes = 0,
                  .lease_remaining_ms = static_cast<std::uint32_t>(left.count()),
-                 .checksum_errors = 0,
-                 .checksum_repairs = 0,
+                 .checksum_errors = v.checksum_errors,
+                 .checksum_repairs = v.checksum_repairs,
                  .reads = 0,
                  .writes = 0,
                  .read_bytes = 0,
@@ -1746,6 +1865,413 @@ auto HoldServer::has_lease(std::uint64_t volume_id, Clock::time_point now) const
 auto HoldServer::reconciling(std::uint64_t volume_id) const -> bool {
     const auto it = _volumes.find(volume_id);
     return it != _volumes.end() && it->second.reconcile.has_value();
+}
+
+// ---- scrubbing -------------------------------------------------------------
+
+auto HoldServer::start_scrub(std::uint64_t volume_id, std::uint64_t op_id, std::uint64_t epoch,
+                             std::uint32_t mib_per_s, Clock::time_point now) -> void {
+    _now = now;
+    const auto answer = [&](proto::OpStatus status) {
+        _reports.emplace_back(proto::OpOutcome{.volume_id = volume_id,
+                                               .op_id = op_id,
+                                               .epoch = epoch,
+                                               .detail = 0,
+                                               .kind = proto::VolumeOpKind::scrub,
+                                               .status = status,
+                                               .slot = 0});
+    };
+    const auto it = _volumes.find(volume_id);
+    if (it == _volumes.end()) {
+        answer(proto::OpStatus::unknown_volume);
+        return;
+    }
+    Volume& v = it->second;
+    if (const auto done = std::ranges::find(v.scrubs_done, op_id, &proto::OpOutcome::op_id);
+        done != v.scrubs_done.end()) {
+        _reports.emplace_back(*done);  // a resend: the outcome went missing
+        return;
+    }
+    if (v.scrub && v.scrub->op_id == op_id) {
+        return;  // a resend while it runs
+    }
+    const auto* me = find_member(v.config, _config.server_id);
+    if (me == nullptr || !v.store || me->role == proto::ReplicaRole::joining) {
+        answer(proto::OpStatus::unknown_volume);  // nothing here worth scrubbing
+        return;
+    }
+    if (epoch > v.config.epoch) {
+        answer(proto::OpStatus::stale_epoch);  // this server is behind: resent later
+        return;
+    }
+    if (v.scrub) {
+        end_scrub(v, proto::OpStatus::timed_out);  // superseded
+    }
+    constexpr double mib = 1024.0 * 1024.0;
+    constexpr std::uint32_t default_mib_per_s = 50;
+    const double rate = mib * (mib_per_s == 0 ? default_mib_per_s : mib_per_s);
+    v.scrub = Scrub{};
+    v.scrub->op_id = op_id;
+    v.scrub->epoch = epoch;
+    v.scrub->replica_gen = me->replica_gen;
+    v.scrub->budget = TokenBucket{rate, copy_depth(rate), now};
+}
+
+auto HoldServer::scrubbing(std::uint64_t volume_id) const -> bool {
+    const auto it = _volumes.find(volume_id);
+    return it != _volumes.end() && it->second.scrub.has_value();
+}
+
+auto HoldServer::end_scrub(Volume& v, proto::OpStatus status) -> void {
+    auto& sc = *v.scrub;
+    if (status == proto::OpStatus::ok && sc.unrepairable != 0) {
+        status = proto::OpStatus::io_error;
+    }
+    const proto::OpOutcome o{.volume_id = v.config.volume_id,
+                             .op_id = sc.op_id,
+                             .epoch = sc.epoch,
+                             .detail = sc.found,
+                             .kind = proto::VolumeOpKind::scrub,
+                             .status = status,
+                             .slot = 0};
+    _reports.emplace_back(o);
+    if (sc.unrepairable != 0 && find_member(v.config, _config.server_id) != nullptr) {
+        // This replica holds blocks no one can mend: the controller
+        // replaces it (a secondary) or fails over (the primary).
+        _reports.emplace_back(
+            proto::VolumeFault{.volume_id = v.config.volume_id,
+                               .epoch = v.config.epoch,
+                               .suspect = _config.server_id,
+                               .kind = proto::VolumeFaultKind::checksum_unrepairable,
+                               .reporter = proto::FaultReporter::hold,
+                               .slot = 0});
+    }
+    constexpr std::size_t remembered = 8;
+    v.scrubs_done.push_back(o);
+    if (v.scrubs_done.size() > remembered) {
+        v.scrubs_done.pop_front();
+    }
+    v.scrub.reset();
+}
+
+auto HoldServer::pump_scrub(Volume& v, Clock::time_point now) -> void {
+    if (!v.scrub) {
+        return;
+    }
+    auto& sc = *v.scrub;
+    const auto* me = find_member(v.config, _config.server_id);
+    if (me == nullptr || me->replica_gen != sc.replica_gen ||
+        me->role == proto::ReplicaRole::joining) {
+        end_scrub(v, proto::OpStatus::unknown_volume);  // not the replica it was asked about
+        return;
+    }
+    if (!v.store) {
+        end_scrub(v, proto::OpStatus::io_error);  // the store failed
+        return;
+    }
+    // Lowest priority, with copies: only what tenant requests leave.
+    if (!v.queue.empty() || v.reconcile) {
+        return;
+    }
+    const bool primary = is_primary(v);
+    const std::uint64_t rb = region_blocks(v);
+    const std::uint64_t cap = v.config.capacity_blocks;
+    const std::uint64_t regions = (cap + rb - 1) / rb;
+    constexpr std::size_t max_scan = 4096;  // regions looked at per pass, so run() stays short
+    _scrub_budget.refill(now);
+    sc.budget.refill(now);
+    sc.blocked = false;
+    std::size_t scanned = 0;
+    while (!sc.walked && _scrub_budget.ready() && sc.budget.ready() && scanned++ < max_scan) {
+        if (sc.next >= regions) {
+            sc.walked = now;
+            break;
+        }
+        const std::uint64_t lba = sc.next * rb;
+        const std::uint64_t n = std::min(rb, cap - lba);
+        auto w = v.store->written(lba, n);
+        if (!w) {
+            ++_stats.io_errors;
+            v.store.reset();
+            end_scrub(v, proto::OpStatus::io_error);
+            return;
+        }
+        if (!*w) {
+            ++sc.next;  // never written: nothing to verify
+            continue;
+        }
+        proto::HoldHeader range;
+        range.lba = lba;
+        range.blocks = static_cast<std::uint32_t>(n);
+        if (primary && std::ranges::any_of(v.replicating, [&](const Replicating& r) {
+                return overlaps(r.request.header, range);
+            })) {
+            sc.blocked = true;  // read once the members hold the write (advance)
+            break;
+        }
+        if (!scrub_range(v, lba, n)) {
+            return;
+        }
+        const auto bytes = static_cast<double>(n * v.config.block_size);
+        _scrub_budget.take(bytes);
+        sc.budget.take(bytes);
+        ++sc.next;
+    }
+    scrub_repair(v, now);
+    if (!v.scrub || !sc.walked) {
+        return;
+    }
+    if (sc.bad.empty() && sc.asks.empty() && sc.repairing == 0) {
+        end_scrub(v, proto::OpStatus::ok);
+        return;
+    }
+    if (now - *sc.walked >= _config.scrub_timeout) {
+        sc.unrepairable += sc.bad.size() + sc.asks.size() + sc.repairing;
+        _stats.unrepairable += sc.bad.size() + sc.asks.size() + sc.repairing;
+        end_scrub(v, proto::OpStatus::io_error);
+    }
+}
+
+auto HoldServer::scrub_range(Volume& v, std::uint64_t lba, std::uint64_t blocks) -> bool {
+    auto& sc = *v.scrub;
+    const std::uint32_t bs = v.config.block_size;
+    std::vector<std::byte> data(blocks * bs);
+    std::vector<std::uint32_t> crcs(blocks);
+    auto bad = v.store->read(lba, data, crcs);
+    if (!bad && bad.error() == store::StoreError::not_hydrated) {
+        // Block by block, past those awaiting hydration (not ours to judge).
+        bad.emplace();
+        for (std::uint64_t b = lba; b < lba + blocks; ++b) {
+            auto u = v.store->unhydrated(b);
+            if (!u) {
+                bad = std::unexpected(u.error());
+                break;
+            }
+            if (*u) {
+                continue;
+            }
+            auto one = v.store->read(b, std::span{data}.first(bs), std::span{crcs}.first(1));
+            if (!one) {
+                bad = std::unexpected(one.error());
+                break;
+            }
+            bad->insert(bad->end(), one->begin(), one->end());
+        }
+    }
+    if (!bad) {
+        if (bad.error() == store::StoreError::io) {
+            ++_stats.io_errors;
+        }
+        v.store.reset();  // a failed replica is reopened by the next config
+        end_scrub(v, proto::OpStatus::io_error);
+        return false;
+    }
+    _stats.scrubbed += blocks;
+    for (const auto b : *bad) {
+        if (sc.bad.contains(b) || std::ranges::contains(std::views::values(sc.asks), b)) {
+            continue;
+        }
+        sc.bad.insert(b);
+        ++sc.found;
+        ++_stats.checksum;
+        ++v.checksum_errors;
+    }
+    return true;
+}
+
+auto HoldServer::scrub_repair(Volume& v, Clock::time_point now) -> void {
+    auto& sc = *v.scrub;
+    if (sc.bad.empty() || now < sc.ask_at) {
+        return;
+    }
+    if (!is_primary(v)) {
+        scrub_ask(v, now);
+        return;
+    }
+    if (v.links.empty()) {
+        // The only replica: no good copy anywhere.
+        sc.unrepairable += sc.bad.size();
+        _stats.unrepairable += sc.bad.size();
+        sc.bad.clear();
+        return;
+    }
+    for (auto it = sc.bad.begin(); it != sc.bad.end() && sc.repairing < _config.scrub_asks;) {
+        proto::HoldHeader h;
+        h.opcode = HoldOpcode::read;
+        h.volume_id = v.config.volume_id;
+        h.epoch = v.config.epoch;
+        h.lba = *it;
+        h.blocks = 1;
+        if (std::ranges::any_of(v.replicating, [&](const Replicating& r) {
+                return overlaps(r.request.header, h);
+            })) {
+            // A member may not hold that write yet: its copy could be older.
+            sc.ask_at = now + _config.scrub_retry;
+            ++it;
+            continue;
+        }
+        Request r{.session = 0,
+                  .header = h,
+                  .data = {},
+                  .crcs = {},
+                  .block_size = v.config.block_size,
+                  .seq = 0,
+                  .commit_seq = 0,
+                  .member = false,
+                  .scrub = true};
+        if (!start_repair(v, r, {*it})) {
+            sc.ask_at = now + _config.scrub_retry;  // no member to ask yet
+            return;
+        }
+        ++sc.repairing;
+        it = sc.bad.erase(it);
+    }
+}
+
+auto HoldServer::scrub_ask(Volume& v, Clock::time_point now) -> void {
+    auto& sc = *v.scrub;
+    const auto* p = proto::primary_member(v.config);
+    const auto sit = _sessions.find(v.from_primary);
+    if (p == nullptr || sit == _sessions.end() || !sit->second.open ||
+        sit->second.peer != p->server_id || sit->second.generation != p->replica_gen) {
+        sc.ask_at = now + _config.scrub_retry;  // no session from this epoch's primary yet
+        return;
+    }
+    const SessionId id = sit->first;
+    if (sc.asked_on != id) {
+        sc.bad.insert(std::views::values(sc.asks).begin(), std::views::values(sc.asks).end());
+        sc.asks.clear();
+        sc.asked_on = id;
+    }
+    while (sc.asks.size() < _config.scrub_asks && !sc.bad.empty()) {
+        const std::uint64_t lba = *sc.bad.begin();
+        sc.bad.erase(sc.bad.begin());
+        proto::HoldHeader h;
+        h.opcode = HoldOpcode::read;
+        h.request_id = v.next_request++;
+        h.volume_id = v.config.volume_id;
+        h.epoch = v.config.epoch;
+        h.lba = lba;
+        h.blocks = 1;
+        sc.asks.emplace(h.request_id, lba);
+        if (auto frame = proto::encode_hold_frame({.header = h, .payload = {}}); frame) {
+            _sink->send(id, std::move(*frame));
+        }
+    }
+}
+
+auto HoldServer::on_fill(Volume& v, const Session& s, SessionId id, const proto::HoldFrame& f)
+    -> void {
+    if (!v.scrub) {
+        return;
+    }
+    auto& sc = *v.scrub;
+    const auto ask = sc.asks.find(f.header.request_id);
+    if (ask == sc.asks.end() || sc.asked_on != id) {
+        return;
+    }
+    const std::uint64_t lba = ask->second;
+    sc.asks.erase(ask);
+    // Only the primary of this epoch, on its newest session: a copy from
+    // anywhere else may be older than what this replica holds.
+    const auto* p = proto::primary_member(v.config);
+    const bool current = p != nullptr && p->server_id == s.peer && p->replica_gen == s.generation &&
+                         id == v.from_primary && f.header.epoch == v.config.epoch && v.store;
+    const auto status = f.header.status;
+    const bool final = f.header.opcode == HoldOpcode::read &&
+                       (status == HoldStatus::ok || status == HoldStatus::checksum ||
+                        status == HoldStatus::io_error || status == HoldStatus::not_hydrated ||
+                        status == HoldStatus::range || status == HoldStatus::bad_request);
+    if (!current || !final) {
+        sc.bad.insert(lba);  // asked again
+        sc.ask_at = _now + _config.scrub_retry;
+        return;
+    }
+    const std::uint32_t bs = v.config.block_size;
+    const auto* d = status == HoldStatus::ok ? std::get_if<proto::BlockData>(&f.payload) : nullptr;
+    bool good = d != nullptr && f.header.lba == lba && f.header.blocks == 1 &&
+                d->block_size == bs && d->data.size() == bs;
+    if (good) {
+        const auto crc = proto::block_crc(*d, 0);
+        good = crc32c::of(d->data) == crc ||
+               (crc == 0 && v.store->past_source(lba) && all_zero(d->data));
+        if (good) {
+            if (auto r = v.store->repair(lba, d->data, crc); !r) {
+                good = false;
+                if (r.error() == store::StoreError::io) {
+                    ++_stats.io_errors;
+                    v.store.reset();  // run() ends the scrub
+                }
+            }
+        }
+    }
+    if (!good) {
+        ++sc.unrepairable;
+        ++_stats.unrepairable;
+        return;
+    }
+    ++_stats.repaired;
+    ++v.checksum_repairs;
+}
+
+auto HoldServer::member_read(Session& s, SessionId id, const proto::HoldFrame& f) -> void {
+    const auto vit = _volumes.find(s.volume_id);
+    if (vit == _volumes.end()) {
+        return;
+    }
+    Volume& v = vit->second;
+    const auto lit = v.links.find(s.peer);
+    if (lit == v.links.end() || lit->second.session != id ||
+        lit->second.state != Link::State::open) {
+        return;
+    }
+    ++_stats.requests;
+    const auto verdict = check(s, f.header);
+    if (verdict.status != HoldStatus::ok) {
+        respond(id, f.header, verdict.status);
+        return;
+    }
+    if (v.queue.size() >= _config.max_queue) {
+        ++_stats.throttled;
+        respond(id, f.header, HoldStatus::throttled);
+        return;
+    }
+    // Served in order with the tenant's requests, held back like a read.
+    v.queue.push_back(Request{.session = id,
+                              .header = f.header,
+                              .data = {},
+                              .crcs = {},
+                              .block_size = v.config.block_size,
+                              .seq = 0,
+                              .commit_seq = 0,
+                              .member = true,
+                              .scrub = false});
+}
+
+auto HoldServer::scrub_due(const Volume& v) const -> std::optional<Clock::time_point> {
+    if (!v.scrub || !v.store || !v.queue.empty() || v.reconcile) {
+        // Gone, or after the tenant's requests (whose run() comes first).
+        return v.scrub && (!v.store || find_member(v.config, _config.server_id) == nullptr)
+                   ? std::optional{_now}
+                   : std::nullopt;
+    }
+    const auto& sc = *v.scrub;
+    std::optional<Clock::time_point> t;
+    const auto at = [&](Clock::time_point x) { t = t ? std::min(*t, x) : x; };
+    if (!sc.walked && !sc.blocked) {
+        at(_now + std::max(_scrub_budget.wait(), sc.budget.wait()));
+    }
+    const bool room =
+        is_primary(v) ? sc.repairing < _config.scrub_asks : sc.asks.size() < _config.scrub_asks;
+    if (!sc.bad.empty() && room) {
+        at(sc.ask_at);
+    }
+    if (sc.walked) {
+        at(sc.bad.empty() && sc.asks.empty() && sc.repairing == 0
+               ? _now
+               : *sc.walked + _config.scrub_timeout);
+    }
+    return t;
 }
 
 // ---- responses -------------------------------------------------------------

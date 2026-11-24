@@ -10,6 +10,7 @@
 #include <variant>
 
 #include "proto/map_update.hpp"
+#include "proto/vpc_config.hpp"
 
 namespace ak::oar::net {
 
@@ -27,6 +28,24 @@ constexpr std::byte placeholder_mac_fill{0xFF};
 constexpr unsigned byte_bits = 8;
 constexpr std::size_t mac_fn_high = 4;
 constexpr std::size_t mac_fn_low = 5;
+
+// The VSwitch's config from a decoded frame. decode_vpc_config already
+// checked every value against the same rules; the VSwitch checks them
+// again.
+auto to_vpc_config(const proto::VpcConfigFrame& f) -> VpcConfig {
+    VpcConfig c{.gateway_mac = f.gateway_mac,
+                .ipv4 = {.address = f.ipv4_prefix, .length = f.ipv4_length},
+                .ipv4_gateway = f.ipv4_gateway,
+                .ipv6_prefix = std::nullopt,
+                .dns4 = f.dns4,
+                .dns6 = f.dns6,
+                .domain = f.domain,
+                .lease_seconds = f.lease_seconds};
+    if (f.has_ipv6) {
+        c.ipv6_prefix = f.ipv6_prefix;
+    }
+    return c;
+}
 
 auto to_map_update(const proto::MapUpdate& u) -> MapUpdate {
     MapUpdate out{.vni = u.vni, .version = u.map_version, .entries = {}};
@@ -231,6 +250,44 @@ auto NetRole::deliver_key(const oar::DeliverKey& /*request*/) -> oar::Status {
 
 auto NetRole::drop_key(const oar::DropKey& /*request*/) -> oar::Status {
     return oar::Status::unsupported;
+}
+
+auto NetRole::vpc_config(std::span<const std::byte> frame) -> oar::Status {
+    auto config = proto::decode_vpc_config(frame);
+    if (!config) {
+        ++_counters.vpc_undecodable;
+        return oar::Status::failed;
+    }
+    if (config->server_id != _config.server_id) {
+        ++_counters.vpc_wrong_server;
+        return oar::Status::failed;
+    }
+    if (!_verifier(proto::vpc_config_signed_bytes(frame), config->signature, config->key_id)) {
+        ++_counters.vpc_bad_signature;
+        return oar::Status::failed;
+    }
+    // Versions are looked at only after the signature, as for map_update.
+    const auto applied = _vpc_versions.find(config->vni);
+    if (applied != _vpc_versions.end()) {
+        if (applied->second == config->config_version) {
+            ++_counters.vpc_redelivered;
+            return oar::Status::ok;
+        }
+        if (applied->second > config->config_version) {
+            ++_counters.vpc_stale;
+            return oar::Status::failed;
+        }
+    }
+    // Routes need the source/destination opt-out (task 22). Refusing the
+    // whole frame keeps the previous config rather than applying a VPC
+    // whose route table is silently missing.
+    if (!config->routes.empty() || !_vswitch->set_vpc_config(config->vni, to_vpc_config(*config))) {
+        ++_counters.vpc_rejected;
+        return oar::Status::failed;
+    }
+    _vpc_versions.insert_or_assign(config->vni, config->config_version);
+    ++_counters.vpc_applied;
+    return oar::Status::ok;
 }
 
 auto NetRole::map_update(std::span<const std::byte> frame) -> oar::Status {

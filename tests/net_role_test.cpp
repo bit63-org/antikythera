@@ -33,6 +33,7 @@
 #include "oar/net/net_role.hpp"
 #include "proto/map_update.hpp"
 #include "proto/tunnel_peers.hpp"
+#include "proto/vpc_config.hpp"
 #include "test_support.hpp"
 #include "virtio_driver_support.hpp"
 
@@ -139,6 +140,37 @@ auto signed_map(std::uint64_t server, std::uint64_t version,
     BOOST_REQUIRE(bytes.has_value());
     const auto sig = signer().sign(proto::map_update_signed_bytes(*bytes));
     proto::set_map_update_signature(*bytes, sig);
+    return *bytes;
+}
+
+// A VpcConfig for `vpc` (10.0.0.0/24, gateway .1), signed like the
+// controller signs it. `routes` adds a default route to nic_b.
+auto signed_vpc(std::uint64_t server, std::uint64_t version, std::uint32_t lease = 3600,
+                bool routes = false) -> std::vector<std::byte> {
+    proto::VpcConfigFrame c{};
+    c.server_id = server;
+    c.key_id = key_id;
+    c.vni = vpc;
+    c.config_version = version;
+    c.gateway_mac = {std::byte{0x02}, std::byte{0}, std::byte{0},
+                     std::byte{0},    std::byte{0}, std::byte{0xFE}};
+    c.ipv4_prefix = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}};
+    c.ipv4_length = 24;
+    c.ipv4_gateway = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{1}};
+    c.has_ipv6 = true;
+    c.ipv6_prefix[0] = std::byte{0xFD};
+    c.ipv6_prefix[1] = std::byte{0x10};
+    c.dns4 = {{std::byte{10}, std::byte{0}, std::byte{0}, std::byte{2}}};
+    c.domain = "ec2.internal";
+    c.lease_seconds = lease;
+    if (routes) {
+        c.routes = {
+            {.family = proto::RouteFamily::ipv4, .length = 0, .prefix = {}, .target_nic = nic_b}};
+    }
+    auto bytes = proto::encode_vpc_config(c);
+    BOOST_REQUIRE(bytes.has_value());
+    const auto sig = signer().sign(proto::vpc_config_signed_bytes(*bytes));
+    proto::set_vpc_config_signature(*bytes, sig);
     return *bytes;
 }
 
@@ -492,6 +524,56 @@ BOOST_FIXTURE_TEST_CASE(map_updates_are_checked, One,
 }
 
 // An ARP request from `nic` for `target`, as a guest sends it.
+BOOST_FIXTURE_TEST_CASE(vpc_configs_are_checked, One,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto good = signed_vpc(server_one, 2);
+
+    BOOST_TEST((role->vpc_config(std::span{good}.first(good.size() - 1)) == Status::failed));
+    BOOST_TEST(role->counters().vpc_undecodable == 1U);
+
+    BOOST_TEST((role->vpc_config(signed_vpc(server_two, 2)) == Status::failed));
+    BOOST_TEST(role->counters().vpc_wrong_server == 1U);
+
+    auto tampered = good;
+    tampered[0x40] ^= std::byte{0x01};  // lease_seconds
+    BOOST_TEST((role->vpc_config(tampered) == Status::failed));
+    BOOST_TEST(role->counters().vpc_bad_signature == 1U);
+    BOOST_TEST(role->vswitch().vpc_config(vpc) == nullptr);
+
+    BOOST_TEST((role->vpc_config(good) == Status::ok));
+    BOOST_TEST(role->counters().vpc_applied == 1U);
+    const auto* applied = role->vswitch().vpc_config(vpc);
+    BOOST_REQUIRE(applied != nullptr);
+    BOOST_TEST(std::to_integer<int>(applied->gateway_mac[5]) == 0xFE);
+    BOOST_TEST(applied->ipv4.length == 24U);
+    BOOST_TEST(std::to_integer<int>(applied->ipv4_gateway[3]) == 1);
+    BOOST_REQUIRE(applied->ipv6_prefix.has_value());
+    BOOST_TEST(std::to_integer<int>((*applied->ipv6_prefix)[1]) == 0x10);
+    BOOST_REQUIRE(applied->dns4.size() == 1U);
+    BOOST_TEST(applied->domain == "ec2.internal");
+    BOOST_TEST(applied->lease_seconds == 3600U);
+
+    // helm resends its kept frames when the sideband reopens: ok, unchanged.
+    BOOST_TEST((role->vpc_config(good) == Status::ok));
+    BOOST_TEST(role->counters().vpc_redelivered == 1U);
+    BOOST_TEST(role->counters().vpc_applied == 1U);
+
+    // An older version is refused, even a validly signed one.
+    BOOST_TEST((role->vpc_config(signed_vpc(server_one, 1, 60)) == Status::failed));
+    BOOST_TEST(role->counters().vpc_stale == 1U);
+    BOOST_TEST(role->vswitch().vpc_config(vpc)->lease_seconds == 3600U);
+
+    // Routes wait for task 22: refused whole, the old config stays.
+    BOOST_TEST((role->vpc_config(signed_vpc(server_one, 3, 7200, true)) == Status::failed));
+    BOOST_TEST(role->counters().vpc_rejected == 1U);
+    BOOST_TEST(role->vswitch().vpc_config(vpc)->lease_seconds == 3600U);
+
+    // A newer config replaces it, and the refused version can still come later.
+    BOOST_TEST((role->vpc_config(signed_vpc(server_one, 3, 7200)) == Status::ok));
+    BOOST_TEST(role->vswitch().vpc_config(vpc)->lease_seconds == 7200U);
+    BOOST_TEST(role->counters().vpc_applied == 2U);
+}
+
 auto arp_request(std::uint64_t nic, const proto::Ipv4Address& target) -> std::vector<std::byte> {
     constexpr std::uint16_t ethertype_arp = 0x0806;
     constexpr std::uint16_t ethertype_ipv4 = 0x0800;

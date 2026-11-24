@@ -42,6 +42,7 @@
 #include "hull/signature_verifier.hpp"
 #include "proto/test_vectors.hpp"
 #include "proto/tunnel_peers.hpp"
+#include "proto/vpc_config.hpp"
 #include "test_support.hpp"
 #include "tls_test_support.hpp"
 
@@ -190,6 +191,17 @@ public:
         _peer_sets.emplace_back(frame.begin(), frame.end());
         return oar::Status::ok;
     }
+    // A network role's VPC configs.
+    std::atomic<oar::Status> vpc_status{oar::Status::ok};
+    [[nodiscard]] auto vpc_configs() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _vpc_configs;
+    }
+    auto vpc_config(std::span<const std::byte> frame) -> oar::Status override {
+        const std::scoped_lock lock{_mutex};
+        _vpc_configs.emplace_back(frame.begin(), frame.end());
+        return vpc_status.load();
+    }
 
     // A hold role's side.
     std::atomic<oar::Status> config_status{oar::Status::ok};
@@ -274,6 +286,7 @@ private:
     std::vector<std::vector<std::byte>> _peer_sets;
     std::vector<oar::PrepareFunction> _prepared;
     std::vector<std::vector<std::byte>> _frames;
+    std::vector<std::vector<std::byte>> _vpc_configs;
 };
 
 // One slot's board: every connect() opens a fresh in-process sideband and
@@ -633,6 +646,71 @@ BOOST_AUTO_TEST_CASE(map_updates_reach_net_roles_only) {
     r.daemon.run_once(0ms);
     BOOST_TEST(r.count<proto::MapApplied>() == 1U);
     BOOST_TEST(r.daemon.stats().maps_refused == 1U);
+}
+
+namespace {
+
+// A VpcConfig as the ControllerSession hands it over: helm never checks
+// the signature, so any bytes there do.
+auto vpc_frame(std::uint32_t net, std::uint64_t version)
+    -> std::pair<proto::VpcConfigFrame, std::vector<std::byte>> {
+    proto::VpcConfigFrame c{};
+    c.server_id = server;
+    c.key_id = 1;
+    c.vni = net;
+    c.config_version = version;
+    c.gateway_mac = {std::byte{0x02}, std::byte{0}, std::byte{0},
+                     std::byte{0},    std::byte{0}, std::byte{0xFE}};
+    c.ipv4_prefix = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}};
+    c.ipv4_length = 24;
+    c.ipv4_gateway = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{1}};
+    c.lease_seconds = static_cast<std::uint32_t>(version) * 60;
+    auto b = proto::encode_vpc_config(c);
+    BOOST_REQUIRE(b.has_value());
+    return {c, *b};
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(vpc_configs_reach_net_roles_and_follow_a_restart) {
+    Rig r;
+    (void)r.daemon.boot();
+    const auto [v1, frame1] = vpc_frame(vni, 1);
+    std::thread{[&] { r.daemon.on_vpc_config(v1, frame1); }}.join();
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.role.vpc_configs().size() == 1U);
+    BOOST_TEST((r.net.role.vpc_configs()[0] == frame1));  // unmodified
+    BOOST_TEST(r.blk.role.vpc_configs().empty());
+
+    // Not newer: kept back. Newer, or another VNI: forwarded.
+    r.daemon.on_vpc_config(v1, frame1);
+    const auto [v2, frame2] = vpc_frame(vni, 2);
+    r.daemon.on_vpc_config(v2, frame2);
+    const auto [other, other_frame] = vpc_frame(vni + 1, 1);
+    r.daemon.on_vpc_config(other, other_frame);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.role.vpc_configs().size() == 3U);
+    BOOST_TEST((r.net.role.vpc_configs()[1] == frame2));
+    BOOST_TEST((r.net.role.vpc_configs()[2] == other_frame));
+    BOOST_TEST(r.daemon.stats().vpc_configs == 3U);
+    BOOST_TEST(r.daemon.stats().vpc_configs_stale == 1U);
+
+    // A refusal is counted; helm still keeps the frame for the next role.
+    r.net.role.vpc_status = oar::Status::failed;
+    const auto [v3, frame3] = vpc_frame(vni, 3);
+    r.daemon.on_vpc_config(v3, frame3);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().vpc_configs_refused == 1U);
+    r.net.role.vpc_status = oar::Status::ok;
+
+    // A restarted role gets the newest of each VNI again, in VNI order.
+    r.backplane.dropped.insert(net_slot);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.connects.load() == 2);
+    const auto got = r.net.role.vpc_configs();
+    BOOST_REQUIRE(got.size() == 6U);
+    BOOST_TEST((got[4] == frame3));
+    BOOST_TEST((got[5] == other_frame));
 }
 
 namespace {

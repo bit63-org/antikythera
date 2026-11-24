@@ -62,6 +62,13 @@
 // the controller a fresh inventory report, so a role that attaches or
 // degrades after registration is not invisible until the next connection.
 //
+// VPC configuration (oar-net task 20, controller-interface Requirement
+// 10). A VpcConfig frame goes unmodified to every attached net role, which
+// verifies it. helm keeps the newest per VNI (by config_version; an older
+// or equal one is not forwarded) and hands them all to a net role whose
+// sideband (re)opens before the router registers its functions, so no NIC
+// there is prepared under a missing gateway.
+//
 // Block volumes (.kiro/specs/block-volume-service/ task 12). ReplicaConfig
 // and VolumeOp frames go unmodified to every hold role, which verifies
 // them, and so do the controller's lease acknowledgements. helm keeps the
@@ -161,7 +168,10 @@ struct DaemonStats {
     std::uint64_t host_slots{0};
     std::uint64_t map_updates{0};
     std::uint64_t maps_applied{0};
-    std::uint64_t maps_refused{0};  // a net role refused it, or no net role is attached
+    std::uint64_t maps_refused{0};         // a net role refused it, or no net role is attached
+    std::uint64_t vpc_configs{0};          // kept: newer than the last for the VNI
+    std::uint64_t vpc_configs_stale{0};    // not newer: dropped
+    std::uint64_t vpc_configs_refused{0};  // a net role refused or missed one
     std::uint64_t inbox_dropped{0};
     std::uint64_t sideband_failures{0};  // a slot's sideband or inventory could not be read
     // Block volumes.
@@ -248,6 +258,8 @@ public:
         -> void override;
     auto on_image_key(const proto::ImageKey& key, std::span<const std::byte> frame)
         -> void override;
+    auto on_vpc_config(const proto::VpcConfigFrame& config, std::span<const std::byte> frame)
+        -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
     // The newest published snapshot (ControllerSession's InventorySource).
@@ -284,9 +296,14 @@ private:
     struct ImageKeyFrame {
         std::vector<std::byte> frame;
     };
+    struct VpcFrame {
+        std::uint32_t vni{0};
+        std::uint64_t config_version{0};
+        std::vector<std::byte> frame;
+    };
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
                               proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
-                              ImageKeyFrame>;
+                              ImageKeyFrame, VpcFrame>;
 
     struct SlotState;
 
@@ -339,6 +356,12 @@ private:
     auto enqueue(Item item) -> void;
     auto handle(Item& item) -> void;
     auto apply_map(MapFrame& map) -> void;
+    // VPC configs: kept per VNI, to every attached net role (with or
+    // without a VTEP).
+    [[nodiscard]] static auto is_net_role(const SlotState& slot) -> bool;
+    auto forward_vpc_config(VpcFrame& config) -> void;
+    auto replay_vpc_configs(SlotState& slot) -> void;
+    auto count_vpc_refusal(const std::expected<void, LinkError>& r) -> void;
     // Block volumes: to every attached hold role.
     [[nodiscard]] static auto is_hold(const SlotState& slot) -> bool;
     [[nodiscard]] static auto is_blk(const SlotState& slot) -> bool;
@@ -377,6 +400,7 @@ private:
     Clock::time_point _next_identity;
     std::map<std::uint64_t, ConfigFrame> _volume_configs;  // the newest, by volume
     TunnelKeyring _keyring;
+    std::map<std::uint32_t, VpcFrame> _vpc_configs;  // the newest, by VNI
 
     mutable std::mutex _inbox_mutex;
     std::condition_variable _inbox_ready;

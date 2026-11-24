@@ -717,6 +717,11 @@ public:
         policies.emplace_back(frame.begin(), frame.end());
         return oar::Status::ok;
     }
+    std::vector<std::vector<std::byte>> vpc_configs;
+    auto vpc_config(std::span<const std::byte> frame) -> oar::Status override {
+        vpc_configs.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
+    }
     auto group_usage(std::uint16_t cursor) -> std::expected<oar::UsagePage, oar::Status> override {
         return _pager.page(cursor, [this] {
             ++snapshots;
@@ -786,6 +791,38 @@ BOOST_AUTO_TEST_CASE(group_policy_is_forwarded_whole) {
     }
     BOOST_REQUIRE(role.policies.size() == 1U);
     BOOST_TEST(role.policies[0] == frame);
+}
+
+BOOST_AUTO_TEST_CASE(vpc_config_is_forwarded_whole) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    MeterRole role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const auto smallest = pattern(oar::min_vpc_config_frame);
+    const auto largest = pattern(oar::max_vpc_config_frame);
+    {
+        const Server server{endpoint, role};
+        BOOST_TEST(link.vpc_config(smallest).has_value());
+        BOOST_TEST(link.vpc_config(largest).has_value());
+        // Out of range never reaches the wire.
+        BOOST_TEST(
+            (link.vpc_config(std::span{smallest}.first(10)).error().code == LinkErrc::bad_request));
+        BOOST_TEST((link.vpc_config(pattern(oar::max_vpc_config_frame + 1)).error().code ==
+                    LinkErrc::bad_request));
+    }
+    BOOST_REQUIRE(role.vpc_configs.size() == 2U);
+    BOOST_TEST(role.vpc_configs[0] == smallest);
+    BOOST_TEST(role.vpc_configs[1] == largest);
+
+    // A role that keeps no gateway (the default) answers unsupported.
+    auto [helm_c, oar_c] = InProcessBinding::make_pair();
+    FakeOar fake;
+    OarEndpoint other{*oar_c, oar_config()};
+    OarLink other_link{*helm_c, config()};
+    const Server server{other, fake};
+    const auto refused = other_link.vpc_config(smallest);
+    BOOST_REQUIRE(!refused.has_value());
+    BOOST_TEST((refused.error().status == oar::Status::unsupported));
 }
 
 BOOST_AUTO_TEST_CASE(roles_without_group_meters_answer_unsupported) {

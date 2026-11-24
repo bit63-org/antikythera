@@ -326,6 +326,14 @@ auto OarLink::group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkE
     return out;
 }
 
+auto OarLink::vpc_config(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
+    auto body = oar::encode_vpc_config_frame(frame);
+    if (!body) {
+        return std::unexpected(bad_request());
+    }
+    return expect_empty(transact(mctp::VendorType::vpc_config, *body));
+}
+
 auto OarLink::replica_config(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
     auto body = oar::encode_replica_config_frame(frame);
     if (!body) {
@@ -667,6 +675,10 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
                                                                    : page.error());
             }
             return with_body(oar::encode_usage_page(*page, *cursor));
+        }
+        case mctp::VendorType::vpc_config: {
+            auto frame = oar::decode_vpc_config_frame(body);
+            return status_only(frame ? handler.vpc_config(*frame) : oar::Status::bad_request);
         }
         case mctp::VendorType::replica_config: {
             auto frame = oar::decode_replica_config_frame(body);

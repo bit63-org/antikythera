@@ -29,6 +29,10 @@
 //   health              ok, or degraded with fault_code bits saying why: a
 //                       peer VTEP is down, a peer has not proved a full-size
 //                       path (mtu_ok), or the tunnel has no key yet
+//   vpc_config          decode the controller's VpcConfig frame, check it
+//                       like a map_update, and set the VNI's gateway and
+//                       DHCP configuration in the VSwitch (Requirement 12.1,
+//                       task 20)
 //
 // Volume keys and volumes are not the network role's: deliver_key, drop_key
 // and the volume requests answer unsupported.
@@ -72,6 +76,14 @@
 // VNI once the mapping is applied: they feed the ARP/ND proxy and the IP
 // source and destination checks, so a VNI's addresses always match its
 // signed mapping.
+//
+// vpc_config is checked the same way and by the same verifier: the frame
+// must name this server and verify under a controller key. Each VNI keeps
+// the version last applied; re-delivery of that version answers ok without
+// touching the VSwitch (helm resends every kept config when the sideband
+// reopens), an older one answers failed. A frame the VSwitch refuses, or
+// one with routes (applied only once routing exists, task 22), leaves the
+// previous config in place: a config is never half applied.
 //
 // Not thread-safe: the sideband, the transports and the underlay share one
 // thread, as the VSwitch and Vtep require.
@@ -156,6 +168,14 @@ struct NetRoleConfig {
 };
 
 struct RoleCounters {
+    // VpcConfig frames (task 20), counted like map_updates.
+    std::uint64_t vpc_applied{0};
+    std::uint64_t vpc_redelivered{0};
+    std::uint64_t vpc_undecodable{0};
+    std::uint64_t vpc_wrong_server{0};
+    std::uint64_t vpc_bad_signature{0};
+    std::uint64_t vpc_stale{0};         // older than the version applied for the VNI
+    std::uint64_t vpc_rejected{0};      // the VSwitch refused it, or it carries routes
     std::uint64_t map_applied{0};       // frames that changed the table
     std::uint64_t map_redelivered{0};   // the version already applied: ok, unchanged
     std::uint64_t map_undecodable{0};   // proto::decode_map_update refused it
@@ -196,6 +216,8 @@ public:
     auto deliver_key(const helm::oar::DeliverKey& request) -> helm::oar::Status override;
     auto drop_key(const helm::oar::DropKey& request) -> helm::oar::Status override;
     auto map_update(std::span<const std::byte> frame) -> helm::oar::Status override;
+    auto vpc_config(std::span<const std::byte> frame) -> helm::oar::Status override;
+
     auto health() -> std::expected<helm::oar::Health, helm::oar::Status> override;
     auto set_tunnel_key(const helm::oar::SetTunnelKey& request) -> helm::oar::Status override;
     auto set_tunnel_peer(const helm::oar::SetTunnelPeer& request) -> helm::oar::Status override;
@@ -254,6 +276,7 @@ private:
     std::unique_ptr<TunnelPeerSet> _peer_set;
     std::unique_ptr<Vtep> _vtep;
     std::unique_ptr<VSwitch> _vswitch;
+    std::map<std::uint32_t, std::uint64_t> _vpc_versions;  // applied config version, by VNI
     std::vector<Slot> _slots;
     NetRoleConfig::Clock::time_point _started;
     // Up peers without mtu_ok, with when tick() first saw them so, and the

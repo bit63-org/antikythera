@@ -261,6 +261,13 @@ auto HelmDaemon::on_image_key(const proto::ImageKey& /*key*/, std::span<const st
     enqueue(ImageKeyFrame{.frame = {frame.begin(), frame.end()}});
 }
 
+auto HelmDaemon::on_vpc_config(const proto::VpcConfigFrame& config,
+                               std::span<const std::byte> frame) -> void {
+    enqueue(VpcFrame{.vni = config.vni,
+                     .config_version = config.config_version,
+                     .frame = {frame.begin(), frame.end()}});
+}
+
 auto HelmDaemon::post_host_slot(const mailbox::Slot& slot) -> void {
     enqueue(slot);
 }
@@ -329,6 +336,49 @@ auto HelmDaemon::handle(Item& item) -> void {
             ++_stats.tunnel_peer_sets;
         }
         forward_peers(*peers);
+    } else if (auto* vpc = std::get_if<VpcFrame>(&item)) {
+        forward_vpc_config(*vpc);
+    }
+}
+
+// ---- VPC configuration ----------------------------------------------------------
+
+auto HelmDaemon::is_net_role(const SlotState& slot) -> bool {
+    return slot.link && slot.inventory && slot.inventory->role == oar::Role::net;
+}
+
+auto HelmDaemon::count_vpc_refusal(const std::expected<void, LinkError>& r) -> void {
+    if (!r) {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.vpc_configs_refused;
+    }
+}
+
+auto HelmDaemon::forward_vpc_config(VpcFrame& config) -> void {
+    const auto kept = _vpc_configs.find(config.vni);
+    if (kept != _vpc_configs.end() && config.config_version <= kept->second.config_version) {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.vpc_configs_stale;
+        return;
+    }
+    {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.vpc_configs;
+    }
+    auto& frame = _vpc_configs.insert_or_assign(config.vni, std::move(config)).first->second;
+    for (auto& [n, slot] : _slots) {
+        if (is_net_role(*slot)) {
+            count_vpc_refusal(slot->link->vpc_config(frame.frame));
+        }
+    }
+}
+
+auto HelmDaemon::replay_vpc_configs(SlotState& slot) -> void {
+    if (!is_net_role(slot)) {
+        return;
+    }
+    for (const auto& [vni, config] : _vpc_configs) {
+        count_vpc_refusal(slot.link->vpc_config(config.frame));
     }
 }
 
@@ -608,6 +658,7 @@ auto HelmDaemon::attach(SlotState& slot) -> bool {
         replay_configs(slot);  // a hold role has no functions for the router
         return true;
     }
+    replay_vpc_configs(slot);  // before the router can prepare a NIC here
     _router.add_slot(slot.number, slot.port, *inv);
     if (is_blk(slot)) {
         for (const auto frame : _router.network_configs()) {

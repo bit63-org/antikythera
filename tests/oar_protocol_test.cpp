@@ -24,6 +24,7 @@
 #include "proto/replica_config.hpp"
 #include "proto/report.hpp"
 #include "proto/volume_op.hpp"
+#include "proto/vpc_config.hpp"
 #include "proto/tunnel_peers.hpp"
 #include "test_support.hpp"
 
@@ -662,6 +663,20 @@ BOOST_AUTO_TEST_CASE(group_policy_frame_and_usage_request) {
     BOOST_TEST(
         (oar::decode_usage_request(bytes_of(0, 0, 1, 0)).error() == BodyError::reserved_not_zero));
     BOOST_TEST((oar::decode_usage_request(bytes_of(0, 0)).error() == BodyError::truncated));
+}
+
+BOOST_AUTO_TEST_CASE(vpc_config_mirrors_match_proto) {
+    BOOST_TEST(oar::min_vpc_config_frame == ak::proto::min_vpc_config_size);
+    BOOST_TEST(oar::max_vpc_config_frame == ak::proto::max_vpc_config_size);
+    BOOST_TEST(oar::max_vpc_config_frame <= oar::max_body_size);
+    const std::vector<std::byte> frame(oar::min_vpc_config_frame + 20, std::byte{6});
+    BOOST_TEST(
+        oar::decode_vpc_config_frame(oar::encode_vpc_config_frame(frame).value()).value().size() ==
+        frame.size());
+    BOOST_TEST((oar::decode_vpc_config_frame(std::vector<std::byte>(oar::min_vpc_config_frame - 1))
+                    .error() == BodyError::truncated));
+    BOOST_TEST((oar::encode_vpc_config_frame(std::vector<std::byte>(oar::max_vpc_config_frame + 1))
+                    .error() == BodyError::trailing_bytes));
 }
 
 BOOST_AUTO_TEST_CASE(hold_mirrors_match_proto) {

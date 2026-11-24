@@ -206,7 +206,8 @@ struct Ipv4Prefix {
 };
 
 // A VNI's gateway and guest configuration (Requirement 12.1). Written by the
-// controller, signed, and forwarded by helm (the frame is task 20).
+// controller, signed (proto::VpcConfigFrame), forwarded by helm and
+// applied by NetRole::vpc_config.
 struct VpcConfig {
     MacAddress gateway_mac{};  // locally administered unicast, from the controller's pool
     Ipv4Prefix ipv4{};         // the VPC's IPv4 prefix, length 8..30, no host bits

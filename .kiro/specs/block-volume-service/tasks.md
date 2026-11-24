@@ -160,9 +160,13 @@ repository. Prerequisites outside this spec: oar-blk task 14
   images and re-keyed restores, `not_hydrated` and the `HYDRATE` write
   flag; local ↔ network conversion as a keyed copy. _Requirements: 8.6,
   11.7, 12.5_ (cloud)
-- [ ] 24. Scrubbing: periodic full read and checksum verification per
+- [x] 24. Scrubbing: periodic full read and checksum verification per
   replica within 14 days, repair from peers, reporting.
-  _Requirements: 5.5_ (cloud)
+  _Requirements: 5.5_ (cloud) As built: `scrub` VolumeOp run by
+  `HoldServer::start_scrub` (paced walk; the primary repairs from a
+  member, a secondary asks its primary), `Master` schedules every
+  in-sync replica each 7 days; repair now works with leases on and
+  mends bad blocks one by one; simulation case with latent errors.
 
 ## Outside this repository
 

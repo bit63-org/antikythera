@@ -40,6 +40,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -113,7 +114,12 @@ struct Params {
     std::optional<Clock::duration> grow_at;
     // Move to a two-replica class here, and back to three 3 s later.
     std::optional<Clock::duration> reclass_at;
+    // Corrupt a written block on one replica this often (latent errors),
+    // with replicas scrubbed every scrub_interval.
+    std::optional<Clock::duration> corrupt_every;
 };
+
+constexpr std::chrono::seconds scrub_interval{2};
 
 // One guest operation and what it saw.
 struct Op {
@@ -193,7 +199,7 @@ class World final : public m::Transport {
 
 public:
     World(std::uint64_t seed, Params p)
-        : _rng{seed}, _p{p}, master{*this, timing()}, core{{.attachment_id = att}} {
+        : _rng{seed}, _p{p}, master{*this, timing(p)}, core{{.attachment_id = att}} {
         for (std::uint64_t id = 1; id <= 3; ++id) {
             auto& h = _holds[id];
             h.id = id;
@@ -233,7 +239,9 @@ public:
     auto send_config(const proto::ReplicaConfig& c) -> void override {
         schedule(latency(), Deliver{.server = c.server_id, .config = c});
     }
-    auto send_op(const proto::VolumeOp& op) -> void override { static_cast<void>(op); }
+    auto send_op(const proto::VolumeOp& op) -> void override {
+        schedule(latency(), DeliverOp{.op = op});
+    }
     auto grant_lease(std::uint64_t server, std::uint64_t volume, std::uint64_t epoch)
         -> void override {
         schedule(latency(), Grant{.server = server, .volume = volume, .epoch = epoch});
@@ -279,6 +287,7 @@ public:
         bool grown = false;
         int reclass = 0;
         auto next_op = t0;
+        auto next_corrupt = t0 + _p.corrupt_every.value_or(0s);
         while (now < stop + _p.settle) {
             const bool working = now < stop;
             if (now >= next_tick) {
@@ -301,6 +310,10 @@ public:
                     ++reclass;
                 }
             }
+            if (working && _p.corrupt_every && now >= next_corrupt) {
+                corrupt();
+                next_corrupt = now + *_p.corrupt_every;
+            }
             if (working && _p.faults && now >= next_fault) {
                 fault();
                 next_fault = now + std::chrono::milliseconds{200 + _rng() % 2000};
@@ -313,7 +326,9 @@ public:
             }
             if (!working) {
                 heal();
-                if (outstanding() == 0 && quiet()) {
+                // Every replica scrubbed since the last corruption.
+                const bool scrubbed = !_p.corrupt_every || now >= stop + 3 * scrub_interval;
+                if (outstanding() == 0 && quiet() && scrubbed) {
                     break;
                 }
             }
@@ -330,6 +345,9 @@ public:
                 }
                 if (_p.grow_at && !grown) {
                     wake = std::min(wake, t0 + *_p.grow_at);
+                }
+                if (_p.corrupt_every) {
+                    wake = std::min(wake, next_corrupt);
                 }
             }
             if (!_events.empty()) {
@@ -374,6 +392,23 @@ public:
     [[nodiscard]] auto primary_now() const -> std::uint64_t { return primary(); }
     [[nodiscard]] auto epoch() const -> std::uint64_t { return master.volume(vol)->epoch; }
     [[nodiscard]] auto cuts() const -> std::size_t { return _cuts; }
+    [[nodiscard]] auto corrupted() const -> std::size_t { return _corrupted.size(); }
+    // Bad blocks the replicas' scrubs found, and blocks rewritten from a
+    // good copy (by scrubs and reads alike).
+    [[nodiscard]] auto scrub_found() const -> std::uint64_t {
+        std::uint64_t n = 0;
+        for (const auto& [id, h] : _holds) {
+            n += h.server ? h.server->stats().checksum : 0;
+        }
+        return n;
+    }
+    [[nodiscard]] auto repaired() const -> std::uint64_t {
+        std::uint64_t n = 0;
+        for (const auto& [id, h] : _holds) {
+            n += h.server ? h.server->stats().repaired : 0;
+        }
+        return n;
+    }
     [[nodiscard]] auto copied() const -> std::uint64_t {
         std::uint64_t n = 0;
         for (const auto& [id, h] : _holds) {
@@ -411,7 +446,10 @@ private:
         std::uint64_t volume{0};
         std::uint64_t epoch{0};
     };
-    using Event = std::variant<Frame, Dial, Closed, Deliver, Up, Grant>;
+    struct DeliverOp {
+        proto::VolumeOp op;
+    };
+    using Event = std::variant<Frame, Dial, Closed, Deliver, Up, Grant, DeliverOp>;
 
     static auto sim_qos() -> proto::VolumeQos {
         return {
@@ -419,9 +457,12 @@ private:
     }
 
     // Dropped members come back within the run.
-    static auto timing() -> m::Timing {
+    static auto timing(const Params& p) -> m::Timing {
         m::Timing t;
         t.rejoin_after = m::Time{3000};
+        if (p.corrupt_every) {
+            t.scrub_interval = scrub_interval;
+        }
         return t;
     }
 
@@ -547,6 +588,14 @@ private:
         } else if (auto* up = std::get_if<Up>(&e)) {
             master.on_report(
                 {.server_id = up->server, .report_seq = 0, .body = std::move(up->body)}, mnow());
+        } else if (auto* o = std::get_if<DeliverOp>(&e)) {
+            // helm hands the hold role a scrub; other ops are not modelled.
+            auto& h = _holds.at(o->op.server_id);
+            if (const auto* sc = std::get_if<proto::ScrubVolume>(&o->op.args);
+                sc != nullptr && h.up) {
+                h.server->start_scrub(o->op.volume_id, o->op.op_id, o->op.epoch, sc->mib_per_s,
+                                      now);
+            }
         } else if (auto* g = std::get_if<Grant>(&e)) {
             if (auto& h = _holds.at(g->server); h.up) {
                 h.server->grant_lease(g->volume, g->epoch, now);
@@ -630,6 +679,38 @@ private:
                 return mem.role == proto::ReplicaRole::primary ||
                        mem.role == proto::ReplicaRole::secondary;
             }));
+    }
+
+    // Overwrites a block some write completed on one replica's data file,
+    // behind the store's back; each block once, so a good copy remains.
+    auto corrupt() -> void {
+        std::vector<std::uint64_t> written;
+        for (const auto& [id, op] : _ops) {
+            if (op.write && op.result && op.result->has_value()) {
+                for (std::uint64_t b = op.lba; b < op.lba + op.n; ++b) {
+                    if (!_corrupted.contains(b)) {
+                        written.push_back(b);
+                    }
+                }
+            }
+        }
+        if (written.empty()) {
+            return;
+        }
+        const auto lba = written[_rng() % written.size()];
+        auto& h = _holds.at(1 + (_rng() % 3));
+        const auto* r = h.up ? h.server->replica(vol) : nullptr;
+        if (r == nullptr) {
+            return;
+        }
+        auto f =
+            h.files.open(std::filesystem::path{"/srv/hold"} /
+                             ak::hold::store::replica_dir_name(vol, r->meta().replica_gen) / "data",
+                         false);
+        BOOST_TEST_REQUIRE(f.has_value());
+        const Bytes junk(bs, std::byte{0x5A});
+        BOOST_TEST_REQUIRE((*f)->pwrite(lba * bs, junk).has_value());
+        _corrupted.insert(lba);
     }
 
     auto fault() -> void {
@@ -818,6 +899,7 @@ private:
     std::size_t _crashes{0};
     std::size_t _primary_crashes{0};
     std::size_t _cuts{0};
+    std::set<std::uint64_t> _corrupted;  // LBAs
 };
 
 auto HoldSink::send(SessionId session, Bytes frame) -> void {
@@ -863,7 +945,8 @@ BOOST_AUTO_TEST_CASE(runs_without_faults, *utf::timeout(ak::test::unit_timeout_s
                .faults = false,
                .crash_primary = {},
                .grow_at = {},
-               .reclass_at = {}});
+               .reclass_at = {},
+               .corrupt_every = {}});
 }
 
 BOOST_AUTO_TEST_CASE(survives_crashes_and_cuts, *utf::timeout(ak::test::unit_timeout_seconds)) {
@@ -874,7 +957,8 @@ BOOST_AUTO_TEST_CASE(survives_crashes_and_cuts, *utf::timeout(ak::test::unit_tim
                .faults = true,
                .crash_primary = {},
                .grow_at = {},
-               .reclass_at = {}});
+               .reclass_at = {},
+               .corrupt_every = {}});
 }
 
 BOOST_AUTO_TEST_CASE(grows_and_changes_class_under_load,
@@ -890,7 +974,8 @@ BOOST_AUTO_TEST_CASE(grows_and_changes_class_under_load,
              .faults = false,
              .crash_primary = {},
              .grow_at = 1s,
-             .reclass_at = 2s}};
+             .reclass_at = 2s,
+             .corrupt_every = {}}};
     w.run();
     w.check();
     BOOST_TEST(w.master.volume(vol)->spec.capacity_blocks == grown_capacity);
@@ -908,7 +993,29 @@ BOOST_AUTO_TEST_CASE(grows_while_holds_crash, *utf::timeout(ak::test::unit_timeo
                .faults = true,
                .crash_primary = {},
                .grow_at = 1500ms,
-               .reclass_at = {}});
+               .reclass_at = {},
+               .corrupt_every = {}});
+}
+
+BOOST_AUTO_TEST_CASE(scrubs_mend_latent_errors, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    // Blocks go bad behind the stores' backs while the guest runs; the
+    // controller's scrubs (every 2 s here) find each one and mend it from
+    // a good copy, so every replica ends whole (Requirements 5.4-5.5).
+    World w{env_number("AK_SIM_SEED").value_or(21),
+            {.workload = 6s,
+             .settle = 60s,
+             .max_latency = 2ms,
+             .faults = false,
+             .crash_primary = {},
+             .grow_at = {},
+             .reclass_at = {},
+             .corrupt_every = 200ms}};
+    w.run();
+    w.check();
+    BOOST_TEST(w.corrupted() > 10U);
+    BOOST_TEST(w.scrub_found() > 0U);
+    BOOST_TEST(w.repaired() == w.scrub_found());
+    BOOST_TEST(w.master.pending_ops() == 0U);
 }
 
 BOOST_AUTO_TEST_CASE(fails_over_a_lost_primary, *utf::timeout(ak::test::unit_timeout_seconds)) {
@@ -921,7 +1028,8 @@ BOOST_AUTO_TEST_CASE(fails_over_a_lost_primary, *utf::timeout(ak::test::unit_tim
              .faults = false,
              .crash_primary = 2s,
              .grow_at = {},
-             .reclass_at = {}}};
+             .reclass_at = {},
+             .corrupt_every = {}}};
     const auto first = w.primary_now();
     w.run();
     w.check();
@@ -939,5 +1047,6 @@ BOOST_AUTO_TEST_CASE(long_sweep, *utf::disabled()) {
                .faults = true,
                .crash_primary = {},
                .grow_at = {},
-               .reclass_at = {}});
+               .reclass_at = {},
+               .corrupt_every = {}});
 }

@@ -15,6 +15,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -839,6 +840,109 @@ BOOST_AUTO_TEST_CASE(class_changes_it_refuses, *boost::unit_test::timeout(unit_t
     BOOST_TEST(rig.master.set_class(11, wider, rig.now).has_value());
     BOOST_TEST(rig.vol(11).epoch == epoch + 1);
     BOOST_TEST(rig.vol(11).spec.volume_class.replicas == 4U);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_AUTO_TEST_SUITE(scrubs)
+
+// The distinct scrub ops sent since the last clear, by server.
+auto scrubs_sent(const Recorder& t) -> std::map<std::uint64_t, std::set<std::uint64_t>> {
+    std::map<std::uint64_t, std::set<std::uint64_t>> out;
+    for (const auto& op : t.ops_of<proto::ScrubVolume>()) {
+        out[op.server_id].insert(op.op_id);
+    }
+    return out;
+}
+
+BOOST_AUTO_TEST_CASE(every_replica_is_scrubbed_within_the_interval,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{{1, 2, 3}};
+    rig.create(10);
+    rig.create(11);
+    rig.advance(Time{100});
+    BOOST_TEST(rig.t.ops_of<proto::ScrubVolume>().empty());  // fresh replicas wait
+    const m::Timing timing;
+    rig.t.clear();
+    rig.advance(timing.scrub_interval);
+    // Four replicas on three servers, one scrub per server at a time.
+    auto sent = scrubs_sent(rig.t);
+    std::size_t total = 0;
+    for (const auto& [server, ids] : sent) {
+        BOOST_TEST(ids.size() == 1U);
+        total += ids.size();
+    }
+    BOOST_TEST(total == 3U);
+    for (const auto& op : rig.t.ops_of<proto::ScrubVolume>()) {
+        BOOST_TEST(std::get<proto::ScrubVolume>(op.args).mib_per_s == timing.scrub_mib_per_s);
+    }
+    // Each finishes (one with blocks it could not mend); the fourth
+    // replica's turn comes on its server.
+    const auto first = rig.t.ops_of<proto::ScrubVolume>();
+    rig.outcome(first[0], proto::OpStatus::ok, 3);
+    rig.outcome(first[1], proto::OpStatus::io_error, 1);
+    rig.outcome(first[2], proto::OpStatus::ok);
+    rig.t.clear();
+    rig.advance(Time{100});
+    sent = scrubs_sent(rig.t);
+    BOOST_REQUIRE(sent.size() == 1U);
+    rig.outcome(rig.t.ops_of<proto::ScrubVolume>().front());
+    BOOST_TEST(rig.master.pending_ops() == 0U);
+    // Nothing more until the interval has passed again.
+    rig.t.clear();
+    rig.advance(timing.scrub_interval - Time{1000});
+    BOOST_TEST(rig.t.ops_of<proto::ScrubVolume>().empty());
+    rig.advance(Time{1000});
+    BOOST_TEST(!rig.t.ops_of<proto::ScrubVolume>().empty());
+    BOOST_TEST(timing.scrub_interval * 2 <= std::chrono::days{14});  // Requirement 5.5
+}
+
+BOOST_AUTO_TEST_CASE(a_refused_scrub_is_tried_again_later,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{{1, 2}};
+    rig.create(10);
+    rig.advance(Time{100});
+    const m::Timing timing;
+    rig.t.clear();
+    rig.advance(timing.scrub_interval);
+    const auto ops = rig.t.ops_of<proto::ScrubVolume>();
+    BOOST_REQUIRE(ops.size() == 2U);
+    // Resent until an outcome arrives, as the same op.
+    rig.t.clear();
+    rig.advance(timing.retry);
+    BOOST_TEST(scrubs_sent(rig.t).at(ops[0].server_id) == std::set{ops[0].op_id});
+    rig.outcome(ops[0], proto::OpStatus::unknown_volume);
+    rig.outcome(ops[1]);
+    rig.t.clear();
+    rig.advance(timing.scrub_retry - Time{1});
+    BOOST_TEST(rig.t.ops_of<proto::ScrubVolume>().empty());
+    rig.advance(Time{1});
+    const auto again = rig.t.ops_of<proto::ScrubVolume>();
+    BOOST_REQUIRE(again.size() == 1U);
+    BOOST_TEST(again[0].server_id == ops[0].server_id);
+    BOOST_TEST(again[0].op_id != ops[0].op_id);
+}
+
+BOOST_AUTO_TEST_CASE(scrubs_follow_the_replica_set,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{{1, 2, 3}};
+    rig.create(10);
+    rig.advance(Time{100});
+    const auto members = rig.vol(10).members;
+    const std::uint64_t s = rig.with_role(10, ReplicaRole::secondary).front();
+    // The secondary is dropped; its replacement joins and is not scrubbed
+    // while it is copied, then waits a full interval of its own.
+    rig.fault(rig.primary(10), 10, proto::VolumeFaultKind::member_timeout, s);
+    rig.advance(Time{100});
+    const auto joining = rig.with_role(10, ReplicaRole::joining);
+    BOOST_REQUIRE(joining.size() == 1U);
+    const m::Timing timing;
+    rig.t.clear();
+    rig.advance(timing.scrub_interval);
+    const auto sent = scrubs_sent(rig.t);
+    BOOST_TEST(sent.size() == 1U);
+    BOOST_TEST(sent.contains(rig.primary(10)));
+    BOOST_TEST(!sent.contains(joining[0]));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

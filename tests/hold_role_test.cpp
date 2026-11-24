@@ -17,6 +17,7 @@
 #include <optional>
 #include <ostream>
 #include <span>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -82,13 +83,14 @@ auto frame_of(const proto::ReplicaConfig& c) -> Bytes {
     return *b;
 }
 
-auto op(std::uint64_t server = me) -> proto::VolumeOp {
+auto op(std::uint64_t server = me,
+        proto::VolumeOpArgs args = proto::DeleteReplica{.replica_gen = 1}) -> proto::VolumeOp {
     proto::VolumeOp o{.key_id = good_key,
                       .server_id = server,
                       .volume_id = vol,
                       .epoch = 1,
                       .op_id = 44,
-                      .args = proto::ScrubVolume{.mib_per_s = 50},
+                      .args = std::move(args),
                       .signature = {}};
     o.signature.fill(good_sig);
     return o;
@@ -198,8 +200,43 @@ BOOST_AUTO_TEST_CASE(verified_ops_are_answered_unsupported_for_now) {
     const auto* out = std::get_if<proto::OpOutcome>(&rep->body);
     BOOST_REQUIRE(out != nullptr);
     BOOST_TEST(out->op_id == 44U);
-    BOOST_TEST((out->kind == proto::VolumeOpKind::scrub));
+    BOOST_TEST((out->kind == proto::VolumeOpKind::delete_replica));
     BOOST_TEST((out->status == proto::OpStatus::unsupported));
+}
+
+BOOST_AUTO_TEST_CASE(a_scrub_op_runs_on_the_server) {
+    Rig r;
+    std::uint64_t ack = 0;
+    const auto scrub = frame_of(op(me, proto::ScrubVolume{.mib_per_s = 50}));
+    // No replica of the volume here.
+    BOOST_TEST(r.role.volume_op(scrub) == oar::Status::ok);
+    r.role.pump(r.now);
+    std::optional<proto::OpOutcome> out;
+    while (auto rep = next_report(r.role, ack)) {
+        if (const auto* o = std::get_if<proto::OpOutcome>(&rep->body)) {
+            out = *o;
+        }
+    }
+    BOOST_REQUIRE(out.has_value());
+    BOOST_TEST((out->status == proto::OpStatus::unknown_volume));
+
+    BOOST_REQUIRE(r.role.replica_config(frame_of(config(1))) == oar::Status::ok);
+    BOOST_TEST(r.role.volume_op(scrub) == oar::Status::ok);
+    BOOST_TEST(r.server.scrubbing(vol));
+    r.server.run(r.now);  // an empty replica: nothing to read
+    BOOST_TEST(!r.server.scrubbing(vol));
+    r.role.pump(r.now);
+    out.reset();
+    while (auto rep = next_report(r.role, ack)) {
+        if (const auto* o = std::get_if<proto::OpOutcome>(&rep->body)) {
+            out = *o;
+        }
+    }
+    BOOST_REQUIRE(out.has_value());
+    BOOST_TEST(out->op_id == 44U);
+    BOOST_TEST((out->kind == proto::VolumeOpKind::scrub));
+    BOOST_TEST((out->status == proto::OpStatus::ok));
+    BOOST_TEST(out->detail == 0U);
 }
 
 BOOST_AUTO_TEST_CASE(server_reports_go_up_in_order_and_once) {

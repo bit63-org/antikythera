@@ -14,10 +14,11 @@
 //   function_inventory  role hold, no functions (a hold role serves the
 //                       storage network, not guests)
 //   replica_config      decode, verify, HoldServer::apply_config
-//   volume_op           decode, verify; no operation is implemented yet,
-//                       so each verified op is answered with an OpOutcome
-//                       report, status unsupported (snapshots, clones and
-//                       scrubs arrive with their tasks)
+//   volume_op           decode, verify; scrub goes to
+//                       HoldServer::start_scrub, whose outcome comes up
+//                       with its reports; every other op is answered with
+//                       an OpOutcome report, status unsupported (snapshots,
+//                       clones and replica deletion arrive with their tasks)
 //   lease_grant         HoldServer::grant_lease (helm forwards only the
 //                       controller's grants for this server)
 //   hold_reports        pump() moves HoldServer::take_reports into an

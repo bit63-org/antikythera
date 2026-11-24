@@ -56,6 +56,14 @@
 //                 upload by a secondary; deleting snapshots schedules
 //                 one mark-and-sweep per lineage at a time, during which
 //                 that lineage's uploads wait (11.1-11.3, 11.8).
+//   scrubs        every in-sync replica (primary or secondary) is sent a
+//                 scrub VolumeOp scrub_interval after it was first seen
+//                 and after each scrub that finished (ok, or io_error:
+//                 the bad blocks it could not mend are a fault of their
+//                 own), at most scrubs_per_server at once per server, so
+//                 each replica is read in full well within 14 days
+//                 (5.5); a refused or abandoned scrub is tried again
+//                 after scrub_retry.
 //   erasure       when a lineage has no volume and no snapshot left its
 //                 key is destroyed, once, and the lineage is never reused
 //                 (12.4).
@@ -66,8 +74,7 @@
 // and a member that has not applied the current epoch is sent its config
 // again. Frames leave unsigned with no key_id: the transport signs them.
 //
-// Not modelled here: clones, scrub scheduling and hydration progress
-// (later tasks).
+// Not modelled here: clones and hydration progress (later tasks).
 
 #include <chrono>
 #include <cstddef>
@@ -76,6 +83,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <utility>
 #include <span>
 #include <vector>
 
@@ -123,12 +131,17 @@ struct Timing {
     Time rejoin_after{30'000};
     Time retry{1000};  // VolumeOp and config resend interval
     std::uint32_t prepare_timeout_ms{1000};
+    // Scrubs (Requirement 5.5: every replica within 14 days).
+    Time scrub_interval{std::chrono::days{7}};
+    Time scrub_retry{std::chrono::minutes{10}};
+    std::uint32_t scrub_mib_per_s{50};
 };
 
 struct Limits {
     std::size_t rebuilds{16};            // joining replicas at once, all volumes
     std::size_t rebuilds_per_server{2};  // joining replicas per target server
     std::size_t drain_moves{4};          // moves started by drain() at once
+    std::size_t scrubs_per_server{1};    // scrub ops outstanding per server
 };
 
 // Controller policy carried as numbers (design "QoS and elasticity").
@@ -203,6 +216,12 @@ struct AwayReplica {
     Time since{0};
 };
 
+// A replica's next scrub.
+struct ScrubPlan {
+    Time due{0};
+    std::uint64_t op_id{0};  // the scrub running, if any
+};
+
 struct Move {
     std::uint64_t from{0};
     std::uint64_t to{0};
@@ -229,6 +248,8 @@ struct Volume {
     bool loss_possible{false};  // enable_io resumed from a replica not known in sync
     std::optional<proto::ManifestName> last_manifest;
     Time published{0};
+    // By (server, replica_gen), for the in-sync members.
+    std::map<std::pair<std::uint64_t, std::uint32_t>, ScrubPlan> scrubs;
 };
 
 enum class SnapshotStatus : std::uint8_t {
@@ -366,7 +387,9 @@ private:
 
     auto commit(Volume& v, Time now, const std::vector<std::uint64_t>& also = {}) -> void;
     auto publish(const Volume& v, std::uint64_t server) -> void;
-    auto send_op(const Volume& v, std::uint64_t server, proto::VolumeOpArgs args, Time now) -> void;
+    // Returns the op_id.
+    auto send_op(const Volume& v, std::uint64_t server, proto::VolumeOpArgs args, Time now)
+        -> std::uint64_t;
     auto delete_replica(const Volume& v, std::uint64_t server, std::uint32_t replica_gen, Time now)
         -> void;
 
@@ -383,6 +406,7 @@ private:
     auto server_lost(std::uint64_t server, Time now) -> void;
     auto schedule_rebuilds(Time now) -> void;
     auto schedule_drains(Time now) -> void;
+    auto schedule_scrubs(Time now) -> void;
     // Fails uploads of `volume` whose uploader on `server` left the set.
     auto uploader_lost(std::uint64_t volume, std::uint64_t server) -> void;
 

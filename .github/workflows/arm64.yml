@@ -1,0 +1,85 @@
+# Copyright (c) 2026 Clark Rawlins
+# SPDX-License-Identifier: Apache-2.0
+#
+# arm64 cross-build (build-and-ci task 10, Requirement 5.5): configure and
+# build the whole tree, tests included, for 64-bit Arm Linux with GCC 14
+# from an x86-64 host. Build only: nothing runs, so no emulator or arm64
+# runner is needed.
+#
+# Kept off the shared self-hosted scale set and out of most pull requests,
+# because that queue is the bottleneck:
+# - runs on a GitHub-hosted ubuntu-24.04 VM, never AK_SELF_HOSTED_RUNNER;
+# - pull requests run it only when they touch the build system, a
+#   toolchain or this workflow, where an arm64 break is most likely;
+# - every push to main runs it, so a source-only regression shows up on
+#   main within one merge;
+# - a workflow of its own, like kernel-interop.yml, so its hosted queue
+#   wait never holds ci.yml's concurrency group, and superseded runs are
+#   cancelled on main too since only the newest result matters.
+# Not a required check: with path filters a required check would block
+# every pull request that skips it.
+#
+# Debug, like ci.yml. Release turns on _FORTIFY_SOURCE and -O2 flow
+# warnings that the tree does not yet build clean under on any target.
+
+name: arm64
+
+on:
+  pull_request:
+    paths:
+      - "**/CMakeLists.txt"
+      - "cmake/**"
+      - "vcpkg.json"
+      - "vcpkg-configuration.json"
+      - ".github/workflows/arm64.yml"
+      - ".github/scripts/arm64-multiarch.sh"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_GENERATOR: Ninja
+
+jobs:
+  arm64:
+    name: arm64 (gcc-14 cross)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross toolchain and arm64 libraries
+        run: .github/scripts/arm64-multiarch.sh
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-arm64 \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux-gnu.cmake \
+            -DAK_COMPILER_LAUNCHER=none \
+            -DAK_VFIO_USER=OFF
+
+      - name: Build
+        run: cmake --build build-arm64 --parallel "$(nproc)"
+
+      # A host compiler slipping in would still build; fail if any linked
+      # executable is not aarch64.
+      - name: Check target architecture
+        run: |
+          bad=0 count=0
+          while IFS= read -r -d '' f; do
+            count=$((count + 1))
+            if ! file -b "$f" | grep -q 'ARM aarch64'; then
+              echo "::error::$f is not an aarch64 ELF: $(file -b "$f")"
+              bad=1
+            fi
+          done < <(find build-arm64 -type f -executable ! -path '*/CMakeFiles/*' -print0)
+          echo "checked ${count} executables"
+          [ "$count" -gt 0 ] && [ "$bad" -eq 0 ]

@@ -551,6 +551,62 @@ auto Master::set_qos(std::uint64_t volume, const proto::VolumeQos& qos, Time now
     return {};
 }
 
+auto Master::set_class(std::uint64_t volume, const VolumeClass& cls, Time now)
+    -> std::expected<void, Error> {
+    auto r = live(volume);
+    if (!r) {
+        return std::unexpected(r.error());
+    }
+    Volume& v = **r;
+    if (cls.replicas < min_replicas || cls.replicas > proto::max_replica_members ||
+        !valid_qos(cls.qos)) {
+        return std::unexpected(Error::bad_spec);
+    }
+    if ((v.flags & proto::replica_flags::multi_attach) != 0 && !cls.multi_attach_allowed) {
+        return std::unexpected(Error::multi_attach_needed);
+    }
+    const std::size_t have = in_sync_count(v) + joining_count(v);
+    if (have > cls.replicas) {
+        if (v.move) {
+            return std::unexpected(Error::busy);
+        }
+        if (suspended(v) || v.failover || primary_of(v) == nullptr) {
+            return std::unexpected(Error::suspended);
+        }
+    }
+    v.spec.volume_class = cls;
+    v.qos = cls.qos;
+    // The surplus, cheapest to lose first: a copy not yet complete, then a
+    // replica on a server leaving or gone, then the one using most room.
+    std::vector<const Member*> surplus;
+    for (const auto& m : v.members) {
+        if (m.role == ReplicaRole::joining || m.role == ReplicaRole::secondary) {
+            surplus.push_back(&m);
+        }
+    }
+    std::ranges::sort(surplus, {}, [&](const Member* m) {
+        const auto& srv = _servers.at(m->server_id);
+        return std::tuple{m->role != ReplicaRole::joining, !srv.draining, srv.up,
+                          std::numeric_limits<std::uint64_t>::max() - used_bytes(m->server_id),
+                          std::numeric_limits<std::uint64_t>::max() - m->server_id};
+    });
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> dropped;
+    for (std::size_t i = 0; i < surplus.size() && have - dropped.size() > cls.replicas; ++i) {
+        dropped.emplace_back(surplus[i]->server_id, surplus[i]->replica_gen);
+    }
+    std::vector<std::uint64_t> removed;
+    for (const auto& [server, gen] : dropped) {
+        remove_member(v, server);
+        uploader_lost(v.spec.volume_id, server);
+        removed.push_back(server);
+    }
+    commit(v, now, removed);
+    for (const auto& [server, gen] : dropped) {
+        delete_replica(v, server, gen, now);
+    }
+    return {};
+}
+
 auto Master::enable_io(std::uint64_t volume, Time now) -> std::expected<void, Error> {
     auto r = live(volume);
     if (!r) {

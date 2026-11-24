@@ -742,6 +742,107 @@ BOOST_AUTO_TEST_CASE(drain_empties_a_server, *boost::unit_test::timeout(unit_tim
 
 BOOST_AUTO_TEST_SUITE_END()
 
+BOOST_AUTO_TEST_SUITE(elasticity)
+
+BOOST_AUTO_TEST_CASE(a_bigger_class_adds_a_replica_through_rebuild,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{{1, 2, 3}};
+    rig.create(10);
+    const auto before = rig.vol(10).members;
+    rig.t.clear();
+    BOOST_REQUIRE(rig.master.set_class(10, m::provisioned_class(), rig.now).has_value());
+    // The new limits at once, to members and attachments alike.
+    BOOST_TEST(rig.vol(10).epoch == 2U);
+    BOOST_TEST((rig.vol(10).qos == m::provisioned_class().qos));
+    BOOST_REQUIRE(!rig.t.configs.empty());
+    BOOST_TEST((rig.t.configs.back().qos == m::provisioned_class().qos));
+    BOOST_TEST(rig.vol(10).members.size() == 2U);
+    // The third replica comes as a rebuild (Requirements 7 and 10.4).
+    rig.advance(Time{100});
+    const auto joining = rig.with_role(10, ReplicaRole::joining);
+    BOOST_REQUIRE(joining.size() == 1U);
+    BOOST_TEST(std::ranges::none_of(
+        before, [&](const m::Member& mem) { return mem.server_id == joining[0]; }));
+    rig.status(joining[0], 10, 0, proto::ReplicaState::in_sync);
+    BOOST_TEST(rig.with_role(10, ReplicaRole::secondary).size() == 2U);
+    BOOST_TEST(rig.t.ops_of<proto::DeleteReplica>().empty());
+}
+
+BOOST_AUTO_TEST_CASE(a_smaller_class_drops_the_cheapest_replica,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{{1, 2, 3, 4}};
+    rig.create(10, m::provisioned_class());
+    const std::uint64_t p = rig.primary(10);
+    const auto secondaries = rig.with_role(10, ReplicaRole::secondary);
+    BOOST_REQUIRE(secondaries.size() == 2U);
+    // One secondary's server drains: that is the replica to drop.
+    BOOST_REQUIRE(rig.master.drain(secondaries[1]).has_value());
+    rig.t.clear();
+    const auto epoch = rig.vol(10).epoch;
+    BOOST_REQUIRE(rig.master.set_class(10, m::general_class(), rig.now).has_value());
+    BOOST_TEST(rig.vol(10).epoch == epoch + 1);  // one epoch: limits and members
+    BOOST_TEST(rig.primary(10) == p);
+    BOOST_TEST(rig.with_role(10, ReplicaRole::secondary) ==
+               std::vector<std::uint64_t>{secondaries[0]});
+    BOOST_TEST((rig.vol(10).qos == m::general_class().qos));
+    // The dropped server hears the epoch without it, then deletes.
+    BOOST_TEST(std::ranges::any_of(rig.t.configs, [&](const proto::ReplicaConfig& c) {
+        return c.server_id == secondaries[1] && c.epoch == epoch + 1;
+    }));
+    const auto deletes = rig.t.ops_of<proto::DeleteReplica>();
+    BOOST_REQUIRE(deletes.size() == 1U);
+    BOOST_TEST(deletes[0].server_id == secondaries[1]);
+    // Nothing comes back: two is the class's count.
+    rig.advance(Time{100});
+    BOOST_TEST(rig.vol(10).members.size() == 2U);
+}
+
+BOOST_AUTO_TEST_CASE(a_copy_in_progress_goes_first,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{{1, 2, 3, 4}};
+    rig.create(10, m::provisioned_class());
+    const std::uint64_t p = rig.primary(10);
+    const std::uint64_t s = rig.with_role(10, ReplicaRole::secondary).front();
+    rig.fault(p, 10, proto::VolumeFaultKind::member_timeout, s);
+    rig.advance(Time{100});
+    const auto joining = rig.with_role(10, ReplicaRole::joining);
+    BOOST_REQUIRE(joining.size() == 1U);
+    BOOST_REQUIRE(rig.master.set_class(10, m::general_class(), rig.now).has_value());
+    BOOST_TEST(rig.with_role(10, ReplicaRole::joining).empty());
+    BOOST_TEST(rig.vol(10).members.size() == 2U);
+    BOOST_TEST(rig.t.ops_of<proto::DeleteReplica>().back().server_id == joining[0]);
+}
+
+BOOST_AUTO_TEST_CASE(class_changes_it_refuses, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{{1, 2, 3, 4}};
+    rig.create(10, m::provisioned_class(), 0, true);
+    BOOST_TEST(rig.master.set_class(10, m::general_class(), rig.now).error() ==
+               m::Error::multi_attach_needed);
+    auto bad = m::provisioned_class();
+    bad.replicas = 1;
+    BOOST_TEST(rig.master.set_class(10, bad, rig.now).error() == m::Error::bad_spec);
+    bad.replicas = 6;
+    BOOST_TEST(rig.master.set_class(10, bad, rig.now).error() == m::Error::bad_spec);
+    bad = m::provisioned_class();
+    bad.qos.burst_iops = bad.qos.iops - 1;
+    BOOST_TEST(rig.master.set_class(10, bad, rig.now).error() == m::Error::bad_spec);
+    BOOST_TEST(rig.master.set_class(99, m::general_class(), rig.now).error() ==
+               m::Error::unknown_volume);
+    // Fewer replicas wait for a move to finish; more do not.
+    rig.create(11, m::provisioned_class());
+    const std::uint64_t s = rig.with_role(11, ReplicaRole::secondary).front();
+    BOOST_REQUIRE(rig.master.move_replica(11, s, 0, rig.now).has_value());
+    BOOST_TEST(rig.master.set_class(11, m::general_class(), rig.now).error() == m::Error::busy);
+    auto wider = m::provisioned_class();
+    wider.replicas = 4;
+    const auto epoch = rig.vol(11).epoch;
+    BOOST_TEST(rig.master.set_class(11, wider, rig.now).has_value());
+    BOOST_TEST(rig.vol(11).epoch == epoch + 1);
+    BOOST_TEST(rig.vol(11).spec.volume_class.replicas == 4U);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
 BOOST_AUTO_TEST_SUITE(snapshots)
 
 BOOST_AUTO_TEST_CASE(a_multi_volume_cut_prepares_commits_and_uploads,
@@ -965,7 +1066,7 @@ BOOST_AUTO_TEST_CASE(random_events_keep_the_invariants,
             const auto& v = rig.vol(id);
             const std::uint64_t any =
                 v.members.empty() ? 1 : v.members[pick(v.members.size())].server_id;
-            switch (pick(10)) {
+            switch (pick(11)) {
                 case 0:
                     if (rig.primary(id) != 0) {
                         rig.fault(rig.primary(id), id, proto::VolumeFaultKind::member_timeout, any);
@@ -1015,6 +1116,15 @@ BOOST_AUTO_TEST_CASE(random_events_keep_the_invariants,
                     }
                     rig.t.ops.clear();
                     break;
+                case 9:
+                    // Class changes move the replica count both ways
+                    // (Requirement 10.4); refusals (a move running) are fine.
+                    static_cast<void>(rig.master.set_class(id,
+                                                           v.spec.volume_class.replicas == 2
+                                                               ? m::provisioned_class()
+                                                               : m::general_class(),
+                                                           rig.now));
+                    break;
                 default:
                     break;
             }
@@ -1042,6 +1152,14 @@ BOOST_AUTO_TEST_CASE(random_events_keep_the_invariants,
                 BOOST_TEST_REQUIRE(primaries <= 1U, "seed " << seed << " step " << step);
                 BOOST_TEST_REQUIRE((susp || primaries == 1U), "seed " << seed << " step " << step);
                 BOOST_TEST_REQUIRE(vv.members.size() <= proto::max_replica_members);
+                // The class's count, plus a move's target: a smaller class
+                // drops its surplus at once (Requirement 10.4).
+                BOOST_TEST_REQUIRE(std::ranges::count_if(vv.members,
+                                                         [](const m::Member& mem) {
+                                                             return mem.role !=
+                                                                    ReplicaRole::leaving;
+                                                         }) <= vv.spec.volume_class.replicas + 1,
+                                   "seed " << seed << " step " << step);
                 std::set<std::uint64_t> seen;  // one rack per server here
                 for (const auto& mem : vv.members) {
                     BOOST_TEST_REQUIRE(seen.insert(mem.server_id).second,

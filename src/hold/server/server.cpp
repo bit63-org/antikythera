@@ -241,6 +241,13 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
         next.store->set_commit(next.store->last_seq());
     }
     auto& v = _volumes.insert_or_assign(c.volume_id, std::move(next)).first->second;
+    if (v.store) {
+        // The controller hears at once that this epoch is applied, and a
+        // new primary asks for its lease at once rather than at the next
+        // status_interval: a planned handover pauses reads only for the
+        // grant's round trip (Requirement 8.2).
+        _next_status.reset();
+    }
     if (v.scrub) {
         // Asked at the old epoch: asked again (run() ends a scrub this
         // config makes moot).
@@ -880,6 +887,7 @@ auto HoldServer::execute(Volume& v, Request& r) -> void {
             }
             if ((r.header.flags & proto::hold_flags::last) != 0) {
                 v.synced = r.session;
+                _next_status.reset();  // in sync: tell the controller now (8.5)
             }
             respond(r.session, r.header, HoldStatus::ok);
             return;
@@ -1625,10 +1633,15 @@ auto HoldServer::send_copy(Volume& v, Link& l, std::uint64_t lba, std::uint64_t 
         h.lba = first;
         h.blocks = static_cast<std::uint32_t>(n);
         const auto crc = crc_bytes(sums);
+        // Stream positions start at 1 and the codec refuses 0, so a
+        // primary that has taken no write yet (a volume never written,
+        // moved or rebuilt while unattached) names the first position;
+        // the member does not act on it. With 0 the encode failed, the
+        // marker never left, and the joining member never got in sync.
         send_link(
             v, l,
             {.header = h,
-             .payload = proto::SyncData{.seq = v.store->last_seq(),
+             .payload = proto::SyncData{.seq = std::max(v.store->last_seq(), std::uint64_t{1}),
                                         .data = {.block_size = bs, .crcs = crc, .data = bytes}}});
         if (marker) {
             c.marker = h.request_id;
@@ -1695,7 +1708,14 @@ auto HoldServer::finish_reconcile(Volume& v) -> void {
     v.reconcile.reset();
     v.store->set_commit(rec.commit);
     v.committed = v.store->commit_seq();
-    v.seq_floor = std::max(v.seq_floor, rec.base);
+    // Above every seq any replica holds: the highest uncommitted one is
+    // in the INTENTS, the highest committed one is the commit point a
+    // member reported. This server's own store may hold neither: a
+    // replica that joined by copy alone, with no write forwarded while it
+    // joined (a move during a lull), took the role at last_seq 0, numbered
+    // its writes from 1, and the members acknowledged them as resends of
+    // seqs they already held without writing them.
+    v.seq_floor = std::max({v.seq_floor, rec.base, rec.commit});
     // The union of the extents, merged and cut to what one write carries.
     std::ranges::sort(rec.extents, {}, &proto::HoldIntent::lba);
     const std::uint32_t bs = v.config.block_size;

@@ -1175,6 +1175,42 @@ BOOST_AUTO_TEST_CASE(a_joining_member_takes_up_a_lower_stream,
 
 namespace {
 
+// A replica that joined by the copy alone (no write forwarded to it while
+// it joined) holds no seq of its own. Made primary, it must still number
+// its writes above what the members hold: numbered from 1, the members
+// took them for resends of seqs they had and acknowledged them unwritten.
+BOOST_AUTO_TEST_CASE(a_primary_that_joined_by_copy_numbers_above_the_members,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Net net{small_regions()};
+    net.apply(config(
+        1, {member(1, proto::ReplicaRole::primary), member(2, proto::ReplicaRole::secondary)}));
+    net.step();
+    const auto s = net.initiator();
+    for (std::uint64_t i = 0; i < 4; ++i) {
+        BOOST_TEST((net.status(s, net.write(s, i, blocks_of(10 + i, 1))) == HoldStatus::ok));
+    }
+    net.run_for(3s);  // the commit point reaches the member
+    net.apply(config(2, members_1_2()));
+    net.step();
+    BOOST_TEST(net.stored(3, 0, 4) == net.stored(1, 0, 4));
+    BOOST_TEST(net.hold(3).replica(vol)->last_seq() == 0U);  // the copy carries no seq
+    // A planned handover: 3 takes over, 1 leaves.
+    net.apply(config(3, members_1_2(proto::ReplicaRole::secondary)));
+    net.step();
+    const auto handed = config(
+        4, {member(2, proto::ReplicaRole::secondary), member(3, proto::ReplicaRole::primary)});
+    net.apply_to(1, handed);
+    net.apply(handed);
+    net.run_for(1s);
+    BOOST_REQUIRE(!net.hold(3).reconciling(vol));
+    const auto s3 = net.initiator(3, 4);
+    const auto c = blocks_of(20, 1);
+    BOOST_TEST((net.status(s3, net.write(s3, 0, c, 3, 4)) == HoldStatus::ok));
+    BOOST_TEST(net.stored(2, 0, 1) == c);
+    BOOST_TEST(net.hold(3).replica(vol)->last_seq() == 5U);
+    BOOST_TEST(net.hold(2).replica(vol)->last_seq() == 5U);
+}
+
 struct ScrubReports {
     std::vector<proto::OpOutcome> outcomes;
     std::vector<proto::VolumeFault> faults;

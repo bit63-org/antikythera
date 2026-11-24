@@ -78,7 +78,9 @@
 // detection and failover"). take_reports() hands helm what goes up its
 // report path: a ReplicaStatus every status_interval (at most lease_ms / 4
 // apart while this server is a primary), which is also each primary's
-// lease request, and faults and demotions as they happen. grant_lease()
+// lease request, and faults and demotions as they happen; also at once
+// after a config this server is a member of is applied (so a new primary
+// asks for its lease without waiting) and when a joining copy completes. grant_lease()
 // takes the controller's acknowledgement; the lease runs lease_ms from
 // when the first unanswered request was sent, and a primary serves reads
 // only while it holds one (writes are fenced by epochs instead). Faults:

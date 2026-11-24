@@ -1021,8 +1021,10 @@ BOOST_AUTO_TEST_CASE(scrubs_mend_latent_errors, *utf::timeout(ak::test::unit_tim
 BOOST_AUTO_TEST_CASE(fails_over_a_lost_primary, *utf::timeout(ak::test::unit_timeout_seconds)) {
     // No other faults: a clean failover, then the old primary comes back
     // as a joining member and is resynced into the set.
+    // The workload outlasts the old primary's lease, so the controller
+    // replaces it before the end of the run brings it back.
     World w{7,
-            {.workload = 5s,
+            {.workload = 8s,
              .settle = 60s,
              .max_latency = 2ms,
              .faults = false,

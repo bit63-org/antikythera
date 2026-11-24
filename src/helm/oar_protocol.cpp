@@ -923,6 +923,75 @@ auto decode_report_chunk(std::span<const std::byte> body) noexcept
     return c;
 }
 
+namespace {
+
+constexpr auto valid_eject_op(std::uint8_t raw) noexcept -> bool {
+    return raw >= std::to_underlying(EjectOp::request) && raw <= std::to_underlying(EjectOp::query);
+}
+
+constexpr auto valid_eject_state(std::uint8_t raw) noexcept -> bool {
+    return raw <= std::to_underlying(EjectState::released);
+}
+
+}  // namespace
+
+auto encode_eject(const Eject& e) -> std::expected<std::vector<std::byte>, BodyError> {
+    if (!valid_eject_op(std::to_underlying(e.op))) {
+        return std::unexpected(BodyError::unknown_enum);
+    }
+    std::vector<std::byte> out;
+    out.reserve(eject_request_size);
+    wire::Writer w{out};
+    w.le16(e.fn);
+    w.u8(std::to_underlying(e.op));
+    w.u8(0);
+    return out;
+}
+
+auto decode_eject(std::span<const std::byte> body) noexcept -> std::expected<Eject, BodyError> {
+    if (auto ok = check_size(body, eject_request_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    wire::Reader r{body};
+    const auto fn = r.le16().value_or(0);
+    const auto op = r.u8().value_or(0);
+    if (r.u8().value_or(1) != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    if (!valid_eject_op(op)) {
+        return std::unexpected(BodyError::unknown_enum);
+    }
+    return Eject{.fn = fn, .op = static_cast<EjectOp>(op)};
+}
+
+auto encode_eject_answer(EjectState s) -> std::expected<std::vector<std::byte>, BodyError> {
+    if (!valid_eject_state(std::to_underlying(s))) {
+        return std::unexpected(BodyError::unknown_enum);
+    }
+    std::vector<std::byte> out;
+    out.reserve(eject_answer_size);
+    wire::Writer w{out};
+    w.u8(std::to_underlying(s));
+    w.u8(0);
+    return out;
+}
+
+auto decode_eject_answer(std::span<const std::byte> body) noexcept
+    -> std::expected<EjectState, BodyError> {
+    if (auto ok = check_size(body, eject_answer_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    wire::Reader r{body};
+    const auto state = r.u8().value_or(0xFF);
+    if (r.u8().value_or(1) != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    if (!valid_eject_state(state)) {
+        return std::unexpected(BodyError::unknown_enum);
+    }
+    return static_cast<EjectState>(state);
+}
+
 auto encode_cert_answer(const CertAnswer& a) -> std::expected<std::vector<std::byte>, BodyError> {
     if (a.role != Role::blk && a.role != Role::hold) {
         return std::unexpected(BodyError::unknown_enum);

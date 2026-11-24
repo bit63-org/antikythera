@@ -957,6 +957,70 @@ BOOST_AUTO_TEST_CASE(roles_without_replicas_answer_unsupported) {
     BOOST_TEST((link.hold_reports(1).error().status == oar::Status::unsupported));
     BOOST_TEST((link.cert_request().error().status == oar::Status::unsupported));
     BOOST_TEST((link.role_certificate(pattern(10)).error().status == oar::Status::unsupported));
+    BOOST_TEST((link.eject({.fn = 0, .op = oar::EjectOp::query}).error().status ==
+                oar::Status::unsupported));
+}
+
+namespace {
+
+// A storage role's half of cooperative detach: one function, which the
+// guest releases at once.
+class EjectingRole final : public ak::helm::OarHandler {
+public:
+    auto function_inventory() -> std::expected<oar::Inventory, oar::Status> override {
+        return oar::Inventory{.role = oar::Role::blk, .vtep = {}, .functions = {}};
+    }
+    auto prepare_function(const oar::PrepareFunction& /*r*/) -> oar::Status override {
+        return oar::Status::ok;
+    }
+    auto clean_function(const oar::CleanFunction& /*r*/) -> oar::Status override {
+        return oar::Status::ok;
+    }
+    auto deliver_key(const oar::DeliverKey& /*r*/) -> oar::Status override {
+        return oar::Status::ok;
+    }
+    auto drop_key(const oar::DropKey& /*r*/) -> oar::Status override { return oar::Status::ok; }
+    auto map_update(std::span<const std::byte> /*f*/) -> oar::Status override {
+        return oar::Status::unsupported;
+    }
+    auto health() -> std::expected<oar::Health, oar::Status> override { return oar::Health{}; }
+    auto eject(const oar::Eject& r) -> std::expected<oar::EjectState, oar::Status> override {
+        seen.push_back(r);
+        if (r.fn != 0) {
+            return std::unexpected(oar::Status::unknown_function);
+        }
+        if (r.op == oar::EjectOp::request) {
+            state = oar::EjectState::released;
+        } else if (r.op == oar::EjectOp::cancel) {
+            state = oar::EjectState::none;
+        }
+        return state;
+    }
+    oar::EjectState state{oar::EjectState::none};
+    std::vector<oar::Eject> seen;
+};
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(eject_requests_and_answers_cross) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    EjectingRole role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    {
+        const Server server{endpoint, role};
+        BOOST_TEST(
+            (link.eject({.fn = 0, .op = oar::EjectOp::query}).value() == oar::EjectState::none));
+        BOOST_TEST((link.eject({.fn = 0, .op = oar::EjectOp::request}).value() ==
+                    oar::EjectState::released));
+        BOOST_TEST(
+            (link.eject({.fn = 0, .op = oar::EjectOp::cancel}).value() == oar::EjectState::none));
+        BOOST_TEST((link.eject({.fn = 9, .op = oar::EjectOp::query}).error().status ==
+                    oar::Status::unknown_function));
+        BOOST_TEST((link.eject({.fn = 0, .op = static_cast<oar::EjectOp>(7)}).error().code ==
+                    LinkErrc::bad_request));  // never sent
+    }
+    BOOST_TEST(role.seen.size() == 4U);
 }
 
 BOOST_AUTO_TEST_CASE(names) {

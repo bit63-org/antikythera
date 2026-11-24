@@ -340,3 +340,102 @@ BOOST_FIXTURE_TEST_CASE(poll_reaches_the_device_only_when_live, Fixture,
     BOOST_TEST(!fn->poll());
     BOOST_TEST(device.polls == 1);
 }
+
+// .kiro/specs/block-volume-service/ Requirement 3.3, design "Detach blocked
+// while mounted": the vendor-data capability and the eject request.
+BOOST_AUTO_TEST_CASE(the_eject_capability_is_vendor_data_in_config_space,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    ak::test::GuestRam ram;
+    ak::test::RecordingInterrupts irq;
+    FakeDevice device;
+    auto f = virtio::PciFunction::create(device, ram.memory(), irq,
+                                         {.identity = {.device_id = device_id},
+                                          .device_features = features,
+                                          .num_queues = num_queues,
+                                          .max_queue_size = ak::test::test_queue_size,
+                                          .device_config_size = config_size,
+                                          .eject_capability = true});
+    BOOST_REQUIRE(f);
+    const auto caps = (*f)->capabilities();
+    BOOST_REQUIRE_EQUAL(caps.size(), 5U);
+    BOOST_TEST((caps[4].type == virtio::CfgType::vendor));
+
+    const auto bytes = virtio::encode_capability(caps[4], 0x40, 1);
+    const std::vector<std::byte> want{
+        std::byte{0x09}, std::byte{0x40}, std::byte{16},  std::byte{9},    // id, next, len, type
+        std::byte{0xF4}, std::byte{0x1A}, std::byte{1},   std::byte{0},    // vendor, version
+        std::byte{'A'},  std::byte{'K'},  std::byte{'V'}, std::byte{'D'},  // magic
+        std::byte{1},    std::byte{0},    std::byte{0},   std::byte{0},    // flags
+    };
+    BOOST_TEST((bytes == want));
+}
+
+BOOST_FIXTURE_TEST_CASE(a_function_without_the_capability_ignores_eject, Fixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_TEST(fn->capabilities().size() == 4U);
+    fn->request_eject();
+    BOOST_TEST(!fn->eject_requested());
+    BOOST_TEST(irq.raised.empty());
+}
+
+BOOST_AUTO_TEST_CASE(eject_sets_the_flag_tells_the_transport_and_interrupts,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    ak::test::GuestRam ram;
+    ak::test::RecordingInterrupts irq;
+    FakeDevice device;
+    auto f = virtio::PciFunction::create(device, ram.memory(), irq,
+                                         {.identity = {.device_id = device_id},
+                                          .device_features = features,
+                                          .num_queues = num_queues,
+                                          .max_queue_size = ak::test::test_queue_size,
+                                          .device_config_size = config_size,
+                                          .eject_capability = true});
+    BOOST_REQUIRE(f);
+    auto& fn = **f;
+    ak::test::VirtioDriver driver{ram, fn};
+    BOOST_REQUIRE(driver.bring_up(features, {0}));
+    std::vector<std::uint32_t> told;
+    fn.set_vendor_listener([&](std::uint32_t flags) { told.push_back(flags); });
+
+    fn.request_eject();
+    BOOST_TEST(fn.eject_requested());
+    BOOST_TEST(fn.vendor_flags() == virtio::vendor_data::flag_eject_requested);
+    BOOST_TEST(told == std::vector<std::uint32_t>{1U}, boost::test_tools::per_element());
+    BOOST_REQUIRE(!irq.raised.empty());
+    BOOST_TEST(irq.raised.back() == config_vector);
+    // ISR shows a configuration change, read-to-clear.
+    const auto isr = fn.bar_read(layout::isr_offset, width8);
+    BOOST_REQUIRE(isr);
+    BOOST_TEST((*isr & virtio::isr_config) != 0U);
+
+    // Asking again changes nothing; an FLR keeps the request.
+    const auto raised = irq.raised.size();
+    fn.request_eject();
+    BOOST_TEST(irq.raised.size() == raised);
+    fn.reset();
+    BOOST_TEST(fn.eject_requested());
+
+    fn.cancel_eject();
+    BOOST_TEST(!fn.eject_requested());
+    BOOST_TEST(told == (std::vector<std::uint32_t>{1U, 0U}), boost::test_tools::per_element());
+}
+
+BOOST_FIXTURE_TEST_CASE(status_changes_count_driver_writes_and_resets, Fixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_TEST(fn->status_changes() == 0U);
+    // bring_up writes 0 (no change), then four distinct statuses.
+    BOOST_REQUIRE(driver->bring_up(features, {0}));
+    const auto up = fn->status_changes();
+    BOOST_TEST(up == 4U);
+    // The driver resets the device: one change; writing 0 again: none.
+    BOOST_REQUIRE(driver->common_write(cc::device_status, width8, 0));
+    BOOST_TEST(fn->status_changes() == up + 1);
+    BOOST_REQUIRE(driver->common_write(cc::device_status, width8, 0));
+    BOOST_TEST(fn->status_changes() == up + 1);
+    // FLR of a device already at 0 changes nothing either.
+    fn->reset();
+    BOOST_TEST(fn->status_changes() == up + 1);
+    BOOST_REQUIRE(driver->bring_up(features, {0}));
+    fn->reset();
+    BOOST_TEST(fn->status_changes() == up + 1 + 4 + 1);
+}

@@ -572,6 +572,19 @@ local, image and network volumes:
    the request stays pending until the guest releases, the controller
    cancels it, or a forced detach replaces it.
 
+As built (task 13, oar-blk side): every virtio-blk function, placeholder
+or not, carries the vendor-data capability (`VIRTIO_PCI_CAP_VENDOR_CFG`,
+16 bytes in config space: vendor 0x1AF4, version 1, magic `AKVD`, then
+`flags` le32 with bit 0 `eject_requested`), so the PCI shape stays the
+same across attachments. The vfio-user binding rewrites the flags in its
+config-space copy when they change. helm drives it with the sideband
+request `eject` (MCTP vendor type 0x17: `fn u16 | op u8` with request,
+cancel or query; the answer is `none`, `requested` or `released`). The
+function counts as released once `device_status` has stayed 0 for 2 s,
+by its status-change count, with the request set and none of its
+requests still in the backend (Requirement 3.6). The request survives
+FLR and goes with the function at cleaning.
+
 **Forced detach** (`force`): the controller first publishes a
 ReplicaConfig without the attachment's generation and waits for the
 primary to apply it (fencing, Requirement 3.5), then hull hot-unplugs

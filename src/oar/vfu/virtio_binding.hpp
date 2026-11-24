@@ -13,7 +13,9 @@
 //   - virtio vendor/device IDs from the function, revision 1 (modern only);
 //   - a PCI Express capability with FLR (Requirement 1.3), MSI-X with one
 //     vector per queue plus config (Requirement 1.1), and the virtio vendor
-//     capabilities from PciFunction::capabilities(), read-only;
+//     capabilities from PciFunction::capabilities(), read-only to the
+//     guest; the vendor-data one (cooperative detach) is rewritten in
+//     place whenever the function's vendor flags change;
 //   - BAR0 routed to bar_read()/bar_write(), BAR2 holding the MSI-X table
 //     and PBA (the client emulates them, as vfio-pci does);
 //   - DMA map/unmap feeding GuestMemory; unmapping tells the function first,
@@ -97,6 +99,10 @@ private:
     virtio::GuestMemory _memory;
     virtio::PciFunction* _function{nullptr};
     std::function<void()> _on_reset;
+    long _vendor_cap{-1};  // config-space offset of the vendor-data capability
+
+    auto follow(virtio::PciFunction& function) -> void;
+    auto write_vendor_flags(std::uint32_t flags) -> void;
 };
 
 }  // namespace ak::oar::vfu

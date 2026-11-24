@@ -77,9 +77,21 @@
 // A ring error, or a request with no writable status byte (which cannot be
 // completed), puts the function in DEVICE_NEEDS_RESET (PciFunction::fail).
 //
+// Cooperative detach (.kiro/specs/block-volume-service/ design "Detach
+// blocked while mounted"). request_eject() sets eject_requested in the
+// function's vendor-data capability and raises a configuration-change
+// interrupt; the guest releases the disk through its normal removal path,
+// which resets the device. eject_state() calls that released once
+// device_status has stayed 0 for release_quiet with the request set and
+// no request of the function is still in the backend (Requirement 3.6): a
+// guest that resets and re-initialises the device (a reboot, a re-probe)
+// changes device_status again and starts the wait over. The request
+// survives FLR; only cancel_eject() or a new function clears it.
+//
 // Not thread-safe: the transport serializes every call.
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -123,6 +135,17 @@ inline constexpr std::uint32_t writeback = 32;   // u8
 inline constexpr std::uint32_t num_queues = 34;  // le16
 inline constexpr std::uint32_t size = 36;
 }  // namespace blk_cfg
+
+// How long device_status must stay 0, with an eject requested, before the
+// function counts as released.
+inline constexpr std::chrono::milliseconds release_quiet{2000};
+
+// Where a function stands in a cooperative detach.
+enum class EjectState : std::uint8_t {
+    none,       // no eject requested
+    requested,  // requested; the guest still holds the device
+    released,   // the guest let go and nothing is in flight
+};
 
 // Linux needs each data segment to hold at least one page (it refuses a
 // max_segment_size below PAGE_SIZE), so size_max may not go lower.
@@ -291,6 +314,12 @@ public:
     [[nodiscard]] auto counters() const noexcept -> const BlkCounters& { return _counters; }
     // Requests submitted to the backend and not yet completed.
     [[nodiscard]] auto in_flight() const noexcept -> std::size_t { return _in_flight; }
+    // Cooperative detach (above).
+    using Clock = std::chrono::steady_clock;
+    auto request_eject() -> void { _pci->request_eject(); }
+    auto cancel_eject() -> void;
+    [[nodiscard]] auto eject_state(Clock::time_point now) -> EjectState;
+
     // The backend's wake descriptor (BlockBackend::wake_fd), or -1.
     [[nodiscard]] auto wake_fd() const noexcept -> int { return _backend->wake_fd(); }
 
@@ -359,6 +388,9 @@ private:
     std::array<std::byte, id_bytes> _serial{};
     bool _awaiting_key{false};
     BlkCounters _counters;
+    // While an eject is requested and device_status is 0: when that was
+    // first seen, and the status change count then.
+    std::optional<std::pair<Clock::time_point, std::uint64_t>> _quiet_since;
 };
 
 }  // namespace ak::oar::blk

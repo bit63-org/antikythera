@@ -341,6 +341,34 @@ auto BlkRole::cert_request() -> std::expected<oar::CertAnswer, oar::Status> {
     return _enrollment->answer();
 }
 
+auto BlkRole::eject(const oar::Eject& request) -> std::expected<oar::EjectState, oar::Status> {
+    Slot* s = slot(request.fn);
+    if (s == nullptr) {
+        return std::unexpected(oar::Status::unknown_function);
+    }
+    if (!s->active) {
+        // Nothing attached: nothing to release, and nothing to ask for.
+        if (request.op == oar::EjectOp::request) {
+            return std::unexpected(oar::Status::busy);
+        }
+        return oar::EjectState::none;
+    }
+    if (request.op == oar::EjectOp::request) {
+        s->active->request_eject();
+    } else if (request.op == oar::EjectOp::cancel) {
+        s->active->cancel_eject();
+    }
+    switch (s->active->eject_state(_config.clock())) {
+        case EjectState::none:
+            return oar::EjectState::none;
+        case EjectState::requested:
+            return oar::EjectState::requested;
+        case EjectState::released:
+            return oar::EjectState::released;
+    }
+    return std::unexpected(oar::Status::failed);
+}
+
 auto BlkRole::role_certificate(std::span<const std::byte> chain) -> oar::Status {
     return _enrollment == nullptr ? oar::Status::unsupported : _enrollment->install(chain);
 }

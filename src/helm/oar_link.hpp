@@ -157,6 +157,10 @@ public:
     };
     auto cert_request() -> std::expected<CertRequest, LinkError>;
     auto role_certificate(std::span<const std::byte> chain) -> std::expected<void, LinkError>;
+    // Cooperative detach, to a storage role (blk): asks the guest to
+    // release a function, withdraws that, or looks; the answer is where the
+    // function stands.
+    auto eject(const oar::Eject& request) -> std::expected<oar::EjectState, LinkError>;
 
     [[nodiscard]] auto stats() const noexcept -> const LinkStats& { return _stats; }
 
@@ -266,6 +270,11 @@ public:
     }
     virtual auto role_certificate(std::span<const std::byte> /*chain*/) -> oar::Status {
         return oar::Status::unsupported;
+    }
+    // Cooperative detach, which only the storage role (blk) implements.
+    virtual auto eject(const oar::Eject& /*request*/)
+        -> std::expected<oar::EjectState, oar::Status> {
+        return std::unexpected(oar::Status::unsupported);
     }
 };
 

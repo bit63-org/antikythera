@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -223,6 +224,11 @@ public:
     [[nodiscard]] auto backend() -> AsyncBackend& { return *_backend; }
     [[nodiscard]] auto ram() -> GuestRam& { return _ram; }
     [[nodiscard]] auto driver() -> VirtioDriver& { return *_driver; }
+    // The guest driver resets the device (device_status = 0).
+    auto reset_by_driver() -> bool {
+        return _driver->common_write(vio::common_cfg::device_status, ak::test::width8, 0)
+            .has_value();
+    }
     auto destroy() -> void {
         _backend = nullptr;
         _fn.reset();
@@ -415,6 +421,73 @@ BOOST_AUTO_TEST_CASE(max_in_flight_is_checked) {
         BOOST_REQUIRE(!fn);
         BOOST_TEST((fn.error() == blk::BlkConfigError::bad_in_flight));
     }
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// .kiro/specs/block-volume-service/ Requirements 3.3 and 3.6: a function
+// counts as released once the guest reset it and left it alone for
+// release_quiet, with nothing of its own still in the backend.
+BOOST_AUTO_TEST_SUITE(cooperative_detach)
+
+using Clock = blk::VirtioBlkFunction::Clock;
+
+BOOST_AUTO_TEST_CASE(released_after_a_quiet_reset_with_nothing_in_flight) {
+    Rig rig;
+    const auto t0 = Clock::time_point{} + std::chrono::hours{1};
+    BOOST_TEST((rig.fn().eject_state(t0) == blk::EjectState::none));
+    rig.fn().request_eject();
+    BOOST_TEST(rig.fn().pci().eject_requested());
+    // The driver still runs the device: requested, however long.
+    BOOST_TEST((rig.fn().eject_state(t0) == blk::EjectState::requested));
+    BOOST_TEST((rig.fn().eject_state(t0 + std::chrono::minutes{5}) == blk::EjectState::requested));
+
+    // A read is in the backend when the guest resets the device.
+    static_cast<void>(rig.post(RequestType::in, 0, {}, blk::sector_size));
+    rig.notify();
+    BOOST_REQUIRE(rig.reset_by_driver());
+    BOOST_TEST((rig.fn().eject_state(t0) == blk::EjectState::requested));
+    const auto later = t0 + blk::release_quiet;
+    BOOST_TEST((rig.fn().eject_state(later) == blk::EjectState::requested));  // still in flight
+    rig.backend().release(0);
+    static_cast<void>(rig.fn().poll());
+    BOOST_TEST(rig.fn().in_flight() == 0U);
+    BOOST_TEST(
+        (rig.fn().eject_state(later - std::chrono::milliseconds{1}) == blk::EjectState::requested));
+    BOOST_TEST((rig.fn().eject_state(later) == blk::EjectState::released));
+
+    // Withdrawn: back to none.
+    rig.fn().cancel_eject();
+    BOOST_TEST((rig.fn().eject_state(later) == blk::EjectState::none));
+}
+
+BOOST_AUTO_TEST_CASE(a_driver_that_comes_back_is_not_a_release) {
+    Rig rig;
+    const auto t0 = Clock::time_point{} + std::chrono::hours{1};
+    rig.fn().request_eject();
+    BOOST_REQUIRE(rig.reset_by_driver());
+    BOOST_TEST((rig.fn().eject_state(t0) == blk::EjectState::requested));
+    // A reboot: the driver initialises the device again and resets it,
+    // all between two looks.
+    BOOST_REQUIRE(rig.up());
+    BOOST_REQUIRE(rig.reset_by_driver());
+    const auto later = t0 + blk::release_quiet;
+    BOOST_TEST((rig.fn().eject_state(later) == blk::EjectState::requested));  // the wait restarts
+    BOOST_TEST((rig.fn().eject_state(later + blk::release_quiet) == blk::EjectState::released));
+    // Probed again after the release: no longer released.
+    BOOST_REQUIRE(rig.up());
+    BOOST_TEST(
+        (rig.fn().eject_state(later + (2 * blk::release_quiet)) == blk::EjectState::requested));
+}
+
+BOOST_AUTO_TEST_CASE(the_request_survives_an_flr) {
+    Rig rig;
+    const auto t0 = Clock::time_point{} + std::chrono::hours{1};
+    rig.fn().request_eject();
+    rig.fn().function_reset();
+    BOOST_TEST(rig.fn().pci().eject_requested());
+    BOOST_TEST((rig.fn().eject_state(t0) == blk::EjectState::requested));
+    BOOST_TEST((rig.fn().eject_state(t0 + blk::release_quiet) == blk::EjectState::released));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

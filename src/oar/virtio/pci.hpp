@@ -56,11 +56,35 @@ enum class CfgType : std::uint8_t {
     isr = 3,
     device = 4,
     pci = 5,
+    vendor = 9,  // VIRTIO_PCI_CAP_VENDOR_CFG (virtio 1.2 4.1.4.10)
 };
 
 inline constexpr std::uint8_t pci_cap_id_vendor = 0x09;
 inline constexpr std::size_t virtio_pci_cap_size = 16;
 inline constexpr std::size_t virtio_pci_notify_cap_size = 20;
+
+// antikythera's vendor-data capability (VIRTIO_PCI_CAP_VENDOR_CFG), the
+// host's side of cooperative detach (.kiro/specs/block-volume-service/
+// design "Detach blocked while mounted"). It lives in config space, where
+// the guest helper reads it through sysfs, and standard drivers skip it:
+//
+//   0  cap_vndr 0x09 | cap_next | cap_len 16 | cfg_type 9
+//   4  vendor_id le16 (0x1AF4, the function's own vendor) | version u8 (1) |
+//      reserved u8
+//   8  magic "AKVD"
+//   12 flags le32: bit 0 eject_requested
+//
+// The vendor ID is the function's, since antikythera has none of its own;
+// the magic tells this capability from any other vendor data.
+namespace vendor_data {
+inline constexpr std::size_t size = 16;
+inline constexpr std::uint16_t vendor_id = 0x1AF4;
+inline constexpr std::uint8_t version = 1;
+inline constexpr std::array<std::byte, 4> magic{std::byte{'A'}, std::byte{'K'}, std::byte{'V'},
+                                                std::byte{'D'}};
+inline constexpr std::size_t flags_offset = 12;
+inline constexpr std::uint32_t flag_eject_requested = 1;
+}  // namespace vendor_data
 
 struct PciCapability {
     CfgType type{CfgType::common};
@@ -71,9 +95,11 @@ struct PciCapability {
 };
 
 // Encodes one capability as it appears in config space, with `next` the
-// config-space offset of the following capability (0 for the last).
-[[nodiscard]] auto encode_capability(const PciCapability& cap, std::uint8_t next)
-    -> std::vector<std::byte>;
+// config-space offset of the following capability (0 for the last). A
+// vendor capability is the vendor-data layout above with `flags`; the
+// others ignore it.
+[[nodiscard]] auto encode_capability(const PciCapability& cap, std::uint8_t next,
+                                     std::uint32_t flags = 0) -> std::vector<std::byte>;
 
 // --- Common configuration (spec 4.1.4.3) ---------------------------------
 

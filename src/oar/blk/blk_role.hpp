@@ -20,6 +20,9 @@
 //   delete_volume     erase and unlink the volume file (closing it first if
 //                     a function still has it: helm deletes the volumes of a
 //                     destroyed VM before their functions are cleaned)
+//   eject             cooperative detach of an attached function (block
+//                     volume task 13): ask the guest to release it, withdraw
+//                     that, or look (VirtioBlkFunction::eject_state)
 //
 // Each function sits on a FunctionTransport (vfio-user in harbor). The
 // transport exists for the life of the role, since the client (L0 QEMU in
@@ -187,6 +190,8 @@ public:
     auto replica_config(std::span<const std::byte> frame) -> helm::oar::Status override;
     auto cert_request() -> std::expected<helm::oar::CertAnswer, helm::oar::Status> override;
     auto role_certificate(std::span<const std::byte> chain) -> helm::oar::Status override;
+    auto eject(const helm::oar::Eject& request)
+        -> std::expected<helm::oar::EjectState, helm::oar::Status> override;
 
     // Enrollment through `enrollment` (must outlive the role); its Apply
     // should call set_storage_tls.

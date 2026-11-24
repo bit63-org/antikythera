@@ -89,6 +89,25 @@
 //     bytes_uploaded u64 | state u8 | slot u8 | rsvd [6]
 //     manifest_name [32] (non-zero exactly when completed)
 //
+// Enrollment (block-volume-service task 12, design "Keys and crypto-erase"
+// and "hold wire protocol"):
+//   enrollment  -- helm's secure-element transport key, sent after the
+//                  inventory on every connection
+//     kem u16 (HPKE KEM ID; 0x0020, DHKEM(X25519, HKDF-SHA256)) | rsvd [6]
+//     transport_key [32] (never all zero)
+//   cert_request  -- a storage role asks for its storage certificate
+//     slot u8 | role u8 (StorageRole) | csr_len u16 | rsvd u32
+//     csr [csr_len] (a DER PKCS#10 request, 1..max_csr_size bytes)
+//
+// The controller seals every VolumeKey for this server to the newest
+// transport key it holds. A cert_request's CSR is the role's own key pair
+// (the private key never leaves the role); its outer framing is checked
+// here (der.hpp) and the rest is the controller's to parse. The controller
+// signs a request only with names it vouches for: exactly one URI SAN, the
+// reporting server's (server_identity.hpp), plus for a hold role the IP
+// SANs of that server's storage endpoints, and answers with a
+// role_certificate record (link.hpp) for the same slot.
+//
 // group_usage entries are in strictly increasing (slot, nic_id, attachment)
 // order, at most max_group_usage_entries per report. Counters are
 // cumulative for one attachment: the controller bills the difference
@@ -127,6 +146,7 @@
 
 #include "common/wire.hpp"
 #include "proto/codec.hpp"
+#include "proto/der.hpp"
 #include "proto/map_update.hpp"
 #include "proto/replica_config.hpp"
 #include "proto/volume_op.hpp"
@@ -178,6 +198,11 @@ inline constexpr std::size_t attachment_status_size = 32;
 inline constexpr std::size_t demotion_confirmed_size = 32;
 inline constexpr std::size_t op_outcome_size = 40;
 inline constexpr std::size_t snapshot_progress_size = 80;
+inline constexpr std::uint16_t hpke_kem_x25519 = 0x0020;
+inline constexpr std::size_t transport_key_size = 32;
+inline constexpr std::size_t enrollment_size = 8 + transport_key_size;
+inline constexpr std::size_t cert_request_fixed_size = 8;
+inline constexpr std::size_t max_csr_size = 4096;
 
 inline constexpr std::size_t max_report_size =
     report_header_size +
@@ -198,6 +223,14 @@ enum class ReportKind : std::uint16_t {
     demotion_confirmed = 11,
     op_outcome = 12,
     snapshot_progress = 13,
+    enrollment = 14,
+    cert_request = 15,
+};
+
+// Which storage role a certificate is for.
+enum class StorageRole : std::uint8_t {
+    hold = 1,
+    initiator = 2,  // oar-blk
 };
 
 enum class ReplicaState : std::uint8_t {
@@ -502,9 +535,25 @@ struct SnapshotProgress {
     friend auto operator==(const SnapshotProgress&, const SnapshotProgress&) -> bool = default;
 };
 
-using ReportBody = std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport,
-                                MapApplied, HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault,
-                                AttachmentStatus, DemotionConfirmed, OpOutcome, SnapshotProgress>;
+using TransportKey = std::array<std::byte, transport_key_size>;
+
+struct Enrollment {
+    std::uint16_t kem{hpke_kem_x25519};
+    TransportKey transport_key{};
+    friend auto operator==(const Enrollment&, const Enrollment&) -> bool = default;
+};
+
+struct CertRequest {
+    std::uint8_t slot{0};
+    StorageRole role{StorageRole::hold};
+    std::vector<std::byte> csr;  // DER PKCS#10
+    friend auto operator==(const CertRequest&, const CertRequest&) -> bool = default;
+};
+
+using ReportBody =
+    std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport, MapApplied,
+                 HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault, AttachmentStatus,
+                 DemotionConfirmed, OpOutcome, SnapshotProgress, Enrollment, CertRequest>;
 
 struct Report {
     std::uint64_t server_id{0};
@@ -518,7 +567,7 @@ struct Report {
     return static_cast<ReportKind>(body.index() + 1);
 }
 static_assert(std::variant_size_v<ReportBody> ==
-              static_cast<std::size_t>(ReportKind::snapshot_progress));
+              static_cast<std::size_t>(ReportKind::cert_request));
 
 namespace detail {
 
@@ -557,6 +606,9 @@ namespace detail {
 }
 [[nodiscard]] constexpr auto known(SnapshotState s) noexcept -> bool {
     return s >= SnapshotState::frozen && s <= SnapshotState::failed;
+}
+[[nodiscard]] constexpr auto known(StorageRole r) noexcept -> bool {
+    return r == StorageRole::hold || r == StorageRole::initiator;
 }
 [[nodiscard]] constexpr auto has_owner(FunctionState s) noexcept -> bool {
     return s == FunctionState::assigned || s == FunctionState::releasing;
@@ -824,6 +876,31 @@ namespace detail {
     }
     if (all_zero(p.manifest_name) == (p.state == SnapshotState::completed)) {
         return std::unexpected(DecodeError::bad_source);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const Enrollment& e) noexcept
+    -> std::expected<void, DecodeError> {
+    if (e.kem != hpke_kem_x25519) {
+        return std::unexpected(DecodeError::unknown_value);
+    }
+    if (all_zero(e.transport_key)) {
+        return std::unexpected(DecodeError::bad_public_key);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const CertRequest& c) noexcept
+    -> std::expected<void, DecodeError> {
+    if (!known(c.role)) {
+        return std::unexpected(DecodeError::unknown_value);
+    }
+    if (c.csr.size() > max_csr_size) {
+        return std::unexpected(DecodeError::bad_der);
+    }
+    if (auto n = der_sequences(c.csr, 1); !n) {
+        return std::unexpected(n.error());
     }
     return {};
 }
@@ -1367,6 +1444,56 @@ inline auto write_volume_event(wire::Writer& w, const SnapshotProgress& b) -> vo
     w.bytes(b.manifest_name);
 }
 
+[[nodiscard]] inline auto decode_enrollment(std::span<const std::byte> body)
+    -> std::expected<Enrollment, DecodeError> {
+    if (body.size() < enrollment_size) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (body.size() > enrollment_size) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    BodyReader in{.r = wire::Reader{body}};
+    Enrollment out;
+    out.kem = in.le16();
+    const bool zero = in.zeros(6);
+    in.bytes(out.transport_key);
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (auto ok = check_body(out); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return out;
+}
+
+[[nodiscard]] inline auto decode_cert_request(std::span<const std::byte> body)
+    -> std::expected<CertRequest, DecodeError> {
+    wire::Reader r{body};
+    auto slot = r.u8();
+    auto role = r.u8();
+    auto csr_len = r.le16();
+    auto reserved = r.le32();
+    if (!slot || !role || !csr_len || !reserved) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (*reserved != 0) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (r.remaining() < *csr_len) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (r.remaining() > *csr_len) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    const auto csr = r.rest();
+    CertRequest out{
+        .slot = *slot, .role = static_cast<StorageRole>(*role), .csr = {csr.begin(), csr.end()}};
+    if (auto ok = check_body(out); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return out;
+}
+
 inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
     std::visit(
         [&w]<typename T>(const T& b) {
@@ -1404,6 +1531,16 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
                 write_replica_status(w, b);
             } else if constexpr (volume_event_size<T> != 0) {
                 write_volume_event(w, b);
+            } else if constexpr (std::is_same_v<T, Enrollment>) {
+                w.le16(b.kem);
+                w.bytes(std::array<std::byte, 6>{});
+                w.bytes(b.transport_key);
+            } else if constexpr (std::is_same_v<T, CertRequest>) {
+                w.u8(b.slot);
+                w.u8(static_cast<std::uint8_t>(b.role));
+                w.le16(static_cast<std::uint16_t>(b.csr.size()));
+                w.le32(0);
+                w.bytes(b.csr);
             } else {
                 static_assert(std::is_same_v<T, HostFaultReport>);
                 w.le16(static_cast<std::uint16_t>(b.code));
@@ -1490,6 +1627,10 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
             return wrap(detail::decode_volume_event<OpOutcome>(body));
         case ReportKind::snapshot_progress:
             return wrap(detail::decode_volume_event<SnapshotProgress>(body));
+        case ReportKind::enrollment:
+            return wrap(detail::decode_enrollment(body));
+        case ReportKind::cert_request:
+            return wrap(detail::decode_cert_request(body));
     }
     return std::unexpected(DecodeError::unknown_value);
 }

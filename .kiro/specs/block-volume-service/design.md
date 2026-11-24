@@ -195,6 +195,21 @@ from its master key (HPKE DeriveKeyPair over HMAC-SHA256(master,
 and dies with the master key. HPKE is built from OpenSSL 3.0 primitives
 (OSSL_HPKE needs 3.2) and checked against the CFRG test vector.
 
+Enrollment (task 12): helm registers the transport key with an
+`enrollment` report (`kem u16 | rsvd [6] | transport_key [32]`, KEM
+0x0020) that the session sends right after the inventory on every
+connection, and an unacknowledged older one is never replayed, so the
+controller always ends up holding the current key. A storage role asks
+for its certificate with a `cert_request` report (`slot u8 | role u8 |
+csr_len u16 | rsvd u32 | csr`, a DER PKCS#10 of at most 4096 bytes), and
+the controller answers with a `role_certificate` link record (type 12:
+`server_id u64 | slot u8 | rsvd [3] | chain_len u32 | chain`, at most four
+DER certificates and 16 KiB, leaf first). `src/proto/` checks only the
+outer DER framing (`der.hpp`); the controller parses the request, signs
+only the reporting server's URI SAN plus, for a hold role, the IP SANs of
+that server's storage endpoints, and the role checks the chain, its names
+and its key before using it.
+
 ### Reports (hold and oar-blk → helm → controller)
 
 Additions to `src/proto/report.hpp`:

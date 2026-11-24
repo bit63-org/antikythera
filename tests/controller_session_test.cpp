@@ -69,6 +69,10 @@ struct RecordingSink final : helm::ControllerSink {
         keys.emplace_back(k, std::vector<std::byte>{frame.begin(), frame.end()});
     }
     auto on_lease_grant(const proto::LeaseGrant& g) -> void override { grants.push_back(g); }
+    std::vector<proto::RoleCertificate> certificates;
+    auto on_role_certificate(const proto::RoleCertificate& c) -> void override {
+        certificates.push_back(c);
+    }
 };
 
 // A sink that keeps ControllerSink's default for tunnel peer sets.
@@ -419,6 +423,76 @@ BOOST_AUTO_TEST_CASE(tunnel_peers_default_to_dropped) {
     BOOST_TEST(session.on_bytes(tunnel_peers_record(server)).has_value());
     BOOST_TEST(session.on_bytes(envelope_record(server, 10)).has_value());
     BOOST_TEST(sink.envelopes == 1);
+}
+
+namespace {
+
+auto enrollment(std::uint8_t fill) -> proto::Enrollment {
+    proto::Enrollment e;
+    e.transport_key.fill(std::byte{fill});
+    return e;
+}
+
+auto role_certificate_record(std::uint64_t to) -> std::vector<std::byte> {
+    auto b = proto::encode_role_certificate(
+        {.server_id = to, .slot = 2, .chain = ak::test::bytes_of(0x30, 0x01, 0x05)});
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::role_certificate, *b);
+}
+
+}  // namespace
+
+BOOST_FIXTURE_TEST_CASE(enrollment_follows_the_inventory_on_every_connection, Fixture) {
+    session.set_enrollment(enrollment(0x11));  // before any connection: nothing sent yet
+    BOOST_TEST(session.take_outbound().empty());
+    session.on_connected();
+    auto recs = records(session.take_outbound());
+    BOOST_REQUIRE(recs.size() == 3U);
+    BOOST_TEST(std::holds_alternative<proto::Inventory>(as_report(recs[1]).body));
+    const auto e = as_report(recs[2]);
+    BOOST_TEST(e.report_seq == 2U);
+    BOOST_TEST((std::get<proto::Enrollment>(e.body) == enrollment(0x11)));
+
+    // A new key while connected goes out now, and supersedes the old one.
+    session.set_enrollment(enrollment(0x22));
+    recs = records(session.take_outbound());
+    BOOST_REQUIRE(recs.size() == 1U);
+    BOOST_TEST((std::get<proto::Enrollment>(as_report(recs[0]).body) == enrollment(0x22)));
+
+    // Nothing acknowledged: a reconnect restates both, freshly numbered,
+    // and replays neither old copy.
+    session.on_disconnected();
+    session.on_connected();
+    recs = records(session.take_outbound());
+    BOOST_REQUIRE(recs.size() == 3U);
+    BOOST_TEST(as_report(recs[1]).report_seq == 4U);
+    const auto again = as_report(recs[2]);
+    BOOST_TEST(again.report_seq == 5U);
+    BOOST_TEST((std::get<proto::Enrollment>(again.body) == enrollment(0x22)));
+    BOOST_TEST(session.pending_reports() == 2U);
+}
+
+BOOST_FIXTURE_TEST_CASE(role_certificates_reach_the_sink, Fixture) {
+    session.on_connected();
+    BOOST_TEST(session.on_bytes(role_certificate_record(server)).has_value());
+    BOOST_REQUIRE(sink.certificates.size() == 1U);
+    BOOST_TEST(sink.certificates[0].slot == 2U);
+    BOOST_TEST((sink.certificates[0].chain == ak::test::bytes_of(0x30, 0x01, 0x05)));
+
+    auto res = session.on_bytes(role_certificate_record(other_server));
+    BOOST_REQUIRE(!res.has_value());
+    BOOST_TEST((res.error() == SessionError::wrong_server));
+    session.on_disconnected();
+
+    auto bad = role_certificate_record(server);
+    bad.back() = std::byte{0};
+    bad[bad.size() - 2] = std::byte{0x02};  // the chain is no longer a SEQUENCE
+    bad[bad.size() - 3] = std::byte{0x02};
+    session.on_connected();
+    res = session.on_bytes(bad);
+    BOOST_REQUIRE(!res.has_value());
+    BOOST_TEST((res.error() == SessionError::bad_record));
+    BOOST_TEST(sink.certificates.size() == 1U);
 }
 
 BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {

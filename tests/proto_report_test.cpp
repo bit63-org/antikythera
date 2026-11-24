@@ -303,9 +303,40 @@ auto all_bodies() -> std::vector<proto::ReportBody> {
     };
 }
 
+auto sample_enrollment() -> proto::Enrollment {
+    proto::Enrollment e;
+    e.transport_key.fill(std::byte{0x5A});
+    return e;
+}
+
+// A DER SEQUENCE of `n` content bytes: the outer framing of a CSR.
+auto der_seq(std::size_t n, std::uint8_t fill = 0x02) -> std::vector<std::byte> {
+    std::vector<std::byte> out{std::byte{0x30}};
+    if (n < 0x80) {
+        out.push_back(static_cast<std::byte>(n));
+    } else if (n < 0x100) {
+        out.push_back(std::byte{0x81});
+        out.push_back(static_cast<std::byte>(n));
+    } else {
+        out.push_back(std::byte{0x82});
+        out.push_back(static_cast<std::byte>(n >> 8U));
+        out.push_back(static_cast<std::byte>(n & 0xFFU));
+    }
+    out.insert(out.end(), n, static_cast<std::byte>(fill));
+    return out;
+}
+
+auto sample_cert_request() -> proto::CertRequest {
+    return {.slot = 3, .role = proto::StorageRole::hold, .csr = der_seq(300)};
+}
+
 auto every_body() -> std::vector<proto::ReportBody> {
     auto all = all_bodies();
     std::ranges::move(volume_bodies(), std::back_inserter(all));
+    all.emplace_back(sample_enrollment());
+    all.emplace_back(sample_cert_request());
+    all.emplace_back(
+        proto::CertRequest{.slot = 0, .role = proto::StorageRole::initiator, .csr = der_seq(0)});
     return all;
 }
 
@@ -421,7 +452,7 @@ BOOST_AUTO_TEST_CASE(header_rules) {
     b = good;
     set_le16(b, off_kind, 0);
     BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
-    set_le16(b, off_kind, 14);
+    set_le16(b, off_kind, 16);
     BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
     b = good;
     b[off_reserved + 3] = std::byte{1};
@@ -675,12 +706,13 @@ BOOST_AUTO_TEST_CASE(group_usage_rules_are_enforced_both_ways) {
 }
 
 BOOST_AUTO_TEST_CASE(errors_have_names) {
-    for (auto e : {DecodeError::bad_report_seq, DecodeError::bad_boot_id, DecodeError::bad_id,
-                   DecodeError::unknown_value, DecodeError::bad_capacity,
-                   DecodeError::not_ascending, DecodeError::bad_owner, DecodeError::bad_record_type,
-                   DecodeError::record_too_large, DecodeError::server_id_mismatch,
-                   DecodeError::bad_epoch, DecodeError::bad_source, DecodeError::bad_peers_version,
-                   DecodeError::bad_public_key, DecodeError::duplicate_public_key}) {
+    for (auto e :
+         {DecodeError::bad_report_seq, DecodeError::bad_boot_id, DecodeError::bad_id,
+          DecodeError::unknown_value, DecodeError::bad_capacity, DecodeError::not_ascending,
+          DecodeError::bad_owner, DecodeError::bad_record_type, DecodeError::record_too_large,
+          DecodeError::server_id_mismatch, DecodeError::bad_epoch, DecodeError::bad_source,
+          DecodeError::bad_peers_version, DecodeError::bad_public_key,
+          DecodeError::duplicate_public_key, DecodeError::bad_der}) {
         BOOST_TEST(std::string_view{proto::to_string(e)} != "unknown");
     }
 }
@@ -875,6 +907,80 @@ BOOST_AUTO_TEST_CASE(replica_status_rules_are_enforced_both_ways) {
     b = good;
     b[first + 0x27] = std::byte{0xFF};
     BOOST_TEST((decode_error(b) == DecodeError::bad_capacity));
+}
+
+BOOST_AUTO_TEST_CASE(enrollment_kinds_are_numbered_by_the_spec) {
+    BOOST_TEST(static_cast<int>(proto::report_kind(sample_enrollment())) == 14);
+    BOOST_TEST(static_cast<int>(proto::report_kind(sample_cert_request())) == 15);
+}
+
+BOOST_AUTO_TEST_CASE(enrollment_layout_and_rules) {
+    auto b = encoded(make_report(sample_enrollment()));
+    BOOST_TEST(b.size() == body + proto::enrollment_size);
+    BOOST_TEST(std::to_integer<int>(b[body]) == 0x20);  // kem, little-endian
+    BOOST_TEST(std::to_integer<int>(b[body + 1]) == 0);
+    BOOST_TEST(std::to_integer<int>(b[body + 8]) == 0x5A);  // transport_key
+    BOOST_TEST(std::to_integer<int>(b.back()) == 0x5A);
+
+    auto other_kem = sample_enrollment();
+    other_kem.kem = 0x0021;  // X448: not what the secure element speaks
+    BOOST_TEST((encode_error(make_report(other_kem)) == DecodeError::unknown_value));
+    BOOST_TEST((encode_error(make_report(proto::Enrollment{})) == DecodeError::bad_public_key));
+
+    auto bad = b;
+    bad[body + 2] = std::byte{1};
+    BOOST_TEST((decode_error(bad) == DecodeError::reserved_not_zero));
+    bad = b;
+    std::fill(bad.begin() + static_cast<std::ptrdiff_t>(body + 8), bad.end(), std::byte{0});
+    BOOST_TEST((decode_error(bad) == DecodeError::bad_public_key));
+    bad = b;
+    set_le16(bad, body, 0x0010);
+    BOOST_TEST((decode_error(bad) == DecodeError::unknown_value));
+}
+
+BOOST_AUTO_TEST_CASE(cert_request_layout_and_rules) {
+    const auto req = sample_cert_request();
+    auto b = encoded(make_report(req));
+    BOOST_TEST(b.size() == body + proto::cert_request_fixed_size + req.csr.size());
+    BOOST_TEST(std::to_integer<int>(b[body]) == 3);      // slot
+    BOOST_TEST(std::to_integer<int>(b[body + 1]) == 1);  // hold
+    BOOST_TEST(std::to_integer<int>(b[body + 2]) == static_cast<int>(req.csr.size() & 0xFFU));
+    BOOST_TEST(std::to_integer<int>(b[body + 8]) == 0x30);  // the CSR's SEQUENCE
+
+    auto bad_role = req;
+    bad_role.role = static_cast<proto::StorageRole>(3);
+    BOOST_TEST((encode_error(make_report(bad_role)) == DecodeError::unknown_value));
+    for (const auto& csr : std::vector<std::vector<std::byte>>{
+             {},                                                   // empty
+             ak::test::bytes_of(0x31, 0x00),                       // a SET, not a SEQUENCE
+             ak::test::bytes_of(0x30, 0x80, 0, 0),                 // indefinite length
+             ak::test::bytes_of(0x30, 0x81, 0x05, 1, 2, 3, 4, 5),  // long form for a short length
+             ak::test::bytes_of(0x30, 0x82, 0x00, 0x90),           // a leading zero length octet
+             ak::test::bytes_of(0x30, 0x05, 1, 2),                 // runs past the end
+             ak::test::bytes_of(0x30, 0x00, 0x30, 0x00),           // two of them
+         }) {
+        auto r = req;
+        r.csr = csr;
+        BOOST_TEST((encode_error(make_report(r)) == DecodeError::bad_der));
+    }
+    auto huge = req;
+    huge.csr = der_seq(proto::max_csr_size);  // the header pushes it past the limit
+    BOOST_TEST((encode_error(make_report(huge)) == DecodeError::bad_der));
+    auto largest = req;
+    largest.csr = der_seq(proto::max_csr_size - 4);
+    BOOST_TEST(largest.csr.size() == proto::max_csr_size);
+    BOOST_TEST(proto::encode_report(make_report(largest)).has_value());
+
+    auto bad = b;
+    bad[body + 4] = std::byte{1};
+    BOOST_TEST((decode_error(bad) == DecodeError::reserved_not_zero));
+    bad = b;
+    set_le16(bad, body + 2, static_cast<std::uint16_t>(req.csr.size() + 1));
+    set_le32(bad, off_body_len, static_cast<std::uint32_t>(bad.size() - body));
+    BOOST_TEST((decode_error(bad) == DecodeError::truncated));
+    bad = b;
+    set_le16(bad, body + 2, static_cast<std::uint16_t>(req.csr.size() - 1));
+    BOOST_TEST((decode_error(bad) == DecodeError::trailing_bytes));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -29,6 +29,11 @@
 //                                      the controller acknowledged this
 //                                      server's lease request as primary of
 //                                      the volume at that epoch
+//   role_certificate controller -> helm server_id u64 | slot u8 | rsvd [3]
+//                                      | chain_len u32 | chain [chain_len]:
+//                                      the storage certificate for the role
+//                                      in that slot, answering its
+//                                      cert_request report
 //
 // The block volume records (.kiro/specs/block-volume-service/ task 12):
 // helm forwards replica_config, volume_op and lease_grant to its storage
@@ -37,6 +42,14 @@
 // lease_grant is unsigned: it travels only on this authenticated link and
 // helm's own sideband, and fences nothing but the reads of the role it
 // names (design "Epochs, leases and fencing").
+//
+// role_certificate's chain is DER certificates back to back, leaf first,
+// at most max_cert_chain_certs of them and max_cert_chain_size bytes in
+// all (der.hpp checks the outer framing). helm passes it to the role in
+// that slot unmodified; the role parses it, checks it chains to the
+// storage CA, names this server, and holds the key the role generated,
+// before using it. Like lease_grant it is unsigned: a certificate is
+// public, and the CA's signature is what the role trusts.
 //
 // Report sequence numbers restart when helm reboots, so they are only
 // meaningful together with the boot ID: hello names it before any report,
@@ -60,6 +73,7 @@
 
 #include "common/wire.hpp"
 #include "proto/codec.hpp"
+#include "proto/der.hpp"
 #include "proto/envelope.hpp"
 #include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
@@ -75,10 +89,13 @@ inline constexpr std::size_t record_header_size = 8;
 inline constexpr std::size_t report_ack_size = 16;
 inline constexpr std::size_t hello_size = 16;
 inline constexpr std::size_t lease_grant_size = 24;
-inline constexpr std::size_t max_record_payload =
-    std::max({envelope_size, max_map_update_size, max_report_size, report_ack_size, hello_size,
-              group_policy_size, max_tunnel_peers_size, max_replica_config_size, volume_op_size,
-              volume_key_size, lease_grant_size});
+inline constexpr std::size_t role_certificate_fixed_size = 16;
+inline constexpr std::size_t max_cert_chain_size = 16384;
+inline constexpr std::size_t max_cert_chain_certs = 4;
+inline constexpr std::size_t max_record_payload = std::max(
+    {envelope_size, max_map_update_size, max_report_size, report_ack_size, hello_size,
+     group_policy_size, max_tunnel_peers_size, max_replica_config_size, volume_op_size,
+     volume_key_size, lease_grant_size, role_certificate_fixed_size + max_cert_chain_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class RecordType : std::uint16_t {
@@ -93,6 +110,7 @@ enum class RecordType : std::uint16_t {
     volume_op = 9,
     volume_key = 10,
     lease_grant = 11,
+    role_certificate = 12,
 };
 
 struct Record {
@@ -120,10 +138,17 @@ struct LeaseGrant {
     friend auto operator==(const LeaseGrant&, const LeaseGrant&) -> bool = default;
 };
 
+struct RoleCertificate {
+    std::uint64_t server_id{0};
+    std::uint8_t slot{0};
+    std::vector<std::byte> chain;  // DER certificates, leaf first
+    friend auto operator==(const RoleCertificate&, const RoleCertificate&) -> bool = default;
+};
+
 namespace detail {
 
 [[nodiscard]] constexpr auto known(RecordType t) noexcept -> bool {
-    return t >= RecordType::envelope && t <= RecordType::lease_grant;
+    return t >= RecordType::envelope && t <= RecordType::role_certificate;
 }
 
 }  // namespace detail
@@ -262,6 +287,66 @@ namespace detail {
         return std::unexpected(ok.error());
     }
     return g;
+}
+
+[[nodiscard]] inline auto check_role_certificate(const RoleCertificate& c) noexcept
+    -> std::expected<void, DecodeError> {
+    if (c.server_id == 0) {
+        return std::unexpected(DecodeError::bad_server_id);
+    }
+    if (c.chain.size() > max_cert_chain_size) {
+        return std::unexpected(DecodeError::bad_der);
+    }
+    if (auto n = der_sequences(c.chain, max_cert_chain_certs); !n) {
+        return std::unexpected(n.error());
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto encode_role_certificate(const RoleCertificate& c)
+    -> std::expected<std::vector<std::byte>, DecodeError> {
+    if (auto ok = check_role_certificate(c); !ok) {
+        return std::unexpected(ok.error());
+    }
+    std::vector<std::byte> out;
+    out.reserve(role_certificate_fixed_size + c.chain.size());
+    wire::Writer w{out};
+    w.le64(c.server_id);
+    w.u8(c.slot);
+    w.u8(0);
+    w.le16(0);
+    w.le32(static_cast<std::uint32_t>(c.chain.size()));
+    w.bytes(c.chain);
+    return out;
+}
+
+[[nodiscard]] inline auto decode_role_certificate(std::span<const std::byte> bytes)
+    -> std::expected<RoleCertificate, DecodeError> {
+    wire::Reader r{bytes};
+    auto server_id = r.le64();
+    auto slot = r.u8();
+    auto reserved1 = r.u8();
+    auto reserved2 = r.le16();
+    auto chain_len = r.le32();
+    if (!server_id || !slot || !reserved1 || !reserved2 || !chain_len) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (*reserved1 != 0 || *reserved2 != 0) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (r.remaining() < *chain_len) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (r.remaining() > *chain_len) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    const auto chain = r.rest();
+    RoleCertificate c{
+        .server_id = *server_id, .slot = *slot, .chain = {chain.begin(), chain.end()}};
+    if (auto ok = check_role_certificate(c); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return c;
 }
 
 // Incremental record parser for a byte stream. Feed it whatever the socket

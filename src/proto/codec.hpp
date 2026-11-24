@@ -78,6 +78,7 @@ enum class DecodeError : std::uint8_t {
     bad_block_range,          // a block count or LBA range a hold opcode does not allow
     bad_payload_size,         // a hold payload whose length does not fit its opcode
     bad_hold_direction,       // a hold flag or status that does not fit the opcode's direction
+    bad_der,                  // a certificate or CSR field that is not DER SEQUENCEs
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -176,6 +177,8 @@ enum class DecodeError : std::uint8_t {
             return "hold payload length does not fit its opcode";
         case DecodeError::bad_hold_direction:
             return "hold flags or status do not fit the opcode";
+        case DecodeError::bad_der:
+            return "not a sequence of DER SEQUENCEs";
     }
     return "unknown";
 }

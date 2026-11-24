@@ -1,8 +1,11 @@
 # AWS VPC gap analysis
 
-_Status as of 2026-11-20, against `main` (which now has #41 Vtep and #43
-MapUpdate v2) plus the open networking PRs (#42 mailbox v3, #45 MTU, #46
-NetRole, #47 WireGuard, #48 VTEP key distribution)._
+_Status as of 2026-11-24, against `main`. The fabric stack (#41 Vtep,
+#42 mailbox v3, #43 MapUpdate v2, #45 MTU, #46 NetRole, #47 WireGuard,
+#48 VTEP key distribution) and the first L3 pieces (#56 group policy,
+#61 source/destination check, #62 DHCPv4 and gateway ARP/ND, #63 RA,
+DHCPv6 and the metadata intercept) are all merged; no networking PRs are
+open._
 
 ## Goal
 
@@ -19,7 +22,7 @@ tasks in the spec that owns it (`oar-net-data-plane`,
 
 ## What we have: the fabric
 
-The parts that make the system a VPC at all are built or in review:
+The parts that make the system a VPC at all are built:
 
 - **Isolation by VNI.** Each VPC is a 24-bit Geneve VNI, so overlapping
   tenant address ranges never meet. A NIC's VNI, MAC and NIC ID come only
@@ -35,7 +38,10 @@ The parts that make the system a VPC at all are built or in review:
   the same mapping (`check_ingress`).
 - **Encrypted, authenticated underlay.** WireGuard between VTEPs (#47),
   with per-VTEP keys distributed by the controller (#48). One tunnel per
-  VTEP pair carries every VPC's traffic.
+  VTEP pair carries every VPC's traffic. The pieces are merged but not yet
+  running together: `NetRole`/`ak-oar-net` do not use the `Tunnel` or a
+  `TunnelPeerSet`, and helm's daemon does not hold the `TunnelKeyring`
+  (oar-net task 10 "Not yet" and task 11).
 
 What the fabric gives a tenant today is one flat L2 segment per VPC: every
 NIC can reach every other NIC in the VPC, nothing outside it can reach in,
@@ -43,7 +49,9 @@ and there is no way out. Almost everything AWS sells on top of that is
 missing, and it is mostly control plane plus one new data-plane capability
 in oar-net: **L3 awareness** (routing between subnets, stateful
 filtering, address checks). That capability is the common prerequisite for
-most rows below.
+most rows below. Its first layer has landed: the L3/L4 parser, IP
+source/destination checks, and DHCPv4, DHCPv6, RA and the metadata
+intercept answered from a per-VNI `VpcConfig` (oar-net tasks 15-19).
 
 ## Gap table
 
@@ -58,7 +66,7 @@ spec).
 | Route tables | missing | None; only the implicit "local" reach within the VNI | Per-subnet route tables (destination prefix → target: local, IGW, NAT GW, peering, TGW, VPN, a NIC for appliances), longest-prefix match in oar-net. A new signed `RouteTable` frame per VPC, versioned like MapUpdate, applied atomically with the mapping |
 | Security groups | missing | Refused by controller Req 6.4 | The single most important gap. Stateful per-NIC allow rules (protocol, port range, CIDR or another SG as source/destination) enforced in oar-net, so neither host nor guest can bypass them. Needs connection tracking per function (TCP/UDP/ICMP state, timeouts, a per-NIC table limit), rule evaluation on egress at the source VTEP and on ingress at the destination VTEP, and SG-to-SG references expanded by the controller into address sets. Distributed as a signed per-VPC `SecurityPolicy` frame. Fuzz target over hostile flows |
 | Network ACLs | missing | None | Stateless, ordered, per-subnet allow/deny rules, evaluated at subnet boundaries. Simpler than SGs once the L3 parser and rule distribution exist; can share the `SecurityPolicy` frame |
-| Source/destination check | partial | Source MAC must be the NIC's mapped MAC; ARP sender IP checked against the mapping | IP-level anti-spoofing: drop guest IP packets whose source address is not one of the NIC's mapped addresses, and deliver only to mapped destination addresses. Per-NIC opt-out (AWS `SourceDestCheck=false`) for NAT and firewall appliances, which also needs route-table targets that point at a NIC |
+| Source/destination check | partial | Source MAC must be the NIC's mapped MAC; ARP sender and NA target checked; IP source and destination checked against the NIC's mapped addresses on transmit and receive, with an EtherType allowlist and per-cause counters (oar-net 16, #61) | Per-NIC opt-out (AWS `SourceDestCheck=false`) for NAT and firewall appliances, which also needs route-table targets that point at a NIC (oar-net 22) |
 | Internet gateway | missing | oar-net spec explicitly has no uplink ("no uplink by default") | A gateway role: a VTEP with an external interface that terminates Geneve for VPCs with an IGW attached, does 1:1 NAT between public and private addresses, and advertises public prefixes upstream (BGP). Needs its own spec (placement, HA pairs, capacity) and route-table targets |
 | Elastic IPs / public IPs | missing | Refused by controller Req 6.4 | Public address pool in the controller, allocation and association with a NIC's private address, programmed into the gateway role's NAT table. Depends on the IGW |
 | NAT gateway | missing | None | Source NAT (many private → one EIP) with port allocation and connection tracking in the gateway role. Reuses the SG conntrack code |
@@ -67,54 +75,60 @@ spec).
 | Transit gateway | missing | None | A hub that routes between many VPCs, VPNs and on-premises links with its own route tables. Best built as a gateway-role function after peering and the IGW; not needed early |
 | VPC endpoints (gateway type) | missing | None | Route-table targets that send traffic for a kythira service (S3- or DynamoDB-compatible API) to that service without an IGW. Needs the gateway role plus a service-side ingress |
 | PrivateLink (interface endpoints) | missing | None | A NIC in the consumer VPC whose traffic is NATed to a provider's load balancer in another VPC. Needs NAT in the gateway role and a load-balancer service; late |
-| DHCP options / address assignment | missing | Guest addresses are known to the controller and, with #43, to oar-net. Nothing hands them to the guest | DHCPv4 and DHCPv6 (and IPv6 RA) answered by oar-net from the mapping, like the ARP/ND proxy: address, subnet mask, gateway, DNS servers, domain name, MTU (we already compute it). DHCP option sets as a controller object |
+| DHCP options / address assignment | partial | oar-net answers DHCPv4, stateless DHCPv6 and RAs from the mapping and a per-VNI `VpcConfig` (gateway, prefixes, DNS, MTU) (oar-net 17-18, #62, #63) | The signed `VpcConfig` frame from the controller through helm (oar-net 20; controller-interface to spec it). DHCP option sets as a controller object |
 | DNS (Route 53 Resolver, `.2`) | missing | None | A resolver reachable at the VPC's `.2` (or `169.254.169.253`), answering instance private names from controller state and forwarding the rest. Either a resolver service reached through the gateway role or an in-oar-net stub that forwards to it. Private hosted zones later |
-| Instance metadata (IMDS, `169.254.169.254`) | missing | None | Not a VPC feature, but every EC2 guest image needs it (cloud-init, credentials). oar-net intercepts the link-local address and proxies to a metadata service through helm or the gateway role, keyed by the trusted NIC ID (so a guest can only read its own metadata). IMDSv2 token semantics |
+| Instance metadata (IMDS, `169.254.169.254`) | partial | oar-net intercepts `169.254.169.254` and `fd00:ec2::254` at the gateway MAC and hands packets to a `MetadataEndpoint` keyed by source NIC, rate-limited per NIC (oar-net 19, #63) | Not a VPC feature, but every EC2 guest image needs it (cloud-init, credentials). The endpoint on the oar-net board and the metadata service behind it in helm, keyed by the trusted NIC ID (so a guest can only read its own metadata), with IMDSv2 token semantics (oar-net 21) |
 | ENIs / multiple NICs | partial | Each ENI is a NIC VF with its own NIC ID and MAC; `ATTACH_DEVICE` per ENI in the RunInstances sequence; EC2 mapping lists `Create/Attach/DetachNetworkInterface` | Secondary private IPs per ENI (MapUpdate v2 already allows several addresses per NIC; the EC2 API and DHCP need to expose them), moving an ENI between instances while keeping its NIC ID, and NICs in different subnets of one VPC (needs subnets) |
-| IPv6 | partial | IPv6 underlay; ND proxy; MapUpdate v2 carries guest IPv6 addresses | VPC and subnet IPv6 prefixes, RA/DHCPv6 to configure guests, IPv6 in SGs, NACLs and route tables, and the egress-only IGW |
+| IPv6 | partial | IPv6 underlay; ND proxy; MapUpdate v2 carries guest IPv6 addresses; RA and stateless DHCPv6 from the per-VNI prefix (oar-net 18) | VPC and subnet IPv6 prefixes in the controller model, IPv6 in SGs, NACLs and route tables, and the egress-only IGW |
 | Flow logs | missing | Per-reason drop counters in the VSwitch and Vtep | Per-flow accept/reject records from the SG/NACL conntrack, batched by oar-net, carried to the controller as a new helm report kind (or a separate bulk channel, since volume can be high), and stored by kythira. Comes almost free with conntrack |
 | Traffic mirroring | missing | None | Copy a NIC's frames to a target NIC or VTEP, encapsulated. Low priority |
 | Site-to-site VPN | missing | None | A VPN gateway in the gateway role speaking IPsec/IKEv2 with BGP, since that is what customer routers speak. WireGuard does not fit here |
 | Client VPN | missing | None | Lower priority; can be a tenant-run appliance once source/destination check opt-out and NIC route targets exist |
-| Encryption in transit | in review | WireGuard between VTEPs (#47), keys via controller (#48); IPsec ESP kept as an option in oar-net Req 5 | Land #47/#48, wire the keyring into the helm daemon and the peer set into NetRole. No per-tenant keys by design; tenants needing their own keys encrypt in the guest. PSP or inline crypto offload later for line rate |
-| Jumbo frames / MTU | in review | MTU plan and probes (#45): 8874 with a 9000 underlay and WireGuard | Land #45/#46 and the harbor multi-server tests |
-| Broadcast / multicast | decided, specced | VSwitch floods group frames to local members and head-end replicates to remote VTEPs | **Decision (2026-11-19): drop by default, like AWS; opt-in, metered and billable multicast per subnet.** ARP/ND stay answered by the proxy and DHCP will be answered locally, so nothing a stock guest needs crosses the fabric as broadcast. A VPC that opts in gets IP multicast (never broadcast) replicated by head-end replication over the encrypted tunnels, with IGMP/MLD snooping and controller-pushed per-group server lists, hard per-NIC rate limits, a per-NIC group cap and a flood-list cap. Every replica sent to the fabric is metered per NIC and reported through helm, so the controller can bill usage, plus an hourly charge per opted-in subnet. Spec: oar-net Requirement 10, controller-interface Requirement 7, helm Requirement 11. See "Broadcast and multicast" below |
+| Encryption in transit | partial | WireGuard between VTEPs (#47), keys via controller (#48), both merged; IPsec ESP kept as an option in oar-net Req 5 | Wire the keyring into the helm daemon and the Tunnel and peer set into NetRole (oar-net 11). No per-tenant keys by design; tenants needing their own keys encrypt in the guest. PSP or inline crypto offload later for line rate |
+| Jumbo frames / MTU | partial | MTU plan and probes (#45, merged): 8858 for guests on a 9000 underlay, reserving room for WireGuard or PSP; advertised through `VIRTIO_NET_F_MTU` | Report `mtu_ok` to helm and run the harbor multi-server tests (oar-net 11) |
+| Broadcast / multicast | partial | VSwitch drops group frames by default; opt-in per-VNI multicast with per-NIC token buckets, the flood-list cap and cumulative usage meters (oar-net 12, #56). Still open: the signed `GroupPolicy` frame applied by `NetRole`, `group_usage` over OarLink, and IGMP/MLD snooping (oar-net 13-14, helm 13) | **Decision (2026-11-19): drop by default, like AWS; opt-in, metered and billable multicast per subnet.** ARP/ND stay answered by the proxy and DHCP will be answered locally, so nothing a stock guest needs crosses the fabric as broadcast. A VPC that opts in gets IP multicast (never broadcast) replicated by head-end replication over the encrypted tunnels, with IGMP/MLD snooping and controller-pushed per-group server lists, hard per-NIC rate limits, a per-NIC group cap and a flood-list cap. Every replica sent to the fabric is metered per NIC and reported through helm, so the controller can bill usage, plus an hourly charge per opted-in subnet. Spec: oar-net Requirement 10, controller-interface Requirement 7, helm Requirement 11. See "Broadcast and multicast" below |
 | Scale limits | partial | MapUpdate holds at most 4096 NICs and 8192 addresses per family per VPC, as a full snapshot | Fine for early tenants. Large VPCs need a new format (sharded or delta updates), and peering/TGW make the set of mappings a VTEP needs larger than "VPCs with a NIC here" |
 
 ## Biggest gaps
 
-1. **No L3 in the data plane.** oar-net switches L2 frames by MAC. Subnets,
-   route tables, security groups, NACLs, IP anti-spoofing, DHCP, IMDS and
-   flow logs all need oar-net to parse IP and keep per-flow state. This is
-   one piece of work (a bounds-checked L3/L4 parser and a conntrack table,
-   both fuzzed) that unlocks most of the table.
+1. **No stateful L3 in the data plane.** oar-net switches L2 frames by
+   MAC. It now parses IP (a fuzzed L3/L4 parser) and uses it for IP
+   anti-spoofing, DHCP, RA and the IMDS intercept, but subnets, route
+   tables, security groups, NACLs and flow logs also need routing and
+   per-flow state. The conntrack table (fuzzed like the parser) is the
+   piece that unlocks most of the rest of the table.
 2. **No security groups.** They are the feature tenants rely on most, and
    the one where enforcing in oar-net (outside host and guest) is our
    strongest selling point.
 3. **No way in or out.** There is no gateway role, so no IGW, Elastic IP,
    NAT gateway, VPN, endpoints or DNS forwarding. This is a new component
    with its own spec, placement and HA design.
-4. **Guests can't configure themselves.** No DHCP, DNS or metadata
-   service, so a stock EC2 image will not boot into a working network.
+4. **Guests can't configure themselves yet.** oar-net answers DHCP and RA,
+   but nothing delivers the signed VPC config it answers from, and there
+   is no DNS resolver or metadata service behind the IMDS intercept, so a
+   stock EC2 image will not yet boot into a working network.
 5. **No VPC object model beyond the VNI.** CIDRs, subnets, route tables,
    SGs and option sets need controller state, EC2 API actions and new
    signed frames to carry them to oar-net.
 
 ## Suggested build order
 
-1. **Land the fabric.** Merge the rest of the in-flight stack (#45, #46,
-   #47, #48, #42), wire the keyring and peer set into the helm daemon and
+1. **Land the fabric.** The stack is merged (#42, #45, #46, #47, #48).
+   Still to do: wire the keyring and peer set into the helm daemon and
    NetRole, and run harbor's multi-server reachability, isolation and MTU
    tests on tikhov. Everything below builds on it.
 2. **Group policy.** Drop group traffic by default in oar-net, with the
    opt-in multicast mode, rate limits and usage meters, then the signed
    `GroupPolicy` frame and the `group_usage` report (small; see
    "Broadcast and multicast"). IGMP/MLD snooping follows the L3 parser.
+   Done in oar-net (task 12); the frame, the report and snooping remain.
 3. **L3 foundation and guest bring-up.** VPC and subnet CIDRs in the
    controller model and a signed per-VPC config frame; an L3/L4 parser in
    oar-net; IP source/destination check; DHCPv4/DHCPv6/RA answered from the
    mapping; the IMDS intercept. After this a stock image boots with an
-   address and metadata.
+   address and metadata. The oar-net half is done (tasks 15-19); the
+   controller model, the signed config frame and the metadata service
+   remain (oar-net 20-22).
 4. **Subnets and the implicit router.** Per-subnet gateway addresses,
    distributed routing between subnets at the source VTEP, and route tables
    with the `local` target only.

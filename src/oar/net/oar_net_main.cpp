@@ -18,11 +18,18 @@
 // index for a link-local --vtep. --server-id is the server the controller's
 // map_updates must name. Each --controller-key is a controller key ID and
 // its Ed25519 public key in 64 hex digits; a map_update must verify under
-// one of them. --underlay-mtu and --tunnel-overhead (default 48, the
-// larger of WireGuard and PSP, so a pair's tunnel can change without
-// changing a guest MTU; 0 for rigs without a tunnel) give the MTU plan
-// (mtu.hpp): every function advertises the guest MTU, and the Vtep neither
-// sends more than the plan allows nor stops probing that size.
+// one of them, and so must the controller's tunnel_peers frames.
+// --underlay-mtu and --tunnel-overhead (default 48, the larger of WireGuard
+// and PSP, so a pair's tunnel can change without changing a guest MTU) give
+// the MTU plan (mtu.hpp): every function advertises the guest MTU, and the
+// Vtep neither sends more than the plan allows nor stops probing that size.
+//
+// The underlay runs WireGuard (tunnel.hpp, oar-net Requirement 5): helm
+// delivers this VTEP's private key over the sideband from its
+// TunnelKeyring, the controller's signed peer set follows, and nothing
+// crosses the underlay until both have arrived. --tunnel-overhead 0 runs
+// without the tunnel (Geneve in the clear), for rigs that test the Vtep on
+// its own; any other value must leave room for WireGuard's 32 bytes.
 //
 // Function i is the i-th --function: L0 QEMU attaches to its socket with
 // vfio-user-pci when the L1 host boots, the L1 host binds it to vfio-pci
@@ -555,6 +562,7 @@ auto run_role(const RoleOptions& opts) -> int {
         raw.push_back(transports.back().get());
     }
     PeerLog peer_log;
+    const bool tunnel = opts.tunnel_overhead != 0;
     auto role = net::NetRole::create(
         {.vtep = *opts.vtep,
          .server_id = *opts.server_id,
@@ -562,6 +570,8 @@ auto run_role(const RoleOptions& opts) -> int {
          .queue_size = net::NetParams{}.queue_size,
          .tx_budget = net::NetParams{}.tx_budget,
          .vtep_config = {},
+         .tunnel = tunnel ? std::optional<net::TunnelConfig>{net::TunnelConfig{}} : std::nullopt,
+         .mtu_grace = {},
          .clock = {}},
         raw,
         [verifier](std::span<const std::byte> msg, std::span<const std::byte, 64> sig,
@@ -587,9 +597,10 @@ auto run_role(const RoleOptions& opts) -> int {
                                 .timeout = {}};
     std::unique_ptr<helm::SocketBinding> sideband;
     std::unique_ptr<helm::OarEndpoint> endpoint;
-    std::println(stderr, "{}: {} function(s), guest MTU {} (underlay {}, tunnel {}), sideband {}",
-                 role_log, transports.size(), plan->guest_mtu, plan->underlay_mtu,
-                 plan->tunnel_overhead, opts.sideband);
+    std::println(
+        stderr, "{}: {} function(s), guest MTU {} (underlay {}, tunnel {}), {}, sideband {}",
+        role_log, transports.size(), plan->guest_mtu, plan->underlay_mtu, plan->tunnel_overhead,
+        tunnel ? "WireGuard, waiting for keys from helm" : "no tunnel", opts.sideband);
 
     std::vector<std::byte> datagram(udp_buffer_size);
     auto next_tick = net::VtepClock::now();
@@ -646,8 +657,7 @@ auto run_role(const RoleOptions& opts) -> int {
 
         bool underlay_more = false;
         if ((fds[1].revents & POLLIN) != 0) {
-            underlay_more = net::pump(**udp, (*role)->vtep(), (*role)->vswitch(), datagram,
-                                      udp_budget, now) == udp_budget;
+            underlay_more = (*role)->pump(**udp, datagram, udp_budget, now) == udp_budget;
         }
 
         for (std::size_t i = 0; i < transports.size(); ++i) {

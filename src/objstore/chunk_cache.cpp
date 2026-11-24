@@ -1,16 +1,16 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-#include "oar/blk/chunk_cache.hpp"
+#include "objstore/chunk_cache.hpp"
 
 #include <cerrno>
 
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "oar/blk/file_io.hpp"
+#include "objstore/file_io.hpp"
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 CachedImage::CachedImage(ChunkCache& cache, int fd, ImageDigest name, ImageManifest manifest,
                          std::string data_key)
@@ -190,4 +190,4 @@ auto ChunkCache::forget(CachedImage& image) -> void {
     }
 }
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

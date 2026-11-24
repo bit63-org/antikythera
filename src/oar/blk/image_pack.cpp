@@ -15,8 +15,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "oar/blk/file_io.hpp"
-#include "oar/blk/image_manifest.hpp"
+#include "objstore/file_io.hpp"
+#include "objstore/image_manifest.hpp"
 #include "oar/blk/xts_cipher.hpp"
 
 namespace ak::oar::blk {
@@ -50,7 +50,7 @@ auto check_options(std::uint64_t image_bytes, const PackOptions& o)
     if (o.logical_block_size != data_unit_512 && o.logical_block_size != data_unit_4k) {
         return std::unexpected(PackError::bad_options);
     }
-    if (o.chunk_shift < min_chunk_shift || o.chunk_shift > max_chunk_shift) {
+    if (o.chunk_shift < objstore::min_chunk_shift || o.chunk_shift > objstore::max_chunk_shift) {
         return std::unexpected(PackError::bad_options);
     }
     if (o.image_key.has_value() == all_zero(o.key_id)) {
@@ -61,7 +61,7 @@ auto check_options(std::uint64_t image_bytes, const PackOptions& o)
     }
     const std::uint64_t chunk = std::uint64_t{1} << o.chunk_shift;
     const std::uint64_t count = (image_bytes + chunk - 1) / chunk;
-    if (count > max_image_chunks) {
+    if (count > objstore::max_image_chunks) {
         return std::unexpected(PackError::too_many_chunks);
     }
     return static_cast<std::uint32_t>(count);
@@ -100,7 +100,7 @@ auto pack_image(int image_fd, std::uint64_t image_bytes, int data_fd, const Pack
     for (std::uint32_t c = 0; c < *count; ++c) {
         const auto at = static_cast<off_t>(m.chunk_offset(c));
         const auto piece = std::span{buf}.first(m.chunk_length(c));
-        const auto got = file_io::pread_all(image_fd, piece, at);
+        const auto got = objstore::file_io::pread_all(image_fd, piece, at);
         if (!got || *got != piece.size()) {
             return std::unexpected(PackError::read_failed);
         }
@@ -111,22 +111,22 @@ auto pack_image(int image_fd, std::uint64_t image_bytes, int data_fd, const Pack
             !cipher->encrypt(static_cast<std::uint64_t>(at) / m.logical_block_size, piece, piece)) {
             return std::unexpected(PackError::crypto_failure);
         }
-        auto digest = sha256_digest(piece);
+        auto digest = objstore::sha256_digest(piece);
         if (!digest) {
             return std::unexpected(PackError::crypto_failure);
         }
         m.chunks[c] = *digest;
-        if (!file_io::pwrite_all(data_fd, piece, at)) {
+        if (!objstore::file_io::pwrite_all(data_fd, piece, at)) {
             return std::unexpected(PackError::write_failed);
         }
         ++out.stored_chunks;
     }
 
-    auto bytes = encode_manifest(m);
+    auto bytes = objstore::encode_manifest(m);
     if (!bytes) {
         return std::unexpected(PackError::bad_options);
     }
-    auto name = sha256_digest(*bytes);
+    auto name = objstore::sha256_digest(*bytes);
     if (!name) {
         return std::unexpected(PackError::crypto_failure);
     }

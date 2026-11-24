@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-#include "oar/blk/image_store_config.hpp"
+#include "objstore/image_store_config.hpp"
 
 #include <charconv>
 #include <cstddef>
@@ -14,9 +14,9 @@
 #include <string_view>
 #include <system_error>
 
-#include "oar/blk/sigv4.hpp"
+#include "objstore/sigv4.hpp"
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 namespace {
 
@@ -174,4 +174,4 @@ auto parse_image_store_config(std::string_view text)
     return out;
 }
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

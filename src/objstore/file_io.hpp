@@ -14,7 +14,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-namespace ak::oar::blk::file_io {
+namespace ak::objstore::file_io {
 
 // Bytes read: out.size(), or fewer at end of file.
 inline auto pread_all(int fd, std::span<std::byte> out, off_t at)
@@ -54,4 +54,4 @@ inline auto pwrite_all(int fd, std::span<const std::byte> in, off_t at)
     return {};
 }
 
-}  // namespace ak::oar::blk::file_io
+}  // namespace ak::objstore::file_io

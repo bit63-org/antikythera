@@ -37,21 +37,23 @@
 #include <vector>
 
 #include "common/wire.hpp"
-#include "oar/blk/chunk_cache.hpp"
-#include "oar/blk/fetcher.hpp"
-#include "oar/blk/image_manifest.hpp"
+#include "objstore/chunk_cache.hpp"
+#include "objstore/fetcher.hpp"
+#include "objstore/image_manifest.hpp"
 #include "oar/blk/lazy_image_backend.hpp"
-#include "oar/blk/object_store.hpp"
+#include "objstore/object_store.hpp"
 #include "oar/blk/overlay.hpp"
 #include "oar/blk/virtio_blk_function.hpp"
 #include "oar/blk/xts_cipher.hpp"
 #include "test_support.hpp"
 #include "virtio_driver_support.hpp"
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 auto operator<<(std::ostream& os, FetchError e) -> std::ostream& {
     return os << to_string(e);
 }
+}  // namespace ak::objstore
+namespace ak::oar::blk {
 auto operator<<(std::ostream& os, OverlayError e) -> std::ostream& {
     return os << to_string(e);
 }
@@ -72,10 +74,11 @@ auto boost_test_print_type(std::ostream& os, std::byte b) -> std::ostream& {
 }  // namespace std
 
 namespace blk = ak::oar::blk;
+namespace objstore = ak::objstore;
 namespace vio = ak::oar::virtio;
 using ak::test::unit_timeout_seconds;
-using blk::FetchError;
-using Clock = blk::ObjectStore::Clock;
+using objstore::FetchError;
+using Clock = objstore::ObjectStore::Clock;
 
 namespace {
 
@@ -83,7 +86,7 @@ constexpr std::uint64_t chunk_bytes = 64ULL * 1024;  // chunk shift 16
 constexpr std::size_t half_key = 32;
 
 // A store in memory that counts requests and fails on demand.
-class MemoryStore final : public blk::ObjectStore {
+class MemoryStore final : public objstore::ObjectStore {
 public:
     auto put(const std::string& key, std::vector<std::byte> bytes) -> void {
         const std::scoped_lock lock{_mutex};
@@ -91,7 +94,8 @@ public:
     }
 
     auto get_range(std::string_view key, std::uint64_t offset, std::span<std::byte> out,
-                   Clock::time_point deadline) -> std::expected<void, FetchError> override {
+                   Clock::time_point deadline)
+        -> std::expected<void, objstore::FetchError> override {
         {
             const std::scoped_lock lock{_mutex};
             ++_ranges;
@@ -100,7 +104,7 @@ public:
         if (delay.count() > 0) {
             std::this_thread::sleep_for(delay);
             if (Clock::now() >= deadline) {
-                return std::unexpected(FetchError::timed_out);
+                return std::unexpected(objstore::FetchError::timed_out);
             }
         }
         const std::scoped_lock lock{_mutex};
@@ -111,7 +115,7 @@ public:
         const auto it = _objects.find(std::string{key});
         if (it == _objects.end() || offset > it->second.size() ||
             out.size() > it->second.size() - offset) {
-            return std::unexpected(FetchError::not_found);
+            return std::unexpected(objstore::FetchError::not_found);
         }
         std::copy_n(it->second.begin() + static_cast<std::ptrdiff_t>(offset), out.size(),
                     out.begin());
@@ -123,14 +127,14 @@ public:
     }
 
     auto get(std::string_view key, std::size_t max_bytes, Clock::time_point /*deadline*/)
-        -> std::expected<std::vector<std::byte>, FetchError> override {
+        -> std::expected<std::vector<std::byte>, objstore::FetchError> override {
         const std::scoped_lock lock{_mutex};
         const auto it = _objects.find(std::string{key});
         if (it == _objects.end()) {
-            return std::unexpected(FetchError::not_found);
+            return std::unexpected(objstore::FetchError::not_found);
         }
         if (it->second.size() > max_bytes) {
-            return std::unexpected(FetchError::too_large);
+            return std::unexpected(objstore::FetchError::too_large);
         }
         return it->second;
     }
@@ -147,7 +151,7 @@ public:
 
     // Read under _mutex inside get_range; set before fetching.
     unsigned fail_next{0};
-    FetchError fail_with{FetchError::io};
+    objstore::FetchError fail_with{objstore::FetchError::io};
     unsigned corrupt_next{0};
     std::chrono::milliseconds delay{0};
 
@@ -193,8 +197,8 @@ auto make_key(std::uint8_t seed) -> std::array<std::byte, blk::xts_key_size> {
 struct TestImage {
     std::vector<std::byte> plain;
     std::vector<std::byte> stored;
-    blk::ImageManifest manifest;
-    blk::ImageDigest name{};
+    objstore::ImageManifest manifest;
+    objstore::ImageDigest name{};
     std::string data_key;
 };
 
@@ -214,7 +218,7 @@ auto make_image(MemoryStore& store, std::uint32_t chunks, std::uint64_t tail,
         std::fill_n(img.plain.begin() + from, len, std::byte{0});
     }
     img.stored = img.plain;
-    img.manifest.chunk_shift = blk::min_chunk_shift;
+    img.manifest.chunk_shift = objstore::min_chunk_shift;
     img.manifest.image_bytes = size;
     if (image_key != nullptr) {
         img.manifest.encrypted = true;
@@ -225,24 +229,24 @@ auto make_image(MemoryStore& store, std::uint32_t chunks, std::uint64_t tail,
     }
     for (std::uint32_t c = 0; c < chunks; ++c) {
         if (std::ranges::find(holes, c) != holes.end()) {
-            img.manifest.chunks.push_back(blk::ImageDigest{});
+            img.manifest.chunks.push_back(objstore::ImageDigest{});
             continue;
         }
         const auto piece = std::span{img.stored}.subspan(
             c * chunk_bytes, std::min(chunk_bytes, size - (c * chunk_bytes)));
-        img.manifest.chunks.push_back(*blk::sha256_digest(piece));
+        img.manifest.chunks.push_back(*objstore::sha256_digest(piece));
     }
-    const auto bytes = blk::encode_manifest(img.manifest);
+    const auto bytes = objstore::encode_manifest(img.manifest);
     BOOST_REQUIRE(bytes.has_value());
-    img.name = *blk::sha256_digest(*bytes);
-    const auto hex = blk::image_name_hex(img.name);
-    img.data_key = blk::image_data_key("images", hex);
-    store.put(blk::image_manifest_key("images", hex), *bytes);
+    img.name = *objstore::sha256_digest(*bytes);
+    const auto hex = objstore::image_name_hex(img.name);
+    img.data_key = objstore::image_data_key("images", hex);
+    store.put(objstore::image_manifest_key("images", hex), *bytes);
     store.put(img.data_key, img.stored);
     return img;
 }
 
-auto fast_config() -> blk::FetcherConfig {
+auto fast_config() -> objstore::FetcherConfig {
     return {.workers = 2,
             .deadline = std::chrono::milliseconds{2000},
             .attempts = 3,
@@ -255,19 +259,20 @@ struct Rig {
     MemoryStore store;
     TempDir dir;
     TestImage image;
-    std::unique_ptr<blk::ChunkCache> cache;
-    std::unique_ptr<blk::Fetcher> fetcher;
-    std::shared_ptr<blk::CachedImage> cached;
+    std::unique_ptr<objstore::ChunkCache> cache;
+    std::unique_ptr<objstore::Fetcher> fetcher;
+    std::shared_ptr<objstore::CachedImage> cached;
 
     explicit Rig(std::uint32_t chunks, std::uint64_t tail = 0,
                  const std::vector<std::uint32_t>& holes = {},
                  const std::array<std::byte, blk::xts_key_size>* image_key = nullptr,
-                 std::uint64_t budget = 64 * chunk_bytes, blk::FetcherConfig config = fast_config())
+                 std::uint64_t budget = 64 * chunk_bytes,
+                 objstore::FetcherConfig config = fast_config())
         : image{make_image(store, chunks, tail, holes, image_key)} {
-        auto c = blk::ChunkCache::create(dir.path(), budget);
+        auto c = objstore::ChunkCache::create(dir.path(), budget);
         BOOST_REQUIRE(c.has_value());
         cache = std::move(*c);
-        fetcher = blk::Fetcher::create(store, config);
+        fetcher = objstore::Fetcher::create(store, config);
         auto ci = cache->open_image(image.name, image.manifest, image.data_key);
         BOOST_REQUIRE(ci.has_value());
         cached = *ci;
@@ -439,22 +444,22 @@ BOOST_AUTO_TEST_CASE(gives_up_and_never_caches_bad_data,
     rig.store.corrupt_next = 10;
     auto got = rig.fetcher->fetch(rig.cached, 0);
     BOOST_REQUIRE(!got.has_value());
-    BOOST_TEST(got.error() == FetchError::corrupt);
+    BOOST_TEST(got.error() == objstore::FetchError::corrupt);
     BOOST_TEST(!rig.cached->resident(0));
     BOOST_TEST(rig.store.ranges() == 3U);  // attempts
 
     // not_found and denied are final.
     rig.store.corrupt_next = 0;
     rig.store.fail_next = 1;
-    rig.store.fail_with = FetchError::denied;
+    rig.store.fail_with = objstore::FetchError::denied;
     got = rig.fetcher->fetch(rig.cached, 1);
     BOOST_REQUIRE(!got.has_value());
-    BOOST_TEST(got.error() == FetchError::denied);
+    BOOST_TEST(got.error() == objstore::FetchError::denied);
     BOOST_TEST(rig.store.ranges() == 4U);
     // Holes and chunks past the end are never fetched.
     Rig holes{2, 0, {1}};
-    BOOST_TEST(holes.fetcher->fetch(holes.cached, 1).error() == FetchError::not_found);
-    BOOST_TEST(holes.fetcher->fetch(holes.cached, 2).error() == FetchError::not_found);
+    BOOST_TEST(holes.fetcher->fetch(holes.cached, 1).error() == objstore::FetchError::not_found);
+    BOOST_TEST(holes.fetcher->fetch(holes.cached, 2).error() == objstore::FetchError::not_found);
     BOOST_TEST(holes.store.ranges() == 0U);
 }
 
@@ -466,7 +471,7 @@ BOOST_AUTO_TEST_CASE(stops_at_the_deadline, *boost::unit_test::timeout(unit_time
     const auto start = Clock::now();
     const auto got = rig.fetcher->fetch(rig.cached, 0);
     BOOST_REQUIRE(!got.has_value());
-    BOOST_TEST(got.error() == FetchError::timed_out);
+    BOOST_TEST(got.error() == objstore::FetchError::timed_out);
     BOOST_TEST((Clock::now() - start < std::chrono::seconds{2}));
 }
 
@@ -496,8 +501,8 @@ BOOST_AUTO_TEST_CASE(async_demands_join_and_report_once,
     Rig rig{3, 0, {2}};
     rig.store.delay = std::chrono::milliseconds{20};
     std::mutex m;
-    std::vector<blk::FetchResult> results;
-    auto record = [&](blk::FetchResult r) {
+    std::vector<objstore::FetchResult> results;
+    auto record = [&](objstore::FetchResult r) {
         const std::scoped_lock lock{m};
         results.push_back(std::move(r));
     };
@@ -516,7 +521,7 @@ BOOST_AUTO_TEST_CASE(async_demands_join_and_report_once,
     rig.fetcher->fetch_async(rig.cached, 2, record);
     const std::scoped_lock lock{m};
     BOOST_REQUIRE(results.size() == 3U);
-    BOOST_TEST(results[2].error() == FetchError::not_found);
+    BOOST_TEST(results[2].error() == objstore::FetchError::not_found);
 }
 
 BOOST_AUTO_TEST_CASE(shutting_down_fails_queued_async_demands,
@@ -527,10 +532,10 @@ BOOST_AUTO_TEST_CASE(shutting_down_fails_queued_async_demands,
     rig.store.delay = std::chrono::milliseconds{50};
     std::atomic<int> ok{0};
     std::atomic<int> shut{0};
-    auto record = [&](const blk::FetchResult& r) {
+    auto record = [&](const objstore::FetchResult& r) {
         if (r) {
             ++ok;
-        } else if (r.error() == FetchError::shut_down) {
+        } else if (r.error() == objstore::FetchError::shut_down) {
             ++shut;
         }
     };
@@ -764,7 +769,7 @@ BOOST_AUTO_TEST_CASE(fetch_failures_fail_the_read,
     auto b = rig.backend(rig.image.plain.size());
     BOOST_REQUIRE(b->load_keys(make_key(7), std::nullopt).has_value());
     rig.store.fail_next = 1;
-    rig.store.fail_with = FetchError::not_found;
+    rig.store.fail_with = objstore::FetchError::not_found;
     std::vector<std::byte> out(512);
     BOOST_TEST(b->read(0, out).error() == blk::BackendError::io);
     BOOST_TEST(b->counters().fetch_failures == 1U);
@@ -921,7 +926,7 @@ BOOST_AUTO_TEST_CASE(a_failed_fetch_fails_the_parked_read,
     auto b = rig.backend(rig.image.plain.size());
     BOOST_REQUIRE(b->load_keys(make_key(13), std::nullopt).has_value());
     rig.store.fail_next = 1;
-    rig.store.fail_with = FetchError::not_found;
+    rig.store.fail_with = objstore::FetchError::not_found;
     std::vector<std::byte> out(512);
     Outcome o;
     b->submit_read(0, out, o.completion());

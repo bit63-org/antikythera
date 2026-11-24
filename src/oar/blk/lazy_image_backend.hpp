@@ -61,8 +61,8 @@
 #include <span>
 #include <vector>
 
-#include "oar/blk/chunk_cache.hpp"
-#include "oar/blk/fetcher.hpp"
+#include "objstore/chunk_cache.hpp"
+#include "objstore/fetcher.hpp"
 #include "oar/blk/overlay.hpp"
 #include "oar/blk/virtio_blk_function.hpp"
 #include "oar/blk/xts_cipher.hpp"
@@ -70,8 +70,8 @@
 namespace ak::oar::blk {
 
 struct LazyImageParams {
-    std::shared_ptr<CachedImage> image;
-    Fetcher* fetcher{nullptr};  // must outlive the backend
+    std::shared_ptr<objstore::CachedImage> image;
+    objstore::Fetcher* fetcher{nullptr};  // must outlive the backend
     std::filesystem::path overlay_dir;
     // At least the image size, whole logical blocks; more reads as zeros.
     std::uint64_t capacity_bytes{0};
@@ -129,7 +129,9 @@ public:
     auto drop_keys() noexcept -> void;
     [[nodiscard]] auto holds_keys() const noexcept -> bool { return _eph.has_value(); }
 
-    [[nodiscard]] auto image() const noexcept -> const CachedImage& { return *_params.image; }
+    [[nodiscard]] auto image() const noexcept -> const objstore::CachedImage& {
+        return *_params.image;
+    }
     [[nodiscard]] auto overlay() const noexcept -> const Overlay& { return *_overlay; }
     [[nodiscard]] auto counters() const noexcept -> const LazyImageCounters& { return _counters; }
 
@@ -157,12 +159,12 @@ private:
         zero,
     };
 
-    using Fetched = std::map<std::uint32_t, ChunkBytes>;
+    using Fetched = std::map<std::uint32_t, objstore::ChunkBytes>;
 
     struct Arrival {
         std::uint64_t read{0};
         std::uint32_t chunk{0};
-        FetchResult result;
+        objstore::FetchResult result;
     };
     // Where fetcher workers leave arrivals for the role thread. Shared with
     // the callbacks so a fetch finishing after the backend is gone is safe.

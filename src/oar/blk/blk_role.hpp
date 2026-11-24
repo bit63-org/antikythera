@@ -83,12 +83,12 @@
 
 #include "helm/oar_link.hpp"
 #include "helm/role_enrollment.hpp"
-#include "oar/blk/chunk_cache.hpp"
-#include "oar/blk/fetcher.hpp"
+#include "objstore/chunk_cache.hpp"
+#include "objstore/fetcher.hpp"
 #include "oar/blk/file_backend.hpp"
 #include "oar/blk/lazy_image_backend.hpp"
 #include "oar/blk/network_volume_backend.hpp"
-#include "oar/blk/object_store.hpp"
+#include "objstore/object_store.hpp"
 #include "oar/blk/virtio_blk_function.hpp"
 
 namespace ak::oar::blk {
@@ -117,9 +117,9 @@ public:
 // An object store image volumes can name, as the role is configured with
 // it. Both pointers must outlive the role.
 struct ImageStore {
-    ObjectStore* store{nullptr};
-    Fetcher* fetcher{nullptr};  // fetches from `store`
-    std::string prefix;         // object keys are <prefix>/<image name>/...
+    objstore::ObjectStore* store{nullptr};
+    objstore::Fetcher* fetcher{nullptr};  // fetches from `store`
+    std::string prefix;                   // object keys are <prefix>/<image name>/...
 };
 
 struct RoleConfig {
@@ -134,7 +134,7 @@ struct RoleConfig {
     // Image volumes: the stores by ID, the chunk cache they share (must
     // outlive the role; null: no image volumes), and the overlays.
     std::map<std::uint16_t, ImageStore> image_stores;
-    ChunkCache* image_cache{nullptr};
+    objstore::ChunkCache* image_cache{nullptr};
     std::filesystem::path overlay_dir;     // empty: volume_dir
     std::uint64_t overlay_limit_bytes{0};  // per volume; 0: up to its capacity
     std::uint32_t max_readahead_chunks{8};

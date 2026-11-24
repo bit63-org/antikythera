@@ -27,7 +27,7 @@
 #include <span>
 #include <string_view>
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 inline constexpr std::size_t max_response_head = 16U * 1024U;
 
@@ -66,4 +66,4 @@ enum class HttpError : std::uint8_t {
 [[nodiscard]] auto parse_content_range(std::string_view value)
     -> std::expected<ContentRange, HttpError>;
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

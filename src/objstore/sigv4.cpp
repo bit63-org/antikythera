@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-#include "oar/blk/sigv4.hpp"
+#include "objstore/sigv4.hpp"
 
 #include <algorithm>
 #include <array>
@@ -12,7 +12,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 namespace {
 
@@ -172,4 +172,4 @@ auto sigv4_authorization(const SigV4Request& request, const SigV4Credentials& cr
     return out;
 }
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

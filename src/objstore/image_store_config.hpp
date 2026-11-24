@@ -30,9 +30,9 @@
 #include <string>
 #include <string_view>
 
-#include "oar/blk/s3_object_store.hpp"
+#include "objstore/s3_object_store.hpp"
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 struct ImageStoreConfig {
     S3Config s3;
@@ -43,4 +43,4 @@ struct ImageStoreConfig {
 [[nodiscard]] auto parse_image_store_config(std::string_view text)
     -> std::expected<ImageStoreConfig, std::string>;
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

@@ -52,8 +52,8 @@
 
 #include <openssl/crypto.h>
 
-#include "oar/blk/file_io.hpp"
-#include "oar/blk/image_manifest.hpp"
+#include "objstore/file_io.hpp"
+#include "objstore/image_manifest.hpp"
 #include "oar/blk/image_pack.hpp"
 #include "oar/blk/key_slot.hpp"
 #include "oar/blk/xts_cipher.hpp"
@@ -61,6 +61,7 @@
 namespace {
 
 namespace blk = ak::oar::blk;
+namespace objstore = ak::objstore;
 namespace fs = std::filesystem;
 
 constexpr std::string_view log_name = "ak-image-pack";
@@ -109,8 +110,8 @@ auto hex_value(char c) -> std::optional<unsigned> {
     return std::nullopt;
 }
 
-auto parse_key_id(std::string_view s) -> std::optional<blk::ImageKeyId> {
-    blk::ImageKeyId id{};
+auto parse_key_id(std::string_view s) -> std::optional<objstore::ImageKeyId> {
+    objstore::ImageKeyId id{};
     if (s.size() != id.size() * 2) {
         return std::nullopt;
     }
@@ -175,7 +176,7 @@ auto load_key(const std::string& path, blk::KeySlot& slot) -> int {
     }
     // One byte more than a key, to tell a long file from a key.
     std::array<std::byte, blk::xts_key_size + 1> buf{};
-    const auto got = blk::file_io::pread_all(fd.get(), buf, 0);
+    const auto got = objstore::file_io::pread_all(fd.get(), buf, 0);
     if (!got) {
         return fail(path, got.error());
     }
@@ -197,7 +198,7 @@ auto write_and_sync(const fs::path& path, std::span<const std::byte> bytes) -> i
     if (!fd.ok()) {
         return fail(path.string(), errno);
     }
-    if (auto ok = blk::file_io::pwrite_all(fd.get(), bytes, 0); !ok) {
+    if (auto ok = objstore::file_io::pwrite_all(fd.get(), bytes, 0); !ok) {
         return fail(path.string(), ok.error());
     }
     if (::fsync(fd.get()) != 0) {
@@ -210,7 +211,7 @@ struct Options {
     std::string out;
     std::string image;
     std::string key_file;
-    std::optional<blk::ImageKeyId> key_id;
+    std::optional<objstore::ImageKeyId> key_id;
     blk::PackOptions pack;
 };
 
@@ -316,7 +317,7 @@ auto main(int argc, char** argv) -> int {
                 break;
             case blk::PackError::too_many_chunks:
                 std::println(stderr, "{}: {}: more than {} chunks; use a larger {}", log_name,
-                             o.image, blk::max_image_chunks, arg_chunk_shift);
+                             o.image, objstore::max_image_chunks, arg_chunk_shift);
                 break;
             default:
                 std::println(stderr, "{}: {}: {}", log_name, o.image,
@@ -333,7 +334,7 @@ auto main(int argc, char** argv) -> int {
         return rc;
     }
 
-    const auto name = blk::image_name_hex(packed->name);
+    const auto name = objstore::image_name_hex(packed->name);
     const auto final_path = fs::path{o.out} / name;
     if (::rename(tmp.path().c_str(), final_path.c_str()) == 0) {
         tmp.keep();

@@ -77,10 +77,10 @@
 #include "helm/sideband_binding.hpp"
 #include "hull/signature_verifier.hpp"
 #include "oar/blk/blk_role.hpp"
-#include "oar/blk/chunk_cache.hpp"
-#include "oar/blk/fetcher.hpp"
-#include "oar/blk/image_store_config.hpp"
-#include "oar/blk/s3_object_store.hpp"
+#include "objstore/chunk_cache.hpp"
+#include "objstore/fetcher.hpp"
+#include "objstore/image_store_config.hpp"
+#include "objstore/s3_object_store.hpp"
 #include "oar/blk/key_slot.hpp"
 #include "oar/vfu/virtio_binding.hpp"
 #include "tls/role_identity.hpp"
@@ -88,6 +88,7 @@
 namespace {
 
 namespace blk = ak::oar::blk;
+namespace objstore = ak::objstore;
 namespace helm = ak::helm;
 
 constexpr std::string_view arg_volumes = "--volumes";
@@ -319,8 +320,8 @@ auto parse(int argc, char** argv) -> std::optional<Options> {
 
 // One configured image store and the fetcher in front of it.
 struct LoadedStore {
-    std::unique_ptr<blk::S3ObjectStore> store;
-    std::unique_ptr<blk::Fetcher> fetcher;
+    std::unique_ptr<objstore::S3ObjectStore> store;
+    std::unique_ptr<objstore::Fetcher> fetcher;
     std::string prefix;
 };
 
@@ -334,7 +335,7 @@ auto load_store(const std::string& path) -> std::expected<LoadedStore, std::stri
         return std::unexpected(std::format("{}: cannot read", path));
     }
     const std::string text{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
-    auto cfg = blk::parse_image_store_config(text);
+    auto cfg = objstore::parse_image_store_config(text);
     if (!cfg) {
         return std::unexpected(std::format("{}: {}", path, cfg.error()));
     }
@@ -342,12 +343,12 @@ auto load_store(const std::string& path) -> std::expected<LoadedStore, std::stri
         return std::unexpected(
             std::format("{}: holds a secret key but is readable by group or others", path));
     }
-    auto store = blk::S3ObjectStore::create(std::move(cfg->s3));
+    auto store = objstore::S3ObjectStore::create(std::move(cfg->s3));
     if (!store) {
-        return std::unexpected(std::format("{}: {}", path, blk::to_string(store.error())));
+        return std::unexpected(std::format("{}: {}", path, objstore::to_string(store.error())));
     }
     LoadedStore out{.store = std::move(*store), .fetcher = nullptr, .prefix = cfg->prefix};
-    out.fetcher = blk::Fetcher::create(*out.store, blk::FetcherConfig{});
+    out.fetcher = objstore::Fetcher::create(*out.store, objstore::FetcherConfig{});
     return out;
 }
 
@@ -378,9 +379,9 @@ auto main(int argc, char** argv) -> int {
     // Image stores, their fetchers and the cache outlive the role.
     std::map<std::uint16_t, LoadedStore> stores;
     std::map<std::uint16_t, blk::ImageStore> image_stores;
-    std::unique_ptr<blk::ChunkCache> cache;
+    std::unique_ptr<objstore::ChunkCache> cache;
     if (!opts->image_cache.empty()) {
-        auto c = blk::ChunkCache::create(opts->image_cache, opts->image_cache_bytes);
+        auto c = objstore::ChunkCache::create(opts->image_cache, opts->image_cache_bytes);
         if (!c) {
             std::println(stderr, "{}: image cache {}: {}", log_name, opts->image_cache,
                          std::strerror(c.error()));

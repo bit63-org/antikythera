@@ -10,7 +10,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "oar/blk/file_io.hpp"
+#include "objstore/file_io.hpp"
 
 namespace ak::oar::blk {
 
@@ -79,7 +79,7 @@ auto Overlay::read(std::uint64_t offset, std::span<std::byte> out) const
     if (!check(offset, out.size())) {
         return std::unexpected(OverlayError::out_of_range);
     }
-    const auto got = file_io::pread_all(_fd, out, static_cast<off_t>(offset));
+    const auto got = objstore::file_io::pread_all(_fd, out, static_cast<off_t>(offset));
     if (!got || *got != out.size()) {
         return std::unexpected(OverlayError::io);
     }
@@ -100,7 +100,7 @@ auto Overlay::write(std::uint64_t offset, std::span<const std::byte> in)
     if (_count + fresh > _limit_blocks) {
         return std::unexpected(OverlayError::full);
     }
-    if (!file_io::pwrite_all(_fd, in, static_cast<off_t>(offset))) {
+    if (!objstore::file_io::pwrite_all(_fd, in, static_cast<off_t>(offset))) {
         return std::unexpected(OverlayError::io);
     }
     for (std::uint64_t b = first; b < first + n; ++b) {

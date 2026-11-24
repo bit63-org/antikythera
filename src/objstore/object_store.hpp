@@ -23,7 +23,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 enum class FetchError : std::uint8_t {
     not_found,     // no such object, or the range starts past its end
@@ -71,4 +71,4 @@ public:
 [[nodiscard]] auto image_data_key(std::string_view prefix, std::string_view name_hex)
     -> std::string;
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

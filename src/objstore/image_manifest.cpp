@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Clark Rawlins
 // SPDX-License-Identifier: Apache-2.0
 
-#include "oar/blk/image_manifest.hpp"
+#include "objstore/image_manifest.hpp"
 
 #include <algorithm>
 
@@ -9,7 +9,7 @@
 
 #include "common/wire.hpp"
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 namespace {
 
@@ -260,4 +260,4 @@ auto parse_image_name(std::string_view hex) -> std::optional<ImageDigest> {
     return out;
 }
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

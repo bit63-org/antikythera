@@ -35,9 +35,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "oar/blk/image_manifest.hpp"
+#include "objstore/image_manifest.hpp"
 
-namespace ak::oar::blk {
+namespace ak::objstore {
 
 class ChunkCache;
 
@@ -144,4 +144,4 @@ private:
     std::unordered_map<std::string, std::weak_ptr<CachedImage>> _images;  // by hex name
 };
 
-}  // namespace ak::oar::blk
+}  // namespace ak::objstore

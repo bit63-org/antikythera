@@ -61,7 +61,8 @@
 - [ ] 8. harbor encryption scenarios. _Requirements: 7.2_
 - [x] 9. Image manifest codec, name and chunk digests, fuzz target.
   _Requirements: 8.3, 8.11_
-  — `src/oar/blk/image_manifest.*` (library `ak_oar_blk_image`): encode
+  — `src/objstore/image_manifest.*` (library `ak_objstore` since
+  block-volume-service task 20; first `ak_oar_blk_image`): encode
   and decode with every field checked (count before allocation, exact
   length, key ID set exactly when encrypted), `decode_named_manifest`
   against the image name, `chunk_matches` for fetched chunks, hex image
@@ -85,7 +86,7 @@
 - [x] 11. S3ObjectStore: HTTP/1.1 range GET over TCP/TLS, SigV4,
   response parser with fuzz target, MinIO test.
   _Requirements: 8.2, 8.9, 8.11, 7.3_
-  — library `ak_oar_blk_s3`: `sigv4.*` (checked against AWS's documented
+  — library `ak_objstore_s3` (was `ak_oar_blk_s3`): `sigv4.*` (checked against AWS's documented
   GET-with-Range example), `http_response.*` (strict head parser,
   `fuzz/fuzz_http_response.cpp`), `s3_object_store.*` (path or
   virtual-host style, keep-alive pool with one retry on an idle-closed

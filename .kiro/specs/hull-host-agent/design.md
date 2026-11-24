@@ -22,11 +22,31 @@ UEFI Secure Boot ─► UKI (kernel + initramfs + cmdline, measured into TPM)
 
 ### Init
 
-A small static C++ binary (not a shell script — there is no shell). Steps:
+A small C++ binary (not a shell script — there is no shell). Steps:
 mount `/proc`, `/sys`, `/dev`, hugetlbfs; write `driver_override` for each
 function in the inventory allow-list; bind to `vfio-pci`; walk
 `/sys/kernel/iommu_groups` and fail closed on a shared group; exec the
 agent.
+
+As built (task 3):
+
+- The allow-list is `/etc/hull/hull.conf` inside the initramfs, so Secure
+  Boot covers it. A slot is named by its PCIe downstream port plus the
+  function type and PCI ID it carries; every matching function below
+  the port belongs to it, numbered in address order. Matching by port
+  rather than by address keeps the file valid when bus numbers move.
+- A shared IOMMU group stops the boot rather than only that function, and
+  the mailbox's group is checked too: a host whose topology is not what
+  the image expects should not run guests at all.
+- Init writes the inventory to `/run/hull/inventory`
+  (`<slot> <type> <function> <bdf> <group> <reset>` per line) and execs
+  the agent with `--mailbox`, `--inventory` and `--server-id`; the agent
+  parses the file as strictly as anything else.
+- The agent keeps CAP_SYS_ADMIN, CAP_SETUID, CAP_SETGID, CAP_CHOWN,
+  CAP_FOWNER, CAP_SYS_RESOURCE and CAP_KILL after setup, all for building
+  jails and handing over group nodes, and sets no_new_privs. Running it
+  unprivileged (a VMM under a fixed UID, groups pre-chowned) is possible
+  but not built.
 
 ### MailboxClient
 
@@ -46,9 +66,12 @@ compiled-in table (supports rotation: up to N keys, selected by the
 Before verifying, `authenticate` compares the signed header's `server_id`
 (mailbox protocol v3) with the server ID the agent was provisioned with
 and refuses a mismatch as `wrong_server`. An agent with no server ID (0)
-refuses every command. Open question: the init binary has to hand the
-agent its server ID at boot; where it reads it from (the signed image's
-command line, or a measured provisioning file) is not decided yet.
+refuses every command. Init hands the agent its server ID at boot; the
+allow-list says where init reads it from (`server-id cmdline` for
+`hull.server_id=` on the signed UKI's command line, or `server-id file
+<path>` for a provisioning file, which production must measure). Both
+are supported, so one image per server and one image per fleet plus a
+measured file both work.
 
 ### VmSupervisor
 

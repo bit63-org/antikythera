@@ -157,6 +157,7 @@ auto BlkRole::close(Slot& s) -> bool {
         return false;
     }
     s.image = nullptr;
+    s.network = nullptr;
     s.active.reset();
     s.volume = 0;
     return true;
@@ -228,6 +229,9 @@ auto BlkRole::prepare_function(const oar::PrepareFunction& request) -> oar::Stat
     if (s->active || slot_of_volume(cfg->volume_id) != nullptr) {
         return oar::Status::busy;
     }
+    if (cfg->network()) {
+        return prepare_network(*s, request, *cfg);
+    }
     const auto m = FileBackend::read_metadata(volume_path(cfg->volume_id));
     if (!m || m->volume_id != cfg->volume_id || m->owner_vm != request.vm_id) {
         return oar::Status::failed;
@@ -263,17 +267,98 @@ auto BlkRole::prepare_function(const oar::PrepareFunction& request) -> oar::Stat
     if (!f) {
         return oar::Status::failed;
     }
+    return serve_active(*s, std::move(*f), cfg->volume_id, image, nullptr);
+}
+
+auto BlkRole::serve_active(Slot& s, std::unique_ptr<VirtioBlkFunction> f, std::uint64_t volume,
+                           LazyImageBackend* image, NetworkVolumeBackend* network) -> oar::Status {
     // Until helm's key arrives (after the VMM opened the function), the
     // guest's requests wait in the rings.
-    (*f)->await_key();
-    if (auto ok = s->transport->serve((*f)->pci(), on_flr(**f, image)); !ok) {
+    f->await_key();
+    if (auto ok = s.transport->serve(f->pci(), on_flr(*f, image)); !ok) {
         // Back to the placeholder; if even that fails the transport is lost.
-        static_cast<void>(s->transport->serve(s->placeholder->pci(), on_flr(*s->placeholder)));
+        static_cast<void>(s.transport->serve(s.placeholder->pci(), on_flr(*s.placeholder)));
         return oar::Status::failed;
     }
-    s->active = std::move(*f);
-    s->volume = cfg->volume_id;
-    s->image = image;
+    s.active = std::move(f);
+    s.volume = volume;
+    s.image = image;
+    s.network = network;
+    return oar::Status::ok;
+}
+
+auto BlkRole::prepare_network(Slot& s, const oar::PrepareFunction& /*request*/,
+                              const oar::BlkConfig& cfg) -> oar::Status {
+    if (!_config.verify_config || !_config.storage_tls) {
+        return oar::Status::unsupported;
+    }
+    const auto c = _configs.find(cfg.volume_id);
+    if (c == _configs.end()) {
+        return oar::Status::failed;  // helm sends the config first
+    }
+    const auto& rc = c->second;
+    const auto att = std::ranges::find_if(rc.attachments, [&](const proto::VolumeAttachment& a) {
+        return a.attachment_id == cfg.attachment_id;
+    });
+    if (att == rc.attachments.end() || att->generation != cfg.generation ||
+        att->server_id != _config.server_id) {
+        return oar::Status::failed;
+    }
+    auto initiator = _config.initiator;
+    initiator.attachment_id = cfg.attachment_id;
+    auto backend =
+        NetworkVolumeBackend::create({.initiator = initiator,
+                                      .tls = *_config.storage_tls,
+                                      .connect_timeout = NetworkVolumeConfig{}.connect_timeout,
+                                      .write_timeout = NetworkVolumeConfig{}.write_timeout});
+    if (!backend || !(*backend)->set_route(rc)) {
+        return oar::Status::failed;
+    }
+    NetworkVolumeBackend* network = backend->get();
+    const VolumeGeometry g{
+        .capacity_sectors = rc.capacity_blocks * (rc.block_size / oar::sector_size),
+        .logical_block_size = rc.block_size,
+        .read_only = att->mode == proto::AttachMode::ro,
+        .seg_max = _config.seg_max,
+        .max_transfer_bytes = _config.max_transfer_bytes};
+    // Requests wait on the network: let the rest of the ring go past them.
+    auto f = VirtioBlkFunction::create(
+        params(g, volume_serial(cfg.volume_id), _config.image_max_in_flight), s.transport->memory(),
+        s.transport->interrupts(), std::move(*backend));
+    if (!f) {
+        return oar::Status::failed;
+    }
+    return serve_active(s, std::move(*f), cfg.volume_id, nullptr, network);
+}
+
+auto BlkRole::replica_config(std::span<const std::byte> frame) -> oar::Status {
+    if (!_config.verify_config || !_config.storage_tls) {
+        return oar::Status::unsupported;
+    }
+    auto c = proto::decode_replica_config(frame);
+    if (!c) {
+        return oar::Status::bad_request;
+    }
+    if (c->server_id != _config.server_id ||
+        !_config.verify_config(proto::replica_config_signed_bytes(frame), c->signature,
+                               c->key_id)) {
+        return oar::Status::failed;
+    }
+    auto it = _configs.find(c->volume_id);
+    if (it == _configs.end()) {
+        if (_configs.size() >= max_network_configs) {
+            return oar::Status::busy;
+        }
+    } else if (c->epoch < it->second.epoch) {
+        return oar::Status::failed;
+    }
+    // A live attachment follows the new epoch: a new primary, or fencing.
+    if (Slot* s = slot_of_volume(c->volume_id); s != nullptr && s->network != nullptr) {
+        if (!s->network->set_route(*c)) {
+            return oar::Status::failed;
+        }
+    }
+    _configs[c->volume_id] = std::move(*c);
     return oar::Status::ok;
 }
 

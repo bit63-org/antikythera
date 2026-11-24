@@ -40,6 +40,18 @@
 // volume never comes back with an earlier attachment's writes. Encrypted
 // images (task 15) are refused until helm can deliver their image key.
 //
+// Network volumes (.kiro/specs/block-volume-service/ task 12): helm sends
+// each ReplicaConfig whose attachments name this server (replica_config);
+// the role verifies its signature under a controller key, checks that it
+// names this server, and keeps the newest per volume. prepare_function
+// with an attachment then serves the volume with a NetworkVolumeBackend
+// (network_volume_backend.hpp) routed by that config, which opens its TLS
+// session to the primary with the storage certificate; a later config for
+// the volume re-routes the live attachment (a new primary, or fencing).
+// The geometry comes from the config, read-only for an ro attachment. The
+// key helm delivers is the attachment's, opened in its secure element.
+// Without verify_config and storage_tls the role takes no network volumes.
+//
 // The volume files are named vol-<16 hex digits>.akv in the volume
 // directory. The role checks a volume's header against the request: a
 // prepare for a VM other than the volume's owner is refused, as helm's
@@ -56,6 +68,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -64,6 +77,7 @@
 #include "oar/blk/fetcher.hpp"
 #include "oar/blk/file_backend.hpp"
 #include "oar/blk/lazy_image_backend.hpp"
+#include "oar/blk/network_volume_backend.hpp"
 #include "oar/blk/object_store.hpp"
 #include "oar/blk/virtio_blk_function.hpp"
 
@@ -121,9 +135,20 @@ struct RoleConfig {
     // queue_size. Disk volumes keep 1: their backend completes in the call.
     std::uint16_t image_max_in_flight{8};
     std::chrono::milliseconds manifest_deadline{10000};
+    // Network volumes: this server, the controller-key check for their
+    // ReplicaConfigs (message, signature, key ID), and the TLS client
+    // configuration for sessions to hold roles (the storage certificate).
+    std::uint64_t server_id{0};
+    std::function<bool(std::span<const std::byte>, std::span<const std::byte, 64>, std::uint16_t)>
+        verify_config;
+    std::optional<tls::Config> storage_tls;
+    InitiatorConfig initiator;  // attachment_id is set per attachment
     // Empty: steady_clock::now (health's uptime).
     std::function<Clock::time_point()> clock;
 };
+
+// Network volume configs a role keeps at once.
+inline constexpr std::size_t max_network_configs = 1024;
 
 // What a GET_ID returns for a volume: "akv-" and its ID in 16 hex digits,
 // exactly the 20 bytes virtio-blk allows.
@@ -154,6 +179,7 @@ public:
     auto create_volume(const helm::oar::CreateVolume& request) -> helm::oar::Status override;
     auto delete_volume(const helm::oar::DeleteVolume& request) -> helm::oar::Status override;
     auto rewrap_volume(const helm::oar::RewrapVolume& request) -> helm::oar::Status override;
+    auto replica_config(std::span<const std::byte> frame) -> helm::oar::Status override;
 
     // Serves deferred requests on every attached function; true if any
     // still has work (call again soon).
@@ -177,6 +203,7 @@ private:
         std::unique_ptr<VirtioBlkFunction> active;
         std::uint64_t volume{0};
         LazyImageBackend* image{nullptr};  // the active function's backend, for an image volume
+        NetworkVolumeBackend* network{nullptr};  // ... for a network volume
     };
 
     explicit BlkRole(RoleConfig config) : _config{std::move(config)} {}
@@ -190,9 +217,15 @@ private:
     // The backend for an image volume, ready for its key.
     [[nodiscard]] auto open_image_volume(const VolumeMetadata& m)
         -> std::expected<std::unique_ptr<LazyImageBackend>, std::string>;
+    auto prepare_network(Slot& s, const helm::oar::PrepareFunction& request,
+                         const helm::oar::BlkConfig& cfg) -> helm::oar::Status;
+    // Puts `f` behind the slot's transport (the placeholder back on failure).
+    auto serve_active(Slot& s, std::unique_ptr<VirtioBlkFunction> f, std::uint64_t volume,
+                      LazyImageBackend* image, NetworkVolumeBackend* network) -> helm::oar::Status;
 
     RoleConfig _config;
     std::vector<Slot> _slots;
+    std::map<std::uint64_t, proto::ReplicaConfig> _configs;  // network volumes, newest
     RoleConfig::Clock::time_point _started;
 };
 

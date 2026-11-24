@@ -35,7 +35,10 @@
 //     the same way and hands it, with its exact signed bytes, to helm,
 //     which forwards it to oar-net to verify and apply. ReplicaConfig,
 //     VolumeOp, VolumeKey and LeaseGrant records are checked and handed
-//     over the same way (block volumes).
+//     over the same way (block volumes), as are RoleCertificate records
+//     (enrollment of the storage roles). After the inventory it sends
+//     helm's enrollment (the secure element's transport key), when set,
+//     which an older unacknowledged one never outlives either.
 //   - Any protocol violation (a malformed record, a record that only helm
 //     sends, an envelope for another server, an ack for a report never
 //     sent) ends the connection; the link reconnects and re-registers.
@@ -58,6 +61,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <optional>
 #include <expected>
 #include <functional>
 #include <mutex>
@@ -116,6 +120,8 @@ public:
                                std::span<const std::byte> /*frame*/) -> void {}
     // The controller acknowledged a storage role's lease request.
     virtual auto on_lease_grant(const proto::LeaseGrant& /*grant*/) -> void {}
+    // A storage role's certificate, for the role in `certificate.slot`.
+    virtual auto on_role_certificate(const proto::RoleCertificate& /*certificate*/) -> void {}
 };
 
 enum class SessionError : std::uint8_t {
@@ -140,8 +146,13 @@ public:
     ControllerSession(std::uint64_t server_id, std::uint64_t boot_id, InventorySource inventory,
                       ControllerSink& sink);
 
-    // A new connection: queues the registration inventory and the replay.
+    // A new connection: queues the replay, then the registration
+    // inventory and the enrollment.
     auto on_connected() -> void;
+
+    // helm's secure-element transport key (block volumes, enrollment):
+    // sent after the inventory on every connection, and now if connected.
+    auto set_enrollment(const proto::Enrollment& enrollment) -> void;
     auto on_disconnected() noexcept -> void;
     [[nodiscard]] auto connected() const noexcept -> bool { return _connected; }
 
@@ -164,6 +175,7 @@ private:
     struct Pending {
         std::uint64_t seq;
         bool inventory;
+        bool enrollment;
         std::vector<std::byte> record;  // the framed report, ready to send
     };
 
@@ -179,6 +191,7 @@ private:
     std::uint64_t _dropped{0};
     bool _connected{false};
     std::deque<Pending> _pending;
+    std::optional<proto::Enrollment> _enrollment;
     std::vector<std::byte> _outbound;
     proto::RecordDecoder _decoder;
 };

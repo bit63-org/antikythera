@@ -369,6 +369,8 @@ constexpr std::array kind_names{
     std::pair{"demotion_confirmed", proto::ReportKind::demotion_confirmed},
     std::pair{"op_outcome", proto::ReportKind::op_outcome},
     std::pair{"snapshot_progress", proto::ReportKind::snapshot_progress},
+    std::pair{"enrollment", proto::ReportKind::enrollment},
+    std::pair{"cert_request", proto::ReportKind::cert_request},
 };
 
 template<typename T, std::size_t N>
@@ -783,6 +785,11 @@ auto to_string(const proto::Report& report) -> std::string {
                 os << " volume=" << b.volume_id << " op=" << b.op_id
                    << " kind=" << static_cast<int>(b.kind)
                    << " status=" << static_cast<int>(b.status) << " detail=" << b.detail;
+            } else if constexpr (std::is_same_v<T, proto::Enrollment>) {
+                os << " kem=0x" << std::hex << b.kem << std::dec;
+            } else if constexpr (std::is_same_v<T, proto::CertRequest>) {
+                os << " slot=" << int{b.slot} << " role=" << static_cast<int>(b.role)
+                   << " csr=" << b.csr.size();
             } else {
                 static_assert(std::is_same_v<T, proto::SnapshotProgress>);
                 os << " volume=" << b.volume_id << " cut=" << b.cut_id
@@ -887,6 +894,7 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::volume_op:
         case proto::RecordType::volume_key:
         case proto::RecordType::lease_grant:
+        case proto::RecordType::role_certificate:
             break;
     }
     return std::unexpected("helm sent a controller-only record");

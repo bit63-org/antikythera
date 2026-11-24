@@ -56,8 +56,12 @@ auto ControllerSession::queue(proto::ReportBody body) -> std::uint64_t {
     if (_connected) {
         _outbound.insert(_outbound.end(), record->begin(), record->end());
     }
-    const bool inventory = std::holds_alternative<proto::Inventory>(report.body);
-    _pending.push_back({.seq = seq, .inventory = inventory, .record = std::move(*record)});
+    // A connection restates the inventory and the enrollment, so an older
+    // unacknowledged one is never replayed.
+    _pending.push_back({.seq = seq,
+                        .inventory = std::holds_alternative<proto::Inventory>(report.body),
+                        .enrollment = std::holds_alternative<proto::Enrollment>(report.body),
+                        .record = std::move(*record)});
     while (_pending.size() > max_pending_reports) {
         _pending.pop_front();
         ++_dropped;
@@ -80,18 +84,30 @@ auto ControllerSession::on_connected() -> void {
     if (hello_record) {
         _outbound = std::move(*hello_record);
     }
-    // An inventory the controller never acknowledged is superseded by the
-    // fresh one below, so it is not replayed.
-    std::erase_if(_pending, [](const Pending& p) { return p.inventory; });
-    // The replay, in sequence order, then the fresh inventory with the
-    // highest sequence number: the controller processes reports in order
-    // and ends up holding the newest snapshot.
+    // An inventory or enrollment the controller never acknowledged is
+    // superseded by the fresh one below, so it is not replayed.
+    std::erase_if(_pending, [](const Pending& p) { return p.inventory || p.enrollment; });
+    // The replay, in sequence order, then the fresh inventory and the
+    // enrollment with the highest sequence numbers: the controller
+    // processes reports in order and ends up holding the newest snapshot
+    // and transport key.
     for (const auto& p : _pending) {
         _outbound.insert(_outbound.end(), p.record.begin(), p.record.end());
     }
     auto inventory = _inventory();
     inventory.boot_id = _boot_id;
     (void)queue(std::move(inventory));
+    if (_enrollment) {
+        (void)queue(*_enrollment);
+    }
+}
+
+auto ControllerSession::set_enrollment(const proto::Enrollment& enrollment) -> void {
+    _enrollment = enrollment;
+    if (_connected) {
+        std::erase_if(_pending, [](const Pending& p) { return p.enrollment; });
+        (void)queue(enrollment);
+    }
 }
 
 auto ControllerSession::on_disconnected() noexcept -> void {
@@ -194,6 +210,17 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
                 return std::unexpected(SessionError::wrong_server);
             }
             _sink->on_lease_grant(*grant);
+            return {};
+        }
+        case proto::RecordType::role_certificate: {
+            auto cert = proto::decode_role_certificate(rec.payload);
+            if (!cert) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (cert->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_role_certificate(*cert);
             return {};
         }
         case proto::RecordType::report_ack: {

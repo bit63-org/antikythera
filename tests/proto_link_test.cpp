@@ -98,7 +98,7 @@ BOOST_AUTO_TEST_CASE(oversized_record_fails_before_its_payload_arrives) {
 BOOST_AUTO_TEST_CASE(bad_type_and_reserved_break_the_stream) {
     for (const auto& [bytes, want] :
          {std::pair{bytes_of(0, 0, 0, 0, 0, 0, 0, 0), DecodeError::bad_record_type},
-          std::pair{bytes_of(0, 0, 0, 0, 12, 0, 0, 0), DecodeError::bad_record_type},
+          std::pair{bytes_of(0, 0, 0, 0, 13, 0, 0, 0), DecodeError::bad_record_type},
           std::pair{bytes_of(0, 0, 0, 0, 1, 0, 0, 1), DecodeError::reserved_not_zero}}) {
         proto::RecordDecoder d;
         d.feed(bytes);
@@ -114,7 +114,7 @@ BOOST_AUTO_TEST_CASE(largest_tunnel_peer_set_fits_a_record) {
 }
 
 BOOST_AUTO_TEST_CASE(encode_refuses_what_decode_would) {
-    auto bad_type = proto::encode_record(static_cast<RecordType>(12), {});
+    auto bad_type = proto::encode_record(static_cast<RecordType>(13), {});
     BOOST_REQUIRE(!bad_type.has_value());
     BOOST_TEST((bad_type.error() == DecodeError::bad_record_type));
     const std::vector<std::byte> huge(proto::max_record_payload + 1);
@@ -213,5 +213,75 @@ BOOST_AUTO_TEST_CASE(block_volume_frames_fit_a_record) {
                          RecordType::lease_grant}) {
         BOOST_TEST(proto::encode_record(t, std::vector<std::byte>(4)).has_value());
     }
-    BOOST_TEST(!proto::encode_record(static_cast<RecordType>(12), {}).has_value());
+    BOOST_TEST(
+        proto::encode_record(RecordType::role_certificate, std::vector<std::byte>(4)).has_value());
+    BOOST_TEST(!proto::encode_record(static_cast<RecordType>(13), {}).has_value());
+}
+
+namespace {
+
+// A DER SEQUENCE of n content bytes, its length in the shortest form.
+auto der_cert(std::size_t n, std::uint8_t fill) -> std::vector<std::byte> {
+    std::vector<std::byte> out{std::byte{0x30}};
+    if (n < 0x80) {
+        out.push_back(static_cast<std::byte>(n));
+    } else {
+        out.push_back(std::byte{0x82});
+        out.push_back(static_cast<std::byte>(n >> 8U));
+        out.push_back(static_cast<std::byte>(n & 0xFFU));
+    }
+    out.insert(out.end(), n, static_cast<std::byte>(fill));
+    return out;
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(role_certificate_round_trips_and_is_strict) {
+    auto chain = der_cert(600, 1);
+    const auto issuer = der_cert(500, 2);
+    chain.insert(chain.end(), issuer.begin(), issuer.end());
+    const proto::RoleCertificate c{.server_id = 0x0102'0304'0506'0708, .slot = 3, .chain = chain};
+    auto b = proto::encode_role_certificate(c);
+    BOOST_REQUIRE(b.has_value());
+    BOOST_TEST(b->size() == proto::role_certificate_fixed_size + chain.size());
+    BOOST_TEST(std::to_integer<int>((*b)[0]) == 0x08);  // server_id, little-endian
+    BOOST_TEST(std::to_integer<int>((*b)[8]) == 3);     // slot
+    BOOST_TEST(std::to_integer<int>((*b)[12]) == static_cast<int>(chain.size() & 0xFFU));
+    BOOST_TEST(std::to_integer<int>((*b)[16]) == 0x30);
+    auto back = proto::decode_role_certificate(*b);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST((*back == c));
+    for (const std::size_t n : {std::size_t{0}, std::size_t{8}, std::size_t{15}}) {
+        BOOST_TEST((proto::decode_role_certificate(std::span{*b}.first(n)).error() ==
+                    DecodeError::truncated));
+    }
+    // A chain_len past the end is truncated; short of it, trailing bytes.
+    BOOST_TEST((proto::decode_role_certificate(std::span{*b}.first(b->size() - 1)).error() ==
+                DecodeError::truncated));
+    auto longer = *b;
+    longer.push_back(std::byte{0});
+    BOOST_TEST((proto::decode_role_certificate(longer).error() == DecodeError::trailing_bytes));
+    auto bad = *b;
+    bad[9] = std::byte{1};
+    BOOST_TEST((proto::decode_role_certificate(bad).error() == DecodeError::reserved_not_zero));
+
+    auto with = [&](std::uint64_t server, std::vector<std::byte> ch) {
+        return proto::encode_role_certificate(
+            {.server_id = server, .slot = 1, .chain = std::move(ch)});
+    };
+    BOOST_TEST((with(0, chain).error() == DecodeError::bad_server_id));
+    BOOST_TEST((with(1, {}).error() == DecodeError::bad_der));
+    BOOST_TEST((with(1, bytes_of(0x04, 0x00)).error() == DecodeError::bad_der));
+    std::vector<std::byte> five;
+    for (int i = 0; i < 5; ++i) {
+        const auto one = der_cert(10, 3);
+        five.insert(five.end(), one.begin(), one.end());
+    }
+    BOOST_TEST((with(1, five).error() == DecodeError::bad_der));  // more than four
+    five.resize(five.size() - der_cert(10, 3).size());
+    BOOST_TEST(with(1, five).has_value());
+    BOOST_TEST((with(1, der_cert(proto::max_cert_chain_size, 4)).error() == DecodeError::bad_der));
+    BOOST_TEST(with(1, der_cert(proto::max_cert_chain_size - 4, 4)).has_value());
+    BOOST_TEST(proto::max_record_payload >=
+               proto::role_certificate_fixed_size + proto::max_cert_chain_size);
 }

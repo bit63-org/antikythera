@@ -190,6 +190,16 @@ auto run(const helm::HelmConfig& cfg) -> int {
 
     helm::ControllerSession session{cfg.server_id, *boot_id,
                                     [&daemon] { return daemon.inventory(); }, daemon};
+    // Enrollment: the controller seals volume keys to this key.
+    if (auto pk = se->transport_public_key(); pk) {
+        ak::proto::Enrollment enrollment;
+        std::ranges::copy(*pk, enrollment.transport_key.begin());
+        session.set_enrollment(enrollment);
+    } else {
+        std::println(stderr, "{}: secure element transport key: {}", log_name,
+                     helm::to_string(pk.error()));
+        return exit_failed;
+    }
     auto created = helm::ControllerLink::create({.host = cfg.controller_host,
                                                  .port = cfg.controller_port,
                                                  .tls = {.role = ak::tls::Role::client,

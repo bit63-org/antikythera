@@ -49,8 +49,9 @@ struct CacheCounters {
     std::uint64_t refused{0};  // inserts that did not fit next to pinned chunks
 };
 
-// One image as the role knows it: its name, manifest, data object key and
-// the chunks of it held locally.
+// One image as the role knows it: its name, manifest, data object key (for
+// a chunked, version-2 image: its lineage's chunks prefix) and the chunks
+// of it held locally.
 class CachedImage {
 public:
     CachedImage(const CachedImage&) = delete;

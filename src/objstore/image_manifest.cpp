@@ -50,6 +50,10 @@ auto check_fields(const ImageManifest& m) -> std::expected<void, ManifestError> 
     if (m.encrypted == all_zero(m.key_id)) {
         return std::unexpected(ManifestError::bad_key_id);
     }
+    if (m.chunked ? (m.lineage_id == 0 || !m.encrypted)
+                  : (m.lineage_id != 0 || !all_zero(m.parent))) {
+        return std::unexpected(ManifestError::bad_lineage);
+    }
     return {};
 }
 
@@ -60,6 +64,10 @@ auto ImageManifest::chunk_length(std::uint32_t index) const noexcept -> std::uin
         return 0;
     }
     return std::min(chunk_size(), image_bytes - chunk_offset(index));
+}
+
+auto ImageManifest::has_parent() const noexcept -> bool {
+    return !all_zero(parent);
 }
 
 auto ImageManifest::is_hole(std::uint32_t index) const noexcept -> bool {
@@ -90,6 +98,8 @@ auto to_string(ManifestError e) noexcept -> const char* {
             return "nonzero_reserved";
         case ManifestError::bad_key_id:
             return "bad_key_id";
+        case ManifestError::bad_lineage:
+            return "bad_lineage";
         case ManifestError::name_mismatch:
             return "name_mismatch";
         case ManifestError::crypto_failure:
@@ -104,11 +114,12 @@ auto encode_manifest(const ImageManifest& m)
         return std::unexpected(ok.error());
     }
     std::vector<std::byte> out;
-    out.reserve(manifest_header_size + (m.chunks.size() * image_digest_size));
+    out.reserve(m.header_size() + (m.chunks.size() * image_digest_size));
     wire::Writer w{out};
     w.bytes(magic);
-    w.le16(manifest_version);
-    w.le16(m.encrypted ? manifest_flag_encrypted : std::uint16_t{0});
+    w.le16(m.version());
+    w.le16(static_cast<std::uint16_t>((m.encrypted ? manifest_flag_encrypted : 0U) |
+                                      (m.chunked ? manifest_flag_chunked : 0U)));
     w.le32(m.logical_block_size);
     w.u8(m.chunk_shift);
     const std::array<std::byte, reserved_after_shift> zeros{};
@@ -117,6 +128,10 @@ auto encode_manifest(const ImageManifest& m)
     w.le32(m.chunk_count());
     w.le32(0);
     w.bytes(m.key_id);
+    if (m.chunked) {
+        w.le64(m.lineage_id);
+        w.bytes(m.parent);
+    }
     for (const auto& d : m.chunks) {
         w.bytes(d);
     }
@@ -146,14 +161,29 @@ auto decode_manifest(std::span<const std::byte> bytes)
         !reserved2 || !key_id) {
         return std::unexpected(ManifestError::truncated);
     }
-    if (*version != manifest_version) {
+    if (*version != manifest_version && *version != manifest_version_chunked) {
         return std::unexpected(ManifestError::unsupported_version);
     }
-    if ((*flags & ~manifest_flag_encrypted) != 0) {
+    if ((*flags & ~(manifest_flag_encrypted | manifest_flag_chunked)) != 0) {
         return std::unexpected(ManifestError::bad_flags);
     }
     if (!all_zero(*reserved1) || *reserved2 != 0) {
         return std::unexpected(ManifestError::nonzero_reserved);
+    }
+    const bool chunked = *version == manifest_version_chunked;
+    if (chunked != ((*flags & manifest_flag_chunked) != 0)) {
+        return std::unexpected(ManifestError::bad_lineage);
+    }
+    std::uint64_t lineage = 0;
+    ImageDigest parent{};
+    if (chunked) {
+        const auto l = r.le64();
+        const auto p = r.bytes(parent.size());
+        if (!l || !p) {
+            return std::unexpected(ManifestError::truncated);
+        }
+        lineage = *l;
+        std::ranges::copy(*p, parent.begin());
     }
     // Check the count before trusting it with an allocation.
     if (*count == 0 || *count > max_image_chunks) {
@@ -172,6 +202,9 @@ auto decode_manifest(std::span<const std::byte> bytes)
     m.chunk_shift = *shift;
     m.image_bytes = *image_bytes;
     std::ranges::copy(*key_id, m.key_id.begin());
+    m.chunked = chunked;
+    m.lineage_id = lineage;
+    m.parent = parent;
     m.chunks.resize(*count);
     for (auto& d : m.chunks) {
         const auto raw = r.bytes(image_digest_size);

@@ -3,6 +3,8 @@
 
 #include "objstore/object_store.hpp"
 
+#include <format>
+
 namespace ak::objstore {
 
 auto to_string(FetchError e) noexcept -> const char* {
@@ -51,6 +53,23 @@ auto image_manifest_key(std::string_view prefix, std::string_view name_hex) -> s
 
 auto image_data_key(std::string_view prefix, std::string_view name_hex) -> std::string {
     return image_key(prefix, name_hex, "data");
+}
+
+auto lineage_chunks_prefix(std::string_view prefix, std::uint64_t lineage) -> std::string {
+    return image_key(prefix, std::format("lineage-{:016x}", lineage), "chunks");
+}
+
+auto chunk_key(std::string_view chunks_prefix, std::string_view digest_hex) -> std::string {
+    std::string key{chunks_prefix};
+    key.push_back('/');
+    key.append(digest_hex);
+    return key;
+}
+
+auto snapshot_manifest_key(std::string_view prefix, std::uint64_t lineage,
+                           std::string_view name_hex) -> std::string {
+    const auto snap = std::format("lineage-{:016x}/snap-{}", lineage, name_hex);
+    return image_key(prefix, snap, "manifest");
 }
 
 }  // namespace ak::objstore

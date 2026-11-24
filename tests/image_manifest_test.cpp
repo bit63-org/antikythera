@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "objstore/image_manifest.hpp"
+#include "objstore/object_store.hpp"
 #include "test_support.hpp"
 
 namespace ak::objstore {
@@ -53,6 +54,20 @@ auto sample_manifest(const std::vector<std::byte>& data) -> objstore::ImageManif
     m.chunks.push_back(*objstore::sha256_digest(all.first(kib64)));
     m.chunks.push_back(objstore::ImageDigest{});  // hole
     m.chunks.push_back(*objstore::sha256_digest(all.subspan(2 * kib64)));
+    return m;
+}
+
+constexpr std::uint64_t lineage = 0x0123'4567'89AB'CDEF;
+
+// sample_manifest as a snapshot: chunked, encrypted, in `lineage`, with a
+// parent.
+auto sample_snapshot(const std::vector<std::byte>& data) -> objstore::ImageManifest {
+    auto m = sample_manifest(data);
+    m.encrypted = true;
+    m.key_id.fill(std::byte{0x11});
+    m.chunked = true;
+    m.lineage_id = lineage;
+    m.parent.fill(std::byte{0x22});
     return m;
 }
 
@@ -170,8 +185,12 @@ BOOST_AUTO_TEST_CASE(refuses_malformed_manifests,
     longer.push_back(std::byte{0});
     BOOST_TEST(decode_error(longer) == objstore::ManifestError::wrong_size);
     BOOST_TEST(decode_error(with(0, 'X')) == objstore::ManifestError::bad_magic);
-    BOOST_TEST(decode_error(with(8, 2)) == objstore::ManifestError::unsupported_version);
-    BOOST_TEST(decode_error(with(10, 2)) == objstore::ManifestError::bad_flags);
+    BOOST_TEST(decode_error(with(8, 3)) == objstore::ManifestError::unsupported_version);
+    BOOST_TEST(decode_error(with(8, 0)) == objstore::ManifestError::unsupported_version);
+    // Version 2 without the chunked flag, the flag on version 1.
+    BOOST_TEST(decode_error(with(8, 2)) == objstore::ManifestError::bad_lineage);
+    BOOST_TEST(decode_error(with(10, 2)) == objstore::ManifestError::bad_lineage);
+    BOOST_TEST(decode_error(with(10, 4)) == objstore::ManifestError::bad_flags);
     BOOST_TEST(decode_error(with(13, 4)) == objstore::ManifestError::bad_block_size);  // 1024
     BOOST_TEST(decode_error(with(16, 15)) == objstore::ManifestError::bad_chunk_shift);
     BOOST_TEST(decode_error(with(16, 23)) == objstore::ManifestError::bad_chunk_shift);
@@ -192,6 +211,87 @@ BOOST_AUTO_TEST_CASE(refuses_malformed_manifests,
     huge[34] = std::byte{0xFF};
     huge[35] = std::byte{0xFF};
     BOOST_TEST(decode_error(huge) == objstore::ManifestError::bad_chunk_count);
+}
+
+BOOST_AUTO_TEST_CASE(version_2_round_trip_and_layout,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto data = sample_data();
+    const auto m = sample_snapshot(data);
+    BOOST_TEST(m.version() == 2U);
+    BOOST_TEST(m.has_parent());
+    const auto bytes = encoded(m);
+    BOOST_REQUIRE(bytes.size() ==
+                  objstore::manifest_header_size_chunked + (3 * objstore::image_digest_size));
+    BOOST_TEST(std::to_integer<int>(bytes[8]) == 2);      // version
+    BOOST_TEST(std::to_integer<int>(bytes[10]) == 0x03);  // encrypted | chunked
+    BOOST_TEST(std::to_integer<int>(bytes[56]) == 0xEF);  // lineage, little-endian
+    BOOST_TEST(std::to_integer<int>(bytes[63]) == 0x01);
+    BOOST_TEST(std::to_integer<int>(bytes[64]) == 0x22);  // parent
+    BOOST_TEST(std::to_integer<int>(bytes[95]) == 0x22);
+    // The digest table starts after the longer header, and is unchanged.
+    BOOST_TEST(std::equal(m.chunks[0].begin(), m.chunks[0].end(), bytes.begin() + 96));
+    const auto d = objstore::decode_manifest(bytes);
+    BOOST_REQUIRE(d.has_value());
+    BOOST_TEST((*d == m));
+    // The name still pins it, and chunks still match their digests.
+    const auto name = objstore::sha256_digest(bytes);
+    BOOST_REQUIRE(name.has_value());
+    BOOST_TEST(objstore::decode_named_manifest(bytes, *name).has_value());
+    BOOST_TEST(objstore::chunk_matches(*d, 0, std::span{data}.first(kib64)));
+    BOOST_TEST(d->is_hole(1));
+
+    // A first snapshot has no parent.
+    auto first = m;
+    first.parent = {};
+    const auto f = objstore::decode_manifest(encoded(first));
+    BOOST_REQUIRE(f.has_value());
+    BOOST_TEST(!f->has_parent());
+}
+
+BOOST_AUTO_TEST_CASE(version_2_rules, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto data = sample_data();
+    const auto good = encoded(sample_snapshot(data));
+    auto with = [&](std::size_t at, std::uint8_t v) {
+        auto b = good;
+        b[at] = static_cast<std::byte>(v);
+        return b;
+    };
+    // Cut inside the lineage/parent fields, or the table.
+    BOOST_TEST(decode_error(std::vector<std::byte>(good.begin(), good.begin() + 60)) ==
+               objstore::ManifestError::truncated);
+    BOOST_TEST(decode_error(std::vector<std::byte>(good.begin(), good.begin() + 96)) ==
+               objstore::ManifestError::truncated);
+    BOOST_TEST(decode_error(with(10, 0x02)) ==
+               objstore::ManifestError::bad_key_id);  // plain, but a key ID
+    BOOST_TEST(decode_error(with(10, 0x01)) == objstore::ManifestError::bad_lineage);  // no flag
+    auto no_lineage = good;
+    std::fill_n(no_lineage.begin() + 56, 8, std::byte{0});
+    BOOST_TEST(decode_error(no_lineage) == objstore::ManifestError::bad_lineage);
+
+    // encode holds the same rules.
+    auto m = sample_snapshot(data);
+    m.lineage_id = 0;
+    BOOST_TEST(objstore::encode_manifest(m).error() == objstore::ManifestError::bad_lineage);
+    m = sample_snapshot(data);
+    m.encrypted = false;
+    m.key_id = {};
+    BOOST_TEST(objstore::encode_manifest(m).error() == objstore::ManifestError::bad_lineage);
+    // Lineage and parent belong to version 2 only.
+    m = sample_manifest(data);
+    m.lineage_id = lineage;
+    BOOST_TEST(objstore::encode_manifest(m).error() == objstore::ManifestError::bad_lineage);
+    m = sample_manifest(data);
+    m.parent.fill(std::byte{1});
+    BOOST_TEST(objstore::encode_manifest(m).error() == objstore::ManifestError::bad_lineage);
+}
+
+BOOST_AUTO_TEST_CASE(snapshot_object_keys, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto chunks = objstore::lineage_chunks_prefix("vols", lineage);
+    BOOST_TEST(chunks == "vols/lineage-0123456789abcdef/chunks");
+    BOOST_TEST(objstore::lineage_chunks_prefix("", 1) == "lineage-0000000000000001/chunks");
+    BOOST_TEST(objstore::chunk_key(chunks, "ab") == "vols/lineage-0123456789abcdef/chunks/ab");
+    BOOST_TEST(objstore::snapshot_manifest_key("vols/", lineage, "cd") ==
+               "vols/lineage-0123456789abcdef/snap-cd/manifest");
 }
 
 BOOST_AUTO_TEST_CASE(encode_checks_fields, *boost::unit_test::timeout(unit_timeout_seconds)) {

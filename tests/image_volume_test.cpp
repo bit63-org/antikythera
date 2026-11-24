@@ -422,6 +422,48 @@ BOOST_AUTO_TEST_CASE(fetches_verifies_and_caches,
     BOOST_TEST(rig.fetcher->counters().fetched == 1U);
 }
 
+// Manifest version 2 (block-volume-service task 20): each chunk is its own
+// object under the lineage's chunk prefix, fetched whole and checked
+// against the same digest list.
+BOOST_AUTO_TEST_CASE(fetches_chunked_snapshots_by_digest,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto key = make_key(3);
+    Rig rig{3, 4096, {1}, &key};
+    auto snap = rig.image.manifest;
+    snap.chunked = true;
+    snap.lineage_id = 0x42;
+    const auto bytes = objstore::encode_manifest(snap);
+    BOOST_REQUIRE(bytes.has_value());
+    const auto name = *objstore::sha256_digest(*bytes);
+    const auto prefix = objstore::lineage_chunks_prefix("snaps", snap.lineage_id);
+    for (std::uint32_t c = 0; c < snap.chunk_count(); ++c) {
+        if (!snap.is_hole(c)) {
+            rig.store.put(objstore::chunk_key(prefix, objstore::image_name_hex(snap.chunks[c])),
+                          slice(rig.image.stored, snap.chunk_offset(c), snap.chunk_length(c)));
+        }
+    }
+    auto ci = rig.cache->open_image(name, snap, prefix);
+    BOOST_REQUIRE(ci.has_value());
+    const auto before = rig.store.gets_at(0);
+    auto got = rig.fetcher->fetch(*ci, 2);
+    BOOST_REQUIRE(got.has_value());
+    BOOST_TEST(((**got) == slice(rig.image.stored, 2 * chunk_bytes, 4096)));
+    got = rig.fetcher->fetch(*ci, 0);
+    BOOST_REQUIRE(got.has_value());
+    BOOST_TEST(((**got) == slice(rig.image.stored, 0, chunk_bytes)));
+    BOOST_TEST(rig.store.gets_at(0) == before + 2);  // whole objects, from offset 0
+    BOOST_TEST((*ci)->resident(2));
+
+    // A store that swaps a chunk object is caught by its digest.
+    auto swapped = slice(rig.image.stored, 0, chunk_bytes);
+    swapped[7] ^= std::byte{0x80};
+    rig.store.put(objstore::chunk_key(prefix, objstore::image_name_hex(snap.chunks[0])), swapped);
+    auto again = rig.cache->open_image(objstore::ImageDigest{std::byte{9}}, snap, prefix);
+    BOOST_REQUIRE(again.has_value());
+    BOOST_TEST((rig.fetcher->fetch(*again, 0).error() == objstore::FetchError::corrupt));
+    BOOST_TEST(!(*again)->resident(0));
+}
+
 BOOST_AUTO_TEST_CASE(retries_corruption_and_errors,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
     Rig rig{2};

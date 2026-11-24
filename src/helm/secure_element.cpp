@@ -18,6 +18,7 @@
 #include <openssl/rand.h>
 
 #include "common/wire.hpp"
+#include "proto/image_key.hpp"
 #include "proto/volume_key.hpp"
 
 namespace ak::helm {
@@ -412,26 +413,63 @@ auto SoftwareSecureElement::transport_public_key() -> std::expected<hpke::Public
     return pair->public_key;
 }
 
-auto SoftwareSecureElement::open_volume_key(
-    std::span<const std::byte> aad, std::span<const std::byte, hpke::enc_size> enc,
-    std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
-    -> std::expected<ScopedKey, SeError> {
+auto SoftwareSecureElement::open_transport(
+    std::string_view info, std::span<const std::byte> aad,
+    std::span<const std::byte, hpke::enc_size> enc,
+    std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped,
+    std::span<std::byte, volume_key_size> out) const -> std::expected<void, SeError> {
     auto pair = transport_key();
     if (!pair) {
         return std::unexpected(pair.error());
     }
-    SecretBytes<volume_key_size> key;
-    const auto info = proto::volume_key_info;
-    auto opened =
-        hpke::open(pair->private_key.span(), enc,
-                   std::as_bytes(std::span{info.data(), info.size()}), aad, wrapped, key.span());
+    auto opened = hpke::open(pair->private_key.span(), enc,
+                             std::as_bytes(std::span{info.data(), info.size()}), aad, wrapped, out);
     if (!opened) {
         ERR_clear_error();
         return std::unexpected(opened.error() == hpke::Error::crypto_failure
                                    ? SeError::crypto_failure
                                    : SeError::authentication_failed);
     }
+    return {};
+}
+
+auto SoftwareSecureElement::open_volume_key(
+    std::span<const std::byte> aad, std::span<const std::byte, hpke::enc_size> enc,
+    std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
+    -> std::expected<ScopedKey, SeError> {
+    SecretBytes<volume_key_size> key;
+    if (auto ok = open_transport(proto::volume_key_info, aad, enc, wrapped, key.span()); !ok) {
+        return std::unexpected(ok.error());
+    }
     return make_scoped_key(key.span());
+}
+
+auto SoftwareSecureElement::check_image_key(
+    std::span<const std::byte> aad, std::span<const std::byte, hpke::enc_size> enc,
+    std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
+    -> std::expected<void, SeError> {
+    SecretBytes<volume_key_size> key;  // wiped on return
+    return open_transport(proto::image_key_info, aad, enc, wrapped, key.span());
+}
+
+auto SoftwareSecureElement::import_image_key(
+    const WrappedVmKey& owner, VolumeId volume, std::span<const std::byte> aad,
+    std::span<const std::byte, hpke::enc_size> enc,
+    std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
+    -> std::expected<WrappedVolumeKey, SeError> {
+    auto vm_key = unwrap_vm_key(owner);
+    if (!vm_key) {
+        return std::unexpected(vm_key.error());
+    }
+    SecretBytes<volume_key_size> key;
+    if (auto ok = open_transport(proto::image_key_info, aad, enc, wrapped, key.span()); !ok) {
+        return std::unexpected(ok.error());
+    }
+    auto sealed = seal(vm_key->span(), volume_identity(volume, owner.vm), key.span());
+    if (!sealed) {
+        return std::unexpected(sealed.error());
+    }
+    return WrappedVolumeKey{.volume = volume, .owner = owner.vm, .key = std::move(*sealed)};
 }
 
 auto SoftwareSecureElement::ephemeral() -> std::expected<SoftwareSecureElement, SeError> {

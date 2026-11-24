@@ -98,7 +98,7 @@ BOOST_AUTO_TEST_CASE(oversized_record_fails_before_its_payload_arrives) {
 BOOST_AUTO_TEST_CASE(bad_type_and_reserved_break_the_stream) {
     for (const auto& [bytes, want] :
          {std::pair{bytes_of(0, 0, 0, 0, 0, 0, 0, 0), DecodeError::bad_record_type},
-          std::pair{bytes_of(0, 0, 0, 0, 13, 0, 0, 0), DecodeError::bad_record_type},
+          std::pair{bytes_of(0, 0, 0, 0, 14, 0, 0, 0), DecodeError::bad_record_type},
           std::pair{bytes_of(0, 0, 0, 0, 1, 0, 0, 1), DecodeError::reserved_not_zero}}) {
         proto::RecordDecoder d;
         d.feed(bytes);
@@ -114,7 +114,7 @@ BOOST_AUTO_TEST_CASE(largest_tunnel_peer_set_fits_a_record) {
 }
 
 BOOST_AUTO_TEST_CASE(encode_refuses_what_decode_would) {
-    auto bad_type = proto::encode_record(static_cast<RecordType>(13), {});
+    auto bad_type = proto::encode_record(static_cast<RecordType>(14), {});
     BOOST_REQUIRE(!bad_type.has_value());
     BOOST_TEST((bad_type.error() == DecodeError::bad_record_type));
     const std::vector<std::byte> huge(proto::max_record_payload + 1);
@@ -209,13 +209,14 @@ BOOST_AUTO_TEST_CASE(block_volume_frames_fit_a_record) {
     BOOST_TEST(proto::max_record_payload >= proto::max_replica_config_size);
     BOOST_TEST(proto::max_record_payload >= proto::volume_op_size);
     BOOST_TEST(proto::max_record_payload >= proto::volume_key_size);
+    BOOST_TEST(proto::max_record_payload >= proto::image_key_size);
     for (const auto t : {RecordType::replica_config, RecordType::volume_op, RecordType::volume_key,
-                         RecordType::lease_grant}) {
+                         RecordType::lease_grant, RecordType::image_key}) {
         BOOST_TEST(proto::encode_record(t, std::vector<std::byte>(4)).has_value());
     }
     BOOST_TEST(
         proto::encode_record(RecordType::role_certificate, std::vector<std::byte>(4)).has_value());
-    BOOST_TEST(!proto::encode_record(static_cast<RecordType>(13), {}).has_value());
+    BOOST_TEST(!proto::encode_record(static_cast<RecordType>(14), {}).has_value());
 }
 
 namespace {

@@ -388,7 +388,9 @@ BOOST_FIXTURE_TEST_CASE(inventory_and_unsupported, One,
         BOOST_TEST((inv->functions[i].type == ak::helm::FunctionType::nic_vf));
     }
     const std::array<std::byte, ak::helm::volume_key_size> key{};
-    BOOST_TEST((role->deliver_key({.fn = fn0, .volume_id = 1, .key = key}) == Status::unsupported));
+    BOOST_TEST(
+        (role->deliver_key({.fn = fn0, .volume_id = 1, .key = key, .image_key = std::nullopt}) ==
+         Status::unsupported));
     BOOST_TEST((role->drop_key({}) == Status::unsupported));
     BOOST_TEST((role->create_volume({}) == Status::unsupported));
     // Without a tunnel, the tunnel requests are not this role's either.

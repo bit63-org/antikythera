@@ -27,6 +27,7 @@
 //   clean_function      0  fn u16 | 2  action u8 (CleaningAction) | 3  reserved u8
 //   deliver_key         0  fn u16 | 2  reserved u16 | 4  reserved u32 | 8  volume_id u64
 //                       16 key [64] (AES-256-XTS volume key, oar-blk Requirement 2)
+//                       80 image_key [64], only for an encrypted image volume
 //   drop_key            0  fn u16 | 2  reserved u16 | 4  reserved u32 | 8  volume_id u64
 //   map_update          0  total u32 | 4  offset u32 | 8  chunk (1..max_map_chunk bytes)
 //   health              (empty)
@@ -165,6 +166,7 @@
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <optional>
 #include <span>
 #include <utility>
 #include <variant>
@@ -197,6 +199,7 @@ inline constexpr std::size_t nic_config_size = 20;
 inline constexpr std::size_t blk_config_size = 24;
 inline constexpr std::size_t clean_function_size = 4;
 inline constexpr std::size_t deliver_key_size = 16 + volume_key_size;
+inline constexpr std::size_t deliver_keys_size = deliver_key_size + volume_key_size;
 inline constexpr std::size_t drop_key_size = 16;
 inline constexpr std::size_t map_chunk_head_size = 8;
 inline constexpr std::size_t create_volume_head_size = 32;
@@ -378,10 +381,17 @@ struct CleanFunction {
 // The key is a view: into the caller's ScopedKey when encoding, into the
 // received message when decoding. The receiver copies it into its key slot
 // and wipes the message (OarEndpoint does).
+//
+// An encrypted image volume (oar-blk Requirement 8.8, task 15) gets its
+// image key K_img in the same request, after the attachment's ephemeral
+// key: a 144-byte body instead of 80. A role that predates it refuses the
+// longer body as the wrong size, so an encrypted image never attaches
+// without its key.
 struct DeliverKey {
     FunctionNumber fn{0};
     VolumeId volume_id{0};
     std::span<const std::byte, volume_key_size> key;
+    std::optional<std::span<const std::byte, volume_key_size>> image_key;
 };
 
 struct DropKey {

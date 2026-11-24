@@ -901,6 +901,7 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::volume_key:
         case proto::RecordType::lease_grant:
         case proto::RecordType::role_certificate:
+        case proto::RecordType::image_key:
             break;
     }
     return std::unexpected("helm sent a controller-only record");

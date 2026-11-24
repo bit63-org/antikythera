@@ -201,6 +201,17 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
             _sink->on_volume_key(*key, rec.payload);
             return {};
         }
+        case proto::RecordType::image_key: {
+            auto key = proto::decode_image_key(rec.payload);
+            if (!key) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (key->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_image_key(*key, rec.payload);
+            return {};
+        }
         case proto::RecordType::lease_grant: {
             auto grant = proto::decode_lease_grant(rec.payload);
             if (!grant) {

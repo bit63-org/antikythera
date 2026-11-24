@@ -106,8 +106,24 @@
   block-volume-service task 3: asynchronous `BlockBackend`, and
   `LazyImageBackend` misses through `Fetcher::fetch_async`).
   _Requirements: 8.10_
-- [ ] 15. Encrypted images: K_img wrapped in helm, delivered with K_eph.
+- [x] 15. Encrypted images: K_img wrapped in helm, delivered with K_eph.
   _Requirements: 8.8_
+  — `src/proto/image_key.hpp` (ImageKey frame, controller-link record
+  `image_key`, `fuzz/fuzz_image_key.cpp`): K_img sealed with HPKE to
+  helm's transport key for one volume and owner. `KeyStore::put_image_key`
+  checks and keeps it; CREATE_VOLUME with an image source re-wraps it in
+  the secure element under the owner's VM key
+  (`SecureElement::import_image_key`) as the volume's key and relays it to
+  the role, which keeps it in the version-2 header. ATTACH_VOLUME delivers
+  K_img with K_eph in one `deliver_key` (144-byte body); the role refuses
+  an encrypted image without its key, a plain one with a key, and a K_img
+  for a disk volume. REWRAP_VOLUME, DELETE_VOLUME and DESTROY_VM treat it
+  as a volume key (`FileBackend::rewrap_image_volume` on the role). Tests
+  in `proto_volume_test`, `key_store_test`, `command_router_test`,
+  `controller_session_test`, `helm_daemon_test` and `blk_role_test` (a
+  guest reading an encrypted image through helm's real KeyStore and
+  OarLink). Not done here: boot from an encrypted image in harbor (part
+  of task 16, tikhov), and a test-controller verb to send an ImageKey.
 - [ ] 16. harbor: boot from an image volume served by MinIO.
   _Requirements: 4, 7.3_
 

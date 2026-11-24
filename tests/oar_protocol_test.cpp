@@ -223,7 +223,8 @@ BOOST_AUTO_TEST_CASE(clean_function_round_trip_and_rejects) {
 BOOST_AUTO_TEST_CASE(deliver_key_round_trip_views_key) {
     std::array<std::byte, ak::helm::volume_key_size> key{};
     key.fill(std::byte{key_fill});
-    auto body = oar::encode_deliver_key({.fn = sample_fn, .volume_id = sample_volume, .key = key});
+    auto body = oar::encode_deliver_key(
+        {.fn = sample_fn, .volume_id = sample_volume, .key = key, .image_key = std::nullopt});
     BOOST_REQUIRE(body.has_value());
     BOOST_TEST(body->size() == oar::deliver_key_size);
     BOOST_TEST(body->capacity() == oar::deliver_key_size);  // no reallocation copies
@@ -234,13 +235,43 @@ BOOST_AUTO_TEST_CASE(deliver_key_round_trip_views_key) {
     BOOST_TEST(std::ranges::equal(back->key, key));
     BOOST_TEST(back->key.data() == body->data() + (oar::deliver_key_size - key.size()));
 
-    BOOST_TEST((oar::encode_deliver_key({.fn = 0, .volume_id = 0, .key = key}).error() ==
-                BodyError::zero_id));
+    BOOST_TEST(
+        (oar::encode_deliver_key({.fn = 0, .volume_id = 0, .key = key, .image_key = std::nullopt})
+             .error() == BodyError::zero_id));
     auto b = *body;
     b[2] = std::byte{1};
     BOOST_TEST((oar::decode_deliver_key(b).error() == BodyError::reserved_not_zero));
     b.pop_back();
     BOOST_TEST((oar::decode_deliver_key(b).error() == BodyError::truncated));
+    BOOST_TEST(!back->image_key.has_value());
+}
+
+// oar-blk task 15: an encrypted image volume's K_img rides along.
+BOOST_AUTO_TEST_CASE(deliver_key_carries_an_image_key) {
+    std::array<std::byte, ak::helm::volume_key_size> key{};
+    std::array<std::byte, ak::helm::volume_key_size> image_key{};
+    key.fill(std::byte{key_fill});
+    image_key.fill(std::byte{0x3C});
+    auto body = oar::encode_deliver_key(
+        {.fn = sample_fn, .volume_id = sample_volume, .key = key, .image_key = image_key});
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::deliver_keys_size);
+    BOOST_TEST(oar::deliver_keys_size == 144U);
+    BOOST_TEST(body->capacity() == oar::deliver_keys_size);
+    auto back = oar::decode_deliver_key(*body);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST(std::ranges::equal(back->key, key));
+    BOOST_REQUIRE(back->image_key.has_value());
+    BOOST_TEST(std::ranges::equal(*back->image_key, image_key));
+    BOOST_TEST(back->image_key->data() == body->data() + oar::deliver_key_size);
+    // Any length between the two shapes, or past the longer, is refused.
+    for (const std::size_t n : {oar::deliver_key_size + 1, oar::deliver_keys_size - 1}) {
+        BOOST_TEST((oar::decode_deliver_key(std::span{*body}.first(n)).error() ==
+                    BodyError::trailing_bytes));
+    }
+    auto longer = *body;
+    longer.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_deliver_key(longer).error() == BodyError::trailing_bytes));
 }
 
 BOOST_AUTO_TEST_CASE(drop_key_round_trip_and_rejects) {

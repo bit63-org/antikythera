@@ -72,7 +72,9 @@
 // status, volume faults, demotions, op outcomes, snapshot progress) to the
 // controller; anything else is dropped and counted. A VolumeKey goes to
 // the KeyStore, which opens it in the secure element and keeps it wrapped
-// for the attachment it names (KeyStore::put_attachment_key). A config
+// for the attachment it names (KeyStore::put_attachment_key); an ImageKey
+// likewise, for the image volume it names (KeyStore::put_image_key, oar-blk
+// task 15), until that volume's CREATE_VOLUME re-wraps it. A config
 // whose attachments name this server also goes to the CommandRouter (which
 // attaches the volume on ATTACH_VOLUME) and to every storage (blk) role,
 // and again to a storage role whose sideband (re)opens.
@@ -171,6 +173,8 @@ struct DaemonStats {
     std::uint64_t hold_reports_dropped{0};  // undecodable, or of a kind a hold role never sends
     std::uint64_t volume_keys{0};           // opened and kept (KeyStore::put_attachment_key)
     std::uint64_t volume_keys_refused{0};   // did not open, stale, or too many
+    std::uint64_t image_keys{0};            // opened and kept (KeyStore::put_image_key)
+    std::uint64_t image_keys_refused{0};    // did not open, or too many
     std::uint64_t blk_configs_refused{0};   // a storage role refused a network volume's config
     std::uint64_t cert_requests{0};         // storage role requests reported to the controller
     std::uint64_t role_certificates{0};     // certificates a storage role took
@@ -242,6 +246,8 @@ public:
         -> void override;
     auto on_tunnel_peers(const proto::TunnelPeers& peers, std::span<const std::byte> frame)
         -> void override;
+    auto on_image_key(const proto::ImageKey& key, std::span<const std::byte> frame)
+        -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
     // The newest published snapshot (ControllerSession's InventorySource).
@@ -275,8 +281,12 @@ private:
         proto::TunnelPeers peers;
         std::vector<std::byte> frame;
     };
+    struct ImageKeyFrame {
+        std::vector<std::byte> frame;
+    };
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
-                              proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame>;
+                              proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
+                              ImageKeyFrame>;
 
     struct SlotState;
 
@@ -290,7 +300,8 @@ private:
             -> std::expected<void, LinkError> override;
         auto clean_function(const oar::CleanFunction& request)
             -> std::expected<void, LinkError> override;
-        auto deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key)
+        auto deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key,
+                         std::optional<ScopedKey> image_key)
             -> std::expected<void, LinkError> override;
         auto drop_key(const oar::DropKey& request) -> std::expected<void, LinkError> override;
         auto create_volume(const oar::CreateVolume& request)

@@ -189,9 +189,14 @@ auto BlkRole::open_image_volume(const VolumeMetadata& m)
         // (block-volume-service tasks 22-23), never as an image volume.
         return std::unexpected(std::format("image {} is a snapshot", hex));
     }
-    if (manifest->encrypted) {
-        // Needs the image key from helm (task 15).
-        return std::unexpected(std::format("image {} is encrypted", hex));
+    // An encrypted image's volume holds K_img wrapped by helm (task 15),
+    // and a plain image's holds no key: one without the other would only
+    // fail at delivery, after the VMM has the function.
+    if (manifest->encrypted && m.wrapped_key.empty()) {
+        return std::unexpected(std::format("image {} is encrypted and the volume has no key", hex));
+    }
+    if (!manifest->encrypted && !m.wrapped_key.empty()) {
+        return std::unexpected(std::format("image {} is plain and the volume has a key", hex));
     }
     auto image = _config.image_cache->open_image(m.image->name, *manifest,
                                                  objstore::image_data_key(is.prefix, hex));
@@ -445,6 +450,10 @@ auto BlkRole::deliver_key(const oar::DeliverKey& request) -> oar::Status {
     if (!s->active || s->volume != request.volume_id) {
         return oar::Status::busy;
     }
+    // Only an image volume takes an image key.
+    if (request.image_key && s->image == nullptr) {
+        return oar::Status::failed;
+    }
     // The span views helm's message, which OarEndpoint wipes after this
     // returns; the function copies it into its key slot now.
     auto ok = s->active->deliver_key(request.key);
@@ -452,8 +461,14 @@ auto BlkRole::deliver_key(const oar::DeliverKey& request) -> oar::Status {
         return ok.error() == KeyError::occupied ? oar::Status::busy : oar::Status::failed;
     }
     // An image volume's backend re-encrypts image blocks under the same
-    // (ephemeral) key. Both hold it or neither does.
-    if (s->image != nullptr && !s->image->load_keys(request.key, std::nullopt)) {
+    // (ephemeral) key, decrypting an encrypted image's under K_img first
+    // (task 15). Both hold the key or neither does; the backend refuses a
+    // K_img for a plain image and its absence for an encrypted one.
+    std::optional<XtsKey> image_key;
+    if (request.image_key) {
+        image_key = *request.image_key;
+    }
+    if (s->image != nullptr && !s->image->load_keys(request.key, image_key)) {
         s->active->drop_key();
         s->image->drop_keys();
         return oar::Status::failed;
@@ -555,6 +570,15 @@ auto BlkRole::delete_volume(const oar::DeleteVolume& request) -> oar::Status {
 auto BlkRole::rewrap_volume(const oar::RewrapVolume& request) -> oar::Status {
     if (slot_of_volume(request.volume_id) != nullptr) {
         return oar::Status::busy;
+    }
+    // An encrypted image volume's key is K_img (task 15); a plain image
+    // volume has none, and rewrap_image_volume refuses it.
+    const auto m = FileBackend::read_metadata(volume_path(request.volume_id));
+    if (m && m->image) {
+        return FileBackend::rewrap_image_volume(volume_path(request.volume_id), request.owner_vm,
+                                                request.wrapped_key)
+                   ? oar::Status::ok
+                   : oar::Status::failed;
     }
     auto backend = FileBackend::open(volume_path(request.volume_id));
     if (!backend) {

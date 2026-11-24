@@ -370,25 +370,38 @@ auto encode_deliver_key(const DeliverKey& d) -> std::expected<std::vector<std::b
     // Reserved to the exact size so the buffer never reallocates and leaves
     // a stray copy of the key behind.
     std::vector<std::byte> out;
-    out.reserve(deliver_key_size);
+    out.reserve(d.image_key ? deliver_keys_size : deliver_key_size);
     wire::Writer w{out};
     write_fn_volume(w, d.fn, d.volume_id);
     w.bytes(d.key);
+    if (d.image_key) {
+        w.bytes(*d.image_key);
+    }
     return out;
 }
 
 auto decode_deliver_key(std::span<const std::byte> body) noexcept
     -> std::expected<DeliverKey, BodyError> {
-    if (auto ok = check_size(body, deliver_key_size); !ok) {
-        return std::unexpected(ok.error());
+    // One key, or the ephemeral key and an image key.
+    if (body.size() != deliver_keys_size) {
+        if (auto ok = check_size(body, deliver_key_size); !ok) {
+            return std::unexpected(ok.error());
+        }
     }
     wire::Reader r{body};
     auto head = read_fn_volume(r);
     if (!head) {
         return std::unexpected(head.error());
     }
-    return DeliverKey{
-        .fn = head->fn, .volume_id = head->volume, .key = r.rest().first<volume_key_size>()};
+    const auto keys = r.rest();
+    DeliverKey d{.fn = head->fn,
+                 .volume_id = head->volume,
+                 .key = keys.first<volume_key_size>(),
+                 .image_key = std::nullopt};
+    if (keys.size() == 2 * volume_key_size) {
+        d.image_key = keys.subspan<volume_key_size, volume_key_size>();
+    }
+    return d;
 }
 
 auto encode_drop_key(const DropKey& d) -> std::expected<std::vector<std::byte>, BodyError> {

@@ -45,7 +45,8 @@ struct FakeNet final : helm::OarPort {
         -> std::expected<void, LinkError> override {
         return {};
     }
-    auto deliver_key(oar::FunctionNumber /*fn*/, helm::VolumeId /*volume*/, helm::ScopedKey /*key*/)
+    auto deliver_key(oar::FunctionNumber /*fn*/, helm::VolumeId /*volume*/, helm::ScopedKey /*key*/,
+                     std::optional<helm::ScopedKey> /*image_key*/)
         -> std::expected<void, LinkError> override {
         return {};
     }

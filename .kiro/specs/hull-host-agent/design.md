@@ -76,6 +76,37 @@ eject wait and the timeout and policy are not applied. helm answers a
 guest that never releases with `busy` itself; the agent never sees that
 command.
 
+As built (task 8):
+
+- The VMM starts with only `--api-socket` and `--seccomp true`; the VM
+  arrives over the socket with `vm.create` (`vm_config_json`): vCPU *i*
+  pinned to the *i*-th allocated core thread, 1 GiB pages, serial and
+  console off. `CREATE_VM` answers `ok` once `vm.create` has succeeded;
+  the VM is then `created` (configured, not booted, no devices).
+  Booting waits for the boot volume, which arrives with the attach
+  commands (task 9).
+- Cloud Hypervisor always adds a virtio-rng backed by `/dev/urandom` (its
+  `RngConfig` cannot be turned off), so that one emulated device remains
+  and the jail allows reading `/dev/urandom`. Requirement 6.1's "no
+  emulated virtio devices" holds for everything the agent configures.
+- Landlock cannot be widened after exec and functions are hot-plugged
+  later, so the jail allows the whole of `/dev/vfio`. A group node stays
+  root-owned and 0600 until its function is assigned, and the VMM has no
+  capabilities, so it can open only the groups the agent hands to its UID
+  (task 9). Cloud Hypervisor can also take an already-open VFIO cdev over
+  `SCM_RIGHTS`, which would let the jail drop `/dev/vfio` entirely; that
+  needs iommufd and is left for later.
+- The VMM's replies are untrusted: one request per connection, a deadline
+  on every exchange, a strict HTTP reply parser and a strict bounded JSON
+  reader (`fuzz_vmm_reply`).
+- `LIST_VMS` and `VM_STATUS` answer with payloads defined in
+  `helm/mailbox.hpp` (`VmList`, `VmStatusInfo`).
+- Events are queued and sent after the command's response, so helm sees
+  `DESTROY_VM`'s `ok` before the `DEVICE_RELEASED` events it waits for.
+- `VM_EXITED`: exit status 0 is reported as `guest_shutdown` (Cloud
+  Hypervisor exits cleanly when the guest powers off), any other exit or a
+  signal as `vmm_failure` with the exit code or 128 + signal.
+
 ### Reset
 
 - Whole-slot functions: secondary bus reset through the downstream port's

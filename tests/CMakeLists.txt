@@ -161,6 +161,13 @@ add_test(NAME wireguard_interop
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/wireguard_interop.sh $<TARGET_FILE:wireguard_interop_peer>)
 set_tests_properties(wireguard_interop PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 
+# The guest's cooperative-detach helper, against a fake sysfs and procfs
+# (block-volume-service task 13, Requirement 3.4).
+add_test(NAME guest_eject_test
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/guest_eject_test.sh
+                 ${PROJECT_SOURCE_DIR}/guest/ak-guest-eject)
+set_tests_properties(guest_eject_test PROPERTIES TIMEOUT 60)
+
 # harbor's sample ak-helm configuration must keep parsing.
 add_test(NAME ak_helm_check
          COMMAND $<TARGET_FILE:ak-helm> --check ${PROJECT_SOURCE_DIR}/harbor/helm.conf.example)

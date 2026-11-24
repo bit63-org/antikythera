@@ -1,0 +1,15 @@
+# Copyright (c) 2026 Clark Rawlins
+# SPDX-License-Identifier: Apache-2.0
+
+# Starts ak-guest-eject when a virtio disk appears, so a cooperative detach
+# of an antikythera volume (.kiro/specs/block-volume-service/ Requirement
+# 3.4) is released without anyone logging in. The helper itself checks for
+# antikythera's capability and ignores every other disk; the service is
+# one per guest however many disks arrive.
+#
+# Install: copy to /etc/udev/rules.d/, ak-guest-eject to /usr/local/sbin/
+# and ak-guest-eject.service to /etc/systemd/system/, then
+# `udevadm control --reload`.
+
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="vd*", \
+  TAG+="systemd", ENV{SYSTEMD_WANTS}+="ak-guest-eject.service"

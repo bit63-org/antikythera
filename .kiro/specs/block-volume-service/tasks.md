@@ -65,7 +65,7 @@ repository. Prerequisites outside this spec: oar-blk task 14
   report path, demotion, member-loss and primary-loss handling, intent
   reconcile on promotion, `io_suspended` and `EnableVolumeIO`; all
   exercised by the simulation. _Requirements: 6_ (cloud)
-- [ ] 11. Resync and rebuild: dirty-region bitmaps, partial resync with
+- [x] 11. Resync and rebuild: dirty-region bitmaps, partial resync with
   returning members' intent extents, full sparse rebuild with `joining`
   members and region locks, pacing and priorities. _Requirements: 7_
   (cloud)

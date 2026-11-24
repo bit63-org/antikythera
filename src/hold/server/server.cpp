@@ -4,6 +4,7 @@
 #include "hold/server/server.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 #include "common/crc32c.hpp"
@@ -60,6 +61,11 @@ auto in_sync(proto::ReplicaRole r) noexcept -> bool {
     return r == proto::ReplicaRole::secondary || r == proto::ReplicaRole::leaving;
 }
 
+// A copy budget's burst: a tenth of a second (a region may go into debt).
+auto copy_depth(double rate) noexcept -> double {
+    return rate / 10.0;
+}
+
 auto crc_bytes(std::span<const std::uint32_t> crcs) -> std::vector<std::byte> {
     std::vector<std::byte> out;
     out.reserve(crcs.size() * proto::hold_block_crc_size);
@@ -87,7 +93,11 @@ auto to_string(ConfigError e) noexcept -> const char* {
 }
 
 HoldServer::HoldServer(store::FileLayer& files, ServerConfig config, SessionSink& sink)
-    : _files{&files}, _config{std::move(config)}, _sink{&sink} {}
+    : _files{&files},
+      _config{std::move(config)},
+      _sink{&sink},
+      _copy_budget{_config.copy_bytes_per_s, copy_depth(_config.copy_bytes_per_s),
+                   Clock::time_point{}} {}
 
 // ---- volumes ---------------------------------------------------------------
 
@@ -167,6 +177,12 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
         next.reconcile = std::move(old.reconcile);
         next.lease_asked = old.lease_asked;
         next.lease_until = old.lease_until;
+        next.dirty = std::move(old.dirty);
+        next.copy_budget = old.copy_budget;
+        next.synced = old.synced;
+    } else {
+        next.copy_budget = TokenBucket{_config.copy_volume_bytes_per_s,
+                                       copy_depth(_config.copy_volume_bytes_per_s), now};
     }
     next.heard = now;  // a new epoch: the primary gets primary_timeout to speak
     next.config = c;
@@ -180,6 +196,7 @@ auto HoldServer::apply_config(const proto::ReplicaConfig& c, Clock::time_point n
             old.replicating = std::move(next.replicating);
             old.repairs = std::move(next.repairs);
             old.reconcile = std::move(next.reconcile);
+            old.dirty = std::move(next.dirty);
         }
     };
     if (const auto* me = find_member(c, _config.server_id); me != nullptr) {
@@ -538,7 +555,22 @@ auto HoldServer::on_frame(SessionId id, const proto::HoldFrame& f, Clock::time_p
             r.commit_seq = w->commit_seq;
             break;
         }
-        default:  // write_zeroes, discard and the replication opcodes come later
+        case HoldOpcode::sync_data: {  // from a peer: the primary copying to a joining member
+            const auto* d = std::get_if<proto::SyncData>(&f.payload);
+            if (initiator || d == nullptr || d->data.block_size != v.config.block_size) {
+                respond(id, h, HoldStatus::bad_request);
+                return;
+            }
+            // As the primary holds them: a bad block stays bad, and a read
+            // here finds and repairs it.
+            r.data.assign(d->data.data.begin(), d->data.data.end());
+            r.crcs.resize(h.blocks);
+            for (std::size_t i = 0; i < h.blocks; ++i) {
+                r.crcs[i] = proto::block_crc(d->data, i);
+            }
+            break;
+        }
+        default:  // write_zeroes, discard and hydrate_fill come later
             respond(id, h, HoldStatus::bad_request);
             return;
     }
@@ -577,8 +609,11 @@ auto HoldServer::run(Clock::time_point now) -> void {
             progress += serve(*v, _config.quantum, now);
         }
         if (progress == 0) {
-            return;
+            break;
         }
+    }
+    for (auto* v : order) {
+        pump_copies(*v, now);  // what tenant requests leave
     }
 }
 
@@ -641,7 +676,8 @@ auto HoldServer::serve(Volume& v, std::size_t budget, Clock::time_point now) -> 
         }
         // The primary already shaped what it replicates, and its own
         // reconcile writes are not the guest's.
-        if (bytes != 0 && !repl && r.session != 0 && !v.limiter.admit(bytes, now)) {
+        if (bytes != 0 && !repl && r.session != 0 && r.header.opcode != HoldOpcode::sync_data &&
+            !v.limiter.admit(bytes, now)) {
             break;
         }
         Request taken = std::move(r);
@@ -673,6 +709,11 @@ auto HoldServer::commit(Volume& v, std::vector<Request>& batch) -> void {
     if (auto res = v.store->write(writes); res) {
         ++_stats.batches;
         _stats.writes += batch.size();
+        for (auto& [key, d] : v.dirty) {  // members away: what they now lack
+            for (const auto& r : batch) {
+                mark_regions(v, d.chunks, r.header.lba, r.header.blocks);
+            }
+        }
         if (!v.links.empty()) {
             // Answered once every member holds them (advance).
             const std::uint64_t first = seq - batch.size() + 1;
@@ -753,6 +794,16 @@ auto HoldServer::execute(Volume& v, Request& r) -> void {
             }
             respond(r.session, r.header, HoldStatus::ok);
             return;
+        case HoldOpcode::sync_data:
+            if (auto c = v.store->copy(r.header.lba, r.data, r.crcs); !c) {
+                fail(c.error());
+                return;
+            }
+            if ((r.header.flags & proto::hold_flags::last) != 0) {
+                v.synced = r.session;
+            }
+            respond(r.session, r.header, HoldStatus::ok);
+            return;
         default:
             respond(r.session, r.header, HoldStatus::bad_request);
             return;
@@ -783,6 +834,11 @@ auto HoldServer::next_wake(Clock::time_point now) const -> std::optional<Clock::
         if (const auto* p = proto::primary_member(v.config);
             p != nullptr && v.store && p->server_id != _config.server_id && !v.primary_reported) {
             at(std::max(now, v.heard + _config.primary_timeout));
+        }
+        if (v.queue.empty() && !v.reconcile && is_primary(v) &&
+            std::ranges::any_of(v.links,
+                                [&](const auto& kv) { return copy_ready(v, kv.second); })) {
+            at(now + std::max(_copy_budget.wait(), v.copy_budget.wait()));
         }
     }
     if (_next_status) {
@@ -821,19 +877,30 @@ auto HoldServer::sync_links(Volume& v, Clock::time_point now) -> void {
         const auto* m = find_member(c, it->first);
         if (m == nullptr || m->replica_gen != it->second.member.replica_gen ||
             m->endpoint != it->second.member.endpoint || m->port != it->second.member.port) {
+            if (m == nullptr) {
+                record_dirty(v, it->second, now);  // removed: it may come back
+            }
             drop_link(v, it->second, now);
             it = v.links.erase(it);
         } else {
             it->second.member.role = m->role;
+            if (m->role != proto::ReplicaRole::joining) {
+                it->second.copy.reset();  // in sync now
+            }
             ++it;
         }
     }
+    const std::chrono::seconds window{c.resync_window_s};
+    std::erase_if(v.dirty, [&](const auto& kv) { return now - kv.second.since > window; });
     for (const auto& m : c.members) {
         if (m.server_id == _config.server_id) {
             continue;
         }
-        auto [it, added] = v.links.try_emplace(m.server_id, Link{.member = m});
+        auto [it, added] = v.links.try_emplace(m.server_id);
         Link& l = it->second;
+        if (added) {
+            l.member = m;
+        }
         if (l.state == Link::State::open && now >= l.next_ping) {
             l.next_ping = now + _config.ping_interval;
             proto::HoldHeader h;
@@ -939,7 +1006,21 @@ auto HoldServer::on_link_frame(Session& s, SessionId id, const proto::HoldFrame&
             if (const auto* ok_ = std::get_if<proto::HoldHelloOk>(&f.payload)) {
                 l.commit_seen = ok_->commit_seq;
             }
-            if (v.reconcile && !l.intents_answered) {
+            if (l.member.role == proto::ReplicaRole::joining) {
+                // A copy starts, or goes on from what the member has not
+                // acknowledged, with the marker sent again on this session.
+                if (!l.copy) {
+                    l.copy = Copy{};
+                }
+                auto& c = *l.copy;
+                for (const auto& [rid, region] : c.sent) {
+                    c.todo.insert(region);
+                }
+                c.sent.clear();
+                c.marker = 0;
+                c.finished = false;
+            }
+            if ((v.reconcile && !l.intents_answered) || (l.copy && !l.copy->planned)) {
                 ask_intents(v, l);
             }
             for (const auto& w : v.replicating) {
@@ -962,9 +1043,17 @@ auto HoldServer::on_link_frame(Session& s, SessionId id, const proto::HoldFrame&
             return;
         case HoldOpcode::intents: {
             const auto* in = std::get_if<proto::HoldIntents>(&f.payload);
-            if (!ok || in == nullptr || !v.reconcile || l.intents_answered ||
+            const bool for_reconcile = v.reconcile && !l.intents_answered;
+            const bool for_copy = l.copy && !l.copy->planned;
+            if (!ok || in == nullptr || (!for_reconcile && !for_copy) ||
                 f.header.request_id != l.intents_asked) {
                 drop_link(v, l, now);  // asked again on the next session
+                return;
+            }
+            if (for_copy) {
+                plan_copy(v, l, *in);
+            }
+            if (!for_reconcile) {
                 return;
             }
             l.intents_answered = true;
@@ -975,6 +1064,19 @@ auto HoldServer::on_link_frame(Session& s, SessionId id, const proto::HoldFrame&
                 rec.extents.push_back(i);
             }
             finish_reconcile(v);
+            return;
+        }
+        case HoldOpcode::sync_data: {
+            if (!ok || !l.copy || l.state != Link::State::open) {
+                drop_link(v, l, now);  // the rest goes on the next session
+                return;
+            }
+            auto& c = *l.copy;
+            if (c.marker != 0 && f.header.request_id == c.marker) {
+                c.finished = true;
+            } else {
+                c.sent.erase(f.header.request_id);
+            }
             return;
         }
         case HoldOpcode::read: {
@@ -1030,6 +1132,7 @@ auto HoldServer::abandon(Volume& v) -> void {
     }
     v.replicating.clear();
     v.reconcile.reset();
+    v.dirty.clear();  // another primary takes the writes from here
     v.lease_asked.reset();
     v.lease_until = {};
     for (auto& [id, rep] : v.repairs) {
@@ -1047,13 +1150,30 @@ auto HoldServer::abandon(Volume& v) -> void {
 }
 
 auto HoldServer::commit_replicas(Volume& v, std::vector<Request>& batch) -> void {
+    const auto* me = find_member(v.config, _config.server_id);
+    const bool joining = me != nullptr && me->role == proto::ReplicaRole::joining;
+    if (const auto sit = _sessions.find(batch.front().session);
+        joining && sit != _sessions.end() && !sit->second.replicated &&
+        batch.front().seq != v.store->last_seq() + 1) {
+        // A joining member takes up the stream where it is: what it held
+        // before is in the copy (its intents were asked first).
+        if (auto res = v.store->rebase(batch.front().seq - 1); !res) {
+            if (res.error() == store::StoreError::io) {
+                ++_stats.io_errors;
+                v.store.reset();
+            }
+            for (const auto& r : batch) {
+                respond(r.session, r.header, status_of(res.error()), proto::ReplAck{.seq = r.seq});
+            }
+            batch.clear();
+            return;
+        }
+    }
     std::uint64_t commit = 0;
     for (const auto& r : batch) {
         commit = std::max(commit, r.commit_seq);
     }
     v.store->set_commit(commit);
-    const auto* me = find_member(v.config, _config.server_id);
-    const bool joining = me != nullptr && me->role == proto::ReplicaRole::joining;
     std::vector<HoldStatus> status(batch.size(), HoldStatus::ok);
     std::vector<store::ReplicaStore::Write> writes;
     std::vector<std::size_t> written;
@@ -1078,7 +1198,7 @@ auto HoldServer::commit_replicas(Volume& v, std::vector<Request>& batch) -> void
         // reconnected resends from this replica's last acknowledgement.
         const auto sit = _sessions.find(r.session);
         const bool first = sit != _sessions.end() && !sit->second.replicated;
-        if (!joining && r.seq != last + 1 && !first) {
+        if (r.seq != last + 1 && !first) {
             status[i] = HoldStatus::bad_request;
             continue;
         }
@@ -1181,6 +1301,220 @@ auto HoldServer::finish_repair(Volume& v, Repair& rep, const proto::HoldFrame* f
     _stats.repaired += rep.bad.size();
     respond(rep.request.session, h, HoldStatus::ok,
             proto::BlockData{.block_size = bs, .crcs = d->crcs, .data = d->data});
+}
+
+// ---- resync and rebuild ----------------------------------------------------
+
+auto HoldServer::region_blocks(const Volume& v) const -> std::uint64_t {
+    const std::uint64_t bs = v.config.block_size;
+    const std::uint8_t shift = v.store ? v.store->meta().chunk_shift : _config.chunk_shift;
+    const std::uint64_t most =
+        std::min<std::uint64_t>(proto::max_hold_blocks, proto::max_hold_data_bytes / bs);
+    return std::clamp<std::uint64_t>((std::uint64_t{1} << shift) / bs, 1, most);
+}
+
+auto HoldServer::mark_regions(const Volume& v, std::set<std::uint64_t>& regions, std::uint64_t lba,
+                              std::uint64_t blocks) const -> void {
+    const std::uint64_t end = std::min(lba + blocks, v.config.capacity_blocks);
+    if (lba >= end) {
+        return;
+    }
+    const std::uint64_t rb = region_blocks(v);
+    for (std::uint64_t r = lba / rb; r <= (end - 1) / rb; ++r) {
+        regions.insert(r);
+    }
+}
+
+auto HoldServer::record_dirty(Volume& v, const Link& l, Clock::time_point now) -> void {
+    const std::pair key{l.member.server_id, l.member.replica_gen};
+    v.dirty.erase(key);
+    const auto regions = (v.config.capacity_blocks + region_blocks(v) - 1) / region_blocks(v);
+    const bool copied = l.member.role == proto::ReplicaRole::joining && l.copy && l.copy->planned &&
+                        (!l.copy->scan || *l.copy->scan >= regions);
+    if (!in_sync(l.member.role) && !copied) {
+        return;  // it holds nothing a partial copy could finish
+    }
+    Volume::Dirty d{.chunks = {}, .since = now};
+    for (const auto& w : v.replicating) {
+        if (w.seq > l.acked) {
+            mark_regions(v, d.chunks, w.request.header.lba, w.request.header.blocks);
+        }
+    }
+    if (l.copy) {
+        d.chunks.insert(l.copy->todo.begin(), l.copy->todo.end());
+        for (const auto& [rid, region] : l.copy->sent) {
+            d.chunks.insert(region);
+        }
+    }
+    v.dirty.emplace(key, std::move(d));
+}
+
+auto HoldServer::plan_copy(Volume& v, Link& l, const proto::HoldIntents& theirs) -> void {
+    auto& c = *l.copy;
+    c.planned = true;
+    const std::pair key{l.member.server_id, l.member.replica_gen};
+    const std::chrono::seconds window{v.config.resync_window_s};
+    const auto it = v.dirty.find(key);
+    const bool partial = it != v.dirty.end() && _now - it->second.since <= window;
+    if (partial) {
+        c.todo.insert(it->second.chunks.begin(), it->second.chunks.end());
+    } else {
+        c.scan = 0;  // every region ever written
+    }
+    v.dirty.erase(key);
+    for (const auto& i : theirs.entries) {
+        // Whatever it holds there, ours wins (a full copy finds them in
+        // its walk, written here or not).
+        mark_regions(v, partial ? c.todo : c.holes, i.lba, i.blocks);
+    }
+}
+
+auto HoldServer::copy_ready(const Volume& v, const Link& l) const -> bool {
+    if (l.state != Link::State::open || !l.copy || !l.copy->planned || l.copy->finished ||
+        l.copy->marker != 0) {
+        return false;
+    }
+    const auto& c = *l.copy;
+    const auto regions = (v.config.capacity_blocks + region_blocks(v) - 1) / region_blocks(v);
+    const bool more = !c.todo.empty() || (c.scan && *c.scan < regions);
+    return more ? c.sent.size() < _config.copy_window : c.sent.empty();
+}
+
+auto HoldServer::pump_copies(Volume& v, Clock::time_point now) -> void {
+    // Lowest priority: only what tenant requests leave (Requirement 7.4).
+    if (!is_primary(v) || v.reconcile || !v.queue.empty()) {
+        return;
+    }
+    _copy_budget.refill(now);
+    v.copy_budget.refill(now);
+    const std::uint64_t rb = region_blocks(v);
+    const std::uint64_t cap = v.config.capacity_blocks;
+    const std::uint64_t regions = (cap + rb - 1) / rb;
+    constexpr std::size_t max_scan = 4096;  // regions looked at per pass, so run() stays short
+    for (auto& [sid, l] : v.links) {
+        if (!copy_ready(v, l)) {
+            continue;
+        }
+        auto& c = *l.copy;
+        std::size_t scanned = 0;
+        while (c.sent.size() < _config.copy_window && _copy_budget.ready() &&
+               v.copy_budget.ready()) {
+            std::uint64_t region = 0;
+            if (!c.todo.empty()) {
+                region = *c.todo.begin();
+                c.todo.erase(c.todo.begin());
+            } else if (c.scan && *c.scan < regions && scanned++ < max_scan) {
+                region = (*c.scan)++;
+                auto w = v.store->written(region * rb, std::min(rb, cap - (region * rb)));
+                if (!w) {
+                    ++_stats.io_errors;
+                    v.store.reset();  // a failed replica is reopened by the next config
+                    return;
+                }
+                if (!*w && !c.holes.contains(region)) {
+                    continue;  // never written: a hole there too
+                }
+            } else {
+                break;
+            }
+            send_copy(v, l, region * rb, std::min(rb, cap - (region * rb)), false);
+            if (!v.store) {
+                return;
+            }
+        }
+        if (c.todo.empty() && (!c.scan || *c.scan >= regions) && c.sent.empty() &&
+            _copy_budget.ready() && v.copy_budget.ready()) {
+            // The marker: one block already copied, sent again with `last`.
+            if (send_copy(v, l, c.tail, 1, true) == 0) {
+                if (!v.store) {
+                    return;
+                }
+                // Block 0 awaits hydration and nothing was copied: wait for
+                // the next session (hydration reaches members later).
+                c.marker = std::numeric_limits<std::uint64_t>::max();
+            }
+        }
+    }
+}
+
+auto HoldServer::send_copy(Volume& v, Link& l, std::uint64_t lba, std::uint64_t blocks, bool last)
+    -> std::size_t {
+    const std::uint32_t bs = v.config.block_size;
+    auto& c = *l.copy;
+    const std::uint64_t region = lba / region_blocks(v);
+    const auto fail = [&](store::StoreError e) {
+        if (e == store::StoreError::io) {
+            ++_stats.io_errors;
+            v.store.reset();  // a failed replica is reopened by the next config
+        }
+    };
+    // Runs of blocks to send: the whole range, or on a volume restored
+    // from a source, the blocks of it no longer awaiting hydration.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs{{lba, blocks}};
+    std::vector<std::byte> data(blocks * bs);
+    std::vector<std::uint32_t> crcs(blocks);
+    // The stored checksums, bad blocks too: the member's reads repair them.
+    auto read = v.store->read(lba, data, crcs);
+    const bool partial = !read && read.error() == store::StoreError::not_hydrated;
+    if (partial) {
+        runs.clear();
+        for (std::uint64_t b = lba; b < lba + blocks; ++b) {
+            auto u = v.store->unhydrated(b);
+            if (!u) {
+                fail(u.error());
+                return 0;
+            }
+            if (*u) {
+                continue;
+            }
+            if (!runs.empty() && runs.back().first + runs.back().second == b) {
+                ++runs.back().second;
+            } else {
+                runs.emplace_back(b, 1);
+            }
+        }
+    } else if (!read) {
+        fail(read.error());
+        return 0;
+    }
+    std::size_t sent = 0;
+    for (const auto& [first, n] : runs) {
+        const auto bytes = std::span{data}.subspan((first - lba) * bs, n * bs);
+        const auto sums = std::span{crcs}.subspan(first - lba, n);
+        if (partial) {
+            if (auto r = v.store->read(first, bytes, sums); !r) {
+                fail(r.error());
+                return sent;
+            }
+        }
+        const bool marker = last && sent + 1 == runs.size();
+        proto::HoldHeader h;
+        h.opcode = HoldOpcode::sync_data;
+        h.flags = marker ? proto::hold_flags::last : std::uint16_t{0};
+        h.request_id = v.next_request++;
+        h.volume_id = v.config.volume_id;
+        h.epoch = v.config.epoch;
+        h.lba = first;
+        h.blocks = static_cast<std::uint32_t>(n);
+        const auto crc = crc_bytes(sums);
+        send_link(
+            v, l,
+            {.header = h,
+             .payload = proto::SyncData{.seq = v.store->last_seq(),
+                                        .data = {.block_size = bs, .crcs = crc, .data = bytes}}});
+        if (marker) {
+            c.marker = h.request_id;
+        } else {
+            c.sent.emplace(h.request_id, region);
+            c.tail = first;
+        }
+        const auto cost = static_cast<double>(n * bs);
+        _copy_budget.take(cost);
+        v.copy_budget.take(cost);
+        ++_stats.copied;
+        ++sent;
+    }
+    return sent;
 }
 
 // ---- failover --------------------------------------------------------------
@@ -1342,8 +1676,9 @@ auto HoldServer::take_reports(Clock::time_point now) -> std::vector<proto::Repor
                     ? std::chrono::duration_cast<std::chrono::milliseconds>(v.lease_until - now)
                     : std::chrono::milliseconds{0};
             proto::ReplicaState state = proto::ReplicaState::in_sync;
-            if (me->role == proto::ReplicaRole::joining) {
-                state = proto::ReplicaState::joining;
+            if (me->role == proto::ReplicaRole::joining &&
+                (v.synced == 0 || !_sessions.contains(v.synced))) {
+                state = proto::ReplicaState::joining;  // the copy is not complete
             }
             status.entries.push_back(
                 {.volume_id = id,

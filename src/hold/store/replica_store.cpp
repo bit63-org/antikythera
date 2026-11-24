@@ -552,6 +552,51 @@ auto ReplicaStore::repair(std::uint64_t lba, std::span<const std::byte> block, s
     return sync_meta();
 }
 
+auto ReplicaStore::copy(std::uint64_t lba, std::span<const std::byte> data,
+                        std::span<const std::uint32_t> crcs) -> std::expected<void, StoreError> {
+    const std::uint32_t bs = _meta.block_size;
+    if (!check_range(lba, data.size()) || crcs.size() != data.size() / bs) {
+        return std::unexpected(StoreError::bad_request);
+    }
+    if (!_data->pwrite(lba * bs, data) || !_data->sync()) {
+        return std::unexpected(StoreError::io);
+    }
+    if (auto r = write_checksums(lba, crcs); !r) {
+        return r;
+    }
+    if (auto r = mark_written(lba, crcs.size()); !r) {
+        return r;
+    }
+    return sync_meta();
+}
+
+auto ReplicaStore::written(std::uint64_t lba, std::uint64_t blocks)
+    -> std::expected<bool, StoreError> {
+    if (blocks == 0 || lba >= _meta.capacity_blocks || blocks > _meta.capacity_blocks - lba) {
+        return std::unexpected(StoreError::bad_request);
+    }
+    std::vector<std::byte> stored(blocks * crc_size);
+    if (!_meta_file->pread(_layout.checksums + (lba * crc_size), stored)) {
+        return std::unexpected(StoreError::io);
+    }
+    return !all_zero(stored);
+}
+
+auto ReplicaStore::rebase(std::uint64_t seq) -> std::expected<void, StoreError> {
+    const std::vector<std::byte> empty(intent_ring_entries * intent_entry_size);
+    if (!_meta_file->pwrite(_layout.intents, empty)) {
+        return std::unexpected(StoreError::io);
+    }
+    if (auto r = sync_meta(); !r) {
+        return r;
+    }
+    std::ranges::fill(_ring, Intent{});
+    _last_seq = seq;
+    _commit_seq = seq;
+    _meta_synced_seq = seq;
+    return {};
+}
+
 auto ReplicaStore::unhydrated(std::uint64_t lba) -> std::expected<bool, StoreError> {
     if (lba >= _meta.capacity_blocks) {
         return std::unexpected(StoreError::bad_request);

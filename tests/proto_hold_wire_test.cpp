@@ -130,6 +130,8 @@ auto every_frame() -> std::vector<proto::HoldFrame> {
     redirect.status = HoldStatus::not_primary;
     auto hydrate = header(HoldOpcode::write, 3);
     hydrate.flags = proto::hold_flags::hydrate;
+    auto last_copy = peer_header(HoldOpcode::sync_data, 3);
+    last_copy.flags = proto::hold_flags::last;
     return {
         F{header(HoldOpcode::hello), proto::HoldHello{.role = proto::HoldPeerRole::initiator}},
         F{peer_header(HoldOpcode::hello),
@@ -160,6 +162,7 @@ auto every_frame() -> std::vector<proto::HoldFrame> {
                                          {.seq = 12, .lba = 64, .blocks = 8}}}},
         F{peer_header(HoldOpcode::intents, 0, true), proto::HoldIntents{}},
         F{peer_header(HoldOpcode::sync_data, 3), proto::SyncData{.seq = 13, .data = four_k.view()}},
+        F{last_copy, proto::SyncData{.seq = 14, .data = four_k.view()}},
         F{peer_header(HoldOpcode::sync_data, 3, true), std::monostate{}},
         F{peer_header(HoldOpcode::hydrate_fill, 3), four_k.view()},
         F{header(HoldOpcode::ping), proto::HoldPing{.commit_seq = 10}},
@@ -288,7 +291,7 @@ BOOST_AUTO_TEST_CASE(header_rules_in_decode) {
     };
     BOOST_TEST((refused([](auto& b) { b[5] = std::byte{0}; }) == DecodeError::unknown_value));
     BOOST_TEST((refused([](auto& b) { b[5] = std::byte{15}; }) == DecodeError::unknown_value));
-    BOOST_TEST((refused([](auto& b) { set_at<std::uint16_t>(b, off_flags, 4); }) ==
+    BOOST_TEST((refused([](auto& b) { set_at<std::uint16_t>(b, off_flags, 8); }) ==
                 DecodeError::reserved_not_zero));
     BOOST_TEST((refused([](auto& b) { b[off_reserved] = std::byte{1}; }) ==
                 DecodeError::reserved_not_zero));
@@ -345,6 +348,7 @@ BOOST_AUTO_TEST_CASE(header_rules_in_encode) {
              x.opcode = HoldOpcode::write;
          }),
          DecodeError::bad_hold_direction},
+        {h([](auto& x) { x.flags = proto::hold_flags::last; }), DecodeError::bad_hold_direction},
         {h([](auto& x) { x.opcode = HoldOpcode::ping; }), DecodeError::bad_block_range},
     };
     for (const auto& c : cases) {

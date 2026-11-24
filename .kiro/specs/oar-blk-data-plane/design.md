@@ -105,7 +105,8 @@ so all the new code sits behind the backend seam.
   `drop_key`, role exit) crypto-erases the overlay.
 - **K_img**, only for encrypted images: the image's AES-256-XTS key,
   held wrapped by helm like a volume key and delivered alongside K_eph.
-  Public images are stored in plaintext and have none.
+  Public images are stored in plaintext and have none. See "Encrypted
+  images" below for how it reaches helm.
 
 The function expects every block the backend returns to be ciphertext
 under K_eph. The backend therefore re-encrypts the blocks it takes from
@@ -266,7 +267,8 @@ On the storage role (task 13, role side):
 - **Prepare.** `prepare_function` reads the header. For an image volume it
   fetches `<prefix>/<name>/manifest` from the configured store (10 s
   deadline) and checks it against the name. It refuses an encrypted image
-  until task 15. It then opens the image in the shared `ChunkCache` and
+  whose volume holds no wrapped key, and a plain image whose volume holds
+  one (task 15). It then opens the image in the shared `ChunkCache` and
   serves a `LazyImageBackend` with a fresh overlay. The capacity must hold
   the image.
 - **Keys.** `deliver_key` gives the key to the function and to the
@@ -278,8 +280,10 @@ On the storage role (task 13, role side):
   `image_store_config.hpp`), `--image-cache DIR` and
   `--image-cache-bytes N`. `create_volume` naming a store the role does
   not have answers `unsupported`.
-- **Rewrap.** `rewrap_volume` of an image volume fails: there is no key to
-  rewrap until task 15.
+- **Rewrap.** `rewrap_volume` of an encrypted image volume rewrites its
+  owner and wrapped K_img in the header
+  (`FileBackend::rewrap_image_volume`); of a plain image volume it fails:
+  there is no key to rewrap.
 
 On the helm side:
 
@@ -298,12 +302,71 @@ On the helm side:
   source; never wrapped or kept) and delivers it as it would an
   unwrapped volume key. Detach and cleaning drop it, which discards the
   overlay; the next attachment sees the image as published.
-- **Lifecycle.** DELETE_VOLUME of an image volume destroys no key.
-  REWRAP_VOLUME answers `unsupported` until task 15. DESTROY_VM deletes
+- **Lifecycle.** DELETE_VOLUME of a plain image volume destroys no key.
+  REWRAP_VOLUME of one answers `unsupported`. DESTROY_VM deletes
   the VM's image volumes unless asked to persist them: there is nothing
   in them worth keeping, but a persisted one can be attached again.
 - **Test controller.** `create-volume VOLUME OWNER_VM SIZE_GIB [STORE
   IMAGE_NAME]` sends the long shape, the name in hex.
+
+### Encrypted images (task 15)
+
+K_img belongs to the image, but helm holds it per image volume: each
+encrypted image volume has its own copy, wrapped by its owner's VM key
+exactly like a disk volume's key. The rest of the key hierarchy then
+applies unchanged: only the owner unwraps it, REWRAP_VOLUME moves it,
+DELETE_VOLUME and DESTROY_VM crypto-erase it, and the wrapped copy lives
+on the media in the volume header, where `import_volume_key` can reload
+it after a helm restart.
+
+- **Delivery to helm.** The controller (kythira KMS in production) seals
+  K_img to the helm secure element's X25519 transport key in an
+  `ImageKey` frame (`src/proto/image_key.hpp`, controller-link record
+  `image_key`, type 13), just ahead of the CREATE_VOLUME:
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0x00 | 4 | magic `AKIK` |
+  | 0x04 | 2 | version (1) |
+  | 0x06 | 2 | zero |
+  | 0x08 | 8 | server ID (non-zero) |
+  | 0x10 | 8 | volume ID (non-zero) |
+  | 0x18 | 8 | owner VM (non-zero) |
+  | 0x20 | 32 | HPKE encapsulated key |
+  | 0x40 | 80 | K_img under AES-256-GCM, with its tag |
+
+  HPKE as for a network volume's VolumeKey, with its own info
+  (`antikythera image key v1`), so neither frame passes for the other. The
+  AAD is the 32-byte header: the key opens only for the server, volume and
+  owner it was sealed for. It never travels on the mailbox, the host or a
+  storage role's sideband in any form helm did not wrap.
+- **Kept until CREATE_VOLUME.** helm opens the frame once in the secure
+  element to refuse a bad one (`KeyStore::put_image_key`) and keeps it,
+  still sealed, under the volume ID; a newer frame replaces it, and at most
+  4096 are kept. When CREATE_VOLUME with an image source arrives for that
+  volume, the router has the secure element re-wrap K_img under the
+  owner's VM key (`SecureElement::import_image_key`; the plaintext never
+  leaves it), after checking the frame names the same owner (otherwise the
+  command is a `conflict`, so the host cannot have K_img wrapped to another
+  VM). The result is the volume's KeyStore entry, relayed in
+  `create_volume`'s wrapped key field. A failed CREATE_VOLUME destroys it
+  with the rest of its undo; the controller resends the frame to retry.
+  Without a frame the volume is created as a plain image volume.
+- **Attach.** At ATTACH_VOLUME's commit helm draws K_eph as before and,
+  for an encrypted image volume, unwraps K_img for the owner; both go in
+  one `deliver_key` (a 144-byte body: K_eph, then K_img). A role that
+  predates this refuses the longer body as the wrong size, so it fails
+  closed. Either key failing is a failed delivery (`device_lost`).
+- **Role.** `deliver_key` hands K_eph to the function and both keys to
+  the `LazyImageBackend` (`load_keys`), which refuses a K_img for a plain
+  image and its absence for an encrypted one, and drops both together.
+  An image key for a disk volume is refused before the function gets the
+  key.
+
+Not checked: that K_img is the key the manifest's image key ID names.
+The manifest's chunk digests are over ciphertext, so the wrong key reads
+as garbage rather than failing. The controller chooses both the image and
+its key, so it is trusted for the pairing, as it is for the image name.
 
 Open: how a storage board reaches the object store (through an oar-net
 function, or its own uplink); on harbor the oar-blk process uses L1's

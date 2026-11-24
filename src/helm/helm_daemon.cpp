@@ -59,12 +59,13 @@ auto HelmDaemon::SlotPort::clean_function(const oar::CleanFunction& request)
     return _slot->link->clean_function(request);
 }
 
-auto HelmDaemon::SlotPort::deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key)
+auto HelmDaemon::SlotPort::deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key,
+                                       std::optional<ScopedKey> image_key)
     -> std::expected<void, LinkError> {
     if (!_slot->link) {
-        return disconnected();  // `key` is wiped as it goes out of scope
+        return disconnected();  // the keys are wiped as they go out of scope
     }
-    return _slot->link->deliver_key(fn, volume, std::move(key));
+    return _slot->link->deliver_key(fn, volume, std::move(key), std::move(image_key));
 }
 
 auto HelmDaemon::SlotPort::drop_key(const oar::DropKey& request) -> std::expected<void, LinkError> {
@@ -255,6 +256,11 @@ auto HelmDaemon::on_tunnel_peers(const proto::TunnelPeers& peers, std::span<cons
     enqueue(PeersFrame{.peers = peers, .frame = {frame.begin(), frame.end()}});
 }
 
+auto HelmDaemon::on_image_key(const proto::ImageKey& /*key*/, std::span<const std::byte> frame)
+    -> void {
+    enqueue(ImageKeyFrame{.frame = {frame.begin(), frame.end()}});
+}
+
 auto HelmDaemon::post_host_slot(const mailbox::Slot& slot) -> void {
     enqueue(slot);
 }
@@ -309,6 +315,12 @@ auto HelmDaemon::handle(Item& item) -> void {
         const auto kept = _keys->put_attachment_key(key->frame);
         const std::scoped_lock lock{_inbox_mutex};
         ++(kept ? _stats.volume_keys : _stats.volume_keys_refused);
+    } else if (const auto* image = std::get_if<ImageKeyFrame>(&item)) {
+        // Opened in the secure element and kept wrapped until the
+        // CREATE_VOLUME of the image volume it names (KeyStore).
+        const auto kept = _keys->put_image_key(image->frame);
+        const std::scoped_lock lock{_inbox_mutex};
+        ++(kept ? _stats.image_keys : _stats.image_keys_refused);
     } else if (const auto* cert = std::get_if<proto::RoleCertificate>(&item)) {
         deliver_certificate(*cert);
     } else if (const auto* peers = std::get_if<PeersFrame>(&item)) {

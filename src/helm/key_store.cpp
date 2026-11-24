@@ -86,6 +86,10 @@ auto KeyStore::destroy_vm_key(VmId vm) -> std::expected<std::vector<VolumeId>, K
         _volume_keys.erase(volume);
     }
     _vm_keys.erase(it);
+    std::erase_if(_image_keys, [vm](const auto& entry) {
+        const auto k = proto::decode_image_key(entry.second);
+        return !k || k->owner_vm == vm;
+    });
     return erased;
 }
 
@@ -203,6 +207,70 @@ auto KeyStore::attachment_key(AttachmentId attachment) const -> std::optional<pr
 
 auto KeyStore::drop_attachment_key(AttachmentId attachment) -> void {
     _attachment_keys.erase(attachment);
+}
+
+auto KeyStore::put_image_key(std::span<const std::byte> frame) -> std::expected<void, KeyError> {
+    const auto k = proto::decode_image_key(frame);
+    if (!k) {
+        return std::unexpected(KeyError::corrupt_key);
+    }
+    if (!_image_keys.contains(k->volume_id) && _image_keys.size() >= max_image_keys) {
+        return std::unexpected(KeyError::too_many_keys);
+    }
+    if (auto ok = _se->check_image_key(proto::image_key_aad(frame), k->hpke_enc, k->wrapped_key);
+        !ok) {
+        return std::unexpected(from_se(ok.error()));
+    }
+    _image_keys[k->volume_id] = {frame.begin(), frame.end()};
+    return {};
+}
+
+auto KeyStore::image_key(VolumeId volume) const -> std::optional<proto::ImageKey> {
+    const auto it = _image_keys.find(volume);
+    if (it == _image_keys.end()) {
+        return std::nullopt;
+    }
+    auto k = proto::decode_image_key(it->second);
+    if (!k) {
+        return std::nullopt;
+    }
+    return *k;
+}
+
+auto KeyStore::import_image_key(VolumeId volume, VmId owner) -> std::expected<void, KeyError> {
+    if (volume == 0 || owner == 0) {
+        return std::unexpected(KeyError::invalid_id);
+    }
+    const auto it = _image_keys.find(volume);
+    if (it == _image_keys.end()) {
+        return std::unexpected(KeyError::unknown_volume);
+    }
+    const auto k = proto::decode_image_key(it->second);
+    if (!k) {
+        return std::unexpected(KeyError::corrupt_key);
+    }
+    if (k->owner_vm != owner) {
+        return std::unexpected(KeyError::wrong_vm);
+    }
+    if (_volume_keys.contains(volume)) {
+        return std::unexpected(KeyError::duplicate_volume);
+    }
+    const auto vm = _vm_keys.find(owner);
+    if (vm == _vm_keys.end()) {
+        return std::unexpected(KeyError::unknown_vm);
+    }
+    auto key = _se->import_image_key(vm->second, volume, proto::image_key_aad(it->second),
+                                     k->hpke_enc, k->wrapped_key);
+    if (!key) {
+        return std::unexpected(from_se(key.error()));
+    }
+    _volume_keys.emplace(volume, std::move(*key));
+    _image_keys.erase(it);
+    return {};
+}
+
+auto KeyStore::drop_image_key(VolumeId volume) -> void {
+    _image_keys.erase(volume);
 }
 
 auto KeyStore::rewrap(VolumeId volume, VmId new_owner) -> std::expected<void, KeyError> {

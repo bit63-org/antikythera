@@ -27,8 +27,8 @@
 // naming the image (object store ID and image name) instead of holding
 // ciphertext. Its data is the image under a throwaway overlay, served by
 // LazyImageBackend; the file is exactly metadata_block_size bytes. A plain
-// image's volume has no wrapped key; an encrypted image's will hold the
-// image key wrapped by helm (task 15).
+// image's volume has no wrapped key; an encrypted image's holds the image
+// key wrapped by helm (task 15).
 //
 // Deleting a volume (Requirement 3.3) is crypto-erase plus release: helm
 // destroys its copy of the wrapped key, and erase() overwrites the header
@@ -138,6 +138,14 @@ public:
     // it) without opening the volume.
     [[nodiscard]] static auto read_metadata(const std::filesystem::path& path)
         -> std::expected<VolumeMetadata, FileFailure>;
+    // REWRAP_VOLUME of an encrypted image volume (task 15): its new owner
+    // and the image key helm re-wrapped for it, written as rewrap() does.
+    // A plain image volume (no key, so nothing to rewrap) and a disk volume
+    // (use rewrap()) are refused as bad_metadata.
+    [[nodiscard]] static auto rewrap_image_volume(const std::filesystem::path& path,
+                                                  std::uint64_t owner_vm,
+                                                  std::span<const std::byte> wrapped_key)
+        -> std::expected<void, FileFailure>;
     // Crypto-erase and release: overwrites the header, syncs, unlinks.
     // The volume must not be open.
     [[nodiscard]] static auto erase(const std::filesystem::path& path)

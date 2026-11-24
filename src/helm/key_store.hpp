@@ -28,6 +28,19 @@
 // the plaintext exists only on its way to OarLink. A newer generation of
 // the attachment replaces the older; drop_attachment_key() forgets it at
 // detach. At most max_attachment_keys are kept.
+//
+// Encrypted images (.kiro/specs/oar-blk-data-plane/ task 15): the
+// controller sends K_img as an ImageKey frame for the image volume a
+// CREATE_VOLUME is about to create. put_image_key() opens it once to
+// refuse a bad one and keeps the frame, still wrapped to the transport
+// key, under the volume ID. import_image_key() then (at that CREATE_VOLUME)
+// re-wraps it in the secure element under the owner's VM key, after
+// checking the frame names the same owner, and keeps the result as the
+// volume's ordinary volume key: unwrap, rewrap, destroy and import all
+// treat it as one. The frame is forgotten once imported, or by
+// drop_image_key(); a newer frame for the volume replaces an older one,
+// and destroy_vm_key() drops the frames naming that VM. At most
+// max_image_keys frames are kept.
 
 #include <cstdint>
 #include <expected>
@@ -36,6 +49,7 @@
 #include <vector>
 
 #include "helm/secure_element.hpp"
+#include "proto/image_key.hpp"
 #include "proto/volume_key.hpp"
 
 namespace ak::helm {
@@ -58,6 +72,7 @@ enum class KeyError : std::uint8_t {
 };
 
 inline constexpr std::size_t max_attachment_keys = 4096;
+inline constexpr std::size_t max_image_keys = 4096;
 
 using AttachmentId = std::uint64_t;
 
@@ -95,6 +110,20 @@ public:
         return _attachment_keys.size();
     }
 
+    // Encrypted images' keys, per volume until its CREATE_VOLUME (see
+    // above). `frame` is the encoded ImageKey the controller sent.
+    auto put_image_key(std::span<const std::byte> frame) -> std::expected<void, KeyError>;
+    // The kept frame's header (volume and owner), without opening it.
+    [[nodiscard]] auto image_key(VolumeId volume) const -> std::optional<proto::ImageKey>;
+    // Re-wraps the volume's kept image key under `owner`'s VM key as the
+    // volume's key and forgets the frame. unknown_volume without a frame,
+    // wrong_vm if the frame names another owner.
+    auto import_image_key(VolumeId volume, VmId owner) -> std::expected<void, KeyError>;
+    auto drop_image_key(VolumeId volume) -> void;
+    [[nodiscard]] auto image_key_count() const noexcept -> std::size_t {
+        return _image_keys.size();
+    }
+
     // Reload persisted wrapped keys. A volume key's owner must already be
     // known.
     auto import_vm_key(WrappedVmKey key) -> std::expected<void, KeyError>;
@@ -112,6 +141,7 @@ private:
     std::map<VmId, WrappedVmKey> _vm_keys;
     std::map<VolumeId, WrappedVolumeKey> _volume_keys;
     std::map<AttachmentId, std::vector<std::byte>> _attachment_keys;  // VolumeKey frames
+    std::map<VolumeId, std::vector<std::byte>> _image_keys;           // ImageKey frames
 };
 
 }  // namespace ak::helm

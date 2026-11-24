@@ -29,6 +29,7 @@
 #include "helm/scoped_key.hpp"
 #include "helm/secure_element.hpp"
 #include "helm/volume_key_seal.hpp"
+#include "proto/image_key.hpp"
 #include "proto/volume_key.hpp"
 #include "test_support.hpp"
 
@@ -147,6 +148,19 @@ auto wrap_for(const ak::helm::hpke::PublicKey& recipient, std::span<const std::b
                                             .hpke_enc = {},
                                             .wrapped_key = {}},
                                            key.first<ak::proto::volume_data_key_size>());
+    BOOST_REQUIRE(frame.has_value());
+    return *frame;
+}
+
+// What the controller does for an encrypted image: wraps K_img to
+// `recipient` for one image volume and its owner.
+auto wrap_image_for(const ak::helm::hpke::PublicKey& recipient, std::span<const std::byte> key,
+                    VolumeId volume = vol_a, VmId owner = vm_one) -> std::vector<std::byte> {
+    BOOST_REQUIRE(key.size() == ak::proto::volume_data_key_size);
+    auto frame = ak::helm::seal_image_key(
+        recipient,
+        {.server_id = 3, .volume_id = volume, .owner_vm = owner, .hpke_enc = {}, .wrapped_key = {}},
+        key.first<ak::proto::volume_data_key_size>());
     BOOST_REQUIRE(frame.has_value());
     return *frame;
 }
@@ -645,6 +659,81 @@ BOOST_AUTO_TEST_CASE(keeps_network_volume_keys_per_attachment,
     store.drop_attachment_key(7);
     BOOST_TEST((store.open_attachment_key(7, 2).error() == KeyError::unknown_attachment));
     BOOST_TEST(store.attachment_key_count() == 0U);
+}
+
+// oar-blk task 15: K_img arrives wrapped to the transport key and becomes
+// the image volume's ordinary volume key at its CREATE_VOLUME.
+BOOST_AUTO_TEST_CASE(imports_image_keys_as_volume_keys,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Fixture f;
+    const auto pk = f.se.transport_public_key().value();
+    const std::vector<std::byte> k_img(ak::helm::volume_key_size, std::byte{0x5A});
+    BOOST_TEST((f.store.import_image_key(vol_a, vm_one).error() == KeyError::unknown_volume));
+
+    BOOST_REQUIRE(f.store.put_image_key(wrap_image_for(pk, k_img)).has_value());
+    BOOST_TEST(f.store.image_key(vol_a)->owner_vm == vm_one);
+    BOOST_TEST(f.store.image_key_count() == 1U);
+    BOOST_TEST(!f.store.owner(vol_a).has_value());  // not a volume key until imported
+
+    // Only for the owner the controller named.
+    BOOST_TEST((f.store.import_image_key(vol_a, vm_two).error() == KeyError::wrong_vm));
+    BOOST_REQUIRE(f.store.import_image_key(vol_a, vm_one).has_value());
+    BOOST_TEST(f.store.image_key_count() == 0U);
+    BOOST_TEST((f.store.owner(vol_a) == vm_one));
+    BOOST_TEST((key_of(f.store.unwrap_volume_key(vol_a, vm_one).value()) == k_img));
+    BOOST_TEST((f.store.unwrap_volume_key(vol_a, vm_two).error() == KeyError::wrong_vm));
+    // Wrapped like any volume key: never the plaintext.
+    const auto wrapped = f.store.find_volume_key(vol_a);
+    BOOST_REQUIRE(wrapped.has_value());
+    BOOST_TEST((wrapped->key.kind() == KeyKind::volume));
+    BOOST_TEST(std::ranges::search(wrapped->key.bytes(), k_img).empty());
+
+    // Rewrapped and destroyed like one too.
+    BOOST_REQUIRE(f.store.rewrap(vol_a, vm_two).has_value());
+    BOOST_TEST((key_of(f.store.unwrap_volume_key(vol_a, vm_two).value()) == k_img));
+    BOOST_REQUIRE(f.store.destroy_volume_key(vol_a).has_value());
+    BOOST_TEST((f.store.unwrap_volume_key(vol_a, vm_two).error() == KeyError::unknown_volume));
+
+    // A second frame for a volume that already has its key is refused at
+    // import; a frame for a volume the store already holds a key for
+    // cannot replace that key.
+    BOOST_REQUIRE(f.store.create_volume_key(vol_b, vm_one).has_value());
+    BOOST_REQUIRE(f.store.put_image_key(wrap_image_for(pk, k_img, vol_b)).has_value());
+    BOOST_TEST((f.store.import_image_key(vol_b, vm_one).error() == KeyError::duplicate_volume));
+    f.store.drop_image_key(vol_b);
+    BOOST_TEST(!f.store.image_key(vol_b).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(refuses_bad_image_keys, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Fixture f;
+    const auto pk = f.se.transport_public_key().value();
+    const std::vector<std::byte> k_img(ak::helm::volume_key_size, std::byte{0x5A});
+    // Wrapped to another secure element, or not a frame at all.
+    auto other = make_se();
+    BOOST_TEST((f.store.put_image_key(wrap_image_for(other.transport_public_key().value(), k_img))
+                    .error() == KeyError::corrupt_key));
+    BOOST_TEST(
+        (f.store.put_image_key(std::vector<std::byte>(10)).error() == KeyError::corrupt_key));
+    // A network VolumeKey frame is not an image key, even to the same SE.
+    BOOST_TEST((f.store.put_image_key(wrap_for(pk, k_img)).error() == KeyError::corrupt_key));
+    // A header changed after sealing (here the owner) no longer opens.
+    auto moved = wrap_image_for(pk, k_img);
+    moved.at(0x18) = std::byte{static_cast<unsigned char>(vm_two)};
+    BOOST_TEST((f.store.put_image_key(moved).error() == KeyError::corrupt_key));
+    BOOST_TEST(f.store.image_key_count() == 0U);
+
+    // A newer frame for the volume replaces the older.
+    BOOST_REQUIRE(f.store.put_image_key(wrap_image_for(pk, k_img, vol_a, vm_one)).has_value());
+    BOOST_REQUIRE(f.store.put_image_key(wrap_image_for(pk, k_img, vol_a, vm_two)).has_value());
+    BOOST_TEST(f.store.image_key_count() == 1U);
+    BOOST_TEST(f.store.image_key(vol_a)->owner_vm == vm_two);
+    // An owner that has no VM key yet.
+    BOOST_REQUIRE(f.store.put_image_key(wrap_image_for(pk, k_img, vol_b, missing_vm)).has_value());
+    BOOST_TEST((f.store.import_image_key(vol_b, missing_vm).error() == KeyError::unknown_vm));
+    // Destroying a VM drops the frames naming it.
+    BOOST_REQUIRE(f.store.destroy_vm_key(vm_two).has_value());
+    BOOST_TEST(!f.store.image_key(vol_a).has_value());
+    BOOST_TEST(f.store.image_key(vol_b).has_value());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

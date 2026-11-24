@@ -19,6 +19,7 @@
 
 #include "common/wire.hpp"
 #include "proto/replica_config.hpp"
+#include "proto/image_key.hpp"
 #include "proto/volume_key.hpp"
 #include "proto/volume_op.hpp"
 #include "test_support.hpp"
@@ -164,6 +165,14 @@ auto sample_key() -> proto::VolumeKey {
                        .generation = 2,
                        .hpke_enc = {},
                        .wrapped_key = {}};
+    k.hpke_enc.fill(std::byte{0x11});
+    k.wrapped_key.fill(std::byte{0x22});
+    return k;
+}
+
+auto sample_image_key() -> proto::ImageKey {
+    proto::ImageKey k{
+        .server_id = 7, .volume_id = 0x100, .owner_vm = 0xB2, .hpke_enc = {}, .wrapped_key = {}};
     k.hpke_enc.fill(std::byte{0x11});
     k.wrapped_key.fill(std::byte{0x22});
     return k;
@@ -608,6 +617,81 @@ BOOST_AUTO_TEST_CASE(strict_decode) {
     k = sample_key();
     k.server_id = 0;
     BOOST_TEST((proto::encode_volume_key(k).error() == DecodeError::bad_server_id));
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// oar-blk task 15: an encrypted image's key on its way to helm.
+BOOST_AUTO_TEST_SUITE(image_key, *boost::unit_test::timeout(unit_timeout_seconds))
+
+BOOST_AUTO_TEST_CASE(round_trips_and_lays_out) {
+    const auto k = sample_image_key();
+    auto b = proto::encode_image_key(k);
+    BOOST_REQUIRE(b.has_value());
+    BOOST_TEST(b->size() == proto::image_key_size);
+    BOOST_TEST(proto::image_key_size == 0x90U);
+    BOOST_TEST(std::to_integer<char>((*b)[0]) == 'A');
+    BOOST_TEST(std::to_integer<char>((*b)[2]) == 'I');
+    BOOST_TEST(std::to_integer<char>((*b)[3]) == 'K');
+    BOOST_TEST(le64_at(*b, 0x08) == 7U);
+    BOOST_TEST(le64_at(*b, 0x10) == 0x100U);
+    BOOST_TEST(le64_at(*b, 0x18) == 0xB2U);
+    BOOST_TEST(std::to_integer<int>((*b)[0x20]) == 0x11);
+    BOOST_TEST(std::to_integer<int>((*b)[0x40]) == 0x22);
+    BOOST_TEST(std::to_integer<int>((*b)[0x8F]) == 0x22);
+    BOOST_TEST(proto::image_key_aad(*b).size() == proto::image_key_aad_size);
+    auto back = proto::decode_image_key(*b);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST((*back == k));
+    // Not interchangeable with a VolumeKey: different magic, size and info.
+    BOOST_TEST(!proto::decode_volume_key(*b).has_value());
+    BOOST_TEST(proto::image_key_info != proto::volume_key_info);
+}
+
+BOOST_AUTO_TEST_CASE(strict_decode) {
+    const auto good = proto::encode_image_key(sample_image_key()).value();
+    const auto refused = [](std::span<const std::byte> b) {
+        auto k = proto::decode_image_key(b);
+        BOOST_REQUIRE(!k.has_value());
+        return k.error();
+    };
+    for (std::size_t n = 0; n < good.size(); ++n) {
+        BOOST_TEST((refused(std::span{good}.first(n)) == DecodeError::truncated));
+    }
+    auto b = good;
+    b.push_back(std::byte{0});
+    BOOST_TEST((refused(b) == DecodeError::trailing_bytes));
+    b = good;
+    b[2] = std::byte{'V'};
+    BOOST_TEST((refused(b) == DecodeError::bad_magic));
+    b = good;
+    b[4] = std::byte{0};
+    BOOST_TEST((refused(b) == DecodeError::bad_version));
+    for (const std::size_t off : {0x06U, 0x07U}) {
+        b = good;
+        b[off] = std::byte{1};
+        BOOST_TEST((refused(b) == DecodeError::reserved_not_zero), "offset " << off);
+    }
+    const std::pair<std::size_t, DecodeError> ids[] = {
+        {0x08, DecodeError::bad_server_id},
+        {0x10, DecodeError::bad_id},
+        {0x18, DecodeError::bad_id},
+    };
+    for (const auto& [off, want] : ids) {
+        b = good;
+        std::ranges::fill(std::span{b}.subspan(off, 8), std::byte{0});
+        BOOST_TEST((refused(b) == want), "offset " << off);
+    }
+    b = good;
+    std::ranges::fill(std::span{b}.subspan(0x20, proto::hpke_enc_size), std::byte{0});
+    BOOST_TEST((refused(b) == DecodeError::bad_id));
+
+    auto k = sample_image_key();
+    k.owner_vm = 0;
+    BOOST_TEST((proto::encode_image_key(k).error() == DecodeError::bad_id));
+    k = sample_image_key();
+    k.server_id = 0;
+    BOOST_TEST((proto::encode_image_key(k).error() == DecodeError::bad_server_id));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

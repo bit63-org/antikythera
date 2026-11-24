@@ -241,7 +241,9 @@ u16 | reserved u16 | payload`. Controller to helm: `envelope`, `map_update`, `gr
 `report_ack` (`server_id u64 | report_seq u64`, acknowledging every report
 up to that sequence), `tunnel_peers` (type 7, a TunnelPeers frame), and the
 block volume records `replica_config`, `volume_op`, `volume_key`, `lease_grant` and
-`role_certificate` (types 8 to 12, `.kiro/specs/block-volume-service/`). Helm to controller: `hello` (`server_id u64 | boot_id
+`role_certificate` (types 8 to 12, `.kiro/specs/block-volume-service/`), and
+`image_key` (type 13, an encrypted image's key for the image volume a
+CREATE_VOLUME is about to create, `.kiro/specs/oar-blk-data-plane/` task 15). Helm to controller: `hello` (`server_id u64 | boot_id
 u64`, the first record on every connection) and `report`. Report sequence
 numbers restart when helm reboots, so the controller keys them by the
 connection's boot ID and drops any `(boot_id, report_seq)` it has already

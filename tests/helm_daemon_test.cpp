@@ -935,6 +935,33 @@ BOOST_AUTO_TEST_CASE(a_degraded_net_role_degrades_the_inventory) {
     BOOST_TEST(r.count<proto::Inventory>() == inventories + 2);
 }
 
+// oar-blk task 15: an encrypted image's key waits in the KeyStore for its
+// CREATE_VOLUME.
+BOOST_AUTO_TEST_CASE(image_keys_are_opened_and_kept_per_volume) {
+    Rig r;
+    (void)r.daemon.boot();
+    const std::array<std::byte, proto::volume_data_key_size> k_img{std::byte{7}};
+    const proto::ImageKey header{.server_id = server,
+                                 .volume_id = 0x100,
+                                 .owner_vm = 0xB2,
+                                 .hpke_enc = {},
+                                 .wrapped_key = {}};
+    const auto frame = helm::seal_image_key(r.se.transport_public_key().value(), header, k_img);
+    BOOST_REQUIRE(frame.has_value());
+    r.daemon.on_image_key(proto::decode_image_key(*frame).value(), *frame);
+    auto other = make_se();
+    auto stray = header;
+    stray.volume_id = 0x101;
+    const auto bad = helm::seal_image_key(other.transport_public_key().value(), stray, k_img);
+    BOOST_REQUIRE(bad.has_value());
+    r.daemon.on_image_key(proto::decode_image_key(*bad).value(), *bad);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().image_keys == 1U);
+    BOOST_TEST(r.daemon.stats().image_keys_refused == 1U);
+    BOOST_TEST(r.keys.image_key(0x100).has_value());
+    BOOST_TEST(!r.keys.image_key(0x101).has_value());
+}
+
 BOOST_AUTO_TEST_CASE(an_unreachable_sideband_is_reported_and_retried) {
     Rig r;
     r.blk.refuse = true;

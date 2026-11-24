@@ -38,6 +38,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -104,8 +105,11 @@ public:
     auto function_inventory() -> std::expected<oar::Inventory, LinkError>;
     auto prepare_function(const oar::PrepareFunction& request) -> std::expected<void, LinkError>;
     auto clean_function(const oar::CleanFunction& request) -> std::expected<void, LinkError>;
-    // Consumes the key: it is wiped on return whatever the outcome.
-    auto deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key)
+    // Consumes the keys: they are wiped on return whatever the outcome.
+    // `image_key` is an encrypted image volume's K_img, sent in the same
+    // request as its ephemeral `key` (oar-blk task 15).
+    auto deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key,
+                     std::optional<ScopedKey> image_key = std::nullopt)
         -> std::expected<void, LinkError>;
     auto drop_key(const oar::DropKey& request) -> std::expected<void, LinkError>;
     // The storage role's volume store (oar-blk Requirement 3).

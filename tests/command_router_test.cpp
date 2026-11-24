@@ -117,6 +117,8 @@ struct FakeOar final : helm::OarPort {
     };
     std::vector<Stored> created;
     std::vector<std::vector<std::byte>> key_bytes;  // every key delivered, in order
+    // The image key delivered with each of those (empty: none).
+    std::vector<std::vector<std::byte>> image_key_bytes;
     std::vector<VolumeId> deleted;
     std::vector<Stored> rewrapped;
     std::optional<LinkError> prepare_error;
@@ -145,10 +147,13 @@ struct FakeOar final : helm::OarPort {
         }
         return {};
     }
-    auto deliver_key(oar::FunctionNumber fn, VolumeId volume, helm::ScopedKey key)
+    auto deliver_key(oar::FunctionNumber fn, VolumeId volume, helm::ScopedKey key,
+                     std::optional<helm::ScopedKey> image_key)
         -> std::expected<void, LinkError> override {
         keys.emplace_back(fn, volume);
         key_bytes.push_back(helm::ScopedKeyTestAccess::bytes(key));
+        image_key_bytes.push_back(image_key ? helm::ScopedKeyTestAccess::bytes(*image_key)
+                                            : std::vector<std::byte>{});
         if (deliver_error) {
             return std::unexpected(*deliver_error);
         }
@@ -662,7 +667,10 @@ BOOST_AUTO_TEST_CASE(image_volumes_get_a_fresh_key_per_attachment,
     BOOST_TEST(h.blk_role.key_bytes.at(0).size() == helm::volume_key_size);
     BOOST_TEST(h.host_faults().empty());
     BOOST_TEST(h.audit_text().find("ev=volume_key_delivered") != std::string::npos);
-    // Image volumes cannot be rewrapped yet, nor deleted while attached.
+    // A plain image has no key: no K_img goes with the ephemeral key.
+    BOOST_REQUIRE(h.blk_role.image_key_bytes.size() == 1U);
+    BOOST_TEST(h.blk_role.image_key_bytes.at(0).empty());
+    // A plain image volume cannot be rewrapped, nor deleted while attached.
     h.send(mb::RewrapVolume{.volume_id = vol_one, .from_vm = vm_one, .to_vm = vm_two});
     BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::unsupported));
     h.send(mb::DeleteVolume{.volume_id = vol_one});
@@ -709,6 +717,140 @@ BOOST_AUTO_TEST_CASE(destroy_vm_deletes_its_image_volumes_unless_persisted,
     BOOST_TEST((h.blk_role.deleted == std::vector<VolumeId>{vol_one}));
     BOOST_REQUIRE(h.router.inventory().volumes.size() == 1U);
     BOOST_TEST(h.router.inventory().volumes.at(0).volume_id == vol_two);
+}
+
+// oar-blk task 15: the controller's K_img becomes the volume's key, kept
+// wrapped on the media and delivered with each attachment's ephemeral key.
+auto image_key_frame(helm::SoftwareSecureElement& se, VolumeId volume, VmId owner,
+                     std::span<const std::byte, 64> key) -> std::vector<std::byte> {
+    auto f = helm::seal_image_key(
+        se.transport_public_key().value(),
+        {.server_id = 3, .volume_id = volume, .owner_vm = owner, .hpke_enc = {}, .wrapped_key = {}},
+        key);
+    BOOST_REQUIRE(f.has_value());
+    return *f;
+}
+
+BOOST_AUTO_TEST_CASE(encrypted_image_volumes_get_their_image_key_with_each_attachment,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    h.run(mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib});
+    h.run(mb::CreateVm{.vm_id = vm_two, .vcpus = vcpus, .memory_mib = memory_mib});
+    std::array<std::byte, helm::volume_key_size> k_img{};
+    k_img.fill(std::byte{0x5A});
+    const std::vector<std::byte> k_img_bytes{k_img.begin(), k_img.end()};
+
+    // K_img sent for another owner: the create is a conflict, and nothing
+    // reaches the role.
+    BOOST_REQUIRE(h.keys.put_image_key(image_key_frame(h.se, vol_one, vm_two, k_img)).has_value());
+    h.send(image_volume(vol_one, vm_one));
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::conflict));
+    BOOST_TEST(h.blk_role.created.empty());
+    BOOST_TEST(!h.keys.owner(vol_one).has_value());
+
+    BOOST_REQUIRE(h.keys.put_image_key(image_key_frame(h.se, vol_one, vm_one, k_img)).has_value());
+    h.run(image_volume(vol_one, vm_one));
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::ok));
+    BOOST_TEST((h.keys.owner(vol_one) == vm_one));
+    BOOST_TEST(h.keys.image_key_count() == 0U);
+    // The role keeps the wrapped K_img with the image source.
+    BOOST_REQUIRE(h.blk_role.created.size() == 1U);
+    const auto& stored = h.blk_role.created.at(0);
+    BOOST_TEST(stored.image_store == 2);
+    const auto wrapped = h.keys.find_volume_key(vol_one);
+    BOOST_REQUIRE(wrapped.has_value());
+    BOOST_TEST(std::ranges::equal(stored.wrapped_key, wrapped->key.bytes()));
+    BOOST_TEST(h.audit_text().find("ev=volume_key_created") != std::string::npos);
+
+    // Each attachment: a fresh ephemeral key, and K_img with it.
+    const mb::AttachVolume attach{.volume_id = vol_one, .vm_id = vm_one, .device = blk(fn_one)};
+    const mb::DetachVolume detach{.volume_id = vol_one,
+                                  .vm_id = vm_one,
+                                  .device = blk(fn_one),
+                                  .timeout_s = detach_timeout_s,
+                                  .policy = mb::DetachPolicy::force};
+    for (int i = 0; i < 2; ++i) {
+        h.run(attach);
+        h.run(detach);
+        h.router.on_host_slot(host_slot(mb::DeviceReleased{
+            .vm_id = vm_one, .device = blk(fn_one), .reset = mb::ResetResult::ok}));
+    }
+    BOOST_REQUIRE(h.blk_role.key_bytes.size() == 2U);
+    BOOST_REQUIRE(h.blk_role.image_key_bytes.size() == 2U);
+    BOOST_TEST((h.blk_role.key_bytes.at(0) != h.blk_role.key_bytes.at(1)));
+    BOOST_TEST((h.blk_role.key_bytes.at(0) != k_img_bytes));
+    BOOST_TEST((h.blk_role.image_key_bytes.at(0) == k_img_bytes));
+    BOOST_TEST((h.blk_role.image_key_bytes.at(1) == k_img_bytes));
+    BOOST_TEST(h.host_faults().empty());
+
+    // Rewrap moves K_img to the new owner, on the media too.
+    h.run(mb::RewrapVolume{.volume_id = vol_one, .from_vm = vm_one, .to_vm = vm_two});
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::ok));
+    BOOST_TEST((h.keys.owner(vol_one) == vm_two));
+    BOOST_REQUIRE(h.blk_role.rewrapped.size() == 1U);
+    BOOST_TEST(h.blk_role.rewrapped.at(0).owner == vm_two);
+    BOOST_TEST(std::ranges::equal(h.blk_role.rewrapped.at(0).wrapped_key,
+                                  h.keys.find_volume_key(vol_one)->key.bytes()));
+    BOOST_REQUIRE(h.router.inventory().volumes.size() == 1U);
+    BOOST_TEST(h.router.inventory().volumes.at(0).owner_vm == vm_two);
+    h.send(attach);  // vm_one no longer owns it
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::conflict));
+    const mb::AttachVolume attach_two{.volume_id = vol_one, .vm_id = vm_two, .device = blk(fn_one)};
+    h.run(attach_two);
+    BOOST_REQUIRE(h.blk_role.image_key_bytes.size() == 3U);
+    BOOST_TEST((h.blk_role.image_key_bytes.at(2) == k_img_bytes));
+    h.run(mb::DetachVolume{.volume_id = vol_one,
+                           .vm_id = vm_two,
+                           .device = blk(fn_one),
+                           .timeout_s = detach_timeout_s,
+                           .policy = mb::DetachPolicy::force});
+    h.router.on_host_slot(host_slot(
+        mb::DeviceReleased{.vm_id = vm_two, .device = blk(fn_one), .reset = mb::ResetResult::ok}));
+
+    // Delete crypto-erases this volume's copy of K_img.
+    h.run(mb::DeleteVolume{.volume_id = vol_one});
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::ok));
+    BOOST_TEST(!h.keys.owner(vol_one).has_value());
+    BOOST_TEST((h.blk_role.deleted == std::vector<VolumeId>{vol_one}));
+    BOOST_TEST(h.router.inventory().volumes.empty());
+    BOOST_TEST(h.router.stats().inconsistencies == 0U);
+    BOOST_TEST(h.audit_text().find("ev=volume_key_destroyed") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(destroy_vm_erases_encrypted_image_volumes_once,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    h.run(mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib});
+    std::array<std::byte, helm::volume_key_size> k_img{};
+    k_img.fill(std::byte{0x5A});
+    BOOST_REQUIRE(h.keys.put_image_key(image_key_frame(h.se, vol_one, vm_one, k_img)).has_value());
+    h.run(image_volume(vol_one, vm_one));  // encrypted
+    h.run(image_volume(vol_two, vm_one));  // plain
+    BOOST_REQUIRE(h.keys.owner(vol_one).has_value());
+    h.run(mb::DestroyVm{.vm_id = vm_one});
+    BOOST_TEST(!h.keys.owner(vol_one).has_value());
+    auto deleted = h.blk_role.deleted;
+    std::ranges::sort(deleted);
+    BOOST_TEST((deleted == std::vector<VolumeId>{vol_one, vol_two}));
+    BOOST_TEST(h.router.inventory().volumes.empty());
+    BOOST_TEST(h.router.stats().inconsistencies == 0U);
+    BOOST_TEST(h.router.stats().storage_failures == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(a_failed_encrypted_image_create_destroys_its_key,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    h.run(mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib});
+    std::array<std::byte, helm::volume_key_size> k_img{};
+    k_img.fill(std::byte{0x5A});
+    BOOST_REQUIRE(h.keys.put_image_key(image_key_frame(h.se, vol_one, vm_one, k_img)).has_value());
+    h.blk_role.create_error =
+        LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported};
+    h.send(image_volume(vol_one, vm_one));
+    BOOST_TEST((status_of(h.reports.last_outcome()) != mb::Status::ok));
+    BOOST_TEST(!h.keys.owner(vol_one).has_value());
+    BOOST_TEST(h.keys.volume_count() == 0U);
+    BOOST_TEST(h.router.inventory().volumes.empty());
 }
 
 BOOST_AUTO_TEST_CASE(a_refused_image_volume_is_not_relayed,

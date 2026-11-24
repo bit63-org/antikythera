@@ -118,6 +118,11 @@ public:
     // `frame` carries the HPKE AAD (proto::volume_key_aad).
     virtual auto on_volume_key(const proto::VolumeKey& /*key*/,
                                std::span<const std::byte> /*frame*/) -> void {}
+    // An encrypted image's key for an image volume about to be created
+    // (oar-blk task 15), wrapped to this helm's secure element; `frame`
+    // carries the HPKE AAD (proto::image_key_aad).
+    virtual auto on_image_key(const proto::ImageKey& /*key*/, std::span<const std::byte> /*frame*/)
+        -> void {}
     // The controller acknowledged a storage role's lease request.
     virtual auto on_lease_grant(const proto::LeaseGrant& /*grant*/) -> void {}
     // A storage role's certificate, for the role in `certificate.slot`.

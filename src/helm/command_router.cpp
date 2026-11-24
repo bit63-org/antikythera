@@ -107,9 +107,10 @@ auto OarLinkPort::group_usage() -> std::expected<std::vector<oar::UsageEntry>, L
     return _link->group_usage();
 }
 
-auto OarLinkPort::deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key)
+auto OarLinkPort::deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key,
+                              std::optional<ScopedKey> image_key)
     -> std::expected<void, LinkError> {
-    return _link->deliver_key(fn, volume, std::move(key));
+    return _link->deliver_key(fn, volume, std::move(key), std::move(image_key));
 }
 
 auto OarLinkPort::drop_key(const oar::DropKey& request) -> std::expected<void, LinkError> {
@@ -549,12 +550,39 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
         if (!slot) {
             return std::unexpected(Status::insufficient_resources);
         }
+        // An encrypted image: the controller sent K_img for this volume
+        // ahead of the command. It becomes the volume's key, wrapped by the
+        // owner's VM key, and the role keeps that on the media as it would
+        // a disk volume's (task 15). Without one the image must be plain;
+        // the role refuses to attach an encrypted image that has no key.
+        std::optional<WrappedVolumeKey> image_key;
+        if (_keys->image_key(c->volume_id)) {
+            if (auto k = _keys->import_image_key(c->volume_id, c->owner_vm); !k) {
+                switch (k.error()) {
+                    case KeyError::wrong_vm:  // K_img was sent for another owner
+                        return std::unexpected(Status::conflict);
+                    case KeyError::unknown_vm:
+                        return std::unexpected(Status::unknown_vm);
+                    default:
+                        return std::unexpected(Status::internal_error);
+                }
+            }
+            undo.created_volume_key = c->volume_id;
+            audit(AuditRecord::of(AuditEvent::volume_key_created)
+                      .with_seq(seq)
+                      .with_vm(c->owner_vm)
+                      .with_volume(c->volume_id));
+            image_key = _keys->find_volume_key(c->volume_id);
+            if (!image_key) {
+                return std::unexpected(Status::internal_error);
+            }
+        }
         auto stored = port_for(*slot)->create_volume(
             {.volume_id = c->volume_id,
              .owner_vm = c->owner_vm,
              .capacity_sectors = std::uint64_t{c->size_gib} << gib_sector_shift,
              .block_size = oar::sector_size,
-             .wrapped_key = {},
+             .wrapped_key = image_key ? image_key->key.bytes() : std::span<const std::byte>{},
              .image_store = c->image_store,
              .image_name = c->image_name});
         if (!stored) {
@@ -679,8 +707,8 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
     }
 
     if (const auto* r = std::get_if<mailbox::RewrapVolume>(&body)) {
-        if (is_image_volume(r->volume_id)) {
-            return std::unexpected(Status::unsupported);  // no key to rewrap (task 15)
+        if (is_image_volume(r->volume_id) && !_keys->owner(r->volume_id)) {
+            return std::unexpected(Status::unsupported);  // a plain image: no key to rewrap
         }
         const auto owner = _keys->owner(r->volume_id);
         if (!owner) {
@@ -749,10 +777,12 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body, const U
             drop_unattached(volume);
         }
         if (!d->persist_volumes) {
-            // Image volumes have no key to erase: only their descriptors go.
+            // Plain image volumes have no key to erase: only their
+            // descriptors go. An encrypted image's K_img copy goes with
+            // the VM key, below, like a disk volume's key.
             std::vector<VolumeId> images;
             for (const auto& [id, volume] : _volumes) {
-                if (volume.image && volume.owner == d->vm_id) {
+                if (volume.image && volume.owner == d->vm_id && !_keys->owner(id)) {
                     images.push_back(id);
                 }
             }
@@ -783,17 +813,17 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body, const U
                    .slot = undo.stored_volume ? undo.stored_volume->slot : std::uint8_t{0},
                    .image = cv->image_store != 0};
     } else if (const auto* dv = std::get_if<mailbox::DeleteVolume>(&body)) {
-        // An image volume has nothing to crypto-erase: each attachment's
-        // key died with the attachment.
-        if (!is_image_volume(dv->volume_id)) {
-            if (_keys->destroy_volume_key(dv->volume_id)) {
-                audit(AuditRecord::of(AuditEvent::volume_key_destroyed)
-                          .with_seq(seq)
-                          .with_volume(dv->volume_id));
-            } else {
-                ++_stats.inconsistencies;
-            }
+        // A plain image volume has nothing to crypto-erase: each
+        // attachment's key died with the attachment. An encrypted one's
+        // copy of K_img goes like a disk volume's key.
+        if (_keys->destroy_volume_key(dv->volume_id)) {
+            audit(AuditRecord::of(AuditEvent::volume_key_destroyed)
+                      .with_seq(seq)
+                      .with_volume(dv->volume_id));
+        } else if (!is_image_volume(dv->volume_id)) {
+            ++_stats.inconsistencies;
         }
+        _keys->drop_image_key(dv->volume_id);
         erase_volume(dv->volume_id);
         _volumes.erase(dv->volume_id);
     } else if (const auto* av = std::get_if<mailbox::AttachVolume>(&body)) {
@@ -849,16 +879,27 @@ auto CommandRouter::deliver_volume_key(std::uint64_t seq, const mailbox::AttachV
     const auto id = function_id(attach.device);
     auto* port = port_for(attach.device.slot);
     // An image volume's key exists only for this attachment; a network
-    // volume's is the controller's, opened for this attachment.
+    // volume's is the controller's, opened for this attachment. An
+    // encrypted image volume's own (wrapped) key is K_img, which goes
+    // along with that ephemeral key.
     const auto net = _network.find(attach.volume_id);
+    const bool image = is_image_volume(attach.volume_id);
     auto key = net != _network.end() && net->second.attached_by == attach.vm_id
                    ? _keys->open_attachment_key(net->second.attachment, net->second.generation)
-               : is_image_volume(attach.volume_id)
-                   ? _keys->create_ephemeral_key()
-                   : _keys->unwrap_volume_key(attach.volume_id, attach.vm_id);
+               : image ? _keys->create_ephemeral_key()
+                       : _keys->unwrap_volume_key(attach.volume_id, attach.vm_id);
+    std::optional<std::expected<ScopedKey, KeyError>> image_key;
+    if (image && _keys->owner(attach.volume_id)) {
+        image_key = _keys->unwrap_volume_key(attach.volume_id, attach.vm_id);
+    }
     bool delivered = false;
-    if (port != nullptr && key) {
-        delivered = port->deliver_key(attach.device.function, attach.volume_id, std::move(*key))
+    if (port != nullptr && key && (!image_key || image_key->has_value())) {
+        std::optional<ScopedKey> k_img;
+        if (image_key) {
+            k_img = std::move(**image_key);
+        }
+        delivered = port->deliver_key(attach.device.function, attach.volume_id, std::move(*key),
+                                      std::move(k_img))
                         .has_value();
     }
     const auto record = AuditRecord::of(delivered ? AuditEvent::volume_key_delivered

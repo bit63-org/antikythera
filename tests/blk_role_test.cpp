@@ -43,6 +43,7 @@
 #include "helm/oar_link.hpp"
 #include "helm/secure_element.hpp"
 #include "helm/sideband_binding.hpp"
+#include "helm/volume_key_seal.hpp"
 #include "hold/server/node.hpp"
 #include "hold/store/file_layer.hpp"
 #include "oar/blk/blk_role.hpp"
@@ -620,9 +621,11 @@ struct Rig {
                                        .vm_id = vm,
                                        .config = oar::BlkConfig{.volume_id = volume}});
     }
-    auto deliver(oar::FunctionNumber fn, std::uint64_t volume) -> oar::Status {
+    auto deliver(oar::FunctionNumber fn, std::uint64_t volume,
+                 std::optional<blk::XtsKey> image_key = std::nullopt) -> oar::Status {
         const auto key = test_key();
-        return role->deliver_key({.fn = fn, .volume_id = volume, .key = key});
+        return role->deliver_key(
+            {.fn = fn, .volume_id = volume, .key = key, .image_key = image_key});
     }
     auto clean(oar::FunctionNumber fn) -> oar::Status {
         return role->clean_function(
@@ -953,7 +956,7 @@ BOOST_AUTO_TEST_CASE(image_volume_create_writes_only_a_header) {
     BOOST_TEST((rig.create_image(vol_two, vm_one, name, 9) == oar::Status::unsupported));
     Rig plain;
     BOOST_TEST((plain.create_image(vol_two, vm_one, name) == oar::Status::unsupported));
-    // Image volumes cannot be rewrapped yet (no key to rewrap); delete works.
+    // A plain image volume has no key to rewrap; delete works.
     const std::vector<std::byte> wrapped(wrapped_size, std::byte{wrapped_fill});
     BOOST_TEST((rig.role->rewrap_volume(
                     {.volume_id = vol_one, .owner_vm = vm_two, .wrapped_key = wrapped}) ==
@@ -1085,11 +1088,21 @@ BOOST_AUTO_TEST_CASE(image_volume_refuses_a_missing_or_wrong_image) {
                   *other_manifest);
     BOOST_TEST((rig.prepare(fn0, vm_one, vol_one) == oar::Status::failed));
 
-    // An encrypted image waits for helm to deliver its key (task 15).
+    // An encrypted image whose volume holds no image key (task 15).
     const auto key = test_key();
     const auto secret = rig.publish(image_raw(), blk::XtsKey{key});
     BOOST_REQUIRE(rig.create_image(vol_two, vm_one, secret) == oar::Status::ok);
     BOOST_TEST((rig.prepare(fn0, vm_one, vol_two) == oar::Status::failed));
+    // A plain image whose volume holds one.
+    const std::vector<std::byte> wrapped(wrapped_size, std::byte{wrapped_fill});
+    BOOST_REQUIRE(rig.role->create_volume({.volume_id = 0x204,
+                                           .owner_vm = vm_one,
+                                           .capacity_sectors = volume_sectors,
+                                           .block_size = blk::sector_size,
+                                           .wrapped_key = wrapped,
+                                           .image_store = image_store_id,
+                                           .image_name = name}) == oar::Status::ok);
+    BOOST_TEST((rig.prepare(fn0, vm_one, 0x204) == oar::Status::failed));
 
     // The image is fine but the volume is smaller than it.
     BOOST_REQUIRE(rig.role->create_volume({.volume_id = 0x203,
@@ -1101,6 +1114,179 @@ BOOST_AUTO_TEST_CASE(image_volume_refuses_a_missing_or_wrong_image) {
                                            .image_name = name}) == oar::Status::ok);
     BOOST_TEST((rig.prepare(fn0, vm_one, 0x203) == oar::Status::failed));
     BOOST_TEST(!rig.role->attached(fn0).has_value());
+}
+
+// ---- encrypted images (task 15) ------------------------------------------
+
+// K_img, distinct from the attachment key test_key() delivers.
+auto image_key_bytes() -> std::array<std::byte, blk::xts_key_size> {
+    std::array<std::byte, blk::xts_key_size> k{};
+    for (std::size_t i = 0; i < k.size(); ++i) {
+        k[i] = static_cast<std::byte>(0x90 + i);
+    }
+    return k;
+}
+
+BOOST_AUTO_TEST_CASE(encrypted_image_volume_decrypts_with_the_image_key) {
+    Rig rig{true};
+    const auto raw = image_raw();
+    const auto k_img = image_key_bytes();
+    const auto name = rig.publish(raw, blk::XtsKey{k_img});
+    // What the store holds is ciphertext.
+    const auto stored = rig.store.get(
+        objstore::image_data_key(image_prefix, objstore::image_name_hex(name)), 1U << 20U, {});
+    BOOST_REQUIRE(stored.has_value());
+    BOOST_TEST(!contains(*stored, marker()));
+
+    const std::vector<std::byte> wrapped(wrapped_size, std::byte{wrapped_fill});
+    BOOST_REQUIRE(rig.role->create_volume({.volume_id = vol_one,
+                                           .owner_vm = vm_one,
+                                           .capacity_sectors = volume_sectors,
+                                           .block_size = blk::sector_size,
+                                           .wrapped_key = wrapped,
+                                           .image_store = image_store_id,
+                                           .image_name = name}) == oar::Status::ok);
+    const auto m = blk::FileBackend::read_metadata(rig.role->volume_path(vol_one));
+    BOOST_REQUIRE(m.has_value());
+    BOOST_TEST((m->wrapped_key == wrapped));
+    BOOST_REQUIRE(rig.prepare(fn0, vm_one, vol_one) == oar::Status::ok);
+    rig.t0.flr();
+
+    // Without K_img the key is refused and the function stays keyless.
+    BOOST_TEST((rig.deliver(fn0, vol_one) == oar::Status::failed));
+    BOOST_TEST(!rig.role->function(fn0)->holds_key());
+    BOOST_REQUIRE(rig.deliver(fn0, vol_one, blk::XtsKey{k_img}) == oar::Status::ok);
+
+    Guest g{rig.ram0, *rig.t0.served(), rig.role.get()};
+    BOOST_REQUIRE(g.up());
+    BOOST_TEST(g.read(marker_sector) == marker(), boost::test_tools::per_element());
+    BOOST_TEST(g.read(3) == sector_of(raw, 3), boost::test_tools::per_element());
+    BOOST_TEST(g.read(far_sector) == std::vector<std::byte>(blk::sector_size),
+               boost::test_tools::per_element());
+    const std::vector<std::byte> mine(blk::sector_size, std::byte{0xEE});
+    BOOST_TEST((g.write(3, mine) == Status::ok));
+    BOOST_TEST(g.read(3) == mine, boost::test_tools::per_element());
+
+    // Dropping the key drops K_img too: a new delivery needs it again, and
+    // the overlay is gone.
+    BOOST_TEST((rig.role->drop_key({.fn = fn0, .volume_id = vol_one}) == oar::Status::ok));
+    BOOST_TEST((rig.deliver(fn0, vol_one) == oar::Status::failed));
+    BOOST_REQUIRE(rig.deliver(fn0, vol_one, blk::XtsKey{k_img}) == oar::Status::ok);
+    BOOST_TEST(g.read(3) == sector_of(raw, 3), boost::test_tools::per_element());
+    BOOST_REQUIRE(rig.clean(fn0) == oar::Status::ok);
+
+    // A disk volume takes no image key.
+    BOOST_REQUIRE(rig.create(vol_two, vm_one) == oar::Status::ok);
+    BOOST_REQUIRE(rig.prepare(fn1, vm_one, vol_two) == oar::Status::ok);
+    BOOST_TEST((rig.deliver(fn1, vol_two, blk::XtsKey{k_img}) == oar::Status::failed));
+    BOOST_TEST(!rig.role->function(fn1)->holds_key());
+    BOOST_TEST((rig.deliver(fn1, vol_two) == oar::Status::ok));
+}
+
+BOOST_AUTO_TEST_CASE(encrypted_image_volume_rewraps_its_image_key) {
+    Rig rig{true};
+    const auto k_img = image_key_bytes();
+    const auto name = rig.publish(image_raw(), blk::XtsKey{k_img});
+    const std::vector<std::byte> wrapped(wrapped_size, std::byte{wrapped_fill});
+    const std::vector<std::byte> rewrapped(wrapped_size, std::byte{rewrapped_fill});
+    BOOST_REQUIRE(rig.role->create_volume({.volume_id = vol_one,
+                                           .owner_vm = vm_one,
+                                           .capacity_sectors = volume_sectors,
+                                           .block_size = blk::sector_size,
+                                           .wrapped_key = wrapped,
+                                           .image_store = image_store_id,
+                                           .image_name = name}) == oar::Status::ok);
+    // Not while attached.
+    BOOST_REQUIRE(rig.prepare(fn0, vm_one, vol_one) == oar::Status::ok);
+    BOOST_TEST((rig.role->rewrap_volume(
+                    {.volume_id = vol_one, .owner_vm = vm_two, .wrapped_key = rewrapped}) ==
+                oar::Status::busy));
+    BOOST_REQUIRE(rig.clean(fn0) == oar::Status::ok);
+    BOOST_TEST((rig.role->rewrap_volume(
+                    {.volume_id = vol_one, .owner_vm = vm_two, .wrapped_key = rewrapped}) ==
+                oar::Status::ok));
+    const auto m = blk::FileBackend::read_metadata(rig.role->volume_path(vol_one));
+    BOOST_REQUIRE(m.has_value());
+    BOOST_TEST(m->owner_vm == vm_two);
+    BOOST_TEST((m->wrapped_key == rewrapped));
+    BOOST_REQUIRE(m->image.has_value());
+    BOOST_TEST((m->image->name == name));
+    // The new owner attaches it; the old one no longer can.
+    BOOST_TEST((rig.prepare(fn0, vm_one, vol_one) == oar::Status::failed));
+    BOOST_REQUIRE(rig.prepare(fn0, vm_two, vol_one) == oar::Status::ok);
+    rig.t0.flr();
+    BOOST_REQUIRE(rig.deliver(fn0, vol_one, blk::XtsKey{k_img}) == oar::Status::ok);
+    Guest g{rig.ram0, *rig.t0.served(), rig.role.get()};
+    BOOST_REQUIRE(g.up());
+    BOOST_TEST(g.read(marker_sector) == marker(), boost::test_tools::per_element());
+}
+
+// The whole path: the controller's ImageKey into helm's KeyStore, the
+// wrapped K_img onto the media through OarLink, and K_img delivered with
+// the ephemeral key in one deliver_key over the sideband.
+BOOST_AUTO_TEST_CASE(helm_delivers_an_encrypted_image_key_over_the_sideband) {
+    Rig rig{true};
+    const auto raw = image_raw();
+    const auto k_img = image_key_bytes();
+    const auto name = rig.publish(raw, blk::XtsKey{k_img});
+
+    auto se = ak::helm::SoftwareSecureElement::ephemeral();
+    BOOST_REQUIRE(se);
+    ak::helm::KeyStore keys{*se};
+    BOOST_REQUIRE(keys.create_vm_key(vm_one));
+    auto frame = ak::helm::seal_image_key(se->transport_public_key().value(),
+                                          {.server_id = 1,
+                                           .volume_id = vol_one,
+                                           .owner_vm = vm_one,
+                                           .hpke_enc = {},
+                                           .wrapped_key = {}},
+                                          k_img);
+    BOOST_REQUIRE(frame);
+    BOOST_REQUIRE(keys.put_image_key(*frame));
+    BOOST_REQUIRE(keys.import_image_key(vol_one, vm_one));
+    const auto wrapped = keys.find_volume_key(vol_one).value();
+
+    auto pair = ak::helm::SocketBinding::make_pair();
+    BOOST_REQUIRE(pair);
+    ak::helm::OarLink link{*pair->first, {.address = helm_side, .timeout = link_timeout}};
+    ak::helm::OarEndpoint endpoint{*pair->second, {.address = helm_side.reversed()}};
+    {
+        const std::jthread server{[&](const std::stop_token& stop) {
+            while (!stop.stop_requested()) {
+                auto r = endpoint.serve_one(*rig.role, serve_poll);
+                if (!r && r.error() != ak::helm::BindingError::timed_out) {
+                    return;
+                }
+            }
+        }};
+        BOOST_TEST(link.create_volume({.volume_id = vol_one,
+                                       .owner_vm = vm_one,
+                                       .capacity_sectors = volume_sectors,
+                                       .block_size = blk::sector_size,
+                                       .wrapped_key = wrapped.key.bytes(),
+                                       .image_store = image_store_id,
+                                       .image_name = name})
+                       .has_value());
+        BOOST_TEST(link.prepare_function({.fn = fn1,
+                                          .type = ak::helm::FunctionType::blk_fn,
+                                          .vm_id = vm_one,
+                                          .config = oar::BlkConfig{.volume_id = vol_one}})
+                       .has_value());
+        auto ephemeral = keys.create_ephemeral_key();
+        auto image_key = keys.unwrap_volume_key(vol_one, vm_one);
+        BOOST_REQUIRE(ephemeral);
+        BOOST_REQUIRE(image_key);
+        BOOST_TEST(link.deliver_key(fn1, vol_one, std::move(*ephemeral), std::move(*image_key))
+                       .has_value());
+    }
+    // The media holds exactly helm's wrapped K_img.
+    const auto m = blk::FileBackend::read_metadata(rig.role->volume_path(vol_one)).value();
+    BOOST_TEST(std::ranges::equal(m.wrapped_key, wrapped.key.bytes()));
+
+    Guest g{rig.ram1, *rig.t1.served(), rig.role.get()};
+    BOOST_REQUIRE(g.up());
+    BOOST_TEST(g.read(marker_sector) == marker(), boost::test_tools::per_element());
+    BOOST_TEST(g.read(3) == sector_of(raw, 3), boost::test_tools::per_element());
 }
 
 BOOST_AUTO_TEST_CASE(network_volume_serves_the_guest_through_hold) {

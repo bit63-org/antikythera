@@ -131,14 +131,18 @@ auto OarLink::clean_function(const oar::CleanFunction& request) -> std::expected
     return response->empty() ? std::expected<void, LinkError>{} : std::unexpected(bad_response());
 }
 
-auto OarLink::deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key)
-    -> std::expected<void, LinkError> {
-    // `key` is a by-value parameter, so its bytes are wiped when this
+auto OarLink::deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key,
+                          std::optional<ScopedKey> image_key) -> std::expected<void, LinkError> {
+    // The keys are by-value parameters, so their bytes are wiped when this
     // returns, whichever path returns.
-    if (!key.holds_key()) {
+    if (!key.holds_key() || (image_key && !image_key->holds_key())) {
         return std::unexpected(bad_request());
     }
-    auto body = oar::encode_deliver_key({.fn = fn, .volume_id = volume, .key = key.bytes()});
+    oar::DeliverKey request{.fn = fn, .volume_id = volume, .key = key.bytes(), .image_key = {}};
+    if (image_key) {
+        request.image_key = image_key->bytes();
+    }
+    auto body = oar::encode_deliver_key(request);
     if (!body) {
         return std::unexpected(bad_request());
     }

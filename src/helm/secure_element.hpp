@@ -34,6 +34,12 @@
 // unwraps it straight into a ScopedKey. The transport private key never
 // leaves the secure element; enrollment registers transport_public_key().
 //
+// An encrypted image's key (oar-blk task 15, proto::ImageKey) arrives the
+// same way, under its own HPKE info, and import_image_key() re-wraps it
+// under the owning VM's key as that image volume's volume key, again
+// without the plaintext leaving the secure element. From then on it is an
+// ordinary wrapped volume key.
+//
 // SoftwareSecureElement is the harbor stand-in: the master key is a 32-byte
 // file, created 0600 on first use and refused if anyone else can read it.
 // Its transport key is derived from the master key (HPKE DeriveKeyPair over
@@ -46,6 +52,7 @@
 #include <expected>
 #include <filesystem>
 #include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -180,6 +187,20 @@ public:
         std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
         -> std::expected<ScopedKey, SeError> = 0;
 
+    // Encrypted images (proto::ImageKey: HPKE, info proto::image_key_info,
+    // `aad` the frame header). check_image_key() only checks that the key
+    // opens; import_image_key() opens it and returns it wrapped by
+    // `owner`'s VM key as `volume`'s key, as create_volume_key() would.
+    virtual auto check_image_key(
+        std::span<const std::byte> aad, std::span<const std::byte, hpke::enc_size> enc,
+        std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
+        -> std::expected<void, SeError> = 0;
+    virtual auto import_image_key(
+        const WrappedVmKey& owner, VolumeId volume, std::span<const std::byte> aad,
+        std::span<const std::byte, hpke::enc_size> enc,
+        std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
+        -> std::expected<WrappedVolumeKey, SeError> = 0;
+
     // Draws a fresh random volume key that is never wrapped or stored: an
     // image volume's attachment key (oar-blk Requirement 8.6), gone once
     // delivered. The default draws it from OpenSSL's RNG.
@@ -225,6 +246,15 @@ public:
                          std::span<const std::byte, hpke::enc_size> enc,
                          std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
         -> std::expected<ScopedKey, SeError> override;
+    auto check_image_key(std::span<const std::byte> aad,
+                         std::span<const std::byte, hpke::enc_size> enc,
+                         std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
+        -> std::expected<void, SeError> override;
+    auto import_image_key(const WrappedVmKey& owner, VolumeId volume,
+                          std::span<const std::byte> aad,
+                          std::span<const std::byte, hpke::enc_size> enc,
+                          std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
+        -> std::expected<WrappedVolumeKey, SeError> override;
 
 private:
     explicit SoftwareSecureElement(SecretBytes<master_key_size> master) noexcept
@@ -233,6 +263,12 @@ private:
     [[nodiscard]] auto unwrap_vm_key(const WrappedVmKey& vm) const
         -> std::expected<SecretBytes<vm_key_size>, SeError>;
     [[nodiscard]] auto transport_key() const -> std::expected<hpke::KeyPair, SeError>;
+    // Opens an HPKE-wrapped 64-byte key under `info` into `out`.
+    [[nodiscard]] auto open_transport(
+        std::string_view info, std::span<const std::byte> aad,
+        std::span<const std::byte, hpke::enc_size> enc,
+        std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped,
+        std::span<std::byte, volume_key_size> out) const -> std::expected<void, SeError>;
 
     SecretBytes<master_key_size> _master;
 };

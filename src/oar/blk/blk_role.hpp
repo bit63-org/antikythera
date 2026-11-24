@@ -16,7 +16,8 @@
 //   drop_key          wipe it
 //   clean_function    wipe the key and close the volume: the function is
 //                     back to its empty placeholder
-//   rewrap_volume     new owner and wrapped key in the volume's header
+//   rewrap_volume     new owner and wrapped key in the volume's header (a
+//                     disk volume, or an encrypted image volume's K_img)
 //   delete_volume     erase and unlink the volume file (closing it first if
 //                     a function still has it: helm deletes the volumes of a
 //                     destroyed VM before their functions are cleaned)
@@ -40,8 +41,16 @@
 // the attachment's ephemeral key: it goes to the function and to the
 // backend, which re-encrypts image blocks under it. Every way the key goes
 // (drop_key, cleaning, FLR) discards the overlay with it, so an image
-// volume never comes back with an earlier attachment's writes. Encrypted
-// images (task 15) are refused until helm can deliver their image key.
+// volume never comes back with an earlier attachment's writes.
+//
+// Encrypted images (task 15): the volume file holds the image key K_img
+// wrapped by helm, as a disk volume holds its volume key, and
+// prepare_function refuses an encrypted image whose volume has no key (or
+// a plain image whose volume has one). deliver_key then carries K_img with
+// the ephemeral key; the backend decrypts image blocks with it before
+// re-encrypting them under the ephemeral key, and drops it with that key.
+// rewrap_volume rewrites an encrypted image volume's owner and key like a
+// disk volume's.
 //
 // Network volumes (.kiro/specs/block-volume-service/ task 12): helm sends
 // each ReplicaConfig whose attachments name this server (replica_config);

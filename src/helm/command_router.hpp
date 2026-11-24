@@ -65,8 +65,20 @@
 // the secure element (KeyStore::create_ephemeral_key), never wrapped or
 // kept, so the overlay written under it is unreadable once the function
 // drops it. DELETE_VOLUME has no key to destroy, and DESTROY_VM without
-// persist_volumes deletes the VM's image volumes too. REWRAP_VOLUME is
-// unsupported until encrypted images give them a key to rewrap (task 15).
+// persist_volumes deletes the VM's image volumes too. REWRAP_VOLUME of a
+// plain image volume is unsupported: there is no key to rewrap.
+//
+// Encrypted images (task 15): the controller sends the image's key K_img
+// as an ImageKey frame for the volume ahead of its CREATE_VOLUME
+// (KeyStore::put_image_key). CREATE_VOLUME then re-wraps it under the
+// owner's VM key as the volume's key (KeyStore::import_image_key; a frame
+// naming another owner is a conflict) and relays that wrapped key with the
+// image source, for the role to keep on the media. From there it is a
+// volume key like a disk volume's: ATTACH_VOLUME unwraps it for the owner
+// and delivers it as K_img alongside the ephemeral key, REWRAP_VOLUME
+// rewraps it, DELETE_VOLUME and DESTROY_VM crypto-erase it. A failed
+// CREATE_VOLUME destroys it with the rest of its undo, so a retry needs
+// the frame again.
 //
 // Network volumes (.kiro/specs/block-volume-service/ task 12). The
 // controller owns them: there is no CREATE_VOLUME, and helm learns of one
@@ -213,7 +225,10 @@ public:
         -> std::expected<void, LinkError> = 0;
     virtual auto clean_function(const oar::CleanFunction& request)
         -> std::expected<void, LinkError> = 0;
-    virtual auto deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key)
+    // `image_key`: an encrypted image volume's K_img, delivered with its
+    // ephemeral `key` (OarLink::deliver_key).
+    virtual auto deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key,
+                             std::optional<ScopedKey> image_key)
         -> std::expected<void, LinkError> = 0;
     virtual auto drop_key(const oar::DropKey& request) -> std::expected<void, LinkError> = 0;
     virtual auto create_volume(const oar::CreateVolume& request)
@@ -253,8 +268,8 @@ public:
         -> std::expected<void, LinkError> override;
     auto clean_function(const oar::CleanFunction& request)
         -> std::expected<void, LinkError> override;
-    auto deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key)
-        -> std::expected<void, LinkError> override;
+    auto deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key,
+                     std::optional<ScopedKey> image_key) -> std::expected<void, LinkError> override;
     auto drop_key(const oar::DropKey& request) -> std::expected<void, LinkError> override;
     auto create_volume(const oar::CreateVolume& request) -> std::expected<void, LinkError> override;
     auto delete_volume(const oar::DeleteVolume& request) -> std::expected<void, LinkError> override;
@@ -427,7 +442,8 @@ private:
         VmId owner{0};
         std::uint32_t size_gib{0};
         std::uint8_t slot{0};  // the storage slot holding it
-        bool image{false};     // an image volume: no KeyStore entry, owner kept here
+        bool image{false};     // an image volume: owner kept here; a KeyStore entry
+                               // only for an encrypted image (its K_img)
     };
 
     using Outcome = proto::CommandOutcome;

@@ -438,6 +438,39 @@ auto FileBackend::open(const std::filesystem::path& path)
     return std::unique_ptr<FileBackend>(new FileBackend(*fd, std::move(*m)));
 }
 
+auto FileBackend::rewrap_image_volume(const std::filesystem::path& path, std::uint64_t owner_vm,
+                                      std::span<const std::byte> wrapped_key)
+    -> std::expected<void, FileFailure> {
+    auto fd = open_volume(path, O_RDWR);
+    if (!fd) {
+        return std::unexpected(fd.error());
+    }
+    auto result = [&]() -> std::expected<void, FileFailure> {
+        auto m = load_metadata(*fd);
+        if (!m) {
+            return std::unexpected(m.error());
+        }
+        if (!m->image || m->wrapped_key.empty() || wrapped_key.empty()) {
+            return metadata_failure(MetadataError::bad_key_length);
+        }
+        m->owner_vm = owner_vm;
+        m->wrapped_key.assign(wrapped_key.begin(), wrapped_key.end());
+        const auto block = encode_metadata(*m);
+        if (!block) {
+            return metadata_failure(block.error());
+        }
+        if (auto w = pwrite_all(*fd, *block, 0); !w) {
+            return io_failure(w.error());
+        }
+        if (::fdatasync(*fd) != 0) {
+            return io_failure();
+        }
+        return {};
+    }();
+    ::close(*fd);
+    return result;
+}
+
 auto FileBackend::erase(const std::filesystem::path& path) -> std::expected<void, FileFailure> {
     auto fd = open_volume(path, O_RDWR);
     if (!fd) {

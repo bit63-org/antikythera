@@ -42,6 +42,7 @@ struct RecordingSink final : helm::ControllerSink {
     std::vector<std::pair<proto::ReplicaConfig, std::vector<std::byte>>> configs;
     std::vector<std::pair<proto::VolumeOp, std::vector<std::byte>>> ops;
     std::vector<std::pair<proto::VolumeKey, std::vector<std::byte>>> keys;
+    std::vector<std::pair<proto::ImageKey, std::vector<std::byte>>> image_keys;
     std::vector<proto::LeaseGrant> grants;
 
     auto on_envelope(const proto::Envelope& e) -> void override { envelopes.push_back(e); }
@@ -67,6 +68,9 @@ struct RecordingSink final : helm::ControllerSink {
     auto on_volume_key(const proto::VolumeKey& k, std::span<const std::byte> frame)
         -> void override {
         keys.emplace_back(k, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
+    auto on_image_key(const proto::ImageKey& k, std::span<const std::byte> frame) -> void override {
+        image_keys.emplace_back(k, std::vector<std::byte>{frame.begin(), frame.end()});
     }
     auto on_lease_grant(const proto::LeaseGrant& g) -> void override { grants.push_back(g); }
     std::vector<proto::RoleCertificate> certificates;
@@ -199,6 +203,15 @@ auto volume_key_record(std::uint64_t to) -> std::vector<std::byte> {
     auto b = proto::encode_volume_key(k);
     BOOST_REQUIRE(b.has_value());
     return framed(RecordType::volume_key, *b);
+}
+
+auto image_key_record(std::uint64_t to) -> std::vector<std::byte> {
+    proto::ImageKey k{
+        .server_id = to, .volume_id = 0x100, .owner_vm = 0xB2, .hpke_enc = {}, .wrapped_key = {}};
+    k.hpke_enc.fill(std::byte{0x11});
+    auto b = proto::encode_image_key(k);
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::image_key, *b);
 }
 
 auto lease_grant_record(std::uint64_t to) -> std::vector<std::byte> {
@@ -353,8 +366,9 @@ BOOST_FIXTURE_TEST_CASE(envelopes_and_updates_reach_the_sink_unmodified, Fixture
 BOOST_FIXTURE_TEST_CASE(block_volume_records_reach_the_sink_unmodified, Fixture) {
     session.on_connected();
     std::vector<std::byte> stream;
-    for (const auto& r : {replica_config_record(server), volume_op_record(server),
-                          volume_key_record(server), lease_grant_record(server)}) {
+    for (const auto& r :
+         {replica_config_record(server), volume_op_record(server), volume_key_record(server),
+          lease_grant_record(server), image_key_record(server)}) {
         stream.insert(stream.end(), r.begin(), r.end());
     }
     for (const auto b : stream) {
@@ -371,6 +385,11 @@ BOOST_FIXTURE_TEST_CASE(block_volume_records_reach_the_sink_unmodified, Fixture)
     BOOST_REQUIRE(sink.keys.size() == 1U);
     BOOST_TEST(sink.keys[0].first.attachment_id == 0xA1U);
     BOOST_TEST(sink.keys[0].second.size() == proto::volume_key_size);
+    BOOST_REQUIRE(sink.image_keys.size() == 1U);
+    BOOST_TEST(sink.image_keys[0].first.owner_vm == 0xB2U);
+    const auto image = image_key_record(server);
+    BOOST_TEST(std::ranges::equal(sink.image_keys[0].second,
+                                  std::span{image}.subspan(proto::record_header_size)));
     BOOST_REQUIRE(sink.grants.size() == 1U);
     BOOST_TEST(
         (sink.grants[0] == proto::LeaseGrant{.server_id = server, .volume_id = 0x100, .epoch = 2}));
@@ -378,7 +397,8 @@ BOOST_FIXTURE_TEST_CASE(block_volume_records_reach_the_sink_unmodified, Fixture)
 
 BOOST_FIXTURE_TEST_CASE(block_volume_records_for_another_server_end_the_connection, Fixture) {
     for (const auto& r : {replica_config_record(other_server), volume_op_record(other_server),
-                          volume_key_record(other_server), lease_grant_record(other_server)}) {
+                          volume_key_record(other_server), lease_grant_record(other_server),
+                          image_key_record(other_server)}) {
         session.on_connected();
         auto res = session.on_bytes(r);
         BOOST_REQUIRE(!res.has_value());

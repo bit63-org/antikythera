@@ -74,7 +74,7 @@ public:
     // and is read from the next poll on. `port` must outlive its slot.
     auto add_slot(std::uint8_t slot, OarPort& port) -> void;
     // The slot went away (power cycle): forgotten until added again.
-    auto remove_slot(std::uint8_t slot) -> void;
+    auto remove_slot(std::uint8_t slot) noexcept -> void;
 
     // A controller GroupPolicy (shape and server checked by the
     // ControllerSession) and its exact frame.

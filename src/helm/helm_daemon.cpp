@@ -56,7 +56,13 @@ auto HelmDaemon::SlotPort::clean_function(const oar::CleanFunction& request)
     if (!_slot->link) {
         return disconnected();
     }
-    return _slot->link->clean_function(request);
+    auto cleaned = _slot->link->clean_function(request);
+    if (cleaned && request.action == CleaningAction::reset_nic_vf) {
+        // A detached NIC's final group meter waits in the role: read it on
+        // the next pass, not at the next interval (Requirement 11.2).
+        _daemon->_groups.nic_detached();
+    }
+    return cleaned;
 }
 
 auto HelmDaemon::SlotPort::deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key,
@@ -107,6 +113,21 @@ auto HelmDaemon::SlotPort::replica_config(std::span<const std::byte> frame)
     return _slot->link->replica_config(frame);
 }
 
+auto HelmDaemon::SlotPort::group_policy(std::span<const std::byte> frame)
+    -> std::expected<void, LinkError> {
+    if (!_slot->link) {
+        return disconnected();
+    }
+    return _slot->link->group_policy(frame);
+}
+
+auto HelmDaemon::SlotPort::group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError> {
+    if (!_slot->link) {
+        return disconnected();
+    }
+    return _slot->link->group_usage();
+}
+
 // ---- HelmDaemon ---------------------------------------------------------------
 
 HelmDaemon::HelmDaemon(DaemonConfig config, KeyStore& keys, AuditLog& audit, HostPort& host,
@@ -116,9 +137,10 @@ HelmDaemon::HelmDaemon(DaemonConfig config, KeyStore& keys, AuditLog& audit, Hos
       _connect{std::move(connect)},
       _reports{std::move(reports)},
       _router{_config.router, _pool, keys, host, *this, audit},
-      _sequencer{sequencer_config(_config), backplane, *this} {
+      _sequencer{sequencer_config(_config), backplane, *this},
+      _groups{{.interval = _config.group_usage_interval, .clock = _config.clock}, *this} {
     for (const auto& s : _config.slots) {
-        _slots.try_emplace(s.slot, std::make_unique<SlotState>(s.slot, s.link));
+        _slots.try_emplace(s.slot, std::make_unique<SlotState>(s.slot, s.link, *this));
     }
     _next_check = now() + _config.check_interval;
     _next_reports = now();
@@ -176,6 +198,7 @@ auto HelmDaemon::run_once(std::chrono::milliseconds wait) -> void {
         }
         _next_identity = now() + _config.identity_interval;
     }
+    _groups.poll();
     publish();
 }
 
@@ -268,6 +291,11 @@ auto HelmDaemon::on_vpc_config(const proto::VpcConfigFrame& config,
                      .frame = {frame.begin(), frame.end()}});
 }
 
+auto HelmDaemon::on_group_policy(const proto::GroupPolicy& policy, std::span<const std::byte> frame)
+    -> void {
+    enqueue(PolicyFrame{.policy = policy, .frame = {frame.begin(), frame.end()}});
+}
+
 auto HelmDaemon::post_host_slot(const mailbox::Slot& slot) -> void {
     enqueue(slot);
 }
@@ -336,6 +364,8 @@ auto HelmDaemon::handle(Item& item) -> void {
             ++_stats.tunnel_peer_sets;
         }
         forward_peers(*peers);
+    } else if (const auto* policy = std::get_if<PolicyFrame>(&item)) {
+        _groups.on_group_policy(policy->policy, policy->frame);
     } else if (auto* vpc = std::get_if<VpcFrame>(&item)) {
         forward_vpc_config(*vpc);
     }
@@ -659,6 +689,10 @@ auto HelmDaemon::attach(SlotState& slot) -> bool {
         return true;
     }
     replay_vpc_configs(slot);  // before the router can prepare a NIC here
+    if (inv->role == oar::Role::net) {
+        // Every kept group policy before the router can prepare a NIC here.
+        _groups.add_slot(slot.number, slot.port);
+    }
     _router.add_slot(slot.number, slot.port, *inv);
     if (is_blk(slot)) {
         for (const auto frame : _router.network_configs()) {
@@ -669,6 +703,7 @@ auto HelmDaemon::attach(SlotState& slot) -> bool {
 }
 
 auto HelmDaemon::detach(SlotState& slot) noexcept -> void {
+    _groups.remove_slot(slot.number);
     slot.link.reset();
     slot.binding.reset();
     slot.keys_pending = false;

@@ -1,6 +1,6 @@
 # Implementation Plan — oar-net: the network data plane
 
-## Status: 16/22 tasks complete
+## Status: 19/22 tasks complete
 
 ## Tasks
 
@@ -207,9 +207,19 @@
   drop VNI never replicates and that meters stay consistent. With drop
   as the default, ARP and ND between VTEPs depend on the proxy, which
   `NetRole` feeds from MapUpdate v2 (task 11).
-- [ ] 13. `GroupPolicy` frame (controller-interface task 10) applied by
+- [x] 13. `GroupPolicy` frame (controller-interface task 10) applied by
   `NetRole` over OarLink `group_policy`, and `group_usage` answered from
-  the VSwitch meters. _Requirements: 10.2, 10.6, 10.7_
+  the VSwitch meters. _Requirements: 10.2, 10.6, 10.7_ — checked like a
+  map_update with the same verifier (server ID, then signature, then
+  version), applied with `VSwitch::set_group_policy`. The version applied
+  per VNI is kept: the same version answers ok untouched (helm replays on
+  reconnect), an older one fails, and a policy the VSwitch refuses leaves
+  the previous one in place. `group_usage` pages `VSwitch::group_usage()`
+  through an `oar::UsagePager`; each entry carries the VNI helm gave in
+  `prepare_function` (kept until a snapshot takes the NIC's final reading),
+  because a detached NIC's mapping may already be gone and billing follows
+  the attachment helm made. `max_groups_per_nic` is not used until
+  snooping (task 14).
 - [ ] 14. IGMP/MLD snooping, per-NIC group cap, join reports through helm
   and per-group VTEP lists. Needs the L3 parser. _Requirements: 10.5_
 - [x] 15. L3/L4 packet parser (`src/oar/net/packet.*`): untagged

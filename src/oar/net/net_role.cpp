@@ -9,6 +9,7 @@
 #include <utility>
 #include <variant>
 
+#include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
 #include "proto/vpc_config.hpp"
 
@@ -80,6 +81,18 @@ auto to_neighbors(const proto::MapUpdate& u) -> NeighborUpdate {
         out.ipv6.push_back({.ip = g.address, .nic = geneve::NicId{g.nic_id}});
     }
     return out;
+}
+
+// The VSwitch's policy from a decoded frame. decode_group_policy already
+// checked the mode and limits against the same bounds; the VSwitch checks
+// them again.
+auto to_group_policy(const proto::GroupPolicy& p) -> GroupPolicy {
+    return {.mode = p.mode == proto::GroupMode::multicast ? GroupMode::multicast : GroupMode::drop,
+            .rate_frames = p.rate_frames,
+            .burst_frames = p.burst_frames,
+            .rate_bytes = p.rate_bytes,
+            .burst_bytes = p.burst_bytes,
+            .max_remote_vteps = p.max_remote_vteps};
 }
 
 }  // namespace
@@ -229,6 +242,7 @@ auto NetRole::prepare_function(const oar::PrepareFunction& request) -> oar::Stat
         return oar::Status::failed;
     }
     s->nic = nic;
+    _nic_vnis.insert_or_assign(cfg->nic_id, cfg->vni);
     return oar::Status::ok;
 }
 
@@ -332,6 +346,74 @@ auto NetRole::map_update(std::span<const std::byte> frame) -> oar::Status {
     }
     ++_counters.map_applied;
     return oar::Status::ok;
+}
+
+auto NetRole::group_policy(std::span<const std::byte> frame) -> oar::Status {
+    auto policy = proto::decode_group_policy(frame);
+    if (!policy) {
+        ++_counters.group_undecodable;
+        return oar::Status::failed;
+    }
+    if (policy->server_id != _config.server_id) {
+        ++_counters.group_wrong_server;
+        return oar::Status::failed;
+    }
+    if (!_verifier(proto::group_policy_signed_bytes(frame), policy->signature, policy->key_id)) {
+        ++_counters.group_bad_signature;
+        return oar::Status::failed;
+    }
+    // Versions are looked at only after the signature, as for map_update.
+    const auto applied = _group_versions.find(policy->vni);
+    if (applied != _group_versions.end()) {
+        if (applied->second == policy->policy_version) {
+            ++_counters.group_redelivered;
+            return oar::Status::ok;
+        }
+        if (applied->second > policy->policy_version) {
+            ++_counters.group_stale;
+            return oar::Status::failed;
+        }
+    }
+    if (!_vswitch->set_group_policy(policy->vni, to_group_policy(*policy))) {
+        ++_counters.group_rejected;
+        return oar::Status::failed;
+    }
+    _group_versions.insert_or_assign(policy->vni, policy->policy_version);
+    ++_counters.group_applied;
+    return oar::Status::ok;
+}
+
+auto NetRole::usage_snapshot() -> oar::UsagePager::Snapshot {
+    oar::UsagePager::Snapshot out;
+    for (const auto& u : _vswitch->group_usage()) {
+        const auto vni = _nic_vnis.find(u.nic.value);
+        if (vni == _nic_vnis.end()) {
+            ++_counters.usage_unknown_vni;  // unreachable: every attach goes through prepare
+            continue;
+        }
+        out.push_back({.nic_id = u.nic.value,
+                       .vni = vni->second,
+                       .detached = u.detached,
+                       .attachment = u.attachment,
+                       .frames = u.meter.frames,
+                       .bytes = u.meter.bytes,
+                       .replicas_remote = u.meter.replicas_remote,
+                       .replica_bytes_remote = u.meter.replica_bytes_remote,
+                       .replicas_local = u.meter.replicas_local,
+                       .replica_bytes_local = u.meter.replica_bytes_local,
+                       .drop_policy = u.meter.drop_policy,
+                       .drop_rate = u.meter.drop_rate,
+                       .drop_fanout = u.meter.drop_fanout});
+    }
+    // Every final reading is in `out` now (the VSwitch hands each out once),
+    // so the VNIs of NICs no longer attached are not needed again.
+    std::erase_if(_nic_vnis,
+                  [this](const auto& kv) { return !_vswitch->attached(geneve::NicId{kv.first}); });
+    return out;
+}
+
+auto NetRole::group_usage(std::uint16_t cursor) -> std::expected<oar::UsagePage, oar::Status> {
+    return _usage.page(cursor, [this] { return usage_snapshot(); });
 }
 
 auto NetRole::health() -> std::expected<oar::Health, oar::Status> {

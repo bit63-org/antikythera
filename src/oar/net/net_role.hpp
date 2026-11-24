@@ -33,6 +33,12 @@
 //                       like a map_update, and set the VNI's gateway and
 //                       DHCP configuration in the VSwitch (Requirement 12.1,
 //                       task 20)
+//   group_policy        decode the controller's GroupPolicy frame, check it
+//                       like a map_update, and set the VNI's policy in the
+//                       VSwitch (Requirement 10.2, task 13)
+//   group_usage         page through the VSwitch's per-NIC group meters
+//                       (Requirement 10.6), final readings of detached NICs
+//                       included
 //
 // Volume keys and volumes are not the network role's: deliver_key, drop_key
 // and the volume requests answer unsupported.
@@ -83,6 +89,19 @@
 // touching the VSwitch (helm resends every kept config when the sideband
 // reopens), an older one answers failed. A frame the VSwitch refuses
 // leaves the previous config in place: a config is never half applied.
+//
+// group_policy is checked the same way and by the same verifier: the frame
+// must name this server and verify under a controller key. Each VNI keeps
+// the version last applied; re-delivery of that version answers ok without
+// touching the VSwitch (helm replays every kept policy when the sideband
+// reopens), an older one answers failed. A frame that cannot be applied
+// leaves the VNI's previous policy in place, so a VNI never falls open.
+//
+// group_usage serves helm::oar::UsagePager pages over VSwitch::group_usage().
+// Each entry carries the VNI helm named in prepare_function for that NIC:
+// the meter is billed to the attachment helm made, and a detached NIC's
+// mapping may already be gone. The VNI is kept until a snapshot has taken
+// the NIC's final reading.
 //
 // Not thread-safe: the sideband, the transports and the underlay share one
 // thread, as the VSwitch and Vtep require.
@@ -183,6 +202,15 @@ struct RoleCounters {
     std::uint64_t map_rejected{0};  // MappingTable refused it (stale version, bad entries)
     std::uint64_t map_neighbors_rejected{0};  // the VSwitch refused its proxy addresses
     std::uint64_t tunnel_keys_refused{0};     // set_tunnel_key / set_tunnel_peer the Tunnel refused
+    // GroupPolicy frames (task 13), counted like map_updates.
+    std::uint64_t group_applied{0};
+    std::uint64_t group_redelivered{0};
+    std::uint64_t group_undecodable{0};
+    std::uint64_t group_wrong_server{0};
+    std::uint64_t group_bad_signature{0};
+    std::uint64_t group_stale{0};        // older than the version applied for the VNI
+    std::uint64_t group_rejected{0};     // the VSwitch refused the policy
+    std::uint64_t usage_unknown_vni{0};  // a meter whose NIC helm never prepared here: skipped
 };
 
 // The identity a function carries between attachments: never in any
@@ -233,6 +261,9 @@ public:
     // receive() does for each; returns how many were read.
     auto pump(UdpEndpoint& endpoint, std::span<std::byte> buffer, std::size_t budget,
               VtepClock::time_point now) -> std::size_t;
+    auto group_policy(std::span<const std::byte> frame) -> helm::oar::Status override;
+    auto group_usage(std::uint16_t cursor)
+        -> std::expected<helm::oar::UsagePage, helm::oar::Status> override;
 
     // Serves deferred transmit work on every function; true if any still
     // has work (call again soon).
@@ -267,6 +298,8 @@ private:
     auto release(helm::oar::FunctionNumber fn, Slot& s) -> bool;
     // Notes which up peers still lack mtu_ok, and since when.
     auto track_mtu(VtepClock::time_point now) -> void;
+    // The VSwitch's meters as group_usage entries (UsagePager's snapshot).
+    auto usage_snapshot() -> helm::oar::UsagePager::Snapshot;
 
     NetRoleConfig _config;
     MapVerifier _verifier;
@@ -282,6 +315,9 @@ private:
     // last tick's time.
     std::map<Ipv6Address, VtepClock::time_point> _mtu_unproven;
     VtepClock::time_point _last_tick{};
+    std::map<std::uint32_t, std::uint64_t> _group_versions;  // applied policy version, by VNI
+    std::map<std::uint64_t, std::uint32_t> _nic_vnis;        // helm's VNI, by NIC ID
+    helm::oar::UsagePager _usage;
     RoleCounters _counters;
 };
 

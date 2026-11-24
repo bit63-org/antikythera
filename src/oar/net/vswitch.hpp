@@ -61,6 +61,22 @@
 // for the VNI admits it too (a sender with a stale or hostile policy cannot
 // push group traffic into a VNI that has not opted in).
 //
+// Snooping (Requirement 10.5, task 14): IGMP and MLD membership reports
+// from a NIC in a VNI that opted in to multicast record which groups the
+// NIC joined (at most the policy's max_groups_per_nic, and
+// max_role_memberships across the role); they are consumed, never
+// replicated, and guests' own queries are dropped as router messages. The
+// gateway is the querier: poll() sends each such NIC IGMPv3 (and, with an
+// IPv6 prefix, MLDv2) general queries from the VpcConfig's gateway every
+// query interval, starting at once, and a join not refreshed within the
+// membership interval expires. memberships() lists every join for helm to
+// report; the controller turns them into per-group VTEP lists
+// (set_group_members, from its signed GroupMembers frame). A frame for a
+// listed group goes only to the listed VTEPs (never this one) and to the
+// local NICs that joined it, on transmit and on receive; a group that is
+// not listed is unknown and still reaches the whole VNI. The cap and the
+// flood-list limit apply to whichever list is used.
+//
 // Metering (Requirement 10.6): every source NIC has a GroupMeter of
 // cumulative counters: group frames accepted, replicas and replica bytes
 // sent to the fabric (the billable quantity) and delivered locally, and
@@ -141,6 +157,7 @@
 #include <vector>
 
 #include "oar/net/geneve.hpp"
+#include "oar/net/igmp.hpp"
 #include "oar/net/mapping_table.hpp"
 #include "oar/net/neighbor.hpp"
 #include "oar/net/packet.hpp"
@@ -306,11 +323,12 @@ enum class GroupMode : std::uint8_t {
 // limits: a multicast policy must set all of them (Requirement 10.4).
 struct GroupPolicy {
     GroupMode mode{GroupMode::drop};
-    std::uint32_t rate_frames{0};       // replicated frames per second
-    std::uint32_t burst_frames{0};      // bucket depth in frames
-    std::uint64_t rate_bytes{0};        // replicated frame bytes per second
-    std::uint64_t burst_bytes{0};       // bucket depth in bytes
-    std::uint32_t max_remote_vteps{0};  // flood-list cap: larger VNIs drop the frame
+    std::uint32_t rate_frames{0};         // replicated frames per second
+    std::uint32_t burst_frames{0};        // bucket depth in frames
+    std::uint64_t rate_bytes{0};          // replicated frame bytes per second
+    std::uint64_t burst_bytes{0};         // bucket depth in bytes
+    std::uint32_t max_remote_vteps{0};    // flood-list cap: larger VNIs drop the frame
+    std::uint16_t max_groups_per_nic{0};  // snooped joins per NIC; 0 refuses every join
 };
 
 inline constexpr std::uint32_t group_rate_frames_max = 1U << 24;
@@ -318,6 +336,31 @@ inline constexpr std::uint32_t group_burst_frames_max = 1U << 20;
 inline constexpr std::uint64_t group_rate_bytes_max = std::uint64_t{1} << 37;  // ~1 Tbit/s
 inline constexpr std::uint64_t group_burst_bytes_max = std::uint64_t{1} << 32;
 inline constexpr std::uint32_t group_max_remote_vteps_max = 1U << 16;
+inline constexpr std::uint16_t group_max_groups_per_nic_max = 256;
+// proto::max_group_membership_entries: what one membership report carries.
+inline constexpr std::size_t max_role_memberships = 1024;
+
+// A VNI's per-group VTEP lists (proto::GroupMembers): each group's VTEPs,
+// ascending.
+using GroupMembers = std::map<igmp::Group, std::vector<Ipv6Address>>;
+
+enum class GroupMembersError : std::uint8_t {
+    vni_out_of_range,
+    too_many_groups,  // more than proto::max_member_groups
+    bad_group,        // not a replicable group
+    bad_vteps,        // none, more than 64, more than 4096 in all, or one not unicast
+};
+
+[[nodiscard]] auto to_string(GroupMembersError e) noexcept -> const char*;
+
+// One NIC's join of one group, as memberships() lists it.
+struct Membership {
+    geneve::NicId nic{};
+    std::uint32_t vni{0};
+    igmp::Group group{};
+
+    friend auto operator==(const Membership&, const Membership&) -> bool = default;
+};
 
 enum class GroupPolicyError : std::uint8_t {
     vni_out_of_range,  // 0, or wider than 24 bits
@@ -382,6 +425,15 @@ struct SwitchCounters {
     std::uint64_t tx_drop_route_target{0};     // the route's target NIC is not in the VNI here
     std::uint64_t tx_drop_ttl{0};              // routed packet whose TTL or hop limit ran out
     std::uint64_t tx_routed{0};                // routed to a target NIC (local or remote)
+    std::uint64_t snoop_reports{0};            // IGMP/MLD membership reports read
+    std::uint64_t snoop_joins{0};              // new joins recorded
+    std::uint64_t snoop_leaves{0};             // joins removed by a leave or done
+    std::uint64_t snoop_drop_cap{0};           // joins refused: the NIC or role is at its cap
+    std::uint64_t snoop_malformed{0};          // reports refused (igmp::SnoopError)
+    std::uint64_t snoop_ignored{0};            // reports from a VNI that has not opted in
+    std::uint64_t snoop_expired{0};            // joins that went unrefreshed
+    std::uint64_t queries_sent{0};             // general queries delivered to NICs
+    std::uint64_t tx_replicas_pruned{0};       // group frames sent by a VTEP list, not flooded
     std::uint64_t arp_replies{0};
     std::uint64_t nd_replies{0};
     std::uint64_t dhcp4_replies{0};
@@ -447,14 +499,28 @@ public:
         -> std::expected<void, GroupPolicyError>;
     [[nodiscard]] auto group_policy(std::uint32_t vni) const -> GroupPolicy;
 
+    // Replaces one VNI's per-group VTEP lists, validated as a whole; an
+    // empty map makes every group unknown again.
+    auto set_group_members(std::uint32_t vni, const GroupMembers& members)
+        -> std::expected<void, GroupMembersError>;
+    [[nodiscard]] auto group_members(std::uint32_t vni) const -> const GroupMembers*;
+
+    // Every snooped join of an attached NIC still in a VNI here, ascending
+    // by (NIC, group). membership_changes() counts changes to that list.
+    [[nodiscard]] auto memberships() const -> std::vector<Membership>;
+    [[nodiscard]] auto membership_changes() const noexcept -> std::uint64_t {
+        return _membership_changes;
+    }
+
     // The meter of an attached NIC, if it is attached.
     [[nodiscard]] auto group_meter(geneve::NicId nic) const -> std::optional<GroupMeter>;
     // Every attached NIC's meter, in NIC ID order, then the final meters of
     // NICs detached since the last call (which this call forgets).
     auto group_usage() -> std::vector<GroupUsage>;
 
-    // Sends the periodic router advertisements that are due (Requirement
-    // 12.4). Called from the data-plane loop, as often as it likes.
+    // Sends the periodic router advertisements and multicast queries that
+    // are due and expires stale joins (Requirements 12.4 and 10.5). Called
+    // from the data-plane loop, as often as it likes.
     auto poll() -> void;
 
     // The metadata endpoint, or null to drop intercepted packets.
@@ -492,6 +558,8 @@ private:
         std::uint64_t attachment{0};
         GroupMeter meter{};
         Bucket bucket{};
+        std::map<igmp::Group, Clock::time_point> groups{};  // snooped joins, with expiry
+        std::optional<Clock::time_point> last_query{};
     };
 
     struct VpcNeighbors {
@@ -506,7 +574,17 @@ private:
     auto handle_nd(const MappingSnapshot& snap, geneve::NicId src, const NicBinding& binding,
                    std::span<const std::byte> frame) -> bool;
     auto replicate(const MappingSnapshot& snap, geneve::NicId src, std::uint32_t vni,
-                   std::span<const std::byte> frame, bool ip_ok) -> void;
+                   std::span<const std::byte> frame, const packet::ParsedPacket* ip) -> void;
+    // An IGMP or MLD message from a guest: snooped or refused.
+    auto snoop(geneve::NicId src, const NicBinding& binding, const packet::ParsedPacket& p,
+               igmp::Kind kind) -> void;
+    // The VTEP list of the group `ip` is sent to, if the VNI lists it.
+    [[nodiscard]] auto listed_vteps(std::uint32_t vni, const packet::ParsedPacket* ip) const
+        -> const std::vector<Ipv6Address>*;
+    [[nodiscard]] auto joined(geneve::NicId nic, const igmp::Group& g) const -> bool;
+    // Drops joins of NICs in `vni` beyond `cap` (a lowered or dropped policy).
+    auto trim_memberships(std::uint32_t vni, std::size_t cap) -> void;
+    auto send_queries(geneve::NicId nic, NicGroupState& state, const VpcConfig& cfg) -> void;
     // Group replication or unicast delivery once the frame passed every
     // check; `ip` is the parsed packet for IP frames, null for ARP.
     auto forward(const MappingSnapshot& snap, geneve::NicId src, const NicBinding& binding,
@@ -562,6 +640,9 @@ private:
     std::unordered_map<std::uint32_t, VpcNeighbors> _neighbors;
     std::unordered_map<std::uint32_t, GroupPolicy> _group_policies;  // only non-drop VNIs
     std::unordered_map<geneve::NicId, NicGroupState, NicIdHash> _group;
+    std::unordered_map<std::uint32_t, GroupMembers> _group_members;  // only non-empty lists
+    std::size_t _membership_count{0};
+    std::uint64_t _membership_changes{0};
     std::vector<GroupUsage> _retired;
     std::uint64_t _attachments{0};
     Now _now;

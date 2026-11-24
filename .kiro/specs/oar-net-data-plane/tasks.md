@@ -212,6 +212,20 @@
   the VSwitch meters. _Requirements: 10.2, 10.6, 10.7_
 - [ ] 14. IGMP/MLD snooping, per-NIC group cap, join reports through helm
   and per-group VTEP lists. Needs the L3 parser. _Requirements: 10.5_
+  - [x] 14.1 Data plane: `src/oar/net/igmp.*` reads IGMPv1-3 and
+    MLDv1-2 reports and builds the gateway's general queries (tests,
+    `fuzz_igmp`); the VSwitch snoops joins under `max_groups_per_nic`,
+    queries every 125 s from the gateway, expires joins after 260 s,
+    lists them (`memberships()`), and prunes listed groups to their VTEPs
+    and joined local NICs (`set_group_members`). See design "Multicast
+    snooping". The frame and report are controller-interface task 15.
+  - [ ] 14.2 Sideband and helm: OarLink `group_members` (chunked, like
+    `tunnel_peers`) verified by `NetRole` and applied with
+    `set_group_members`, a paged membership read, `max_groups_per_nic`
+    carried from the GroupPolicy, and helm keeping the newest frame per
+    VNI, forwarding it like a GroupPolicy and reporting each role's list
+    as `group_membership` when it changes (an empty one when a role goes
+    away). Builds on task 13's NetRole and HelmDaemon group wiring.
 - [x] 15. L3/L4 packet parser (`src/oar/net/packet.*`): untagged
   Ethernet, IPv4 with options, IPv6 with a bounded extension-header walk,
   TCP/UDP/ICMP/ICMPv6 headers, fragments; tests and `fuzz_packet`.

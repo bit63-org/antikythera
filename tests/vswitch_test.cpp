@@ -21,6 +21,7 @@
 #include "common/wire.hpp"
 #include "net_frames.hpp"
 #include "oar/net/geneve.hpp"
+#include "oar/net/igmp.hpp"
 #include "oar/net/mapping_table.hpp"
 #include "oar/net/neighbor.hpp"
 #include "oar/net/dhcp6.hpp"
@@ -2015,6 +2016,263 @@ BOOST_FIXTURE_TEST_CASE(check_off_on_receive, Routing,
     BOOST_TEST(sw.counters().rx_drop_ip_spoofed == 1);
     BOOST_TEST(sw.counters().rx_drop_ip_dst == 1);
     BOOST_TEST(port_a.frames.size() == 1);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// Requirement 10.5 (task 14): IGMP/MLD snooping, the gateway querier and
+// per-group VTEP lists.
+BOOST_FIXTURE_TEST_SUITE(snooping, Fixture)
+
+namespace {
+
+namespace ig = ak::oar::net::igmp;
+
+constexpr std::uint16_t snoop_groups = 2;
+
+auto snoop_policy(std::uint16_t groups = snoop_groups) -> net::GroupPolicy {
+    auto p = multicast_policy();
+    p.max_groups_per_nic = groups;
+    return p;
+}
+
+auto g4(std::uint8_t last) -> nb::Ipv4Address {
+    return {std::byte{239}, std::byte{1}, std::byte{1}, std::byte{last}};
+}
+
+auto group_of(const nb::Ipv4Address& a) -> ig::Group {
+    ig::Group g{.ipv6 = false, .address = {}};
+    std::ranges::copy(a, g.address.begin());
+    return g;
+}
+
+auto group_mac(const nb::Ipv4Address& a) -> net::MacAddress {
+    return {std::byte{0x01}, std::byte{0x00}, std::byte{0x5e}, a[1] & std::byte{0x7f}, a[2], a[3]};
+}
+
+// An IGMPv2 message from `from` (its own address, or 0.0.0.0).
+auto igmp2(NicId from, std::uint8_t type, const nb::Ipv4Address& group, bool unspecified = false)
+    -> std::vector<std::byte> {
+    std::vector<std::byte> m;
+    ak::wire::Writer w{m};
+    w.u8(type);
+    w.u8(0);
+    w.be16(0);
+    w.bytes(group);
+    std::uint32_t sum = 0;
+    for (std::size_t i = 0; i + 1 < m.size(); i += 2) {
+        sum +=
+            (std::to_integer<std::uint32_t>(m[i]) << 8U) | std::to_integer<std::uint32_t>(m[i + 1]);
+    }
+    sum = (sum & 0xFFFFU) + (sum >> 16U);
+    const auto c = static_cast<std::uint16_t>(~sum & 0xFFFFU);
+    m[2] = static_cast<std::byte>(c >> 8U);
+    m[3] = static_cast<std::byte>(c & 0xFFU);
+    const auto src = unspecified ? nb::Ipv4Address{} : ip4(static_cast<std::uint8_t>(from.value));
+    return fr::ipv4(group_mac(group), mac_of(from), src, group, ig::ipproto_igmp, m);
+}
+
+auto join(NicId from, const nb::Ipv4Address& group) -> std::vector<std::byte> {
+    return igmp2(from, ig::igmp_v2_report, group);
+}
+
+auto leave(NicId from, const nb::Ipv4Address& group) -> std::vector<std::byte> {
+    return igmp2(from, ig::igmp_v2_leave, group);
+}
+
+// An MLDv1 report from `from`'s link-local address.
+auto mld_join(NicId from, const net::Ipv6Address& group) -> std::vector<std::byte> {
+    std::vector<std::byte> body;
+    ak::wire::Writer w{body};
+    w.be32(0);
+    w.bytes(group);
+    const net::MacAddress mac{std::byte{0x33}, std::byte{0x33}, group[12],
+                              group[13],       group[14],       group[15]};
+    return fr::ipv6(mac, mac_of(from), link_local(from), group, pk::ipproto_icmpv6,
+                    fr::icmpv6(link_local(from), group, ig::mld_v1_report, 0, body), 1);
+}
+
+auto to_group(NicId from, const nb::Ipv4Address& group) -> std::vector<std::byte> {
+    return udp4(group_mac(group), mac_of(from), ip4(static_cast<std::uint8_t>(from.value)), group);
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(joins_and_leaves, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in(snoop_policy());
+    send(nic_a, join(nic_a, g4(1)));
+    net::Ipv6Address g6{};
+    g6[0] = std::byte{0xff};
+    g6[1] = std::byte{0x05};
+    g6[ipv6_last] = std::byte{0x42};
+    send(nic_b, mld_join(nic_b, g6));
+    BOOST_TEST(nothing_delivered());  // reports are consumed, never replicated
+    const std::vector<net::Membership> want{
+        {.nic = nic_a, .vni = vpc, .group = group_of(g4(1))},
+        {.nic = nic_b, .vni = vpc, .group = {.ipv6 = true, .address = g6}}};
+    BOOST_TEST((sw.memberships() == want));
+    BOOST_TEST(sw.counters().snoop_joins == 2);
+    const auto changes = sw.membership_changes();
+
+    // A repeat refreshes without a change; a leave removes the join.
+    send(nic_a, join(nic_a, g4(1)));
+    BOOST_TEST(sw.membership_changes() == changes);
+    send(nic_a, leave(nic_a, g4(1)));
+    BOOST_TEST(sw.memberships().size() == 1U);
+    BOOST_TEST(sw.counters().snoop_leaves == 1);
+    BOOST_TEST(sw.membership_changes() == changes + 1);
+
+    // A report from 0.0.0.0 (a guest before DHCP) counts as its NIC's.
+    send(nic_a, igmp2(nic_a, ig::igmp_v2_report, g4(2), true));
+    BOOST_TEST(sw.memberships().size() == 2U);
+    BOOST_TEST(sw.counters().snoop_reports == 5);
+
+    // Detaching the NIC forgets its joins.
+    BOOST_REQUIRE(sw.detach(nic_a));
+    BOOST_TEST(sw.memberships().size() == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(guests_never_query_and_drop_vnis_ignore_reports,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    send(nic_a, join(nic_a, g4(1)));
+    BOOST_TEST(sw.counters().snoop_ignored == 1);
+    BOOST_TEST(sw.memberships().empty());
+    opt_in(snoop_policy());
+    send(nic_a, igmp2(nic_a, ig::igmp_query, {}));
+    send(nic_a, igmp2(nic_a, 0x13, {}));  // DVMRP
+    BOOST_TEST(sw.counters().tx_drop_router_msg == 2);
+    auto broken = join(nic_a, g4(1));
+    broken.back() ^= std::byte{1};
+    send(nic_a, broken);
+    BOOST_TEST(sw.counters().snoop_malformed == 1);
+    // Someone else's address is still a spoofed source.
+    send(nic_a, igmp2(nic_b, ig::igmp_v2_report, g4(1)));
+    BOOST_TEST(sw.counters().tx_drop_spoofed + sw.counters().tx_drop_ip_spoofed == 1);
+    BOOST_TEST(nothing_delivered());
+}
+
+BOOST_AUTO_TEST_CASE(joins_are_capped, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in(snoop_policy(2));
+    for (std::uint8_t g = 1; g <= 3; ++g) {
+        send(nic_a, join(nic_a, g4(g)));
+    }
+    BOOST_TEST(sw.memberships().size() == 2U);
+    BOOST_TEST(sw.counters().snoop_drop_cap == 1);
+    // A lower cap trims, a drop policy clears, zero refuses every join.
+    opt_in(snoop_policy(1));
+    BOOST_TEST(sw.memberships().size() == 1U);
+    BOOST_REQUIRE(sw.set_group_policy(vpc, {}));
+    BOOST_TEST(sw.memberships().empty());
+    opt_in(snoop_policy(0));
+    send(nic_a, join(nic_a, g4(1)));
+    BOOST_TEST(sw.memberships().empty());
+    BOOST_TEST(sw.counters().snoop_drop_cap == 2);
+    // The cap is bounded, and a drop policy carries none.
+    BOOST_TEST(
+        (sw.set_group_policy(vpc, snoop_policy(net::group_max_groups_per_nic_max + 1)).error() ==
+         net::GroupPolicyError::limit_too_large));
+    net::GroupPolicy drop{};
+    drop.max_groups_per_nic = 1;
+    BOOST_TEST((sw.set_group_policy(vpc, drop).error() == net::GroupPolicyError::nonzero_limits));
+}
+
+BOOST_AUTO_TEST_CASE(listed_groups_are_pruned_on_transmit,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in(snoop_policy());
+    // 239.1.1.1 is wanted at peer only (this VTEP's own entry is skipped).
+    BOOST_REQUIRE(
+        sw.set_group_members(vpc, {{group_of(g4(1)), {vtep(self_tail), vtep(peer_tail)}}}));
+    send(nic_a, to_group(nic_a, g4(1)));
+    BOOST_TEST(port_b.frames.empty());  // b has not joined
+    BOOST_REQUIRE(underlay.sent.size() == 1);
+    BOOST_TEST((underlay.sent[0].vtep == vtep(peer_tail)));
+    BOOST_TEST(sw.counters().tx_replicas_pruned == 1);
+
+    send(nic_b, join(nic_b, g4(1)));
+    send(nic_a, to_group(nic_a, g4(1)));
+    BOOST_TEST(port_b.frames.size() == 1);
+    BOOST_TEST(underlay.sent.size() == 2);
+
+    // An unlisted group still reaches the whole VNI: b and both peers.
+    underlay.sent.clear();
+    send(nic_a, to_group(nic_a, g4(9)));
+    BOOST_TEST(port_b.frames.size() == 2);
+    BOOST_TEST(underlay.sent.size() == 2);
+    BOOST_TEST(sw.counters().tx_replicas_pruned == 2);
+
+    // An empty list makes every group unknown again.
+    BOOST_REQUIRE(sw.set_group_members(vpc, {}));
+    BOOST_TEST(sw.group_members(vpc) == nullptr);
+}
+
+BOOST_AUTO_TEST_CASE(listed_groups_are_pruned_on_receive,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in(snoop_policy());
+    BOOST_REQUIRE(sw.set_group_members(vpc, {{group_of(g4(1)), {vtep(self_tail)}}}));
+    send(nic_a, join(nic_a, g4(1)));
+    const auto f = udp4(group_mac(g4(1)), mac_of(nic_c), ip4(33), g4(1));
+    const Inbound in{nic_c, geneve::nic_broadcast, vpc, f};
+    BOOST_REQUIRE(sw.receive(in.packet, vtep(peer_tail)).has_value());
+    BOOST_TEST(port_a.frames.size() == 1);
+    BOOST_TEST(port_b.frames.empty());
+    // Unlisted: every local NIC.
+    const Inbound other{nic_c, geneve::nic_broadcast, vpc,
+                        udp4(group_mac(g4(9)), mac_of(nic_c), ip4(33), g4(9))};
+    BOOST_REQUIRE(sw.receive(other.packet, vtep(peer_tail)).has_value());
+    BOOST_TEST(port_a.frames.size() == 2);
+    BOOST_TEST(port_b.frames.size() == 1);
+}
+
+BOOST_AUTO_TEST_CASE(member_list_validation, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    using net::GroupMembersError;
+    BOOST_TEST((sw.set_group_members(0, {}).error() == GroupMembersError::vni_out_of_range));
+    BOOST_TEST((sw.set_group_members(vpc, {{group_of(ip4(1)), {vtep(1)}}}).error() ==
+                GroupMembersError::bad_group));
+    BOOST_TEST((sw.set_group_members(vpc, {{group_of(g4(1)), {}}}).error() ==
+                GroupMembersError::bad_vteps));
+    BOOST_TEST((sw.set_group_members(vpc, {{group_of(g4(1)), {vtep(2), vtep(1)}}}).error() ==
+                GroupMembersError::bad_vteps));
+    BOOST_TEST((sw.set_group_members(vpc, {{group_of(g4(1)), {net::Ipv6Address{}}}}).error() ==
+                GroupMembersError::bad_vteps));
+    BOOST_TEST(std::string_view{net::to_string(GroupMembersError::bad_vteps)} != "unknown");
+    BOOST_TEST(sw.group_members(vpc) == nullptr);
+}
+
+BOOST_AUTO_TEST_CASE(gateway_queries_and_joins_expire,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in(snoop_policy());
+    sw.poll();  // no VpcConfig yet: no querier
+    BOOST_TEST(sw.counters().queries_sent == 0);
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, gateway::config()));
+    sw.poll();
+    // IGMPv3 and MLDv2 (the config has an IPv6 prefix) to a and b; x's VNI
+    // has not opted in. The periodic RAs land on the same ports.
+    BOOST_TEST(sw.counters().queries_sent == 4);
+    const auto queries = [](const FakePort& p) {
+        return std::ranges::count_if(p.frames, [](const auto& f) {
+            const auto parsed = pk::parse(f);
+            return parsed && ig::classify(*parsed) == ig::Kind::query;
+        });
+    };
+    BOOST_TEST(queries(port_a) == 2);
+    BOOST_TEST(queries(port_b) == 2);
+    BOOST_TEST(queries(port_x) == 0);
+    sw.poll();
+    BOOST_TEST(sw.counters().queries_sent == 4);
+    now += std::chrono::seconds{ig::query_interval_seconds};
+    sw.poll();
+    BOOST_TEST(sw.counters().queries_sent == 8);
+
+    // A join lasts the membership interval unless refreshed.
+    send(nic_a, join(nic_a, g4(1)));
+    send(nic_b, join(nic_b, g4(1)));
+    now += std::chrono::seconds{ig::membership_seconds - 1};
+    send(nic_b, join(nic_b, g4(1)));
+    now += std::chrono::seconds{1};
+    sw.poll();
+    const std::vector<net::Membership> want{{.nic = nic_b, .vni = vpc, .group = group_of(g4(1))}};
+    BOOST_TEST((sw.memberships() == want));
+    BOOST_TEST(sw.counters().snoop_expired == 1);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

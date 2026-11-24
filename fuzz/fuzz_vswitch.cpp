@@ -195,7 +195,8 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
                                        .burst_frames = 3,
                                        .rate_bytes = 512,
                                        .burst_bytes = 1024,
-                                       .max_remote_vteps = 1})) {
+                                       .max_remote_vteps = 1,
+                                       .max_groups_per_nic = 2})) {
         std::abort();
     }
     std::array<Port, nic_count> ports{};
@@ -321,6 +322,16 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
         if (m.replicas_remote > m.frames || m.replica_bytes_remote > m.bytes ||
             m.replicas_local > m.frames || m.replica_bytes_local > m.bytes ||
             (u.nic.value == nic_ids[3] && m.frames != 0)) {
+            std::abort();
+        }
+    }
+    // Snooped joins: only from vpc_one (vpc_two never opted in), at most
+    // the policy's two per NIC, and only replicable groups.
+    std::array<std::size_t, nic_count> joins{};
+    for (const auto& j : sw.memberships()) {
+        const std::size_t i = index_of(j.nic);
+        if (i >= nic_count || j.vni != vpc_one || ++joins.at(i) > 2 ||
+            !net::igmp::replicable(j.group)) {
             std::abort();
         }
     }

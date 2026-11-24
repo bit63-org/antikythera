@@ -132,7 +132,7 @@ auto Fetcher::prefetch(const std::shared_ptr<CachedImage>& image, std::uint32_t 
 
 auto Fetcher::drain() -> void {
     std::unique_lock lock{_mutex};
-    _done.wait(lock, [&] { return _jobs.empty(); });
+    _done.wait(lock, [&] { return _jobs.empty() && _calling == 0; });
 }
 
 auto Fetcher::counters() const -> FetcherCounters {
@@ -159,9 +159,12 @@ auto Fetcher::run() -> void {
         lock.lock();
         auto callbacks = finish(job, result);
         if (!callbacks.empty()) {
+            ++_calling;
             lock.unlock();
             run_callbacks(callbacks, result);
             lock.lock();
+            --_calling;
+            _done.notify_all();
         }
     }
 }

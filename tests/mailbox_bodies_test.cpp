@@ -53,7 +53,8 @@ constexpr std::size_t rsvd_in_tail = 7;
 constexpr std::byte zero{0};
 constexpr std::byte nonzero{1};
 constexpr std::byte bad_device_type{5};
-constexpr std::byte bad_policy{3};
+constexpr std::byte wait_policy{3};  // volumes only
+constexpr std::byte bad_policy{4};
 constexpr std::uint8_t too_long_timeout = 0x59;  // low byte of 601 (0x0259)
 constexpr std::uint8_t too_long_timeout_hi = 0x02;
 
@@ -168,6 +169,11 @@ auto every_body() -> std::vector<mb::Body> {
                          .device = blk,
                          .timeout_s = mb::max_detach_timeout_s,
                          .policy = mb::DetachPolicy::force},
+        mb::DetachVolume{.volume_id = volume,
+                         .vm_id = vm_a,
+                         .device = blk,
+                         .timeout_s = timeout_s,
+                         .policy = mb::DetachPolicy::wait},
         mb::RewrapVolume{.volume_id = volume, .from_vm = vm_a, .to_vm = vm_b},
         mb::CreateNetwork{.vni = vni},
         mb::DeleteNetwork{.vni = mb::max_vni},
@@ -380,6 +386,7 @@ BOOST_AUTO_TEST_CASE(policy_timeout_and_reserved_bytes,
     const std::size_t tail = after_vm_id;  // the *_in_tail offsets count from the device ref
     expect_invalid(dd, tail + policy_in_tail, zero);
     expect_invalid(dd, tail + policy_in_tail, bad_policy);
+    expect_invalid(dd, tail + policy_in_tail, wait_policy);  // a device does not wait
     expect_invalid(dd, tail + rsvd_in_tail, nonzero);
 
     const mb::DetachVolume dv{
@@ -436,7 +443,7 @@ BOOST_AUTO_TEST_CASE(response_rules, *boost::unit_test::timeout(unit_timeout_sec
     resp[command_hi] = std::byte{0x02};  // 0x0200 = vm_exited
     BOOST_TEST((decode_error(mb::Type::response, resp) == BodyError::invalid_field));
 
-    expect_invalid(ok_response(), status_lo, std::byte{14});
+    expect_invalid(ok_response(), status_lo, std::byte{15});  // one past busy
 
     // A reply to a command that can never be built yet is still a reply.
     auto reserved = ok_response();

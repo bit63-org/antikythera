@@ -115,6 +115,11 @@ constexpr auto valid_policy(std::uint8_t raw) noexcept -> bool {
            raw == std::to_underlying(DetachPolicy::destroy_vm);
 }
 
+// Volumes may also wait for the guest (block-volume-service task 13).
+constexpr auto valid_volume_policy(std::uint8_t raw) noexcept -> bool {
+    return valid_policy(raw) || raw == std::to_underlying(DetachPolicy::wait);
+}
+
 constexpr auto valid_timeout(std::uint16_t t) noexcept -> bool {
     return t != 0 && t <= max_detach_timeout_s;
 }
@@ -137,7 +142,7 @@ constexpr auto is_gpu(DeviceType t) noexcept -> bool {
 }
 
 constexpr auto valid_status(std::uint16_t raw) noexcept -> bool {
-    return raw <= std::to_underlying(Status::wrong_server);
+    return raw <= std::to_underlying(Status::busy);
 }
 
 constexpr auto takes_payload(Type command) noexcept -> bool {
@@ -296,7 +301,7 @@ auto decode_detach_volume(const Message& msg) noexcept -> std::expected<DetachVo
     const std::uint8_t policy = *r->u8();
     const std::uint8_t rsvd = *r->u8();
     if (out.volume_id == 0 || out.vm_id == 0 || !dev || dev->type != DeviceType::blk_fn ||
-        !valid_timeout(out.timeout_s) || !valid_policy(policy) || rsvd != reserved_byte) {
+        !valid_timeout(out.timeout_s) || !valid_volume_policy(policy) || rsvd != reserved_byte) {
         return invalid();
     }
     out.device = *dev;

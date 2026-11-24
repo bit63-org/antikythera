@@ -213,7 +213,10 @@ auto policy(std::string_view s) -> std::expected<mb::DetachPolicy, std::string> 
     if (s == "destroy-vm") {
         return mb::DetachPolicy::destroy_vm;
     }
-    return std::unexpected("policy must be force or destroy-vm");
+    if (s == "wait") {
+        return mb::DetachPolicy::wait;  // volumes only
+    }
+    return std::unexpected("policy must be force, destroy-vm or wait");
 }
 
 auto mac(std::string_view s) -> std::expected<proto::Mac, std::string> {
@@ -353,6 +356,7 @@ constexpr std::array status_names{
     std::pair{"internal_error", proto::CommandStatus::internal_error},
     std::pair{"unsupported", proto::CommandStatus::unsupported},
     std::pair{"wrong_server", proto::CommandStatus::wrong_server},
+    std::pair{"busy", proto::CommandStatus::busy},
 };
 
 constexpr std::array kind_names{

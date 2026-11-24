@@ -88,6 +88,32 @@
 //   DELETE_VOLUME, REWRAP_VOLUME are the controller's (no mailbox command):
 //                  unknown_volume, as for any volume helm does not hold.
 //
+// Cooperative detach (.kiro/specs/block-volume-service/ task 13,
+// Requirement 3.3-3.5), for every volume kind:
+//
+//   DETACH_VOLUME, policy wait: once prepare passes, helm asks the storage
+//                  role to have the guest release the function (eject
+//                  request) and relays nothing yet: the command waits
+//                  beside the mailbox, which serves the commands behind
+//                  it. poll() asks the role every eject_poll; once it says
+//                  released, the command goes back to the front of the
+//                  queue and is prepared and relayed as usual (hull's
+//                  eject then finishes at once). If the guest has not let
+//                  go by timeout_s, the command is reported `busy` (once,
+//                  not a final outcome) and keeps waiting, the volume still
+//                  attached and serving. A later DETACH_VOLUME of the same
+//                  volume under force or destroy_vm replaces it (the
+//                  waiting one finishes `conflict`), another under wait is
+//                  refused `conflict`; if the function leaves the VM some
+//                  other way (DESTROY_VM, the VM died), the waiting command
+//                  finishes `conflict`. A role without eject: unsupported.
+//   DETACH_VOLUME, policy force, of a network volume: refused `conflict`
+//                  until helm holds a ReplicaConfig that no longer lists
+//                  the attachment at its generation, i.e. the controller
+//                  has fenced it (Requirement 3.5); the controller waits for
+//                  the primary to apply that config before it sends the
+//                  detach.
+//
 // A media step that fails after commit (delete or rewrap) cannot be undone
 // either: it is counted in storage_failures. A failed delete leaves only
 // ciphertext whose key is gone; a failed rewrap leaves the old wrapped key
@@ -210,6 +236,11 @@ public:
         return std::unexpected(
             LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported});
     }
+    // Cooperative detach, to the storage role that serves the function.
+    virtual auto eject(const oar::Eject& /*request*/) -> std::expected<oar::EjectState, LinkError> {
+        return std::unexpected(
+            LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported});
+    }
 };
 
 class OarLinkPort final : public OarPort {
@@ -230,6 +261,7 @@ public:
     auto group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError> override;
     auto replica_config(std::span<const std::byte> frame)
         -> std::expected<void, LinkError> override;
+    auto eject(const oar::Eject& request) -> std::expected<oar::EjectState, LinkError> override;
 
 private:
     OarLink* _link;
@@ -258,6 +290,8 @@ struct RouterConfig {
     std::chrono::milliseconds release_timeout{std::chrono::seconds{60}};
     // How long a GPU function may wait in `cleaning` for SCRUB_DONE.
     std::chrono::milliseconds clean_timeout{std::chrono::minutes{10}};
+    // How often a waiting DETACH_VOLUME asks whether the guest let go.
+    std::chrono::milliseconds eject_poll{std::chrono::milliseconds{500}};
     // This server (the ControllerSession's): network volume attachments
     // naming it are the ones it serves.
     std::uint64_t server_id{0};
@@ -279,6 +313,7 @@ struct RouterStats {
     std::uint64_t inconsistencies{0};        // hull confirmed something helm's state disagrees with
     std::uint64_t key_delivery_failures{0};  // ATTACH_VOLUME succeeded, the key did not arrive
     std::uint64_t storage_failures{0};       // a committed delete or rewrap failed on the media
+    std::uint64_t busy{0};                   // waiting detaches reported busy
 };
 
 class CommandRouter {
@@ -323,6 +358,8 @@ public:
     [[nodiscard]] auto stats() const noexcept -> const RouterStats& { return _stats; }
     [[nodiscard]] auto busy() const noexcept -> bool { return _in_flight.has_value(); }
     [[nodiscard]] auto queued() const noexcept -> std::size_t { return _queue.size(); }
+    // DETACH_VOLUMEs waiting for their guest to release the volume.
+    [[nodiscard]] auto waiting_detaches() const noexcept -> std::size_t { return _ejecting.size(); }
 
 private:
     // What a command did before relay, so it can be undone.
@@ -343,6 +380,15 @@ private:
         mailbox::Body body;
         Undo undo;
         Clock::time_point deadline;
+    };
+
+    // A DETACH_VOLUME under policy wait, until its guest lets go.
+    struct Ejecting {
+        proto::Envelope envelope;
+        mailbox::DetachVolume detach;
+        Clock::time_point deadline;   // busy after this
+        Clock::time_point next_poll;  // ask the role again then
+        bool busy_reported{false};
     };
 
     struct Vm {
@@ -378,6 +424,17 @@ private:
     auto compensate(std::uint64_t seq, Undo& undo) -> void;
     auto commit(std::uint64_t seq, const mailbox::Body& body, const Undo& undo) -> void;
     auto deliver_volume_key(std::uint64_t seq, const mailbox::AttachVolume& attach) -> void;
+    // Policy wait: asks the role to eject. True if the command waits now
+    // (nothing relayed), false to relay it (already released); an error
+    // refuses it.
+    auto start_eject(std::uint64_t seq, const proto::Envelope& envelope,
+                     const mailbox::DetachVolume& detach) -> std::expected<bool, mailbox::Status>;
+    // Asks every waiting detach's role again when due; relays released ones.
+    auto poll_ejects(Clock::time_point t) -> void;
+    // The waiting detach of `volume`, if any.
+    [[nodiscard]] auto ejecting(VolumeId volume) -> std::map<std::uint64_t, Ejecting>::iterator;
+    // Whether the network volume's newest config no longer lists its attachment.
+    [[nodiscard]] auto fenced(VolumeId volume, const NetworkVolume& net) const -> bool;
     // Releases a volume's space on its storage role (after crypto-erase).
     auto erase_volume(VolumeId volume) -> void;
     // A volume's owner: the KeyStore's for a disk volume, ours for an image volume.
@@ -423,8 +480,10 @@ private:
     std::uint64_t _last_seq;
     std::deque<proto::Envelope> _queue;
     std::optional<InFlight> _in_flight;
-    std::set<std::uint64_t> _timed_out;         // relayed, timed out, answer not yet seen
-    std::map<std::uint64_t, Outcome> _history;  // finished outcomes, for retries
+    std::set<std::uint64_t> _timed_out;           // relayed, timed out, answer not yet seen
+    std::map<std::uint64_t, Outcome> _history;    // finished outcomes, for retries
+    std::map<std::uint64_t, Ejecting> _ejecting;  // seq -> waiting DETACH_VOLUME
+    std::set<std::uint64_t> _released;            // waited and released: relay on dispatch
 
     std::map<FunctionId, Clock::time_point> _deadlines;  // releasing / GPU cleaning
     std::map<VmId, Vm> _vms;

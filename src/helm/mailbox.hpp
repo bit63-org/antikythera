@@ -221,10 +221,16 @@ struct DeviceRef {
 };
 
 // What hull does when the guest has not ejected a function by the timeout
-// (hull-host-agent Requirement 7.2).
+// (hull-host-agent Requirement 7.2), and for a volume, whether it waits for
+// the guest at all.
 enum class DetachPolicy : std::uint8_t {
     force = 1,       // hot-unplug anyway
     destroy_vm = 2,  // destroy the whole VM
+    // DETACH_VOLUME only (.kiro/specs/block-volume-service/ Requirement
+    // 3.3): helm relays the command only once the guest has released the
+    // volume, reporting it `busy` meanwhile, and hull never ejects before
+    // that. The controller's default.
+    wait = 3,
 };
 
 inline constexpr std::uint16_t max_detach_timeout_s = 600;
@@ -262,7 +268,8 @@ struct AttachDevice {
 };
 
 // DETACH_DEVICE: vm_id u64 | device (4) | timeout_s u16 | policy u8 | rsvd u8
-// (16 bytes). device.type must not be blk_fn; 1 <= timeout_s <= 600.
+// (16 bytes). device.type must not be blk_fn; 1 <= timeout_s <= 600; policy
+// force or destroy_vm.
 struct DetachDevice {
     std::uint64_t vm_id{0};
     DeviceRef device;
@@ -308,7 +315,9 @@ struct AttachVolume {
 };
 
 // DETACH_VOLUME: volume_id u64 | vm_id u64 | device (4) | timeout_s u16 |
-// policy u8 | rsvd u8  (24 bytes). device.type must be blk_fn.
+// policy u8 | rsvd u8  (24 bytes). device.type must be blk_fn. Under
+// policy wait, timeout_s is how long helm waits for the guest before it
+// reports `busy`.
 struct DetachVolume {
     std::uint64_t volume_id{0};
     std::uint64_t vm_id{0};
@@ -359,6 +368,11 @@ enum class Status : std::uint16_t {
     internal_error = 11,
     unsupported = 12,
     wrong_server = 13,  // the command names another server (protocol v3 server_id)
+    // A DETACH_VOLUME under DetachPolicy::wait whose guest has not released
+    // the volume by its timeout: the volume stays attached and serving, and
+    // the command stays pending (helm reports this; hull never does). Not
+    // a final outcome: the command's own comes later.
+    busy = 14,
 };
 
 inline constexpr std::size_t response_fixed_size = 12;

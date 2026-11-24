@@ -95,6 +95,10 @@ auto OarLinkPort::replica_config(std::span<const std::byte> frame)
     return _link->replica_config(frame);
 }
 
+auto OarLinkPort::eject(const oar::Eject& request) -> std::expected<oar::EjectState, LinkError> {
+    return _link->eject(request);
+}
+
 auto OarLinkPort::group_policy(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
     return _link->group_policy(frame);
 }
@@ -206,7 +210,7 @@ auto CommandRouter::on_envelope(const proto::Envelope& envelope) -> void {
             _reports->report(it->second);
             return;
         }
-        const bool pending = (_in_flight && _in_flight->seq == seq) ||
+        const bool pending = (_in_flight && _in_flight->seq == seq) || _ejecting.contains(seq) ||
                              std::ranges::any_of(_queue, [seq](const proto::Envelope& e) {
                                  return proto::slot_seq(e.slot) == seq;
                              });
@@ -279,6 +283,19 @@ auto CommandRouter::dispatch(const proto::Envelope& envelope) -> void {
         compensate(seq, undo);
         refuse(seq, claimed, ok.error());
         return;
+    }
+    // Policy wait: the guest lets go first (a command already released
+    // comes back here to be relayed).
+    if (const auto* d = std::get_if<mailbox::DetachVolume>(&*body);
+        d != nullptr && d->policy == mailbox::DetachPolicy::wait && _released.erase(seq) == 0) {
+        auto waits = start_eject(seq, envelope, *d);
+        if (!waits) {
+            refuse(seq, claimed, waits.error());
+            return;
+        }
+        if (*waits) {
+            return;
+        }
     }
     // The relay record comes first; if it cannot be written the command is
     // not relayed.
@@ -502,6 +519,21 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
         if (it == _attached.end() || it->second != id || !info ||
             info->state != FunctionState::assigned || info->owner != d->vm_id) {
             return std::unexpected(Status::conflict);
+        }
+        // A forced detach of a network volume comes after the controller
+        // fenced the attachment (Requirement 3.5).
+        if (network && d->policy == mailbox::DetachPolicy::force &&
+            !fenced(d->volume_id, net->second)) {
+            return std::unexpected(Status::conflict);
+        }
+        // One waiting detach per volume; force or destroy_vm replaces it.
+        if (const auto w = ejecting(d->volume_id); w != _ejecting.end() && w->first != seq) {
+            if (d->policy == mailbox::DetachPolicy::wait) {
+                return std::unexpected(Status::conflict);
+            }
+            const auto replaced = w->first;
+            _ejecting.erase(w);
+            refuse(replaced, mailbox::Type::detach_volume, Status::conflict);
         }
         return {};
     }
@@ -808,6 +840,102 @@ auto CommandRouter::prepare_network_attach(const mailbox::AttachVolume& attach, 
     return {};
 }
 
+auto CommandRouter::fenced(VolumeId volume, const NetworkVolume& net) const -> bool {
+    const auto att = network_attachment(volume);
+    return !att || att->attachment_id != net.attachment || att->generation != net.generation;
+}
+
+auto CommandRouter::ejecting(VolumeId volume) -> std::map<std::uint64_t, Ejecting>::iterator {
+    return std::ranges::find_if(
+        _ejecting, [volume](const auto& entry) { return entry.second.detach.volume_id == volume; });
+}
+
+auto CommandRouter::start_eject(std::uint64_t seq, const proto::Envelope& envelope,
+                                const mailbox::DetachVolume& detach)
+    -> std::expected<bool, mailbox::Status> {
+    auto* port = port_for(detach.device.slot);
+    if (port == nullptr) {
+        return std::unexpected(mailbox::Status::unknown_device);
+    }
+    const auto state = port->eject({.fn = detach.device.function, .op = oar::EjectOp::request});
+    if (!state) {
+        return std::unexpected(link_status(state.error()));
+    }
+    audit(AuditRecord::of(AuditEvent::eject_requested)
+              .with_seq(seq)
+              .with_vm(detach.vm_id)
+              .with_volume(detach.volume_id)
+              .with_function(function_id(detach.device)));
+    if (*state == oar::EjectState::released) {
+        return false;
+    }
+    const auto t = now();
+    _ejecting.insert_or_assign(seq, Ejecting{.envelope = envelope,
+                                             .detach = detach,
+                                             .deadline = t + std::chrono::seconds{detach.timeout_s},
+                                             .next_poll = t + _config.eject_poll,
+                                             .busy_reported = false});
+    return true;
+}
+
+auto CommandRouter::poll_ejects(Clock::time_point t) -> void {
+    std::vector<std::uint64_t> released;
+    std::vector<std::uint64_t> gone;
+    for (auto& [seq, e] : _ejecting) {
+        const auto id = function_id(e.detach.device);
+        const auto it = _attached.find(e.detach.volume_id);
+        const auto info = _pool->find(id);
+        if (it == _attached.end() || it->second != id || !info ||
+            info->state != FunctionState::assigned || info->owner != e.detach.vm_id) {
+            gone.push_back(seq);  // the function left the VM some other way
+            continue;
+        }
+        if (t >= e.next_poll) {
+            e.next_poll = t + _config.eject_poll;
+            if (auto* port = port_for(e.detach.device.slot); port != nullptr) {
+                auto state =
+                    port->eject({.fn = e.detach.device.function, .op = oar::EjectOp::query});
+                if (state && *state == oar::EjectState::none) {
+                    // The role lost the request (it restarted): ask again.
+                    state =
+                        port->eject({.fn = e.detach.device.function, .op = oar::EjectOp::request});
+                }
+                if (state && *state == oar::EjectState::released) {
+                    released.push_back(seq);
+                    continue;
+                }
+            }
+        }
+        if (!e.busy_reported && t >= e.deadline) {
+            e.busy_reported = true;
+            ++_stats.busy;
+            audit(AuditRecord::of(AuditEvent::detach_busy)
+                      .with_seq(seq)
+                      .with_command(command_code(mailbox::Type::detach_volume))
+                      .with_status(status_code(mailbox::Status::busy))
+                      .with_volume(e.detach.volume_id));
+            // Not a final outcome: not kept for retries.
+            _reports->report(Outcome{.in_reply_to = seq,
+                                     .command = command_code(mailbox::Type::detach_volume),
+                                     .status = proto::CommandStatus::busy,
+                                     .payload = {}});
+        }
+    }
+    for (const auto seq : gone) {
+        _ejecting.erase(seq);
+        refuse(seq, mailbox::Type::detach_volume, mailbox::Status::conflict);
+    }
+    // Back to the front of the queue, in sequence order, to be relayed.
+    for (auto seq = released.rbegin(); seq != released.rend(); ++seq) {
+        const auto e = _ejecting.extract(*seq);
+        _released.insert(*seq);
+        _queue.push_front(e.mapped().envelope);
+    }
+    if (!released.empty()) {
+        pump();
+    }
+}
+
 auto CommandRouter::drop_unattached(VolumeId volume) -> void {
     const auto it = _network.find(volume);
     if (it != _network.end() && it->second.attached_by == 0 &&
@@ -982,6 +1110,7 @@ auto CommandRouter::poll() -> void {
         it = _deadlines.erase(it);
         (void)pool_event(id, PoolEvent::timed_out);
     }
+    poll_ejects(t);
 }
 
 // ---- pool ------------------------------------------------------------------

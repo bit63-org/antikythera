@@ -44,9 +44,9 @@ constexpr std::array event_names{
     "volume_key_created",   "volume_key_delivered",
     "volume_key_dropped",   "volume_key_rewrapped",
     "volume_key_destroyed", "volume_key_delivery_failed",
+    "eject_requested",      "detach_busy",
 };
-static_assert(event_names.size() ==
-                  static_cast<std::size_t>(AuditEvent::volume_key_delivery_failed) + 1,
+static_assert(event_names.size() == static_cast<std::size_t>(AuditEvent::detach_busy) + 1,
               "event_names must list every AuditEvent");
 
 auto append_uint(std::string& out, std::uint64_t v, int base = decimal_base) -> void {

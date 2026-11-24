@@ -53,8 +53,10 @@ auto verifier() -> ak::hull::SignatureVerifier {
     return std::move(*v);
 }
 
-auto map2_entry(std::uint64_t nic, std::uint8_t vtep_last) -> proto::MapEntry {
+auto map2_entry(std::uint64_t nic, std::uint8_t vtep_last, bool source_dest_check = true)
+    -> proto::MapEntry {
     proto::MapEntry e{.nic_id = nic};
+    e.source_dest_check = source_dest_check;
     e.mac[0] = std::byte{local_unicast};
     e.mac[proto::mac_size - 1] = std::byte{static_cast<std::uint8_t>(nic)};
     e.owner_vtep[0] = std::byte{ula_prefix};
@@ -197,7 +199,7 @@ BOOST_AUTO_TEST_CASE(map2_reproduces_and_verifies) {
                       .key_id = vec::map2_key_id,
                       .vni = vec::map2_vni,
                       .map_version = vec::map2_map_version,
-                      .entries = {map2_entry(map2_nic_a, 1), map2_entry(map2_nic_b, 2)},
+                      .entries = {map2_entry(map2_nic_a, 1), map2_entry(map2_nic_b, 2, false)},
                       .ipv4 = {guest_ipv4(map2_nic_a), guest_ipv4(map2_nic_b)},
                       .ipv6 = {guest_ipv6(map2_nic_a)},
                       .signature = {}},

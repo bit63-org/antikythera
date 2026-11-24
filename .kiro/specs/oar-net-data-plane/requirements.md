@@ -241,8 +241,11 @@ to share one hardened parser.
    cannot bypass them.
 9. Each drop cause SHALL have its own counter. Changing a VNI's addresses
    SHALL take effect for the next frame.
-10. _(Future, with route tables.)_ A per-NIC opt-out of 11.3 and 11.5,
-    like AWS `SourceDestCheck=false`, carried as a signed per-NIC flag.
+10. A per-NIC opt-out of 11.3 and 11.5, like AWS
+    `SourceDestCheck=false`, carried as a flag on the NIC's entry in the
+    signed mapping. Such a NIC MAY send from, and receive for, addresses
+    it does not own; every other NIC keeps both checks, and each VTEP
+    judges the flag from its own mapping.
 
 ### Requirement 12: Guest network configuration
 
@@ -264,7 +267,7 @@ another and nothing is flooded.
    neighbor solicitations for the gateway's link-local address
    (`fe80::/64` with the EUI-64 interface ID of the gateway MAC) and for
    `fd00:ec2::254`, all with the gateway MAC. Other IP packets addressed
-   to the gateway MAC SHALL be dropped and counted until routing exists.
+   to the gateway MAC SHALL be routed by 12.7 or dropped and counted.
 3. oar-net SHALL answer DHCPv4 (RFC 2131) from the mapping without lease
    state: DISCOVER with OFFER, REQUEST with ACK when the requested address
    is the NIC's DHCP address and NAK otherwise, INFORM with ACK. The NIC's
@@ -289,6 +292,16 @@ another and nothing is flooded.
 6. Without a `VpcConfig` (or, for 12.4 and 12.5, without an IPv6 prefix)
    these messages SHALL be dropped and counted, never flooded or
    forwarded.
+7. A `VpcConfig` MAY carry a route table: up to 100 routes, each a
+   destination prefix of one family and a target NIC in the same VPC.
+   A unicast IP packet addressed to the gateway MAC SHALL go to the
+   target of the longest matching route, with the destination MAC
+   rewritten to the target's and the TTL or hop limit lowered by one.
+   A packet with no matching route, a broadcast or multicast
+   destination, a TTL or hop limit of one or less, a target this VTEP
+   does not map in the VPC, the sender itself as target, or a target
+   that keeps its check (11.10) and does not own the destination SHALL
+   be dropped and counted.
 
 ### Requirement 13: Instance metadata intercept
 

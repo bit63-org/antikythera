@@ -563,15 +563,17 @@ BOOST_FIXTURE_TEST_CASE(vpc_configs_are_checked, One,
     BOOST_TEST(role->counters().vpc_stale == 1U);
     BOOST_TEST(role->vswitch().vpc_config(vpc)->lease_seconds == 3600U);
 
-    // Routes wait for task 22: refused whole, the old config stays.
-    BOOST_TEST((role->vpc_config(signed_vpc(server_one, 3, 7200, true)) == Status::failed));
-    BOOST_TEST(role->counters().vpc_rejected == 1U);
-    BOOST_TEST(role->vswitch().vpc_config(vpc)->lease_seconds == 3600U);
-
-    // A newer config replaces it, and the refused version can still come later.
-    BOOST_TEST((role->vpc_config(signed_vpc(server_one, 3, 7200)) == Status::ok));
-    BOOST_TEST(role->vswitch().vpc_config(vpc)->lease_seconds == 7200U);
+    // A newer config replaces it, route table included.
+    BOOST_TEST((role->vpc_config(signed_vpc(server_one, 3, 7200, true)) == Status::ok));
     BOOST_TEST(role->counters().vpc_applied == 2U);
+    BOOST_TEST(role->counters().vpc_rejected == 0U);
+    const auto* routed = role->vswitch().vpc_config(vpc);
+    BOOST_REQUIRE(routed != nullptr);
+    BOOST_TEST(routed->lease_seconds == 7200U);
+    BOOST_REQUIRE(routed->routes.size() == 1U);
+    BOOST_TEST(!routed->routes[0].ipv6);
+    BOOST_TEST(routed->routes[0].length == 0U);
+    BOOST_TEST(routed->routes[0].target.value == nic_b);
 }
 
 auto arp_request(std::uint64_t nic, const proto::Ipv4Address& target) -> std::vector<std::byte> {

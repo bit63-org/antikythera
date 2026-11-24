@@ -33,6 +33,9 @@ struct NicBinding {
     std::uint32_t vni{0};
     MacAddress mac{};
     Ipv6Address owner_vtep{};
+    // False when the mapping turns the NIC's source/destination check off
+    // (MapUpdate v3 flag, oar-net Requirement 11.10).
+    bool source_dest_check{true};
 };
 
 // Read-only view of the controller-pushed mapping table.

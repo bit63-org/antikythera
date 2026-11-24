@@ -296,12 +296,13 @@ auto split(std::string_view s, char sep) -> std::vector<std::string_view> {
     }
 }
 
-// NIC,MAC,VTEP[,GUEST_IP ...]: one mapping entry and the guest addresses
-// (IPv4 or IPv6) its NIC owns, appended to `m`.
+// NIC,MAC,VTEP[,GUEST_IP ...][,nocheck]: one mapping entry and the guest
+// addresses (IPv4 or IPv6) its NIC owns, appended to `m`. `nocheck` turns
+// the NIC's source/destination check off (MapUpdate format v3).
 auto add_map_entry(std::string_view s, SendMapUpdate& m) -> std::expected<void, std::string> {
     const auto fields = split(s, ',');
     if (fields.size() < 3) {
-        return std::unexpected("map entry must be NIC,MAC,VTEP[,GUEST_IP ...]");
+        return std::unexpected("map entry must be NIC,MAC,VTEP[,GUEST_IP ...][,nocheck]");
     }
     auto nic = number<std::uint64_t>(fields[0], "NIC id");
     auto addr = mac(fields[1]);
@@ -317,6 +318,10 @@ auto add_map_entry(std::string_view s, SendMapUpdate& m) -> std::expected<void, 
     }
     m.entries.push_back({.nic_id = *nic, .mac = *addr, .owner_vtep = *v});
     for (const auto ip : std::span{fields}.subspan(3)) {
+        if (ip == "nocheck") {
+            m.entries.back().source_dest_check = false;
+            continue;
+        }
         const std::string text{ip};
         proto::GuestIpv4 g4{.nic_id = *nic, .address = {}};
         proto::GuestIpv6 g6{.nic_id = *nic, .address = {}};
@@ -767,7 +772,7 @@ auto parse_line(std::string_view line) -> std::expected<std::optional<Action>, s
     if (verb == "map-update") {
         if (args.size() < 2) {
             return std::unexpected(
-                "map-update: want VNI VERSION [NIC,MAC,VTEP[,GUEST_IP ...] ...]");
+                "map-update: want VNI VERSION [NIC,MAC,VTEP[,GUEST_IP ...][,nocheck] ...]");
         }
         auto vni = number<std::uint32_t>(args[0], "VNI");
         auto version = number<std::uint64_t>(args[1], "mapping version");

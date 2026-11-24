@@ -45,15 +45,14 @@
 //   then  domain         domain_size bytes, RFC 1035 preferred name syntax
 //   then  signature      64 bytes, Ed25519 over every byte before it
 //
-// Routes are the VPC's route table (oar-net Requirement 11.10, task 22):
+// Routes are the VPC's route table (oar-net Requirements 11.10 and 12.7, task 22):
 // a packet a guest sends to the gateway MAC whose destination falls in a
 // route's prefix goes to the route's target NIC, by longest prefix. A
 // target names a NIC, never a VTEP or an address, because only a NIC with
 // its source/destination check off may receive traffic not addressed to
 // it; the receiver resolves the NIC through its own mapping. Prefixes
 // carry no host bits (IPv4 0..32, IPv6 0..128, so a default route is
-// allowed). A network role that does not route yet refuses a frame with
-// routes whole rather than apply half of it.
+// allowed).
 //
 // The largest frame (max_vpc_dns of each family, max_vpc_routes and the
 // longest domain) is max_vpc_config_size bytes, which fits one OarLink

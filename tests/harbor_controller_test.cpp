@@ -235,6 +235,18 @@ BOOST_AUTO_TEST_CASE(map_updates_parse_and_sort) {
     BOOST_REQUIRE(gm.ipv6.size() == 1U);
     BOOST_TEST(gm.ipv6[0].nic_id == 0x11U);
     BOOST_TEST(std::to_integer<int>(gm.ipv6[0].address[1]) == 0x12);
+    BOOST_TEST(gm.entries[0].source_dest_check);
+
+    // `nocheck` turns a NIC's source/destination check off.
+    auto n = action(
+        "map-update 5 4 0x11,02:00:00:00:00:11,fd00::2,nocheck,10.0.0.9 "
+        "0x10,02:00:00:00:00:10,fd00::1");
+    const auto& nm = std::get<harbor::SendMapUpdate>(n);
+    BOOST_REQUIRE(nm.entries.size() == 2U);
+    BOOST_REQUIRE(nm.ipv4.size() == 1U);
+    for (const auto& e : nm.entries) {
+        BOOST_TEST(e.source_dest_check == (e.nic_id != 0x11U));
+    }
 }
 
 BOOST_AUTO_TEST_CASE(vpc_configs_parse_and_sort) {

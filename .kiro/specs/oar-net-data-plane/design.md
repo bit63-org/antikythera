@@ -58,8 +58,10 @@ whose probes arrive is known to share a full-size path.
 
 Implements `MappingView`. Populated only by helm `map_update` messages
 (versioned per VNI, applied atomically by swapping an immutable snapshot).
-A `map_update` frame (format v2, `src/proto/map_update.hpp`) also lists
-the guest IPv4 and IPv6 addresses each NIC owns; the role hands those to
+A `map_update` frame (format v3, `src/proto/map_update.hpp`) also lists
+the guest IPv4 and IPv6 addresses each NIC owns, and each entry's flags
+byte can turn that NIC's source/destination check off (`NicBinding::
+source_dest_check`, Requirement 11.10); the role hands those to
 `VSwitch::set_neighbors()` as that VNI's complete `NeighborUpdate`, after
 the mapping itself is applied, so the ARP/ND proxy and the mapping always
 come from the same signed frame.
@@ -181,18 +183,20 @@ Transmit order, after the existing dead-VPC, length and source-MAC checks:
    sender IP to be the NIC's or `0.0.0.0`); IPv4/IPv6 are parsed; anything
    else is `tx_drop_ethertype`.
 2. Parse; failure is `tx_drop_malformed`.
-3. Classify the source; `spoofed` is `tx_drop_ip_spoofed`.
+3. Classify the source; `spoofed` is `tx_drop_ip_spoofed`, unless the
+   sending NIC's check is off.
 4. Router-only messages (RA, redirect, UDP source port 67/547 to a client
    port) are `tx_drop_router_msg`.
 5. Local responders, which consume what they match: DHCPv4 (UDP 68→67),
    ICMPv6 RS, NS (gateway target, then the existing proxy), DHCPv6
    (UDP 546→547), then the metadata intercept.
 6. `local_only` packets left are `tx_drop_local_only`.
-7. Destination MAC is the gateway MAC: `tx_drop_no_route`.
+7. Destination MAC is the gateway MAC: routed (see "Routing").
 8. Group frame: group policy; admitted frames also need an IP multicast
    destination (`tx_drop_ip_dst`).
 9. Unicast: destination NIC by MAC as today, then its address table must
-   hold the IP destination (`tx_drop_ip_dst`), then deliver or send.
+   hold the IP destination (`tx_drop_ip_dst`) unless that NIC's check is
+   off, then deliver or send.
 
 NA target checks run in step 5's ND handling (`tx_drop_neighbor_spoofed`).
 Receive runs steps 1–3 and 9's address check on the inner frame against
@@ -202,6 +206,29 @@ the receiving VTEP's tables (`rx_drop_ethertype`, `rx_drop_malformed`,
 The address tables are the ones `set_neighbors()` holds (fed from
 MapUpdate v2 by `NetRole`), so the ARP/ND proxy and the source check can
 never disagree, and a VNI whose map carries no addresses carries no IP.
+
+### Routing
+
+`VpcConfig::routes` (from the signed frame's route table, Requirement
+12.7) is searched longest prefix first, per family, for unicast IP
+packets sent to the gateway MAC that are not metadata. The packet goes to
+the route's target NIC like a unicast frame (`send_unicast`, local port or
+tunnel) after a router's rewrite: destination MAC set to the target's,
+TTL or hop limit minus one, the IPv4 header checksum updated
+incrementally (RFC 1624). The source MAC stays the sender's, because the
+Geneve ingress policy ties a frame's inner source MAC to its source NIC
+and the target is often a virtual appliance that does not care. Drops:
+`tx_drop_no_route` (no route, broadcast or multicast),
+`tx_drop_route_target` (target unmapped here or in another VNI),
+`tx_drop_hairpin` (the sender is the target), `tx_drop_ip_dst` (the
+target keeps its check and does not own the destination) and
+`tx_drop_ttl`. Routed packets count as `tx_routed` and also as
+`tx_local` or `tx_remote`.
+
+The receiving VTEP does not trust the sender's route lookup: its inner
+destination check passes only if the target owns the destination or its
+own mapping turns the target's check off, so a hostile VTEP cannot use a
+routed hop to reach an address the controller never gave it.
 
 ### VPC gateway: DHCP and router advertisements
 

@@ -82,6 +82,9 @@ EC2 concepts map onto it.
 2. Mapping updates SHALL be signed like commands.
 3. The controller SHALL track, per server and VPC, the last applied version,
    and SHALL report a VPC as converged only when every member has applied it.
+4. Each entry SHALL carry the NIC's source/destination check setting
+   (on unless the tenant turns it off, like EC2's `SourceDestCheck`), so
+   every VTEP enforces the same setting from the same signed frame.
 
 ### Requirement 6: EC2 API mapping
 

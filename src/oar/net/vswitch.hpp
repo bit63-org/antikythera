@@ -93,12 +93,26 @@
 // mask, the gateway as router and server, the DNS servers, domain, lease
 // and the NIC's MTU (given at attach). Nothing about DHCP is stored: the
 // mapping is the lease database. Other IP packets for the gateway MAC are
-// dropped until routing exists. Without a VpcConfig, DHCP is dropped and
+// routed (below) or dropped. Without a VpcConfig, DHCP is dropped and
 // counted, never flooded. With an IPv6 prefix the gateway also answers
 // router solicitations and DHCPv6 (the NIC's in-prefix IPv6 addresses in
 // IA_NA), and poll() sends each attached NIC an unsolicited router
 // advertisement every ra_interval, so a guest's default route never
 // expires (task 18).
+//
+// Routing (Requirements 11.10 and 12.7, task 22): a VpcConfig may carry routes, each
+// a prefix and a target NIC in the VNI. A unicast IP packet a guest sends
+// to the gateway MAC (other than metadata) is matched by longest prefix and
+// goes to the target NIC with its destination MAC rewritten to the
+// target's and its TTL or hop limit decremented; the source MAC stays the
+// sender's, so the receiving VTEP's ingress checks (source MAC is the
+// source NIC's) hold unchanged. No route, a target missing from this
+// VTEP's mapping, or a multicast or broadcast destination is dropped and
+// counted. A NIC whose mapping entry turns its source/destination check off
+// may send from addresses it does not own and receive packets addressed to
+// others, on transmit and on receive alike; every other NIC keeps both
+// checks, so a route can only steer traffic to a NIC that has opted out
+// (or to the NIC that owns the destination anyway).
 //
 // Metadata (Requirement 13, task 19): IP packets from a NIC's own address
 // to 169.254.169.254 or fd00:ec2::254 at the gateway MAC go to the
@@ -205,6 +219,17 @@ struct Ipv4Prefix {
     friend auto operator==(const Ipv4Prefix&, const Ipv4Prefix&) -> bool = default;
 };
 
+// One route of a VPC's table (Requirement 11.10): a prefix and the NIC that
+// takes what it matches.
+struct VpcRoute {
+    bool ipv6{false};
+    Ipv6Address prefix{};  // IPv4 in the first four bytes, the rest zero
+    std::uint8_t length{0};
+    geneve::NicId target{};
+
+    friend auto operator==(const VpcRoute&, const VpcRoute&) -> bool = default;
+};
+
 // A VNI's gateway and guest configuration (Requirement 12.1). Written by the
 // controller, signed (proto::VpcConfigFrame), forwarded by helm and
 // applied by NetRole::vpc_config.
@@ -217,6 +242,7 @@ struct VpcConfig {
     std::vector<Ipv6Address> dns6{};            // at most max_dns_servers
     std::string domain{};                       // DNS name, at most max_domain_size bytes
     std::uint32_t lease_seconds{0};             // min_lease_seconds .. max_lease_seconds
+    std::vector<VpcRoute> routes{};             // at most max_vpc_routes, no prefix twice
 
     friend auto operator==(const VpcConfig&, const VpcConfig&) -> bool = default;
 };
@@ -227,6 +253,7 @@ inline constexpr std::uint32_t min_lease_seconds = 60;
 inline constexpr std::uint32_t max_lease_seconds = 0x7FFF'FFFF;
 inline constexpr std::uint8_t min_ipv4_prefix = 8;
 inline constexpr std::uint8_t max_ipv4_prefix = 30;
+inline constexpr std::size_t max_vpc_routes = 100;  // proto::max_vpc_routes
 
 enum class VpcConfigError : std::uint8_t {
     vni_out_of_range,  // 0, or wider than 24 bits
@@ -238,6 +265,8 @@ enum class VpcConfigError : std::uint8_t {
     bad_dns,           // a zero, multicast or broadcast server address
     bad_domain,        // too long, or not a DNS name
     bad_lease,         // outside min_lease_seconds .. max_lease_seconds
+    too_many_routes,   // more than max_vpc_routes
+    bad_route,         // host bits, a bad length, a bad target, or one prefix twice
 };
 
 [[nodiscard]] auto to_string(VpcConfigError e) noexcept -> const char*;
@@ -349,7 +378,10 @@ struct SwitchCounters {
     std::uint64_t tx_drop_unknown_unicast{0};  // no NIC holds the destination MAC
     std::uint64_t tx_drop_hairpin{0};          // unicast to the sender's own MAC
     std::uint64_t tx_drop_unattached{0};       // local destination with no function attached
-    std::uint64_t tx_drop_no_route{0};         // IP for the gateway MAC that nothing consumed
+    std::uint64_t tx_drop_no_route{0};         // IP for the gateway MAC that no route matched
+    std::uint64_t tx_drop_route_target{0};     // the route's target NIC is not in the VNI here
+    std::uint64_t tx_drop_ttl{0};              // routed packet whose TTL or hop limit ran out
+    std::uint64_t tx_routed{0};                // routed to a target NIC (local or remote)
     std::uint64_t arp_replies{0};
     std::uint64_t nd_replies{0};
     std::uint64_t dhcp4_replies{0};
@@ -502,6 +534,13 @@ private:
     auto handle_dhcp6(geneve::NicId src, const NicBinding& binding, const packet::ParsedPacket& p)
         -> void;
     auto handle_metadata(geneve::NicId src, const packet::ParsedPacket& p) -> void;
+    // A packet for the gateway MAC: routed by the VNI's table, or dropped.
+    auto route(const MappingSnapshot& snap, geneve::NicId src, const NicBinding& binding,
+               const VpcConfig& cfg, std::span<const std::byte> frame,
+               const packet::ParsedPacket& p) -> void;
+    // Unicast to a NIC already chosen: delivered locally or sent to its VTEP.
+    auto send_unicast(const MappingSnapshot& snap, geneve::NicId src, std::uint32_t vni,
+                      geneve::NicId dst, std::span<const std::byte> frame) -> bool;
     auto take_metadata_token(Bucket& bucket) -> bool;
     // The NIC's DHCP address: its lowest guest IPv4 address inside `prefix`.
     [[nodiscard]] auto dhcp4_address(std::uint32_t vni, geneve::NicId nic,

@@ -283,10 +283,18 @@
   sideband reopens. `NetRole` checks it like a map_update (server, then
   signature, then version per VNI: the same version answers ok untouched,
   an older one fails) and applies it with `VSwitch::set_vpc_config`; a
-  frame the VSwitch refuses leaves the previous config. Frames with routes
-  are refused whole until task 22 applies them.
+  frame the VSwitch refuses leaves the previous config. Routes are
+  applied by task 22.
 - [ ] 21. Metadata service: the endpoint on the oar-net board, helm's
   service keyed by NIC ID, IMDSv2 tokens (helm and controller specs).
   _Requirements: 13.4_
-- [ ] 22. Per-NIC source/destination check opt-out, with route-table
-  targets that name a NIC (VPC step 3). _Requirements: 11.10_
+- [x] 22. Per-NIC source/destination check opt-out, with route-table
+  targets that name a NIC (VPC step 3). _Requirements: 11.10, 12.7_ —
+  MapUpdate format v3 carries the opt-out in each entry's flags byte
+  (`map_entry_no_source_dest_check`); `NicBinding::source_dest_check`
+  skips the source check on transmit and receive and the destination
+  check for packets to that NIC. `NetRole` applies the VpcConfig route
+  table, and the VSwitch routes unicast packets for the gateway MAC to
+  the longest-prefix target (MAC rewrite, TTL/hop limit minus one; see
+  design "Routing"). Receivers recheck with their own mapping. Harbor's
+  `map-update` takes `nocheck` per entry.

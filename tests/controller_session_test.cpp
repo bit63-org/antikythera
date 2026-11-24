@@ -18,6 +18,7 @@
 #include "helm/mailbox.hpp"
 #include "proto/group_policy.hpp"
 #include "proto/link.hpp"
+#include "proto/vpc_config.hpp"
 #include "test_support.hpp"
 
 namespace helm = ak::helm;
@@ -44,6 +45,7 @@ struct RecordingSink final : helm::ControllerSink {
     std::vector<std::pair<proto::VolumeKey, std::vector<std::byte>>> keys;
     std::vector<std::pair<proto::ImageKey, std::vector<std::byte>>> image_keys;
     std::vector<proto::LeaseGrant> grants;
+    std::vector<std::pair<proto::VpcConfigFrame, std::vector<std::byte>>> vpc_configs;
 
     auto on_envelope(const proto::Envelope& e) -> void override { envelopes.push_back(e); }
     auto on_map_update(const proto::MapUpdate& u, std::span<const std::byte> frame)
@@ -73,6 +75,10 @@ struct RecordingSink final : helm::ControllerSink {
         image_keys.emplace_back(k, std::vector<std::byte>{frame.begin(), frame.end()});
     }
     auto on_lease_grant(const proto::LeaseGrant& g) -> void override { grants.push_back(g); }
+    auto on_vpc_config(const proto::VpcConfigFrame& c, std::span<const std::byte> frame)
+        -> void override {
+        vpc_configs.emplace_back(c, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
     std::vector<proto::RoleCertificate> certificates;
     auto on_role_certificate(const proto::RoleCertificate& c) -> void override {
         certificates.push_back(c);
@@ -229,6 +235,23 @@ auto group_policy_record(std::uint64_t to) -> std::vector<std::byte> {
     auto b = proto::encode_group_policy(p);
     BOOST_REQUIRE(b.has_value());
     return framed(RecordType::group_policy, *b);
+}
+
+auto vpc_config_record(std::uint64_t to) -> std::vector<std::byte> {
+    proto::VpcConfigFrame c{};
+    c.server_id = to;
+    c.key_id = key;
+    c.vni = 5;
+    c.config_version = 3;
+    c.gateway_mac = {std::byte{0x02}, std::byte{0}, std::byte{0},
+                     std::byte{0},    std::byte{0}, std::byte{0xFE}};
+    c.ipv4_prefix = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}};
+    c.ipv4_length = 24;
+    c.ipv4_gateway = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{1}};
+    c.lease_seconds = 3600;
+    auto b = proto::encode_vpc_config(c);
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::vpc_config, *b);
 }
 
 auto tunnel_peers_record(std::uint64_t to) -> std::vector<std::byte> {
@@ -529,12 +552,16 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
     auto hello_payload = proto::encode_hello({.server_id = server, .boot_id = 1});
     auto bad_policy = group_policy_record(server);
     bad_policy[proto::record_header_size] = std::byte{0};  // policy magic
+    auto bad_vpc = vpc_config_record(server);
+    bad_vpc[proto::record_header_size] = std::byte{0};  // VpcConfig magic
     const Case cases[] = {
         {envelope_record(other_server, 10), SessionError::wrong_server},
         {map_update_record(other_server), SessionError::wrong_server},
         {group_policy_record(other_server), SessionError::wrong_server},
         {tunnel_peers_record(other_server), SessionError::wrong_server},
         {bad_policy, SessionError::bad_record},
+        {vpc_config_record(other_server), SessionError::wrong_server},
+        {bad_vpc, SessionError::bad_record},
         {bad_envelope, SessionError::bad_record},
         {bad_peers, SessionError::bad_record},
         {framed(RecordType::report, *report_payload), SessionError::wrong_direction},
@@ -552,7 +579,37 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
         BOOST_TEST(f.sink.envelopes.empty());
         BOOST_TEST(f.sink.updates.empty());
         BOOST_TEST(f.sink.policies.empty());
+        BOOST_TEST(f.sink.vpc_configs.empty());
     }
+}
+
+// Requirement 10.3: a VpcConfig for this server reaches the sink as its
+// exact frame, for helm to forward unmodified.
+BOOST_FIXTURE_TEST_CASE(vpc_configs_reach_the_sink_unmodified, Fixture) {
+    session.on_connected();
+    const auto rec = vpc_config_record(server);
+    BOOST_REQUIRE(session.on_bytes(rec).has_value());
+    BOOST_REQUIRE(sink.vpc_configs.size() == 1U);
+    BOOST_TEST(sink.vpc_configs[0].first.vni == 5U);
+    BOOST_TEST(sink.vpc_configs[0].first.config_version == 3U);
+    BOOST_TEST(std::ranges::equal(sink.vpc_configs[0].second,
+                                  std::span{rec}.subspan(proto::record_header_size)));
+}
+
+// A sink that keeps ControllerSink's default drops a VpcConfig quietly.
+BOOST_AUTO_TEST_CASE(a_sink_without_a_network_role_ignores_vpc_configs) {
+    DefaultSink sink;
+    helm::ControllerSession session{server, boot,
+                                    [] {
+                                        proto::Inventory inv;
+                                        inv.boot_id = 1;
+                                        return inv;
+                                    },
+                                    sink};
+    session.on_connected();
+    BOOST_TEST(session.on_bytes(vpc_config_record(server)).has_value());
+    BOOST_TEST(session.on_bytes(envelope_record(server, 10)).has_value());
+    BOOST_TEST(sink.envelopes == 1);
 }
 
 // Requirement 7.3: a GroupPolicy for this server reaches the sink as its

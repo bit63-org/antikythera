@@ -79,6 +79,9 @@ enum class DecodeError : std::uint8_t {
     bad_payload_size,         // a hold payload whose length does not fit its opcode
     bad_hold_direction,       // a hold flag or status that does not fit the opcode's direction
     bad_der,                  // a certificate or CSR field that is not DER SEQUENCEs
+    bad_config_version,       // VPC config version 0 (versions start at 1)
+    bad_vpc_config,           // a VPC prefix, gateway, domain or lease outside its rules
+    bad_route,                // a route prefix with host bits set or too long for its family
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -179,6 +182,12 @@ enum class DecodeError : std::uint8_t {
             return "hold flags or status do not fit the opcode";
         case DecodeError::bad_der:
             return "not a sequence of DER SEQUENCEs";
+        case DecodeError::bad_config_version:
+            return "VPC config version 0";
+        case DecodeError::bad_vpc_config:
+            return "VPC config field outside its rules";
+        case DecodeError::bad_route:
+            return "route prefix has host bits or a bad length";
     }
     return "unknown";
 }

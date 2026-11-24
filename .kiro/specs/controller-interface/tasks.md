@@ -1,6 +1,6 @@
 # Implementation Plan — Controller interface and the kythira EC2 integration
 
-## Status: 10/13 tasks complete
+## Status: 11/14 tasks complete
 
 ## Tasks
 
@@ -57,6 +57,14 @@
   controller's script. See design "TunnelPeers". Wiring the keyring into
   `HelmDaemon` and `TunnelPeerSet` into `NetRole` follows helm main and
   oar-net task 11.)
+- [x] 14. `VpcConfig` codec in `src/proto/`, `vpc_config` link record,
+  tests, fuzz; `ak-test-controller` can send it. _Requirements: 10_ —
+  Done: `src/proto/vpc_config.hpp` (`AKVC`, variable length up to 3,669
+  bytes, Ed25519 over everything before the trailing 64), link record
+  type 14 checked by the ControllerSession (`ControllerSink::on_vpc_config`
+  gets the exact frame; the default drops it), `ak-test-controller
+  vpc-config`, `fuzz_vpc_config`. helm's fan-out and the network role's
+  side are oar-net task 20; routes are applied by oar-net task 22.
 - [ ] 6. Draft the kythira `ec2-compatible-api` spec in the kythira
   repository, from Requirements 6 and 9 (network volumes ported from
   `ak_hold_master`). _Requirements: 6, 9_

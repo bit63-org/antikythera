@@ -237,6 +237,45 @@ BOOST_AUTO_TEST_CASE(map_updates_parse_and_sort) {
     BOOST_TEST(std::to_integer<int>(gm.ipv6[0].address[1]) == 0x12);
 }
 
+BOOST_AUTO_TEST_CASE(vpc_configs_parse_and_sort) {
+    auto a = action(
+        "vpc-config 100 4 02:00:00:00:ff:01 10.0.0.0/16 10.0.0.1 ipv6=fd10::/64 dns=10.0.0.2 "
+        "dns=fd10::2 domain=ec2.internal lease=7200 route=0.0.0.0/0,0x21 "
+        "route=fd20::/48,0x22 route=192.168.0.0/24,0x23");
+    BOOST_REQUIRE(std::holds_alternative<harbor::SendVpcConfig>(a));
+    const auto& c = std::get<harbor::SendVpcConfig>(a).config;
+    BOOST_TEST(c.vni == 100U);
+    BOOST_TEST(c.config_version == 4U);
+    BOOST_TEST(std::to_integer<int>(c.gateway_mac[5]) == 1);
+    BOOST_TEST(c.ipv4_length == 16U);
+    BOOST_TEST(std::to_integer<int>(c.ipv4_gateway[3]) == 1);
+    BOOST_TEST(c.has_ipv6);
+    BOOST_TEST(std::to_integer<int>(c.ipv6_prefix[1]) == 0x10);
+    BOOST_REQUIRE(c.dns4.size() == 1U);
+    BOOST_REQUIRE(c.dns6.size() == 1U);
+    BOOST_TEST(c.domain == "ec2.internal");
+    BOOST_TEST(c.lease_seconds == 7200U);
+    // Sorted into the frame's order: IPv4 by prefix, then IPv6.
+    BOOST_REQUIRE(c.routes.size() == 3U);
+    BOOST_TEST(c.routes[0].target_nic == 0x21U);
+    BOOST_TEST(c.routes[1].target_nic == 0x23U);
+    BOOST_TEST((c.routes[2].family == proto::RouteFamily::ipv6));
+
+    // The defaults, and mistakes the encoder would refuse, named at parse time.
+    auto d = action("vpc-config 100 1 02:00:00:00:ff:01 10.0.0.0/24 10.0.0.1");
+    BOOST_TEST(std::get<harbor::SendVpcConfig>(d).config.lease_seconds == 3600U);
+    BOOST_TEST(parse_error("vpc-config 100 1 02:00:00:00:ff:01 10.0.0.0/24").find("want VNI") !=
+               std::string::npos);
+    BOOST_TEST(
+        parse_error("vpc-config 100 1 02:00:00:00:ff:01 10.0.0.1/24 10.0.0.1").find("VPC config") !=
+        std::string::npos);
+    BOOST_TEST(parse_error("vpc-config 100 1 02:00:00:00:ff:01 10.0.0.0/24 10.0.0.1 "
+                           "route=10.1.0.1/16,5")
+                   .find("route") != std::string::npos);
+    BOOST_TEST(parse_error("vpc-config 100 1 02:00:00:00:ff:01 10.0.0.0/24 10.0.0.1 color=red")
+                   .find("unknown option") != std::string::npos);
+}
+
 BOOST_AUTO_TEST_CASE(expectations_parse) {
     auto e = action("expect stale_sequence");
     BOOST_TEST((std::get<harbor::ExpectOutcome>(e).status == proto::CommandStatus::stale_sequence));

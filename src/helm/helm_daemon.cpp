@@ -197,6 +197,11 @@ auto HelmDaemon::stats() const -> DaemonStats {
     return _stats;
 }
 
+auto HelmDaemon::role_health(SlotNumber slot) const -> std::optional<oar::Health> {
+    const auto it = _slots.find(slot);
+    return it == _slots.end() ? std::nullopt : it->second->health;
+}
+
 // ---- inbound, any thread ------------------------------------------------------
 
 auto HelmDaemon::enqueue(Item item) -> void {
@@ -243,6 +248,11 @@ auto HelmDaemon::on_role_certificate(const proto::RoleCertificate& certificate) 
 auto HelmDaemon::on_volume_key(const proto::VolumeKey& /*key*/, std::span<const std::byte> frame)
     -> void {
     enqueue(KeyFrame{.frame = {frame.begin(), frame.end()}});
+}
+
+auto HelmDaemon::on_tunnel_peers(const proto::TunnelPeers& peers, std::span<const std::byte> frame)
+    -> void {
+    enqueue(PeersFrame{.peers = peers, .frame = {frame.begin(), frame.end()}});
 }
 
 auto HelmDaemon::post_host_slot(const mailbox::Slot& slot) -> void {
@@ -301,7 +311,83 @@ auto HelmDaemon::handle(Item& item) -> void {
         ++(kept ? _stats.volume_keys : _stats.volume_keys_refused);
     } else if (const auto* cert = std::get_if<proto::RoleCertificate>(&item)) {
         deliver_certificate(*cert);
+    } else if (const auto* peers = std::get_if<PeersFrame>(&item)) {
+        {
+            const std::scoped_lock lock{_inbox_mutex};
+            ++_stats.tunnel_peer_sets;
+        }
+        forward_peers(*peers);
     }
+}
+
+// ---- tunnel keys and network health -------------------------------------------
+
+auto HelmDaemon::is_net(const SlotState& slot) -> bool {
+    return slot.link && slot.inventory && slot.inventory->role == oar::Role::net &&
+           nonzero(slot.inventory->vtep);
+}
+
+auto HelmDaemon::provision_tunnel(SlotState& slot) -> void {
+    slot.keys_pending = false;
+    if (!is_net(slot)) {
+        return;
+    }
+    const auto& vtep = slot.inventory->vtep;
+    std::expected<void, LinkError> done = std::unexpected(LinkError{.code = LinkErrc::bad_request});
+    if (_keyring.ensure(vtep)) {  // fails only if OpenSSL cannot make a key pair
+        done = _keyring.provision(*slot.link, vtep);
+    }
+    if (!done && done.error().code == LinkErrc::refused &&
+        done.error().status == oar::Status::unsupported) {
+        // A role run without a tunnel (ak-oar-net --tunnel-overhead 0): it
+        // has no use for a key, and the inventory must not offer one.
+        static_cast<void>(_keyring.forget(vtep));
+        return;
+    }
+    slot.keys_pending = !done;
+    const std::scoped_lock lock{_inbox_mutex};
+    ++(done ? _stats.tunnel_provisioned : _stats.tunnel_provision_failed);
+}
+
+auto HelmDaemon::forward_peers(const PeersFrame& peers) -> void {
+    // Kept even with no role for the VTEP attached yet: provision() hands
+    // it over when the role's sideband opens.
+    bool forwarded = false;
+    bool refused = false;
+    if (_keyring.store_peers(peers.peers, peers.frame) == PeersOutcome::stored) {
+        for (auto& [n, slot] : _slots) {
+            if (!is_net(*slot) || slot->keys_pending ||
+                !std::ranges::equal(slot->inventory->vtep, peers.peers.vtep)) {
+                continue;  // a role still waiting for its key gets the set with it
+            }
+            if (slot->link->tunnel_peers(peers.frame)) {
+                forwarded = true;
+            } else {
+                refused = true;
+            }
+        }
+    }
+    const std::scoped_lock lock{_inbox_mutex};
+    if (refused) {
+        ++_stats.tunnel_peer_sets_refused;
+    } else if (forwarded) {
+        ++_stats.tunnel_peer_sets_forwarded;
+    } else {
+        ++_stats.tunnel_peer_sets_held;
+    }
+}
+
+auto HelmDaemon::poll_health(SlotState& slot) -> void {
+    if (!is_net(slot)) {
+        slot.health.reset();
+        return;
+    }
+    auto h = slot.link->health();
+    if (h) {
+        slot.health = *h;
+    }
+    // A failed request leaves the last answer: the sequencer, not this
+    // poll, decides when a board is lost.
 }
 
 // ---- enrollment ---------------------------------------------------------------
@@ -503,6 +589,8 @@ auto HelmDaemon::attach(SlotState& slot) -> bool {
     slot.pending = false;
     slot.inventory = *inv;
     slot.reported_csr.clear();  // a restarted role's request is reported afresh
+    slot.health.reset();
+    provision_tunnel(slot);  // network roles: before any NIC is prepared on it
     poll_identity(slot);
     if (inv->role == oar::Role::hold) {
         replay_configs(slot);  // a hold role has no functions for the router
@@ -520,6 +608,8 @@ auto HelmDaemon::attach(SlotState& slot) -> bool {
 auto HelmDaemon::detach(SlotState& slot) noexcept -> void {
     slot.link.reset();
     slot.binding.reset();
+    slot.keys_pending = false;
+    slot.health.reset();
 }
 
 auto HelmDaemon::on_slot_ready(SlotNumber slot) -> void {
@@ -560,23 +650,46 @@ auto HelmDaemon::check() -> void {
         if (slot->pending && _sequencer.health(n) == SlotHealth::ready && attach(*slot)) {
             _router.slot_power_cycled(n);
         }
+        if (slot->keys_pending) {
+            provision_tunnel(*slot);
+        }
+        poll_health(*slot);
     }
 }
 
 auto HelmDaemon::publish() -> void {
     auto inv = _router.inventory();
     for (const auto& [n, slot] : _slots) {
-        if (slot->link && slot->inventory && slot->inventory->role == oar::Role::net &&
-            nonzero(slot->inventory->vtep)) {
+        if (is_net(*slot)) {
             proto::VtepAddress v{};
             std::ranges::copy(slot->inventory->vtep, v.begin());
             if (std::ranges::find(inv.vteps, v) == inv.vteps.end()) {
                 inv.vteps.push_back(v);
             }
+            // A network role that cannot carry traffic as planned degrades
+            // the host; the router's own verdict (faulted functions) stands
+            // if it is worse.
+            if (slot->health && slot->health->state != oar::HealthState::ok &&
+                inv.health == proto::Health::ok) {
+                inv.health = proto::Health::degraded;
+            }
         }
     }
-    const std::scoped_lock lock{_snapshot_mutex};
-    _snapshot = std::move(inv);
+    _keyring.fill(inv);
+    bool changed = false;
+    {
+        const std::scoped_lock lock{_snapshot_mutex};
+        changed = inv.vteps != _snapshot.vteps || inv.tunnels != _snapshot.tunnels ||
+                  inv.health != _snapshot.health;
+        _snapshot = inv;
+    }
+    if (changed) {
+        {
+            const std::scoped_lock lock{_inbox_mutex};
+            ++_stats.inventory_reports;
+        }
+        report(std::move(inv));
+    }
 }
 
 }  // namespace ak::helm

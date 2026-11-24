@@ -781,4 +781,79 @@ auto encode_body(const Body& body) -> std::vector<std::byte> {
     return out;
 }
 
+auto encode_vm_status_payload(const VmStatusInfo& info) -> std::vector<std::byte> {
+    std::vector<std::byte> out;
+    wire::Writer w{out};
+    w.le64(info.vm_id);
+    w.u8(std::to_underlying(info.state));
+    w.u8(info.devices);
+    w.le16(info.vcpus);
+    w.le32(info.hugepages);
+    return out;
+}
+
+auto decode_vm_status_payload(std::span<const std::byte> payload) noexcept
+    -> std::expected<VmStatusInfo, BodyError> {
+    if (payload.size() != vm_status_payload_size) {
+        return std::unexpected(BodyError::wrong_length);
+    }
+    wire::Reader r{payload};
+    VmStatusInfo out;
+    out.vm_id = *r.le64();
+    const std::uint8_t state = *r.u8();
+    out.devices = *r.u8();
+    out.vcpus = *r.le16();
+    out.hugepages = *r.le32();
+    if (out.vm_id == 0 || state < std::to_underlying(VmRunState::created) ||
+        state > std::to_underlying(VmRunState::running) || out.vcpus == 0 || out.hugepages == 0) {
+        return invalid();
+    }
+    out.state = static_cast<VmRunState>(state);
+    return out;
+}
+
+auto encode_vm_list_payload(std::span<const std::uint64_t> vm_ids) -> std::vector<std::byte> {
+    const std::size_t count = std::min(vm_ids.size(), max_listed_vms);
+    std::vector<std::byte> out;
+    wire::Writer w{out};
+    w.le16(static_cast<std::uint16_t>(std::min<std::size_t>(vm_ids.size(), 0xFFFF)));
+    w.le16(static_cast<std::uint16_t>(count));
+    w.le32(0);
+    for (std::size_t i = 0; i < count; ++i) {
+        w.le64(vm_ids[i]);
+    }
+    return out;
+}
+
+auto decode_vm_list_payload(std::span<const std::byte> payload)
+    -> std::expected<VmList, BodyError> {
+    if (payload.size() < vm_list_fixed_size) {
+        return std::unexpected(BodyError::wrong_length);
+    }
+    wire::Reader r{payload};
+    VmList out;
+    out.total = *r.le16();
+    const std::uint16_t count = *r.le16();
+    const std::uint32_t rsvd = *r.le32();
+    if (count > max_listed_vms ||
+        payload.size() != vm_list_fixed_size + std::size_t{count} * sizeof(std::uint64_t)) {
+        return std::unexpected(BodyError::wrong_length);
+    }
+    if (rsvd != 0 || count > out.total) {
+        return invalid();
+    }
+    out.vm_ids.reserve(count);
+    for (std::uint16_t i = 0; i < count; ++i) {
+        const std::uint64_t id = *r.le64();
+        if (id == 0 || (!out.vm_ids.empty() && id <= out.vm_ids.back())) {
+            return invalid();
+        }
+        out.vm_ids.push_back(id);
+    }
+    if (count < out.total && count != max_listed_vms) {
+        return invalid();  // a cut list is always a full one
+    }
+    return out;
+}
+
 }  // namespace ak::helm::mailbox

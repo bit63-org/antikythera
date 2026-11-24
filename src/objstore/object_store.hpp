@@ -71,4 +71,20 @@ public:
 [[nodiscard]] auto image_data_key(std::string_view prefix, std::string_view name_hex)
     -> std::string;
 
+// Object keys of a lineage's snapshots (manifest version 2,
+// block-volume-service design "Format: image manifest version 2"):
+//
+//   <prefix>/lineage-<id>/chunks/<chunk digest>
+//   <prefix>/lineage-<id>/snap-<manifest name>/manifest
+//
+// with the lineage ID as 16 lowercase hex digits and digests and names as
+// 64. A chunked image's data key (CachedImage::data_key) is its lineage's
+// chunks prefix, and each chunk is the whole object chunk_key names.
+[[nodiscard]] auto lineage_chunks_prefix(std::string_view prefix, std::uint64_t lineage)
+    -> std::string;
+[[nodiscard]] auto chunk_key(std::string_view chunks_prefix, std::string_view digest_hex)
+    -> std::string;
+[[nodiscard]] auto snapshot_manifest_key(std::string_view prefix, std::uint64_t lineage,
+                                         std::string_view name_hex) -> std::string;
+
 }  // namespace ak::objstore

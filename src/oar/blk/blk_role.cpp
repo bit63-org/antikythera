@@ -54,7 +54,7 @@ auto on_flr(VirtioBlkFunction& f, LazyImageBackend* image = nullptr) -> std::fun
 
 // Largest manifest: the header and 2^20 chunk digests (32 MiB).
 constexpr std::size_t max_manifest_bytes =
-    objstore::manifest_header_size +
+    objstore::manifest_header_size_chunked +
     (std::size_t{objstore::max_image_chunks} * objstore::image_digest_size);
 
 }  // namespace
@@ -183,6 +183,11 @@ auto BlkRole::open_image_volume(const VolumeMetadata& m)
     const auto manifest = objstore::decode_named_manifest(*bytes, m.image->name);
     if (!manifest) {
         return std::unexpected(std::format("manifest {}: {}", hex, to_string(manifest.error())));
+    }
+    if (manifest->chunked) {
+        // A snapshot, not an image: restores hydrate through hold
+        // (block-volume-service tasks 22-23), never as an image volume.
+        return std::unexpected(std::format("image {} is a snapshot", hex));
     }
     if (manifest->encrypted) {
         // Needs the image key from helm (task 15).

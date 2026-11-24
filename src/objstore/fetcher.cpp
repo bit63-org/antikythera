@@ -191,8 +191,13 @@ auto Fetcher::download(const Job& job) -> std::expected<ChunkBytes, FetchError> 
             last = FetchError::timed_out;
             break;
         }
-        auto got =
-            _store->get_range(job.image->data_key(), m.chunk_offset(job.chunk), *bytes, deadline);
+        // Version 1: a range of the image's data object. Version 2: the
+        // chunk's own object, named by its digest under the lineage prefix.
+        auto got = m.chunked ? _store->get_range(chunk_key(job.image->data_key(),
+                                                           image_name_hex(m.chunks[job.chunk])),
+                                                 0, *bytes, deadline)
+                             : _store->get_range(job.image->data_key(), m.chunk_offset(job.chunk),
+                                                 *bytes, deadline);
         if (got) {
             if (chunk_matches(m, job.chunk, *bytes)) {
                 job.image->insert(job.chunk, *bytes);

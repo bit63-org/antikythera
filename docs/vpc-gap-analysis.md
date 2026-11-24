@@ -38,10 +38,12 @@ The parts that make the system a VPC at all are built:
   the same mapping (`check_ingress`).
 - **Encrypted, authenticated underlay.** WireGuard between VTEPs (#47),
   with per-VTEP keys distributed by the controller (#48). One tunnel per
-  VTEP pair carries every VPC's traffic. The pieces are merged but not yet
-  running together: `NetRole`/`ak-oar-net` do not use the `Tunnel` or a
-  `TunnelPeerSet`, and helm's daemon does not hold the `TunnelKeyring`
-  (oar-net task 10 "Not yet" and task 11).
+  VTEP pair carries every VPC's traffic. Since #93 they run together:
+  `NetRole`/`ak-oar-net` send every Geneve payload through the `Tunnel`
+  and take peers from the controller's signed frame (`TunnelPeerSet`),
+  and helm's daemon holds the `TunnelKeyring`, keys each network role and
+  forwards its peer sets. Not yet exercised across servers in harbor
+  (oar-net task 11).
 
 What the fabric gives a tenant today is one flat L2 segment per VPC: every
 NIC can reach every other NIC in the VPC, nothing outside it can reach in,
@@ -84,8 +86,8 @@ spec).
 | Traffic mirroring | missing | None | Copy a NIC's frames to a target NIC or VTEP, encapsulated. Low priority |
 | Site-to-site VPN | missing | None | A VPN gateway in the gateway role speaking IPsec/IKEv2 with BGP, since that is what customer routers speak. WireGuard does not fit here |
 | Client VPN | missing | None | Lower priority; can be a tenant-run appliance once source/destination check opt-out and NIC route targets exist |
-| Encryption in transit | partial | WireGuard between VTEPs (#47), keys via controller (#48), both merged; IPsec ESP kept as an option in oar-net Req 5 | Wire the keyring into the helm daemon and the Tunnel and peer set into NetRole (oar-net 11). No per-tenant keys by design; tenants needing their own keys encrypt in the guest. PSP or inline crypto offload later for line rate |
-| Jumbo frames / MTU | partial | MTU plan and probes (#45, merged): 8858 for guests on a 9000 underlay, reserving room for WireGuard or PSP; advertised through `VIRTIO_NET_F_MTU` | Report `mtu_ok` to helm and run the harbor multi-server tests (oar-net 11) |
+| Encryption in transit | done | WireGuard between VTEPs (#47), keys via controller (#48), run by `NetRole` and keyed by helm's daemon (#93); IPsec ESP kept as an option in oar-net Req 5 | The harbor multi-server run (oar-net 11) to show it across real servers. No per-tenant keys by design; tenants needing their own keys encrypt in the guest. PSP or inline crypto offload later for line rate |
+| Jumbo frames / MTU | partial | MTU plan and probes (#45, merged): 8858 for guests on a 9000 underlay, reserving room for WireGuard or PSP; advertised through `VIRTIO_NET_F_MTU`; a path that fails the full-size probes degrades the role's health and helm's inventory (#93) | The harbor multi-server tests (oar-net 11) |
 | Broadcast / multicast | partial | VSwitch drops group frames by default; opt-in per-VNI multicast with per-NIC token buckets, the flood-list cap and cumulative usage meters (oar-net 12, #56). Still open: the signed `GroupPolicy` frame applied by `NetRole`, `group_usage` over OarLink, and IGMP/MLD snooping (oar-net 13-14, helm 13) | **Decision (2026-11-19): drop by default, like AWS; opt-in, metered and billable multicast per subnet.** ARP/ND stay answered by the proxy and DHCP will be answered locally, so nothing a stock guest needs crosses the fabric as broadcast. A VPC that opts in gets IP multicast (never broadcast) replicated by head-end replication over the encrypted tunnels, with IGMP/MLD snooping and controller-pushed per-group server lists, hard per-NIC rate limits, a per-NIC group cap and a flood-list cap. Every replica sent to the fabric is metered per NIC and reported through helm, so the controller can bill usage, plus an hourly charge per opted-in subnet. Spec: oar-net Requirement 10, controller-interface Requirement 7, helm Requirement 11. See "Broadcast and multicast" below |
 | Scale limits | partial | MapUpdate holds at most 4096 NICs and 8192 addresses per family per VPC, as a full snapshot | Fine for early tenants. Large VPCs need a new format (sharded or delta updates), and peering/TGW make the set of mappings a VTEP needs larger than "VPCs with a NIC here" |
 
@@ -113,10 +115,9 @@ spec).
 
 ## Suggested build order
 
-1. **Land the fabric.** The stack is merged (#42, #45, #46, #47, #48).
-   Still to do: wire the keyring and peer set into the helm daemon and
-   NetRole, and run harbor's multi-server reachability, isolation and MTU
-   tests on tikhov. Everything below builds on it.
+1. **Land the fabric.** The stack is merged and wired together (#42,
+   #45, #46, #47, #48, #93). Still to do: run harbor's multi-server
+   reachability, isolation and MTU tests on tikhov. Everything below builds on it.
 2. **Group policy.** Drop group traffic by default in oar-net, with the
    opt-in multicast mode, rate limits and usage meters, then the signed
    `GroupPolicy` frame and the `group_usage` report (small; see

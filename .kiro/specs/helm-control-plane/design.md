@@ -206,7 +206,14 @@ controller peer set for its VTEP, on every attach, so a restarted role
 gets both back. `fill` puts the public keys in the inventory. Peer sets
 are kept per VTEP by version (a different frame of the same version
 replaces the held one, since helm cannot judge signatures) and forwarded
-unmodified; the role verifies them.
+unmodified; the role verifies them. HelmDaemon runs it: it provisions a network
+role whenever its sideband opens and retries one that has not taken its key
+on every check, drops the pair of a role that answers unsupported (no
+tunnel), and forwards each stored peer set to its VTEP's role. It also polls
+every network role's `health` on each check; a degraded role (a peer down,
+a path that fails the MTU probes, an unkeyed tunnel) degrades the
+inventory's health, and a change to the inventory's VTEPs, tunnel keys or
+health is sent to the controller as a fresh inventory report.
 
 `create_volume`, `delete_volume` and `rewrap_volume` are the storage
 role's half of the volume commands: the role keeps the wrapped key (opaque

@@ -41,6 +41,7 @@
 #include "helm/volume_key_seal.hpp"
 #include "hull/signature_verifier.hpp"
 #include "proto/test_vectors.hpp"
+#include "proto/tunnel_peers.hpp"
 #include "test_support.hpp"
 #include "tls_test_support.hpp"
 
@@ -150,7 +151,45 @@ public:
         _frames.emplace_back(frame.begin(), frame.end());
         return map_status.load();
     }
-    auto health() -> std::expected<oar::Health, oar::Status> override { return oar::Health{}; }
+    auto health() -> std::expected<oar::Health, oar::Status> override {
+        const std::scoped_lock lock{_mutex};
+        return _health;
+    }
+    auto set_health(oar::Health h) -> void {
+        const std::scoped_lock lock{_mutex};
+        _health = h;
+    }
+
+    // A network role's tunnel: off (unsupported, as without --tunnel) until
+    // `tunnel` is set; then the keys and peer sets helm sends.
+    std::atomic<bool> tunnel{false};
+    std::atomic<oar::Status> key_status{oar::Status::ok};
+    [[nodiscard]] auto tunnel_keys() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _tunnel_keys;
+    }
+    [[nodiscard]] auto peer_sets() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _peer_sets;
+    }
+    auto set_tunnel_key(const oar::SetTunnelKey& r) -> oar::Status override {
+        if (!tunnel) {
+            return oar::Status::unsupported;
+        }
+        const std::scoped_lock lock{_mutex};
+        if (key_status.load() == oar::Status::ok) {
+            _tunnel_keys.emplace_back(r.private_key.begin(), r.private_key.end());
+        }
+        return key_status.load();
+    }
+    auto tunnel_peers(std::span<const std::byte> frame) -> oar::Status override {
+        if (!tunnel) {
+            return oar::Status::unsupported;
+        }
+        const std::scoped_lock lock{_mutex};
+        _peer_sets.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
+    }
 
     // A hold role's side.
     std::atomic<oar::Status> config_status{oar::Status::ok};
@@ -230,6 +269,9 @@ private:
     std::vector<std::byte> _csr;
     std::vector<std::vector<std::byte>> _chains;
     std::size_t _cleaned{0};
+    oar::Health _health{};
+    std::vector<std::vector<std::byte>> _tunnel_keys;
+    std::vector<std::vector<std::byte>> _peer_sets;
     std::vector<oar::PrepareFunction> _prepared;
     std::vector<std::vector<std::byte>> _frames;
 };
@@ -456,6 +498,38 @@ struct Rig {
             [](const helm::FunctionInfo& f) { return f.state == FunctionState::free; }));
     }
 };
+
+// The net board's VTEP address.
+auto net_vtep() -> proto::VtepAddress {
+    proto::VtepAddress v{};
+    v.front() = std::byte{vtep_first};
+    v.back() = std::byte{vtep_last};
+    return v;
+}
+
+// A TunnelPeers frame as ControllerSession hands it over: decoded, with
+// its exact bytes. helm checks no signature, so a fixed one does.
+struct PeersFrame {
+    proto::TunnelPeers peers;
+    std::vector<std::byte> frame;
+};
+
+auto peers_frame(const proto::VtepAddress& vtep, std::uint64_t version) -> PeersFrame {
+    proto::TunnelPeers t{};
+    t.server_id = server;
+    t.key_id = 1;
+    t.vtep = vtep;
+    t.peers_version = version;
+    proto::TunnelPeer p{};
+    p.vtep = vtep;
+    p.vtep.back() = std::byte{0x02};
+    p.key.fill(std::byte{0x09});
+    t.peers.push_back(p);
+    t.signature.fill(std::byte{sig_fill});
+    auto bytes = proto::encode_tunnel_peers(t);
+    BOOST_REQUIRE(bytes.has_value());
+    return {.peers = t, .frame = *bytes};
+}
 
 }  // namespace
 
@@ -748,6 +822,117 @@ BOOST_AUTO_TEST_CASE(volume_keys_are_opened_and_kept_per_attachment) {
     BOOST_TEST(r.keys.attachment_key(55).has_value());
     BOOST_TEST(!r.keys.attachment_key(56).has_value());
     BOOST_TEST(r.keys.open_attachment_key(55, 1).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(net_roles_get_their_tunnel_key_and_peer_sets) {
+    Rig r;
+    r.net.role.tunnel = true;
+    (void)r.daemon.boot();
+    BOOST_TEST(r.daemon.stats().tunnel_provisioned == 1U);
+    const auto keys = r.net.role.tunnel_keys();
+    BOOST_REQUIRE(keys.size() == 1U);
+    BOOST_TEST(std::ranges::any_of(keys[0], [](std::byte b) { return b != std::byte{0}; }));
+
+    // The VTEP's public key is in the inventory, and the controller is told
+    // without waiting for a reconnect.
+    const auto pub = r.daemon.keyring().public_key(net_vtep());
+    BOOST_REQUIRE(pub.has_value());
+    const auto inv = r.daemon.inventory();
+    BOOST_REQUIRE(inv.tunnels.size() == 1U);
+    BOOST_TEST((inv.tunnels[0].public_key == *pub));
+    BOOST_TEST(inv.tunnels[0].modes == proto::tunnel_mode_bit(proto::TunnelMode::wireguard));
+    BOOST_REQUIRE(r.count<proto::Inventory>() >= 1U);
+    BOOST_TEST((r.last<proto::Inventory>().tunnels == inv.tunnels));
+    const auto inventories = r.count<proto::Inventory>();
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.count<proto::Inventory>() == inventories);  // nothing changed: no report
+
+    // The controller's peer sets go to the VTEP's role, newest only.
+    const auto v2 = peers_frame(net_vtep(), 2);
+    std::thread{[&] { r.daemon.on_tunnel_peers(v2.peers, v2.frame); }}.join();
+    r.daemon.run_once(0ms);
+    r.daemon.on_tunnel_peers(v2.peers, v2.frame);  // a duplicate
+    const auto v1 = peers_frame(net_vtep(), 1);
+    r.daemon.on_tunnel_peers(v1.peers, v1.frame);  // older
+    auto other_vtep = net_vtep();
+    other_vtep[1] = std::byte{0x77};
+    const auto elsewhere = peers_frame(other_vtep, 1);
+    r.daemon.on_tunnel_peers(elsewhere.peers, elsewhere.frame);  // no role here for it
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.role.peer_sets().size() == 1U);
+    BOOST_TEST((r.net.role.peer_sets()[0] == v2.frame));
+    const auto stats = r.daemon.stats();
+    BOOST_TEST(stats.tunnel_peer_sets == 4U);
+    BOOST_TEST(stats.tunnel_peer_sets_forwarded == 1U);
+    BOOST_TEST(stats.tunnel_peer_sets_held == 3U);
+    BOOST_TEST(r.blk.role.peer_sets().empty());
+
+    // A restarted role gets the same key and the newest peer set back.
+    r.daemon.on_slot_recovered(net_slot);
+    const auto again = r.net.role.tunnel_keys();
+    BOOST_REQUIRE(again.size() == 2U);
+    BOOST_TEST((again[1] == keys[0]));
+    BOOST_REQUIRE(r.net.role.peer_sets().size() == 2U);
+    BOOST_TEST((r.net.role.peer_sets()[1] == v2.frame));
+}
+
+BOOST_AUTO_TEST_CASE(an_unkeyed_net_role_is_retried_and_one_without_a_tunnel_left_alone) {
+    {
+        Rig r;  // the role runs without a tunnel: no key pair, no key advertised
+        (void)r.daemon.boot();
+        r.daemon.run_once(0ms);
+        BOOST_TEST(r.daemon.keyring().size() == 0U);
+        BOOST_TEST(r.daemon.stats().tunnel_provisioned == 0U);
+        BOOST_TEST(r.daemon.stats().tunnel_provision_failed == 0U);
+        const auto inv = r.daemon.inventory();
+        BOOST_REQUIRE(inv.tunnels.size() == 1U);
+        BOOST_TEST((inv.tunnels[0].public_key == proto::TunnelPublicKey{}));
+    }
+    Rig r;
+    r.net.role.tunnel = true;
+    r.net.role.key_status = oar::Status::failed;
+    (void)r.daemon.boot();
+    BOOST_TEST(r.daemon.stats().tunnel_provision_failed == 1U);
+    // A peer set waits with the keyring while the role has no key.
+    const auto v1 = peers_frame(net_vtep(), 1);
+    r.daemon.on_tunnel_peers(v1.peers, v1.frame);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.net.role.peer_sets().empty());
+    BOOST_TEST(r.daemon.stats().tunnel_peer_sets_held == 1U);
+    BOOST_TEST(r.daemon.stats().tunnel_provision_failed == 2U);  // retried on the check
+    // Once the role takes the key, the next check provisions both.
+    r.net.role.key_status = oar::Status::ok;
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().tunnel_provisioned == 1U);
+    BOOST_TEST(r.net.role.tunnel_keys().size() == 1U);
+    BOOST_REQUIRE(r.net.role.peer_sets().size() == 1U);
+    BOOST_TEST((r.net.role.peer_sets()[0] == v1.frame));
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.net.role.tunnel_keys().size() == 1U);  // not again
+}
+
+BOOST_AUTO_TEST_CASE(a_degraded_net_role_degrades_the_inventory) {
+    Rig r;
+    (void)r.daemon.boot();
+    r.daemon.run_once(0ms);
+    BOOST_TEST((r.daemon.inventory().health == proto::Health::ok));
+    BOOST_REQUIRE(r.daemon.role_health(net_slot).has_value());
+    BOOST_TEST(!r.daemon.role_health(blk_slot).has_value());
+    const auto inventories = r.count<proto::Inventory>();
+
+    // A path that does not carry full-size frames (oar-net's net_fault_mtu).
+    constexpr std::uint16_t mtu_fault = 0x0002;
+    r.net.role.set_health({.state = oar::HealthState::degraded, .fault_code = mtu_fault});
+    r.daemon.run_once(0ms);
+    BOOST_TEST((r.daemon.inventory().health == proto::Health::degraded));
+    BOOST_TEST(r.daemon.role_health(net_slot)->fault_code == mtu_fault);
+    BOOST_REQUIRE(r.count<proto::Inventory>() == inventories + 1);
+    BOOST_TEST((r.last<proto::Inventory>().health == proto::Health::degraded));
+
+    r.net.role.set_health({});
+    r.daemon.run_once(0ms);
+    BOOST_TEST((r.daemon.inventory().health == proto::Health::ok));
+    BOOST_TEST(r.count<proto::Inventory>() == inventories + 2);
 }
 
 BOOST_AUTO_TEST_CASE(an_unreachable_sideband_is_reported_and_retried) {

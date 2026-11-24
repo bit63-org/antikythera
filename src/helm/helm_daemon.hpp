@@ -42,6 +42,26 @@
 // which verifies it before applying it. It is reported applied
 // (CommandRouter::on_map_applied) once every connected net role accepted it.
 //
+// Tunnel keys (oar-net Requirement 5.2, helm design "Tunnel keys"). helm's
+// TunnelKeyring holds one WireGuard key pair per VTEP. When a network
+// role's sideband opens, helm makes its VTEP's pair (the first time) and
+// provisions the role: the private key, then the newest controller peer
+// set for the VTEP, so a restarted role gets both back. A role that
+// cannot be provisioned is retried on every check; one that answers
+// unsupported runs without a tunnel, and its VTEP's key pair is dropped so
+// the inventory advertises no key for it. The public keys go into the
+// inventory (TunnelKeyring::fill). A TunnelPeers frame from the controller
+// is kept if it is newer than the one held for its VTEP and forwarded
+// unmodified to that VTEP's role, which verifies it.
+//
+// Network health (oar-net Requirement 6, task 11). Every check helm asks
+// each network role for its health; a degraded role (a peer VTEP down, a
+// path that does not carry full-size frames, an unkeyed tunnel: the
+// fault_code bits in net_role.hpp) makes the inventory's health degraded.
+// Whenever the inventory's VTEPs, tunnel keys or health change, helm sends
+// the controller a fresh inventory report, so a role that attaches or
+// degrades after registration is not invisible until the next connection.
+//
 // Block volumes (.kiro/specs/block-volume-service/ task 12). ReplicaConfig
 // and VolumeOp frames go unmodified to every hold role, which verifies
 // them, and so do the controller's lease acknowledgements. helm keeps the
@@ -96,8 +116,10 @@
 #include "helm/oar_link.hpp"
 #include "helm/power_sequencer.hpp"
 #include "helm/sideband_binding.hpp"
+#include "helm/tunnel_keyring.hpp"
 #include "proto/envelope.hpp"
 #include "proto/report.hpp"
+#include "proto/tunnel_peers.hpp"
 
 namespace ak::helm {
 
@@ -153,6 +175,14 @@ struct DaemonStats {
     std::uint64_t cert_requests{0};         // storage role requests reported to the controller
     std::uint64_t role_certificates{0};     // certificates a storage role took
     std::uint64_t role_certificates_refused{0};  // refused, or for a slot with no storage role
+    // Tunnel keys.
+    std::uint64_t tunnel_provisioned{0};          // network roles given their key (and peers)
+    std::uint64_t tunnel_provision_failed{0};     // could not be keyed: retried on check
+    std::uint64_t tunnel_peer_sets{0};            // TunnelPeers frames from the controller
+    std::uint64_t tunnel_peer_sets_forwarded{0};  // accepted by the VTEP's role
+    std::uint64_t tunnel_peer_sets_refused{0};    // the role refused it, or its link failed
+    std::uint64_t tunnel_peer_sets_held{0};       // stale or duplicate, or no role for the VTEP yet
+    std::uint64_t inventory_reports{0};           // sent because VTEPs, keys or health changed
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -193,6 +223,10 @@ public:
     [[nodiscard]] auto sequencer() const noexcept -> const PowerSequencer& { return _sequencer; }
     [[nodiscard]] auto attached(SlotNumber slot) const -> bool;
     [[nodiscard]] auto stats() const -> DaemonStats;
+    [[nodiscard]] auto keyring() const noexcept -> const TunnelKeyring& { return _keyring; }
+    // The health a network role last reported (loop thread); empty for
+    // other roles, or before the first answer.
+    [[nodiscard]] auto role_health(SlotNumber slot) const -> std::optional<oar::Health>;
 
     // ---- any thread ---------------------------------------------------------
 
@@ -205,6 +239,8 @@ public:
     auto on_lease_grant(const proto::LeaseGrant& grant) -> void override;
     auto on_role_certificate(const proto::RoleCertificate& certificate) -> void override;
     auto on_volume_key(const proto::VolumeKey& key, std::span<const std::byte> frame)
+        -> void override;
+    auto on_tunnel_peers(const proto::TunnelPeers& peers, std::span<const std::byte> frame)
         -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
@@ -235,8 +271,12 @@ private:
     struct KeyFrame {
         std::vector<std::byte> frame;
     };
+    struct PeersFrame {
+        proto::TunnelPeers peers;
+        std::vector<std::byte> frame;
+    };
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
-                              proto::LeaseGrant, KeyFrame, proto::RoleCertificate>;
+                              proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame>;
 
     struct SlotState;
 
@@ -276,6 +316,9 @@ private:
         // The certificate request last reported for this slot, and when.
         std::vector<std::byte> reported_csr;
         Clock::time_point reported_at{};
+        // A network role not yet given its tunnel key: retried on check.
+        bool keys_pending{false};
+        std::optional<oar::Health> health;  // network roles: the last answer
         SlotPort port;
 
         SlotState(SlotNumber n, LinkConfig c) : number{n}, config{c}, port{*this} {}
@@ -298,6 +341,11 @@ private:
     auto poll_identity(SlotState& slot) -> void;
     auto deliver_certificate(const proto::RoleCertificate& certificate) -> void;
     auto count_refusal(const std::expected<void, LinkError>& r) -> void;
+    // Tunnel keys and network health.
+    [[nodiscard]] static auto is_net(const SlotState& slot) -> bool;
+    auto provision_tunnel(SlotState& slot) -> void;
+    auto forward_peers(const PeersFrame& peers) -> void;
+    auto poll_health(SlotState& slot) -> void;
     // Opens the sideband, reads the inventory, registers with the router.
     auto attach(SlotState& slot) -> bool;
     auto detach(SlotState& slot) noexcept -> void;
@@ -317,6 +365,7 @@ private:
     Clock::time_point _next_reports;
     Clock::time_point _next_identity;
     std::map<std::uint64_t, ConfigFrame> _volume_configs;  // the newest, by volume
+    TunnelKeyring _keyring;
 
     mutable std::mutex _inbox_mutex;
     std::condition_variable _inbox_ready;

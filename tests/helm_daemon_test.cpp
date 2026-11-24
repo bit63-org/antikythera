@@ -191,6 +191,35 @@ public:
         return _reports.serve(r);  // the chunk outlives the lock: one helm, one request at a time
     }
 
+    // A storage role's enrollment: the request it answers with (none once
+    // a certificate is taken), and the chains it was given.
+    std::atomic<bool> enrolls{false};
+    std::atomic<oar::Status> install_status{oar::Status::ok};
+    auto set_csr(std::vector<std::byte> csr) -> void {
+        const std::scoped_lock lock{_mutex};
+        _csr = std::move(csr);
+    }
+    [[nodiscard]] auto chains() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _chains;
+    }
+    auto cert_request() -> std::expected<oar::CertAnswer, oar::Status> override {
+        if (!enrolls) {
+            return std::unexpected(oar::Status::unsupported);
+        }
+        const std::scoped_lock lock{_mutex};
+        return oar::CertAnswer{.role = _inventory.role, .csr = _csr};  // read before the next call
+    }
+    auto role_certificate(std::span<const std::byte> chain) -> oar::Status override {
+        const std::scoped_lock lock{_mutex};
+        _chains.emplace_back(chain.begin(), chain.end());
+        const auto s = install_status.load();
+        if (s == oar::Status::ok) {
+            _csr.clear();
+        }
+        return s;
+    }
+
 private:
     oar::Inventory _inventory;
     mutable std::mutex _mutex;
@@ -198,6 +227,8 @@ private:
     std::vector<std::vector<std::byte>> _ops;
     std::vector<oar::LeaseGrant> _grants;
     oar::ReportQueue _reports;
+    std::vector<std::byte> _csr;
+    std::vector<std::vector<std::byte>> _chains;
     std::size_t _cleaned{0};
     std::vector<oar::PrepareFunction> _prepared;
     std::vector<std::vector<std::byte>> _frames;
@@ -401,7 +432,8 @@ struct Rig {
         c.sequencer.poll_interval = settle;
         c.sequencer.off_time = settle;
         c.sequencer.max_recoveries = 1;
-        c.check_interval = 0ms;  // every pass checks
+        c.check_interval = 0ms;     // every pass checks
+        c.identity_interval = 0ms;  // and asks storage roles for requests
         return c;
     }
 
@@ -636,6 +668,58 @@ BOOST_AUTO_TEST_CASE(hold_reports_are_relayed_by_kind) {
     BOOST_TEST(r.daemon.stats().hold_reports_dropped == 2U);
     r.daemon.run_once(0ms);
     BOOST_TEST(r.reports.size() == before + 1);  // each once
+}
+
+BOOST_AUTO_TEST_CASE(storage_roles_enroll_through_the_controller) {
+    Rig r{link_timeout, nullptr, true};
+    const auto blk_csr = ak::test::bytes_of(0x30, 0x02, 0x11, 0x11);
+    const auto hold_csr = ak::test::bytes_of(0x30, 0x02, 0x22, 0x22);
+    r.blk.role.set_csr(blk_csr);
+    r.blk.role.enrolls = true;
+    r.hold.role.set_csr(hold_csr);
+    r.hold.role.enrolls = true;
+    r.net.role.enrolls = true;  // not a storage role: never asked
+    (void)r.daemon.boot();
+    BOOST_REQUIRE(r.count<proto::CertRequest>() == 2U);
+    for (const auto& b : r.reports) {
+        if (const auto* c = std::get_if<proto::CertRequest>(&b)) {
+            if (c->slot == blk_slot) {
+                BOOST_TEST((c->role == proto::StorageRole::initiator));
+                BOOST_TEST((c->csr == blk_csr));
+            } else {
+                BOOST_TEST(c->slot == hold_slot);
+                BOOST_TEST((c->role == proto::StorageRole::hold));
+                BOOST_TEST((c->csr == hold_csr));
+            }
+        }
+    }
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.count<proto::CertRequest>() == 2U);  // each reported once
+
+    const auto chain = ak::test::bytes_of(0x30, 0x01, 0x07);
+    r.daemon.on_role_certificate({.server_id = server, .slot = blk_slot, .chain = chain});
+    r.daemon.on_role_certificate({.server_id = server, .slot = net_slot, .chain = chain});
+    r.daemon.on_role_certificate({.server_id = server, .slot = 99, .chain = chain});
+    r.hold.role.install_status = oar::Status::failed;
+    r.daemon.on_role_certificate({.server_id = server, .slot = hold_slot, .chain = chain});
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.blk.role.chains().size() == 1U);
+    BOOST_TEST((r.blk.role.chains()[0] == chain));
+    BOOST_TEST(r.net.role.chains().empty());
+    BOOST_TEST(r.hold.role.chains().size() == 1U);
+    BOOST_TEST(r.daemon.stats().role_certificates == 1U);
+    BOOST_TEST(r.daemon.stats().role_certificates_refused == 3U);
+    BOOST_TEST(r.daemon.stats().cert_requests == 2U);
+    BOOST_TEST(r.count<proto::CertRequest>() == 2U);  // blk wants nothing now; hold already asked
+
+    // A renewal after a taken certificate is reported again, even with the
+    // same bytes; a request that is not DER never is.
+    r.blk.role.set_csr(blk_csr);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.count<proto::CertRequest>() == 3U);
+    r.blk.role.set_csr(ak::test::bytes_of(1, 2, 3));
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.count<proto::CertRequest>() == 3U);
 }
 
 BOOST_AUTO_TEST_CASE(volume_keys_are_opened_and_kept_per_attachment) {

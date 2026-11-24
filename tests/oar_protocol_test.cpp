@@ -19,6 +19,7 @@
 
 #include "helm/oar_protocol.hpp"
 #include "proto/group_policy.hpp"
+#include "proto/link.hpp"
 #include "proto/map_update.hpp"
 #include "proto/replica_config.hpp"
 #include "proto/report.hpp"
@@ -637,6 +638,8 @@ BOOST_AUTO_TEST_CASE(hold_mirrors_match_proto) {
     BOOST_TEST(oar::max_replica_config_frame == ak::proto::max_replica_config_size);
     BOOST_TEST(oar::volume_op_frame_size == ak::proto::volume_op_size);
     BOOST_TEST(oar::max_role_report >= ak::proto::max_report_size);
+    BOOST_TEST(oar::max_cert_chain == ak::proto::max_cert_chain_size);
+    BOOST_TEST(oar::max_csr <= ak::proto::max_csr_size);
     BOOST_TEST(oar::max_replica_config_frame <= oar::max_body_size);
     BOOST_TEST(oar::response_head_size + oar::report_chunk_head_size + oar::max_report_chunk ==
                oar::max_body_size);
@@ -705,6 +708,45 @@ BOOST_AUTO_TEST_CASE(report_chunk_round_trip_and_rules) {
         BOOST_TEST(!oar::encode_report_chunk(bad).has_value());
     }
     BOOST_TEST((oar::decode_report_chunk(std::span{b}.first(15)).error() == BodyError::truncated));
+}
+
+BOOST_AUTO_TEST_CASE(cert_answer_round_trip_and_rules) {
+    const auto csr = ak::test::bytes_of(0x30, 0x02, 0x05, 0x00);
+    auto b = oar::encode_cert_answer({.role = oar::Role::hold, .csr = csr});
+    BOOST_REQUIRE(b.has_value());
+    BOOST_TEST((*b == ak::test::bytes_of(4, 0, 4, 0, 0x30, 0x02, 0x05, 0x00)));
+    auto back = oar::decode_cert_answer(*b);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST((back->role == oar::Role::hold));
+    BOOST_TEST(std::ranges::equal(back->csr, csr));
+
+    auto none = oar::encode_cert_answer({.role = oar::Role::blk, .csr = {}});
+    BOOST_REQUIRE(none.has_value());
+    BOOST_TEST(none->size() == oar::cert_answer_head_size);
+    BOOST_TEST(oar::decode_cert_answer(*none).value().csr.empty());
+
+    BOOST_TEST((oar::encode_cert_answer({.role = oar::Role::net, .csr = csr}).error() ==
+                oar::BodyError::unknown_enum));
+    const std::vector<std::byte> huge(oar::max_csr + 1);
+    BOOST_TEST((oar::encode_cert_answer({.role = oar::Role::blk, .csr = huge}).error() ==
+                oar::BodyError::bad_csr));
+    BOOST_TEST(
+        (oar::decode_cert_answer(std::span{*b}.first(3)).error() == oar::BodyError::truncated));
+    BOOST_TEST(
+        (oar::decode_cert_answer(std::span{*b}.first(7)).error() == oar::BodyError::truncated));
+    auto longer = *b;
+    longer.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_cert_answer(longer).error() == oar::BodyError::trailing_bytes));
+    auto bad = *b;
+    bad[1] = std::byte{1};
+    BOOST_TEST((oar::decode_cert_answer(bad).error() == oar::BodyError::reserved_not_zero));
+    bad = *b;
+    bad[0] = std::byte{3};  // gpu
+    BOOST_TEST((oar::decode_cert_answer(bad).error() == oar::BodyError::unknown_enum));
+    bad = *b;
+    bad[2] = std::byte{0xFF};
+    bad[3] = std::byte{0xFF};
+    BOOST_TEST((oar::decode_cert_answer(bad).error() == oar::BodyError::bad_csr));
 }
 
 BOOST_AUTO_TEST_CASE(report_queue_serves_and_acknowledges) {

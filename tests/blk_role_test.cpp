@@ -52,6 +52,7 @@
 #include "proto/replica_config.hpp"
 #include "proto/server_identity.hpp"
 #include "test_support.hpp"
+#include "tls/role_identity.hpp"
 #include "tls_test_support.hpp"
 #include "virtio_driver_support.hpp"
 
@@ -511,8 +512,12 @@ struct Rig {
     std::optional<ak::tls::Config> storage_tls;
     std::unique_ptr<blk::BlkRole> role;
 
-    explicit Rig(bool images = false, std::optional<ak::tls::Config> tls = std::nullopt)
+    explicit Rig(bool images = false, std::optional<ak::tls::Config> tls = std::nullopt,
+                 bool keys = true)
         : storage_tls{std::move(tls)} {
+        if (!keys) {
+            verify = nullptr;
+        }
         std::map<std::uint16_t, blk::ImageStore> stores;
         if (images) {
             auto c = blk::ChunkCache::create(dir.path, std::uint64_t{16} << 20U);
@@ -1087,7 +1092,7 @@ BOOST_AUTO_TEST_CASE(network_volume_serves_the_guest_through_hold) {
 BOOST_AUTO_TEST_CASE(network_volume_configs_must_be_signed_for_this_server) {
     ak::test::TestCa ca{"storage CA"};
     {
-        Rig plain;  // no storage certificate: no network volumes
+        Rig plain{false, std::nullopt, false};  // no controller keys: no network volumes
         BOOST_TEST((plain.role->replica_config(frame_of(net_config(compute_id, 4430))) ==
                     oar::Status::unsupported));
     }
@@ -1115,6 +1120,71 @@ BOOST_AUTO_TEST_CASE(network_volume_configs_must_be_signed_for_this_server) {
     BOOST_TEST((prepare(net_attachment, 2) == oar::Status::failed));      // wrong generation
     BOOST_TEST((prepare(net_attachment + 1, 1) == oar::Status::failed));  // unknown attachment
     BOOST_TEST(!rig.role->attached(fn0).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(network_volume_waits_for_the_storage_certificate) {
+    ak::test::TestCa ca{"storage CA"};
+    Hold hold{ca};
+    Rig rig;  // controller keys, but no storage certificate yet
+    TempDir idir;
+    auto identity = ak::tls::RoleIdentity::open({.key_path = idir.path / "storage.key",
+                                                 .cert_path = idir.path / "storage.crt",
+                                                 .ca_pem = ca.cert_pem(),
+                                                 .server_id = compute_id,
+                                                 .common_name = "oar-blk",
+                                                 .addresses = {}});
+    BOOST_REQUIRE(identity.has_value());
+    ak::helm::RoleEnrollment enrollment{*identity, oar::Role::blk, ak::tls::Role::client,
+                                        [&rig](const ak::tls::Config& cfg) {
+                                            rig.role->set_storage_tls(cfg);
+                                            return true;
+                                        }};
+    rig.role->set_enrollment(enrollment);
+
+    const oar::PrepareFunction prep{
+        .fn = fn0,
+        .type = ak::helm::FunctionType::blk_fn,
+        .vm_id = vm_one,
+        .config =
+            oar::BlkConfig{.volume_id = vol_one, .attachment_id = net_attachment, .generation = 1}};
+    // Configs are taken (they only need the controller's key), but an
+    // attachment waits for a certificate to present.
+    BOOST_REQUIRE((rig.role->replica_config(frame_of(net_config(compute_id, hold.port()))) ==
+                   oar::Status::ok));
+    BOOST_TEST((rig.role->prepare_function(prep) == oar::Status::failed));
+
+    auto asked = rig.role->cert_request();
+    BOOST_REQUIRE(asked.has_value());
+    BOOST_TEST((asked->role == oar::Role::blk));
+    BOOST_REQUIRE(!asked->csr.empty());
+    const std::vector<std::byte> csr{asked->csr.begin(), asked->csr.end()};
+    // helm passes on whatever it is given; the role checks it.
+    BOOST_TEST((rig.role->role_certificate(ca.sign_request(csr, server_san(hold_id))) ==
+                oar::Status::failed));
+    BOOST_TEST((rig.role->prepare_function(prep) == oar::Status::failed));
+    BOOST_TEST((rig.role->role_certificate(ca.sign_request(csr, server_san(compute_id))) ==
+                oar::Status::ok));
+    BOOST_TEST(enrollment.stats().installed == 1U);
+    BOOST_TEST(enrollment.stats().refused == 1U);
+    BOOST_TEST(rig.role->cert_request().value().csr.empty());
+
+    BOOST_REQUIRE((rig.role->prepare_function(prep) == oar::Status::ok));
+    rig.t0.flr();
+    BOOST_REQUIRE(rig.deliver(fn0, vol_one) == oar::Status::ok);
+    Guest g{rig.ram0, *rig.t0.served(), rig.role.get()};
+    BOOST_REQUIRE(g.up());
+    const auto plain = marker();
+    const auto w = g.post(RequestType::out, marker_sector, plain);
+    BOOST_REQUIRE(g.wait(w));
+    BOOST_TEST((g.status(w) == Status::ok));
+    BOOST_TEST(g.read(marker_sector) == plain, boost::test_tools::per_element());
+    BOOST_REQUIRE(rig.clean(fn0) == oar::Status::ok);
+}
+
+BOOST_AUTO_TEST_CASE(roles_without_enrollment_answer_unsupported) {
+    Rig rig;
+    BOOST_TEST((rig.role->cert_request().error() == oar::Status::unsupported));
+    BOOST_TEST((rig.role->role_certificate(std::vector<std::byte>(4)) == oar::Status::unsupported));
 }
 
 BOOST_AUTO_TEST_CASE(network_volume_read_only_attachment_refuses_writes) {

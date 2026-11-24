@@ -57,6 +57,16 @@
 // attaches the volume on ATTACH_VOLUME) and to every storage (blk) role,
 // and again to a storage role whose sideband (re)opens.
 //
+// Enrollment. Every identity_interval, and as soon as its sideband opens,
+// helm asks each storage role (blk, hold) for its certificate request.
+// A request it has not reported for that slot (or reported more than
+// identity_retry ago) goes to the controller as a cert_request report; a
+// role that wants nothing answers with none, and one that does not take
+// part answers unsupported. The controller's role_certificate for a slot
+// goes to that slot's role unmodified (the role checks it); once a role
+// takes one, a later request from it (a renewal, the same bytes) is
+// reported again.
+//
 // The daemon never powers anything off by itself: losing the controller
 // leaves running VMs alone (Requirement 2.3), and stopping run() leaves the
 // slots and the host as they are. shutdown() is the explicit power-off.
@@ -111,6 +121,10 @@ struct DaemonConfig {
     // How often hold roles' reports are taken (their lease requests ride
     // them, every lease_ms / 4).
     std::chrono::milliseconds report_interval{std::chrono::milliseconds{100}};
+    // How often storage roles are asked for a certificate request, and
+    // how long an unanswered one waits before it is reported again.
+    std::chrono::milliseconds identity_interval{std::chrono::seconds{10}};
+    std::chrono::milliseconds identity_retry{std::chrono::minutes{10}};
     // Items waiting for the loop; more are dropped and counted. Only a loop
     // stuck far longer than any timeout fills it.
     std::size_t max_inbox{4096};
@@ -136,6 +150,9 @@ struct DaemonStats {
     std::uint64_t volume_keys{0};           // opened and kept (KeyStore::put_attachment_key)
     std::uint64_t volume_keys_refused{0};   // did not open, stale, or too many
     std::uint64_t blk_configs_refused{0};   // a storage role refused a network volume's config
+    std::uint64_t cert_requests{0};         // storage role requests reported to the controller
+    std::uint64_t role_certificates{0};     // certificates a storage role took
+    std::uint64_t role_certificates_refused{0};  // refused, or for a slot with no storage role
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -186,6 +203,7 @@ public:
         -> void override;
     auto on_volume_op(const proto::VolumeOp& op, std::span<const std::byte> frame) -> void override;
     auto on_lease_grant(const proto::LeaseGrant& grant) -> void override;
+    auto on_role_certificate(const proto::RoleCertificate& certificate) -> void override;
     auto on_volume_key(const proto::VolumeKey& key, std::span<const std::byte> frame)
         -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
@@ -218,7 +236,7 @@ private:
         std::vector<std::byte> frame;
     };
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
-                              proto::LeaseGrant, KeyFrame>;
+                              proto::LeaseGrant, KeyFrame, proto::RoleCertificate>;
 
     struct SlotState;
 
@@ -255,6 +273,9 @@ private:
         std::unique_ptr<OarLink> link;  // set while attached
         std::optional<oar::Inventory> inventory;
         bool pending{false};  // link-ready, attach failed: retried on check
+        // The certificate request last reported for this slot, and when.
+        std::vector<std::byte> reported_csr;
+        Clock::time_point reported_at{};
         SlotPort port;
 
         SlotState(SlotNumber n, LinkConfig c) : number{n}, config{c}, port{*this} {}
@@ -273,6 +294,9 @@ private:
     auto forward_grant(const proto::LeaseGrant& grant) -> void;
     auto replay_configs(SlotState& slot) -> void;
     auto take_hold_reports() -> void;
+    [[nodiscard]] static auto is_storage(const SlotState& slot) -> bool;
+    auto poll_identity(SlotState& slot) -> void;
+    auto deliver_certificate(const proto::RoleCertificate& certificate) -> void;
     auto count_refusal(const std::expected<void, LinkError>& r) -> void;
     // Opens the sideband, reads the inventory, registers with the router.
     auto attach(SlotState& slot) -> bool;
@@ -291,6 +315,7 @@ private:
     std::map<SlotNumber, std::unique_ptr<SlotState>> _slots;
     Clock::time_point _next_check;
     Clock::time_point _next_reports;
+    Clock::time_point _next_identity;
     std::map<std::uint64_t, ConfigFrame> _volume_configs;  // the newest, by volume
 
     mutable std::mutex _inbox_mutex;

@@ -72,7 +72,7 @@ repository. Prerequisites outside this spec: oar-blk task 14
 
 ### Phase D: integration
 
-- [ ] 12. helm integration: forward `ReplicaConfig`/`VolumeOp` to hold
+- [x] 12. helm integration: forward `ReplicaConfig`/`VolumeOp` to hold
   and oar-blk, relay reports, lease acknowledgement path, `VolumeKey`
   opened with HPKE in the secure element (software SE first), network
   volume attach in the CommandRouter, enrollment of the SE public key

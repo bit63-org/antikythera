@@ -23,12 +23,21 @@
 // 64 hex digits). The controller grants leases, so a primary serves reads
 // only while it holds one.
 //
+// With the sideband the role enrolls (block-volume-service task 12): --key
+// is its own key, created (0600) if the file does not exist, and --cert
+// is where it keeps the certificate the controller's CA issues for it,
+// asked for through helm and checked against --ca, this server, the key
+// and the --listen address (which must then be an IP address, the one the
+// certificate names). A --cert that already passes is used at once; until
+// one does, the node listens but answers no one.
+//
 // --configs DIR instead stands in for helm when there is no controller: a
 // directory of encoded ReplicaConfig frames (*.rcfg), trusted as they are
 // (no signature check) and without leases. It is read at start and
 // rescanned every second; a frame is applied when its epoch is new.
 // SIGINT or SIGTERM stops the role.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -50,6 +59,8 @@
 #include <system_error>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <openssl/rand.h>
 #include <sys/stat.h>
 
@@ -60,6 +71,7 @@
 #include "hold/store/file_layer.hpp"
 #include "hull/signature_verifier.hpp"
 #include "proto/replica_config.hpp"
+#include "tls/role_identity.hpp"
 
 namespace {
 
@@ -347,6 +359,18 @@ private:
     std::unique_ptr<ak::helm::OarEndpoint> _endpoint;
 };
 
+// True for an IPv4 or IPv6 literal that names one interface.
+auto specific_address(const std::string& host) -> bool {
+    std::array<unsigned char, sizeof(in6_addr)> buf{};
+    if (::inet_pton(AF_INET, host.c_str(), buf.data()) == 1) {
+        return host != "0.0.0.0";
+    }
+    if (::inet_pton(AF_INET6, host.c_str(), buf.data()) == 1) {
+        return std::ranges::any_of(buf, [](unsigned char b) { return b != 0; });
+    }
+    return false;
+}
+
 }  // namespace
 
 auto main(int argc, char** argv) -> int {
@@ -354,12 +378,49 @@ auto main(int argc, char** argv) -> int {
     if (!opts) {
         return usage();
     }
+    const bool enroll = !opts->sideband.empty();
     const auto ca = read_file(opts->ca);
-    const auto cert = read_file(opts->cert);
-    const auto key = read_file(opts->key);
-    if (!ca || !cert || !key) {
-        std::println(stderr, "ak-hold: cannot read the CA, certificate or key");
+    if (!ca) {
+        std::println(stderr, "ak-hold: cannot read the CA");
         return 1;
+    }
+    std::optional<ak::tls::RoleIdentity> identity;
+    std::string cert_pem;
+    std::string key_pem;
+    if (enroll) {
+        if (!specific_address(opts->host)) {
+            std::println(stderr,
+                         "ak-hold: with --sideband, --listen must be the IP address the "
+                         "certificate names");
+            return usage();
+        }
+        auto opened = ak::tls::RoleIdentity::open({.key_path = opts->key,
+                                                   .cert_path = opts->cert,
+                                                   .ca_pem = *ca,
+                                                   .server_id = opts->server_id,
+                                                   .common_name = "hold",
+                                                   .addresses = {opts->host}});
+        if (!opened) {
+            std::println(stderr, "ak-hold: storage identity: {}",
+                         ak::tls::to_string(opened.error()));
+            return 1;
+        }
+        identity = std::move(*opened);
+        if (const auto cfg = identity->config(ak::tls::Role::server)) {
+            cert_pem = cfg->cert_pem;
+            key_pem = cfg->key_pem;
+        } else {
+            std::println(stderr, "ak-hold: no certificate yet: waiting for enrollment");
+        }
+    } else {
+        const auto cert = read_file(opts->cert);
+        const auto key = read_file(opts->key);
+        if (!cert || !key) {
+            std::println(stderr, "ak-hold: cannot read the certificate or key");
+            return 1;
+        }
+        cert_pem = *cert;
+        key_pem = *key;
     }
     std::error_code ec;
     std::filesystem::create_directories(opts->data_dir, ec);
@@ -369,8 +430,8 @@ auto main(int argc, char** argv) -> int {
         .port = opts->port,
         .tls = {.role = ak::tls::Role::server,
                 .ca_pem = *ca,
-                .cert_pem = *cert,
-                .key_pem = *key,
+                .cert_pem = std::move(cert_pem),
+                .key_pem = std::move(key_pem),
                 .peer_name = {}},
         // With --configs there is no controller to grant leases: the
         // primary serves reads without one.
@@ -412,6 +473,16 @@ auto main(int argc, char** argv) -> int {
         [verifier](std::span<const std::byte> msg, std::span<const std::byte, 64> sig,
                    std::uint16_t key_id) { return verifier->verify(msg, sig, key_id).has_value(); },
         random_seq()};
+    ak::helm::RoleEnrollment enrollment{*identity, ak::helm::oar::Role::hold, ak::tls::Role::server,
+                                        [&node](const ak::tls::Config& cfg) {
+                                            if (!(*node)->set_tls(cfg)) {
+                                                return false;
+                                            }
+                                            std::println(stderr,
+                                                         "ak-hold: storage certificate installed");
+                                            return true;
+                                        }};
+    role.set_enrollment(enrollment);
     remove_stale_socket(opts->sideband);
     auto listener = ak::helm::SocketListener::bind(opts->sideband);
     if (!listener) {

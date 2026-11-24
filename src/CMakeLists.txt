@@ -59,12 +59,14 @@ find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto SSL)
 target_link_libraries(ak_oar_net PRIVATE OpenSSL::Crypto)
 
 # ak_tls: mutually authenticated TLS 1.3 over TCP for the ControllerLink
-# (helm the client, the controller or harbor's test controller the server).
-add_library(ak_tls tls/tls.cpp)
+# (helm the client, the controller or harbor's test controller the server),
+# and a storage role's own key, certificate request and certificate
+# (RoleIdentity, block volume enrollment).
+add_library(ak_tls tls/tls.cpp tls/role_identity.cpp)
 add_library(ak::tls ALIAS ak_tls)
 target_include_directories(ak_tls PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ak_tls
-  PRIVATE OpenSSL::SSL OpenSSL::Crypto ak::warnings ak::hardening)
+  PRIVATE ak::proto OpenSSL::SSL OpenSSL::Crypto ak::warnings ak::hardening)
 
 # helm: control-plane mailbox protocol and register file, device pool, MCTP sideband framing,
 # OarLink (sideband protocol and its transport bindings), key store, the

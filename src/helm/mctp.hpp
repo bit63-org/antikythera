@@ -256,6 +256,8 @@ enum class VendorType : std::uint8_t {
     volume_op = 0x12,
     lease_grant = 0x13,
     hold_reports = 0x14,
+    cert_request = 0x15,
+    role_certificate = 0x16,
 };
 
 struct VendorHeader {

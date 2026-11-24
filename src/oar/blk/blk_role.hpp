@@ -50,7 +50,11 @@
 // the volume re-routes the live attachment (a new primary, or fencing).
 // The geometry comes from the config, read-only for an ro attachment. The
 // key helm delivers is the attachment's, opened in its secure element.
-// Without verify_config and storage_tls the role takes no network volumes.
+// Without verify_config the role takes no network volumes. Enrollment
+// (set_enrollment): the role's storage certificate comes from the
+// controller through helm; until it has one (storage_tls empty) network
+// attachments are refused, and a renewed one goes to every live
+// initiator for its next connection.
 //
 // The volume files are named vol-<16 hex digits>.akv in the volume
 // directory. The role checks a volume's header against the request: a
@@ -73,6 +77,7 @@
 #include <vector>
 
 #include "helm/oar_link.hpp"
+#include "helm/role_enrollment.hpp"
 #include "oar/blk/chunk_cache.hpp"
 #include "oar/blk/fetcher.hpp"
 #include "oar/blk/file_backend.hpp"
@@ -180,6 +185,17 @@ public:
     auto delete_volume(const helm::oar::DeleteVolume& request) -> helm::oar::Status override;
     auto rewrap_volume(const helm::oar::RewrapVolume& request) -> helm::oar::Status override;
     auto replica_config(std::span<const std::byte> frame) -> helm::oar::Status override;
+    auto cert_request() -> std::expected<helm::oar::CertAnswer, helm::oar::Status> override;
+    auto role_certificate(std::span<const std::byte> chain) -> helm::oar::Status override;
+
+    // Enrollment through `enrollment` (must outlive the role); its Apply
+    // should call set_storage_tls.
+    auto set_enrollment(helm::RoleEnrollment& enrollment) noexcept -> void {
+        _enrollment = &enrollment;
+    }
+    // The storage certificate, first or renewed: new attachments use it,
+    // and live ones on their next connection.
+    auto set_storage_tls(const tls::Config& config) -> void;
 
     // Serves deferred requests on every attached function; true if any
     // still has work (call again soon).
@@ -227,6 +243,7 @@ private:
     std::vector<Slot> _slots;
     std::map<std::uint64_t, proto::ReplicaConfig> _configs;  // network volumes, newest
     RoleConfig::Clock::time_point _started;
+    helm::RoleEnrollment* _enrollment{nullptr};
 };
 
 }  // namespace ak::oar::blk

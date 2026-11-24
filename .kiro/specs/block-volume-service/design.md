@@ -210,6 +210,26 @@ only the reporting server's URI SAN plus, for a hold role, the IP SANs of
 that server's storage endpoints, and the role checks the chain, its names
 and its key before using it.
 
+On helm's sideband the roles take part with two messages: `cert_request`
+(the role answers with its DER request, or none while its certificate
+has more than a third of its lifetime left) and `role_certificate` (the
+chain, in map_update's chunk format). helm asks each storage role every
+10 s and as soon as its sideband opens, reports a request it has not
+reported for that slot (again after 10 minutes unanswered, and again
+once the role took a certificate, so a renewal goes out even with the
+same bytes), and passes each `role_certificate` to the role in its slot.
+The role side is `tls::RoleIdentity`: an ECDSA P-256 key generated on
+first start and kept 0600, one request per process naming the server
+(and for a hold its `--listen` address as an IP SAN), and a chain
+installed only if it parses, holds the key, names exactly this server
+(and the address), and verifies against the storage CA now; it is then
+written to the certificate file and used at once. A hold node starts
+without a certificate and closes every connection and fails every dial
+until it has one (`Node::set_tls`, which also takes renewals); oar-blk
+keeps taking configs but refuses network attachments until enrolled,
+and hands a renewed certificate to every live initiator for its next
+connection. The key never changes on renewal; rotating it is later work.
+
 ### Reports (hold and oar-blk → helm → controller)
 
 Additions to `src/proto/report.hpp`:

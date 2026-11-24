@@ -62,6 +62,17 @@ auto HoldRole::map_update(std::span<const std::byte> /*frame*/) -> oar::Status {
     return oar::Status::unsupported;
 }
 
+auto HoldRole::cert_request() -> std::expected<oar::CertAnswer, oar::Status> {
+    if (_enrollment == nullptr) {
+        return std::unexpected(oar::Status::unsupported);
+    }
+    return _enrollment->answer();
+}
+
+auto HoldRole::role_certificate(std::span<const std::byte> chain) -> oar::Status {
+    return _enrollment == nullptr ? oar::Status::unsupported : _enrollment->install(chain);
+}
+
 auto HoldRole::health() -> std::expected<oar::Health, oar::Status> {
     const auto up = std::chrono::duration_cast<std::chrono::seconds>(_clock() - _started);
     const auto secs = static_cast<std::uint64_t>(std::max<std::int64_t>(0, up.count()));

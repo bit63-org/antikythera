@@ -843,6 +843,16 @@ public:
         -> std::expected<oar::ReportChunk, oar::Status> override {
         return reports.serve(r);
     }
+    std::vector<std::byte> csr;
+    std::vector<std::vector<std::byte>> chains;
+    oar::Status install = oar::Status::ok;
+    auto cert_request() -> std::expected<oar::CertAnswer, oar::Status> override {
+        return oar::CertAnswer{.role = oar::Role::hold, .csr = csr};
+    }
+    auto role_certificate(std::span<const std::byte> chain) -> oar::Status override {
+        chains.emplace_back(chain.begin(), chain.end());
+        return install;
+    }
 };
 
 BOOST_AUTO_TEST_CASE(hold_role_takes_configs_ops_and_grants) {
@@ -898,6 +908,40 @@ BOOST_AUTO_TEST_CASE(hold_reports_arrive_whole_and_once) {
     BOOST_TEST(role.reports.size() == 0U);
 }
 
+BOOST_AUTO_TEST_CASE(enrollment_requests_and_certificates_cross_whole) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    HoldRole role;
+    role.csr = pattern(oar::max_csr);
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const auto chain = pattern(oar::max_cert_chain);  // five chunks
+    {
+        const Server server{endpoint, role};
+        auto asked = link.cert_request();
+        BOOST_REQUIRE(asked.has_value());
+        BOOST_TEST((asked->role == oar::Role::hold));
+        BOOST_TEST(asked->csr == role.csr);
+        BOOST_TEST(link.role_certificate(chain).has_value());
+        BOOST_TEST(
+            (link.role_certificate({}).error().code == LinkErrc::bad_request));  // never sent
+        BOOST_TEST((link.role_certificate(pattern(oar::max_cert_chain + 1)).error().code ==
+                    LinkErrc::bad_request));
+    }
+    BOOST_REQUIRE(role.chains.size() == 1U);
+    BOOST_TEST(role.chains[0] == chain);
+
+    // Nothing wanted, and a refused chain.
+    role.csr.clear();
+    role.install = oar::Status::failed;
+    {
+        const Server server{endpoint, role};
+        auto asked = link.cert_request();
+        BOOST_REQUIRE(asked.has_value());
+        BOOST_TEST(asked->csr.empty());
+        BOOST_TEST((link.role_certificate(pattern(10)).error().status == oar::Status::failed));
+    }
+}
+
 BOOST_AUTO_TEST_CASE(roles_without_replicas_answer_unsupported) {
     auto [helm_b, oar_b] = InProcessBinding::make_pair();
     FakeOar fake;  // keeps the defaults
@@ -911,6 +955,8 @@ BOOST_AUTO_TEST_CASE(roles_without_replicas_answer_unsupported) {
     BOOST_TEST((link.lease_grant({.volume_id = 1, .epoch = 1}).error().status ==
                 oar::Status::unsupported));
     BOOST_TEST((link.hold_reports(1).error().status == oar::Status::unsupported));
+    BOOST_TEST((link.cert_request().error().status == oar::Status::unsupported));
+    BOOST_TEST((link.role_certificate(pattern(10)).error().status == oar::Status::unsupported));
 }
 
 BOOST_AUTO_TEST_CASE(names) {

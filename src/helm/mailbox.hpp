@@ -397,6 +397,56 @@ struct Response {
     friend auto operator==(const Response&, const Response&) -> bool = default;
 };
 
+// ---- LIST_VMS and VM_STATUS payloads ---------------------------------------
+//
+// hull's `ok` answers to the two query commands (hull-host-agent task 8).
+// Both are snapshots of hull's own view; helm's inventory remains the
+// controller's main source.
+
+// Values are part of the wire protocol: never renumber.
+enum class VmRunState : std::uint8_t {
+    created = 1,  // the VMM is up and holds the VM's configuration; not booted
+    running = 2,  // booted
+};
+
+// VM_STATUS payload: vm_id u64 | state u8 | devices u8 | vcpus u16 |
+// hugepages u32  (16 bytes). devices counts the functions hull has given
+// the VM; hugepages is its memory in 1 GiB pages.
+inline constexpr std::size_t vm_status_payload_size = 16;
+
+struct VmStatusInfo {
+    std::uint64_t vm_id{0};
+    VmRunState state{VmRunState::created};
+    std::uint8_t devices{0};
+    std::uint16_t vcpus{0};
+    std::uint32_t hugepages{0};
+    friend auto operator==(const VmStatusInfo&, const VmStatusInfo&) -> bool = default;
+};
+
+// LIST_VMS payload: total u16 | count u16 | rsvd u32 | vm_id u64 x count.
+// The IDs are strictly ascending, non-zero, and the lowest `count` of the
+// `total` VMs hull runs; count < total says the list was cut to fit the
+// slot (at most max_listed_vms IDs).
+inline constexpr std::size_t vm_list_fixed_size = 8;
+inline constexpr std::size_t max_listed_vms =
+    (max_response_payload - vm_list_fixed_size) / sizeof(std::uint64_t);
+
+struct VmList {
+    std::uint16_t total{0};
+    std::vector<std::uint64_t> vm_ids;
+    friend auto operator==(const VmList&, const VmList&) -> bool = default;
+};
+
+[[nodiscard]] auto encode_vm_status_payload(const VmStatusInfo& info) -> std::vector<std::byte>;
+[[nodiscard]] auto decode_vm_status_payload(std::span<const std::byte> payload) noexcept
+    -> std::expected<VmStatusInfo, BodyError>;
+// Encodes the lowest max_listed_vms of `vm_ids` (which must be strictly
+// ascending and non-zero) with total = vm_ids.size().
+[[nodiscard]] auto encode_vm_list_payload(std::span<const std::uint64_t> vm_ids)
+    -> std::vector<std::byte>;
+[[nodiscard]] auto decode_vm_list_payload(std::span<const std::byte> payload)
+    -> std::expected<VmList, BodyError>;
+
 // ---- Event bodies ---------------------------------------------------------
 
 enum class ExitReason : std::uint8_t {

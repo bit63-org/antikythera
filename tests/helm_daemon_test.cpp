@@ -3,8 +3,9 @@
 
 // helm's daemon wiring (HelmDaemon): slots attach over real OarLinks when the
 // PowerSequencer brings them up, controller traffic and hull's slots reach
-// the CommandRouter on the loop thread, mapping updates reach net roles,
-// sidebands are retried and reopened, and the whole stack serves harbor's
+// the CommandRouter on the loop thread, mapping updates and group policies
+// reach net roles, group meters are reported, sidebands are retried and
+// reopened, and the whole stack serves harbor's
 // test controller end to end over mTLS.
 
 #define BOOST_TEST_MODULE helm_daemon_test
@@ -40,6 +41,7 @@
 #include "helm/sideband_binding.hpp"
 #include "helm/volume_key_seal.hpp"
 #include "hull/signature_verifier.hpp"
+#include "proto/group_policy.hpp"
 #include "proto/test_vectors.hpp"
 #include "proto/tunnel_peers.hpp"
 #include "proto/vpc_config.hpp"
@@ -203,6 +205,35 @@ public:
         return vpc_status.load();
     }
 
+    // A network role's group policy and meters.
+    [[nodiscard]] auto policies() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _policies;
+    }
+    // The meters the next snapshot returns; detached ones are handed out once.
+    auto set_usage(std::vector<oar::UsageEntry> usage) -> void {
+        const std::scoped_lock lock{_mutex};
+        _usage = std::move(usage);
+    }
+    [[nodiscard]] auto usage_reads() const -> std::size_t {
+        const std::scoped_lock lock{_mutex};
+        return _usage_reads;
+    }
+    auto group_policy(std::span<const std::byte> frame) -> oar::Status override {
+        const std::scoped_lock lock{_mutex};
+        _policies.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
+    }
+    auto group_usage(std::uint16_t cursor) -> std::expected<oar::UsagePage, oar::Status> override {
+        const std::scoped_lock lock{_mutex};
+        return _pager.page(cursor, [this] {
+            ++_usage_reads;
+            auto out = _usage;
+            std::erase_if(_usage, [](const oar::UsageEntry& e) { return e.detached; });
+            return out;
+        });
+    }
+
     // A hold role's side.
     std::atomic<oar::Status> config_status{oar::Status::ok};
     [[nodiscard]] auto configs() const -> std::vector<std::vector<std::byte>> {
@@ -280,6 +311,10 @@ private:
     oar::ReportQueue _reports;
     std::vector<std::byte> _csr;
     std::vector<std::vector<std::byte>> _chains;
+    std::vector<std::vector<std::byte>> _policies;
+    std::vector<oar::UsageEntry> _usage;
+    oar::UsagePager _pager;
+    std::size_t _usage_reads{0};
     std::size_t _cleaned{0};
     oar::Health _health{};
     std::vector<std::vector<std::byte>> _tunnel_keys;
@@ -436,6 +471,19 @@ auto try_response(std::uint64_t seq, mb::Type command) -> std::optional<mb::Slot
     return *slot;
 }
 
+// An event slot hull writes (EVT_SLOT), unsigned like a response.
+auto event(const mb::Body& body) -> mb::Slot {
+    const auto bytes = mb::encode_body(body);
+    const std::array<std::byte, mb::signature_size> sig{};
+    auto slot = mb::encode({.type = mb::type_of(body),
+                            .seq = 0,
+                            .body_len = static_cast<std::uint16_t>(bytes.size()),
+                            .key_id = mb::no_key_id},
+                           bytes, sig);
+    BOOST_REQUIRE(slot);
+    return *slot;
+}
+
 auto response(std::uint64_t seq, mb::Type command) -> mb::Slot {
     auto slot = try_response(seq, command);
     BOOST_REQUIRE(slot);
@@ -489,6 +537,9 @@ struct Rig {
         c.sequencer.max_recoveries = 1;
         c.check_interval = 0ms;     // every pass checks
         c.identity_interval = 0ms;  // and asks storage roles for requests
+        // Group meters are read on the first pass and after a NIC detach:
+        // the tests never wait out an interval.
+        c.group_usage_interval = 1h;
         return c;
     }
 
@@ -542,6 +593,31 @@ auto peers_frame(const proto::VtepAddress& vtep, std::uint64_t version) -> Peers
     auto bytes = proto::encode_tunnel_peers(t);
     BOOST_REQUIRE(bytes.has_value());
     return {.peers = t, .frame = *bytes};
+}
+
+// A GroupPolicy frame as the ControllerSession hands it over: helm never
+// checks the signature, so any bytes there do.
+auto policy_frame(std::uint64_t version) -> std::pair<proto::GroupPolicy, std::vector<std::byte>> {
+    proto::GroupPolicy p{};
+    p.server_id = server;
+    p.key_id = 1;
+    p.vni = vni;
+    p.policy_version = version;
+    auto bytes = proto::encode_group_policy(p);
+    BOOST_REQUIRE(bytes.has_value());
+    return {p, *bytes};
+}
+
+auto usage_entry(std::uint64_t nic, std::uint64_t frames, bool detached = false)
+    -> oar::UsageEntry {
+    return {.nic_id = nic,
+            .vni = vni,
+            .detached = detached,
+            .attachment = 1,
+            .frames = frames,
+            .bytes = frames * 100,
+            .replicas_remote = frames * 2,
+            .replica_bytes_remote = frames * 200};
 }
 
 }  // namespace
@@ -746,6 +822,84 @@ auto hold_report(proto::ReportBody body) -> std::vector<std::byte> {
 }
 
 }  // namespace
+
+BOOST_AUTO_TEST_CASE(group_policies_reach_net_roles_and_follow_a_restart) {
+    Rig r;
+    (void)r.daemon.boot();
+    const auto [v1, frame1] = policy_frame(1);
+    std::thread{[&] { r.daemon.on_group_policy(v1, frame1); }}.join();
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.role.policies().size() == 1U);
+    BOOST_TEST((r.net.role.policies()[0] == frame1));  // unmodified
+    BOOST_TEST(r.blk.role.policies().empty());
+
+    // Not newer: kept back. Newer: forwarded.
+    r.daemon.on_group_policy(v1, frame1);
+    const auto [v2, frame2] = policy_frame(2);
+    r.daemon.on_group_policy(v2, frame2);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.role.policies().size() == 2U);
+    BOOST_TEST((r.net.role.policies()[1] == frame2));
+    BOOST_TEST(r.daemon.group_usage().policies_stale == 1U);
+
+    // A restarted role gets the newest policy again before any NIC.
+    r.backplane.dropped.insert(net_slot);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.connects.load() == 2);
+    BOOST_REQUIRE(r.net.role.policies().size() == 3U);
+    BOOST_TEST((r.net.role.policies()[2] == frame2));
+    BOOST_TEST(r.daemon.group_usage().policies_forwarded == 3U);
+}
+
+BOOST_AUTO_TEST_CASE(group_meters_are_reported_and_read_after_a_detach) {
+    Rig r;
+    r.net.role.set_usage({usage_entry(nic_id, 4)});
+    (void)r.daemon.boot();
+    r.daemon.run_once(0ms);  // the first pass reads
+    BOOST_REQUIRE(r.count<proto::GroupUsage>() == 1U);
+    auto usage = r.last<proto::GroupUsage>();
+    BOOST_REQUIRE(usage.entries.size() == 1U);
+    BOOST_TEST(usage.entries[0].slot == net_slot);
+    BOOST_TEST(usage.entries[0].nic_id == nic_id);
+    BOOST_TEST(usage.entries[0].replica_bytes_remote == 800U);
+    BOOST_TEST(!usage.entries[0].detached);
+
+    // Inside the interval nothing is read.
+    r.net.role.set_usage({usage_entry(nic_id, 6)});
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.net.role.usage_reads() == 1U);
+
+    // A NIC detach: the role cleans the VF and holds the final reading,
+    // which the next pass reads and reports.
+    r.daemon.on_envelope(
+        envelope(1, mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib}));
+    r.daemon.run_once(0ms);
+    r.daemon.post_host_slot(response(1, mb::Type::create_vm));
+    const mb::DeviceRef device{.slot = net_slot, .type = mb::DeviceType::nic_vf, .function = 0};
+    mb::AttachDevice attach{
+        .vm_id = vm_one, .device = device, .vni = vni, .nic_id = nic_id, .mac = {}};
+    attach.mac[0] = std::byte{0x02};
+    r.daemon.on_envelope(envelope(2, attach));
+    r.daemon.run_once(0ms);
+    r.daemon.post_host_slot(response(2, mb::Type::attach_device));
+    r.daemon.run_once(0ms);
+    const auto reads_before = r.net.role.usage_reads();
+    r.net.role.set_usage({usage_entry(nic_id, 7, true)});
+    r.daemon.on_envelope(envelope(3, mb::DetachDevice{.vm_id = vm_one, .device = device}));
+    r.daemon.run_once(0ms);
+    r.daemon.post_host_slot(response(3, mb::Type::detach_device));
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.net.role.usage_reads() == reads_before);  // hull has not reset it yet
+    r.daemon.post_host_slot(
+        event(mb::DeviceReleased{.vm_id = vm_one, .device = device, .reset = mb::ResetResult::ok}));
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.net.role.usage_reads() == reads_before + 1);
+    usage = r.last<proto::GroupUsage>();
+    BOOST_REQUIRE(usage.entries.size() == 1U);
+    BOOST_TEST(usage.entries[0].detached);
+    BOOST_TEST(usage.entries[0].frames == 7U);
+    BOOST_TEST(r.daemon.group_usage().read_failures == 0U);
+}
 
 BOOST_AUTO_TEST_CASE(block_volume_frames_reach_hold_roles_only) {
     Rig r{link_timeout, nullptr, true};

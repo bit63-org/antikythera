@@ -7,7 +7,9 @@
 // key, and guest frames crossing the VSwitch locally and two VTEPs over a
 // fake underlay, in the clear and inside the WireGuard tunnel (keys from
 // helm, peers from the controller's signed TunnelPeers frame). health
-// reports a peer that never proves a full-size path (mtu_ok).
+// reports a peer that never proves a full-size path (mtu_ok). Task 13:
+// signed GroupPolicy frames applied to the VSwitch and its group meters
+// read back with group_usage.
 
 #define BOOST_TEST_MODULE net_role_test
 #include <boost/test/unit_test.hpp>
@@ -31,6 +33,7 @@
 #include "hull/signature_verifier.hpp"
 #include "net_frames.hpp"
 #include "oar/net/net_role.hpp"
+#include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
 #include "proto/tunnel_peers.hpp"
 #include "proto/vpc_config.hpp"
@@ -172,6 +175,40 @@ auto signed_vpc(std::uint64_t server, std::uint64_t version, std::uint32_t lease
     const auto sig = signer().sign(proto::vpc_config_signed_bytes(*bytes));
     proto::set_vpc_config_signature(*bytes, sig);
     return *bytes;
+}
+
+// A GroupPolicy for `vpc`, signed like the controller signs it. A
+// multicast policy gets small limits that fit the oar-net bounds.
+auto signed_policy(std::uint64_t server, std::uint64_t version, bool multicast)
+    -> std::vector<std::byte> {
+    proto::GroupPolicy p{};
+    p.server_id = server;
+    p.key_id = key_id;
+    p.vni = vpc;
+    p.policy_version = version;
+    if (multicast) {
+        p.mode = proto::GroupMode::multicast;
+        p.rate_frames = 100;
+        p.burst_frames = 10;
+        p.rate_bytes = 1'000'000;
+        p.burst_bytes = 100'000;
+        p.max_remote_vteps = 4;
+    }
+    auto bytes = proto::encode_group_policy(p);
+    BOOST_REQUIRE(bytes.has_value());
+    const auto sig = signer().sign(proto::group_policy_signed_bytes(*bytes));
+    proto::set_group_policy_signature(*bytes, sig);
+    return *bytes;
+}
+
+// An IPv4/UDP multicast frame (239.0.0.1) from a guest.
+auto multicast_frame(std::uint64_t src) -> std::vector<std::byte> {
+    const net::MacAddress group{std::byte{0x01}, std::byte{0x00}, std::byte{0x5e},
+                                std::byte{0x00}, std::byte{0x00}, std::byte{0x01}};
+    const proto::Ipv4Address group_ip{std::byte{239}, std::byte{0}, std::byte{0}, std::byte{1}};
+    const std::vector<std::byte> payload(payload_size, std::byte{payload_fill});
+    return ak::test::frames::ipv4(group, mac_of(src), guest_ip(src), group_ip, ipproto_udp,
+                                  ak::test::frames::udp(udp_port, udp_port, payload));
 }
 
 // The verifier ak-oar-net builds: hull's Ed25519 verifier over the
@@ -881,6 +918,106 @@ BOOST_FIXTURE_TEST_CASE(health_degrades_when_a_peer_goes_down, One,
     BOOST_TEST((role->health()->state == oar::HealthState::degraded));
 }
 
+BOOST_FIXTURE_TEST_CASE(group_policies_are_checked, One,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto good = signed_policy(server_one, 2, true);
+
+    BOOST_TEST((role->group_policy(std::span{good}.first(good.size() - 1)) == Status::failed));
+    BOOST_TEST(role->counters().group_undecodable == 1U);
+
+    BOOST_TEST((role->group_policy(signed_policy(server_two, 2, true)) == Status::failed));
+    BOOST_TEST(role->counters().group_wrong_server == 1U);
+
+    auto tampered = good;
+    tampered[0x20] ^= std::byte{0x01};  // rate_frames
+    BOOST_TEST((role->group_policy(tampered) == Status::failed));
+    BOOST_TEST(role->counters().group_bad_signature == 1U);
+    BOOST_TEST((role->vswitch().group_policy(vpc).mode == net::GroupMode::drop));
+
+    BOOST_TEST((role->group_policy(good) == Status::ok));
+    BOOST_TEST(role->counters().group_applied == 1U);
+    const auto applied = role->vswitch().group_policy(vpc);
+    BOOST_TEST((applied.mode == net::GroupMode::multicast));
+    BOOST_TEST(applied.rate_frames == 100U);
+    BOOST_TEST(applied.burst_frames == 10U);
+    BOOST_TEST(applied.rate_bytes == 1'000'000U);
+    BOOST_TEST(applied.burst_bytes == 100'000U);
+    BOOST_TEST(applied.max_remote_vteps == 4U);
+
+    // helm replays its kept frames when the sideband reopens: ok, unchanged.
+    BOOST_TEST((role->group_policy(good) == Status::ok));
+    BOOST_TEST(role->counters().group_redelivered == 1U);
+    BOOST_TEST(role->counters().group_applied == 1U);
+
+    // An older version is refused, even a validly signed one, and the
+    // policy stays.
+    BOOST_TEST((role->group_policy(signed_policy(server_one, 1, false)) == Status::failed));
+    BOOST_TEST(role->counters().group_stale == 1U);
+    BOOST_TEST((role->vswitch().group_policy(vpc).mode == net::GroupMode::multicast));
+
+    // A newer drop policy opts the VNI back out.
+    BOOST_TEST((role->group_policy(signed_policy(server_one, 3, false)) == Status::ok));
+    BOOST_TEST((role->vswitch().group_policy(vpc).mode == net::GroupMode::drop));
+    BOOST_TEST(role->counters().group_applied == 2U);
+}
+
+BOOST_FIXTURE_TEST_CASE(group_usage_reads_every_attachment, One,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(role->map_update(signed_map(
+                      server_one, 1, {{nic_a, self_tail}, {nic_b, self_tail}}, {nic_a, nic_b})) ==
+                  Status::ok);
+    BOOST_REQUIRE(role->group_policy(signed_policy(server_one, 1, true)) == Status::ok);
+    BOOST_REQUIRE(prepare(fn0, nic_a) == Status::ok);
+    BOOST_REQUIRE(prepare(fn1, nic_b) == Status::ok);
+    static_cast<void>(driver(fn0));
+    send(fn0, multicast_frame(nic_a));
+    static_cast<void>(role->poll());
+    BOOST_REQUIRE(role->vswitch().group_meter(NicId{nic_a})->frames == 1U);
+
+    // No read open yet: only cursor 0 starts one.
+    BOOST_TEST((role->group_usage(1).error() == Status::bad_request));
+
+    auto page = role->group_usage(0);
+    BOOST_REQUIRE(page.has_value());
+    BOOST_REQUIRE(page->total == 2U);
+    BOOST_REQUIRE(page->entries.size() == 2U);
+    const auto& a = page->entries[0];
+    BOOST_TEST(a.nic_id == nic_a);
+    BOOST_TEST(a.vni == vpc);
+    BOOST_TEST(!a.detached);
+    BOOST_TEST(a.attachment != 0U);
+    BOOST_TEST(a.frames == 1U);
+    BOOST_TEST(a.replicas_local == role->vswitch().group_meter(NicId{nic_a})->replicas_local);
+    const auto first = a.attachment;  // `a` dangles once `page` is reassigned below
+    BOOST_TEST(page->entries[1].nic_id == nic_b);
+    BOOST_TEST(page->entries[1].frames == 0U);
+
+    // Detach: the final reading comes once, then the NIC is gone.
+    BOOST_REQUIRE(role->clean_function(
+                      {.fn = fn0, .action = ak::helm::CleaningAction::reset_nic_vf}) == Status::ok);
+    page = role->group_usage(0);
+    BOOST_REQUIRE(page.has_value());
+    BOOST_REQUIRE(page->entries.size() == 2U);
+    BOOST_TEST(page->entries[0].nic_id == nic_a);
+    BOOST_TEST(page->entries[0].detached);
+    BOOST_TEST(page->entries[0].vni == vpc);
+    BOOST_TEST(page->entries[0].frames == 1U);
+    page = role->group_usage(0);
+    BOOST_REQUIRE(page.has_value());
+    BOOST_REQUIRE(page->entries.size() == 1U);
+    BOOST_TEST(page->entries[0].nic_id == nic_b);
+
+    // A re-attach starts a new series from zero.
+    BOOST_REQUIRE(prepare(fn0, nic_a) == Status::ok);
+    page = role->group_usage(0);
+    BOOST_REQUIRE(page.has_value());
+    BOOST_REQUIRE(page->entries.size() == 2U);
+    BOOST_TEST(page->entries[0].nic_id == nic_a);
+    BOOST_TEST(page->entries[0].attachment > first);
+    BOOST_TEST(page->entries[0].frames == 0U);
+    BOOST_TEST(role->counters().usage_unknown_vni == 0U);
+}
+
 BOOST_FIXTURE_TEST_CASE(helm_drives_the_role_over_the_sideband, One,
                         *boost::unit_test::timeout(unit_timeout_seconds)) {
     // A VPC big enough that its frame travels in several sideband chunks.
@@ -922,8 +1059,17 @@ BOOST_FIXTURE_TEST_CASE(helm_drives_the_role_over_the_sideband, One,
         // A frame for another server comes back as a failure.
         BOOST_TEST(!link.map_update(signed_map(server_two, 2, {{2, self_tail}})).has_value());
         BOOST_TEST(link.health().has_value());
+        // Group policy and meters (task 13).
+        BOOST_TEST(link.group_policy(signed_policy(server_one, 1, true)).has_value());
+        BOOST_TEST(!link.group_policy(signed_policy(server_two, 2, true)).has_value());
+        auto usage = link.group_usage();
+        BOOST_REQUIRE(usage.has_value());
+        BOOST_REQUIRE(usage->size() == 1U);
+        BOOST_TEST((*usage)[0].nic_id == 2U);
+        BOOST_TEST((*usage)[0].vni == vpc);
     }
     BOOST_TEST(role->mappings().snapshot()->nic_count() == many);
     BOOST_TEST((role->attached(fn0) == NicId{2}));
     BOOST_TEST(role->counters().map_wrong_server == 1U);
+    BOOST_TEST((role->vswitch().group_policy(vpc).mode == net::GroupMode::multicast));
 }

@@ -50,7 +50,7 @@ auto GroupUsageReporter::add_slot(std::uint8_t slot, OarPort& port) -> void {
     }
 }
 
-auto GroupUsageReporter::remove_slot(std::uint8_t slot) -> void {
+auto GroupUsageReporter::remove_slot(std::uint8_t slot) noexcept -> void {
     _slots.erase(slot);
     // Its attachments are gone with the role's state; a re-added role
     // starts new series.

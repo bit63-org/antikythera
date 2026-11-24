@@ -69,6 +69,18 @@
 // sideband (re)opens before the router registers its functions, so no NIC
 // there is prepared under a missing gateway.
 //
+// Group policy and usage (Requirement 11, task 13). The daemon owns a
+// GroupUsageReporter. A controller GroupPolicy frame is kept (the newest
+// per VNI) and forwarded unmodified to every attached network role, which
+// verifies it. A network role whose sideband (re)opens gets every kept
+// frame before the router registers its functions, so no NIC on it is
+// prepared under a missing policy. Every pass polls the reporter: each
+// group_usage_interval, and on the pass after a network role cleaned a NIC
+// function (a detach, whose final meter the role now holds), it reads every
+// network role's meters and reports what moved as group_usage reports,
+// which the ControllerSession resends until acknowledged (Requirement
+// 11.3).
+//
 // Block volumes (.kiro/specs/block-volume-service/ task 12). ReplicaConfig
 // and VolumeOp frames go unmodified to every hold role, which verifies
 // them, and so do the controller's lease acknowledgements. helm keeps the
@@ -120,6 +132,7 @@
 #include "helm/command_router.hpp"
 #include "helm/controller_link.hpp"
 #include "helm/device_pool.hpp"
+#include "helm/group_usage.hpp"
 #include "helm/key_store.hpp"
 #include "helm/mailbox.hpp"
 #include "helm/oar_link.hpp"
@@ -156,6 +169,9 @@ struct DaemonConfig {
     // how long an unanswered one waits before it is reported again.
     std::chrono::milliseconds identity_interval{std::chrono::seconds{10}};
     std::chrono::milliseconds identity_retry{std::chrono::minutes{10}};
+    // How often network roles' group meters are read and reported
+    // (Requirement 11.2: at least every minute).
+    std::chrono::milliseconds group_usage_interval{std::chrono::minutes{1}};
     // Items waiting for the loop; more are dropped and counted. Only a loop
     // stuck far longer than any timeout fills it.
     std::size_t max_inbox{4096};
@@ -241,6 +257,9 @@ public:
     // The health a network role last reported (loop thread); empty for
     // other roles, or before the first answer.
     [[nodiscard]] auto role_health(SlotNumber slot) const -> std::optional<oar::Health>;
+    [[nodiscard]] auto group_usage() const noexcept -> const GroupUsageStats& {
+        return _groups.stats();
+    }
 
     // ---- any thread ---------------------------------------------------------
 
@@ -259,6 +278,8 @@ public:
     auto on_image_key(const proto::ImageKey& key, std::span<const std::byte> frame)
         -> void override;
     auto on_vpc_config(const proto::VpcConfigFrame& config, std::span<const std::byte> frame)
+        -> void override;
+    auto on_group_policy(const proto::GroupPolicy& policy, std::span<const std::byte> frame)
         -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
@@ -301,9 +322,13 @@ private:
         std::uint64_t config_version{0};
         std::vector<std::byte> frame;
     };
+    struct PolicyFrame {
+        proto::GroupPolicy policy;
+        std::vector<std::byte> frame;
+    };
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
                               proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
-                              ImageKeyFrame, VpcFrame>;
+                              ImageKeyFrame, VpcFrame, PolicyFrame>;
 
     struct SlotState;
 
@@ -311,7 +336,7 @@ private:
     // which is replaced when the role restarts and absent while it is down.
     class SlotPort final : public OarPort {
     public:
-        explicit SlotPort(SlotState& slot) noexcept : _slot{&slot} {}
+        SlotPort(SlotState& slot, HelmDaemon& daemon) noexcept : _slot{&slot}, _daemon{&daemon} {}
 
         auto prepare_function(const oar::PrepareFunction& request)
             -> std::expected<void, LinkError> override;
@@ -329,9 +354,13 @@ private:
             -> std::expected<void, LinkError> override;
         auto replica_config(std::span<const std::byte> frame)
             -> std::expected<void, LinkError> override;
+        auto group_policy(std::span<const std::byte> frame)
+            -> std::expected<void, LinkError> override;
+        auto group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError> override;
 
     private:
         SlotState* _slot;
+        HelmDaemon* _daemon;
     };
 
     struct SlotState {
@@ -349,7 +378,8 @@ private:
         std::optional<oar::Health> health;  // network roles: the last answer
         SlotPort port;
 
-        SlotState(SlotNumber n, LinkConfig c) : number{n}, config{c}, port{*this} {}
+        SlotState(SlotNumber n, LinkConfig c, HelmDaemon& daemon)
+            : number{n}, config{c}, port{*this, daemon} {}
     };
 
     [[nodiscard]] auto now() const -> Clock::time_point;
@@ -401,6 +431,7 @@ private:
     std::map<std::uint64_t, ConfigFrame> _volume_configs;  // the newest, by volume
     TunnelKeyring _keyring;
     std::map<std::uint32_t, VpcFrame> _vpc_configs;  // the newest, by VNI
+    GroupUsageReporter _groups;
 
     mutable std::mutex _inbox_mutex;
     std::condition_variable _inbox_ready;

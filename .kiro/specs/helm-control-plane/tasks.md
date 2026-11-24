@@ -1,6 +1,6 @@
 # Implementation Plan — helm: the control-plane role
 
-## Status: 11/13 tasks complete
+## Status: 12/13 tasks complete
 
 ## Tasks
 
@@ -55,9 +55,20 @@
   exits, host faults and map versions, and builds the inventory
   snapshot. See design "Audit log".)
 - [ ] 12. harbor CI: both placements. _Requirements: 7, 10.3_
-- [ ] 13. OarLink `group_policy` and `group_usage`, policy fan-out to
+- [x] 13. OarLink `group_policy` and `group_usage`, policy fan-out to
   network roles, periodic and on-detach usage reports with final readings
-  held until acknowledged. _Requirements: 11_
+  held until acknowledged. _Requirements: 11_ — the link bodies,
+  `oar::UsagePager` and `GroupUsageReporter` (`src/helm/group_usage.*`)
+  came first; `HelmDaemon` now owns the reporter. A controller GroupPolicy
+  is queued to the loop like a MapUpdate, kept (newest per VNI) and sent
+  unmodified to every attached network role; a network role whose
+  sideband (re)opens gets every kept frame before the router registers
+  its functions, so no NIC is prepared under a missing policy. Meters are
+  read every `DaemonConfig::group_usage_interval` (one minute) and on the
+  pass after a network role cleans a NIC VF (`SlotPort::clean_function`,
+  which is where a detach's final reading appears). Final readings are
+  held by the ControllerSession's unacknowledged-report replay
+  (Requirement 11.3), so the reporter does not keep them itself.
 
 Wiring (not a numbered task): `HelmDaemon` and `ak-helm` join the
 ControllerLink, CommandRouter, PowerSequencer and per-slot OarLinks into

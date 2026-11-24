@@ -5,7 +5,9 @@
 // network role behind helm's sideband. Placeholders between attachments,
 // prepare and clean, signed map_updates checked against the controller's
 // key, and guest frames crossing the VSwitch locally and two VTEPs over a
-// fake underlay.
+// fake underlay, in the clear and inside the WireGuard tunnel (keys from
+// helm, peers from the controller's signed TunnelPeers frame). health
+// reports a peer that never proves a full-size path (mtu_ok).
 
 #define BOOST_TEST_MODULE net_role_test
 #include <boost/test/unit_test.hpp>
@@ -30,6 +32,7 @@
 #include "net_frames.hpp"
 #include "oar/net/net_role.hpp"
 #include "proto/map_update.hpp"
+#include "proto/tunnel_peers.hpp"
 #include "test_support.hpp"
 #include "virtio_driver_support.hpp"
 
@@ -170,6 +173,8 @@ public:
 };
 
 // The underlay between two roles: datagrams queue up until delivered.
+// A datagram over `path_limit` bytes is lost, as on a path with a smaller
+// MTU than planned (UdpEndpoint never fragments).
 class Wire final : public net::DatagramSender {
 public:
     struct Datagram {
@@ -178,30 +183,49 @@ public:
     };
     auto send_to(const net::Ipv6Address& dst, std::uint16_t /*dst_port*/,
                  std::uint16_t /*flow_port*/, std::span<const std::byte> payload) -> bool override {
+        if (payload.size() > path_limit) {
+            ++lost;
+            return true;  // sent, and lost on the way
+        }
         sent.push_back({dst, {payload.begin(), payload.end()}});
         return true;
     }
     std::vector<Datagram> sent;
+    std::size_t path_limit{SIZE_MAX};
+    std::size_t lost{0};
+};
+
+enum class Encryption : std::uint8_t {
+    none,
+    wireguard
 };
 
 // One VTEP: a role over `function_count` fake transports, and a guest
 // driver per function.
 struct Board {
-    explicit Board(std::uint64_t server, std::uint8_t tail) {
-        auto plan = net::plan_mtu(underlay_mtu);
+    explicit Board(std::uint64_t server, std::uint8_t tail, Encryption enc = Encryption::none) {
+        auto plan = net::plan_mtu(underlay_mtu,
+                                  enc == Encryption::wireguard
+                                      ? static_cast<std::uint32_t>(net::tunnel_overhead_budget)
+                                      : 0);
         BOOST_REQUIRE(plan.has_value());
         std::vector<net::NetTransport*> raw;
         for (auto& t : transports) {
             raw.push_back(&t);
         }
-        auto r = net::NetRole::create({.vtep = vtep(tail),
-                                       .server_id = server,
-                                       .mtu = *plan,
-                                       .queue_size = ak::test::test_queue_size,
-                                       .tx_budget = 256,
-                                       .vtep_config = {.keepalive_interval = keepalive},
-                                       .clock = {}},
-                                      raw, verifier(), wire, nullptr);
+        auto r = net::NetRole::create(
+            {.vtep = vtep(tail),
+             .server_id = server,
+             .mtu = *plan,
+             .queue_size = ak::test::test_queue_size,
+             .tx_budget = 256,
+             .vtep_config = {.keepalive_interval = keepalive},
+             .tunnel = enc == Encryption::wireguard
+                           ? std::optional<net::TunnelConfig>{net::TunnelConfig{}}
+                           : std::nullopt,
+             .mtu_grace = {},
+             .clock = {}},
+            raw, verifier(), wire, nullptr);
         BOOST_REQUIRE_MESSAGE(r.has_value(), r.error());
         role = std::move(*r);
         for (std::size_t i = 0; i < function_count; ++i) {
@@ -262,17 +286,51 @@ struct One : Board {
     One() : Board(server_one, self_tail) {}
 };
 
-// Carries everything `from` sent to `to`'s VTEP into `to`.
-auto deliver(Board& from, Board& to, const net::Ipv6Address& from_addr) -> std::size_t {
+// Carries everything `from` sent to `to`'s VTEP into `to` (through its
+// tunnel, if it has one). Returns how many data packets reached its VSwitch.
+auto deliver(Board& from, Board& to, const net::Ipv6Address& from_addr,
+             net::VtepClock::time_point now = net::VtepClock::now()) -> std::size_t {
     std::size_t n = 0;
-    for (const auto& d : from.wire.sent) {
-        if (auto p = to.role->vtep().receive(d.payload, from_addr, net::VtepClock::now())) {
-            static_cast<void>(to.role->vswitch().receive(*p, from_addr));
+    auto sent = std::move(from.wire.sent);
+    from.wire.sent.clear();
+    for (const auto& d : sent) {
+        if (to.role->receive(d.payload, from_addr, now)) {
             ++n;
         }
     }
-    from.wire.sent.clear();
     return n;
+}
+
+// Ticks both boards at `now` and carries datagrams both ways until the
+// underlay is quiet (handshakes take a round trip or two).
+auto exchange(Board& one, Board& two, net::VtepClock::time_point now) -> void {
+    static_cast<void>(one.role->tick(now));
+    static_cast<void>(two.role->tick(now));
+    for (int round = 0; round < 8 && !(one.wire.sent.empty() && two.wire.sent.empty()); ++round) {
+        static_cast<void>(deliver(one, two, vtep(self_tail), now));
+        static_cast<void>(deliver(two, one, vtep(peer_tail), now));
+    }
+}
+
+// The controller's TunnelPeers frame for `server`'s VTEP at `tail`, naming
+// one WireGuard peer, signed with the key the roles trust.
+auto signed_peers(std::uint64_t server, std::uint8_t tail, std::uint64_t version,
+                  std::uint8_t peer_tail_addr, const net::wg::Key& peer_key)
+    -> std::vector<std::byte> {
+    proto::TunnelPeers t{};
+    t.server_id = server;
+    t.key_id = key_id;
+    t.vtep = vtep(tail);
+    t.peers_version = version;
+    t.peers.push_back({.vtep = vtep(peer_tail_addr),
+                       .mode = proto::TunnelMode::wireguard,
+                       .spi = 0,
+                       .key = peer_key});
+    auto bytes = proto::encode_tunnel_peers(t);
+    BOOST_REQUIRE(bytes.has_value());
+    proto::set_tunnel_peers_signature(*bytes,
+                                      signer().sign(proto::tunnel_peers_signed_bytes(*bytes)));
+    return *bytes;
 }
 
 }  // namespace
@@ -305,6 +363,17 @@ BOOST_AUTO_TEST_CASE(create_validates, *boost::unit_test::timeout(unit_timeout_s
     BOOST_TEST(!net::NetRole::create(good, {&t}, verifier(), wire, nullptr).has_value());
     t.fail = false;
     BOOST_TEST(net::NetRole::create(good, {&t}, verifier(), wire, nullptr).has_value());
+    // A tunnel needs room for WireGuard in the MTU plan.
+    bad = good;
+    bad.tunnel = net::TunnelConfig{};
+    BOOST_TEST(!net::NetRole::create(bad, {&t}, verifier(), wire, nullptr).has_value());
+    bad.mtu = *net::plan_mtu(underlay_mtu, net::wireguard_overhead);
+    BOOST_TEST(net::NetRole::create(bad, {&t}, verifier(), wire, nullptr).has_value());
+    bad.tunnel->rekey_timeout = std::chrono::milliseconds{0};
+    BOOST_TEST(!net::NetRole::create(bad, {&t}, verifier(), wire, nullptr).has_value());
+    bad = good;
+    bad.mtu_grace = std::chrono::milliseconds{-1};
+    BOOST_TEST(!net::NetRole::create(bad, {&t}, verifier(), wire, nullptr).has_value());
 }
 
 BOOST_FIXTURE_TEST_CASE(inventory_and_unsupported, One,
@@ -322,6 +391,14 @@ BOOST_FIXTURE_TEST_CASE(inventory_and_unsupported, One,
     BOOST_TEST((role->deliver_key({.fn = fn0, .volume_id = 1, .key = key}) == Status::unsupported));
     BOOST_TEST((role->drop_key({}) == Status::unsupported));
     BOOST_TEST((role->create_volume({}) == Status::unsupported));
+    // Without a tunnel, the tunnel requests are not this role's either.
+    const net::wg::Key k{};
+    BOOST_TEST((role->set_tunnel_key({.private_key = k}) == Status::unsupported));
+    BOOST_TEST((role->set_tunnel_peer({.vtep = vtep(peer_tail), .public_key = k, .psk = k}) ==
+                Status::unsupported));
+    BOOST_TEST((role->remove_tunnel_peer({.vtep = vtep(peer_tail)}) == Status::unsupported));
+    BOOST_TEST((role->tunnel_peers(std::array<std::byte, 4>{}) == Status::unsupported));
+    BOOST_TEST(role->tunnel() == nullptr);
     auto h = role->health();
     BOOST_REQUIRE(h.has_value());
     BOOST_TEST((h->state == oar::HealthState::ok));
@@ -522,6 +599,156 @@ BOOST_AUTO_TEST_CASE(guests_on_two_vteps_talk_over_the_underlay,
     BOOST_REQUIRE(peers.size() == 1U);
     BOOST_TEST((peers[0].state == net::PeerState::up));
     BOOST_TEST(peers[0].mtu_ok);
+    auto h = one.role->health();
+    BOOST_REQUIRE(h.has_value());
+    BOOST_TEST((h->state == oar::HealthState::ok));
+    BOOST_TEST(h->fault_code == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(health_reports_a_path_too_small_for_full_size_frames,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Board one{server_one, self_tail};
+    Board two{server_two, peer_tail};
+    BOOST_REQUIRE(one.role->map_update(signed_map(
+                      server_one, 1, {{nic_a, self_tail}, {nic_c, peer_tail}})) == Status::ok);
+    BOOST_REQUIRE(two.role->map_update(signed_map(
+                      server_two, 1, {{nic_a, self_tail}, {nic_c, peer_tail}})) == Status::ok);
+    // Keepalives fit the path; full-size MTU probes do not.
+    constexpr std::size_t small_path = 256;
+    one.wire.path_limit = small_path;
+    two.wire.path_limit = small_path;
+
+    const auto t0 = net::VtepClock::now();
+    exchange(one, two, t0);
+    const auto peers = one.role->vtep().peers();
+    BOOST_REQUIRE(peers.size() == 1U);
+    BOOST_TEST((peers[0].state == net::PeerState::up));
+    BOOST_TEST(!peers[0].mtu_ok);
+    BOOST_TEST(one.wire.lost >= 1U);
+    // Up, unproven, but still within the grace (two probe intervals).
+    BOOST_TEST((one.role->health()->state == oar::HealthState::ok));
+
+    // tick() first sees the peer up and unproven one keepalive after t0.
+    const auto grace = 2 * net::VtepConfig{}.probe_interval;
+    for (auto t = t0 + keepalive; t <= t0 + keepalive + grace; t += keepalive) {
+        exchange(one, two, t);
+    }
+    auto h = one.role->health();
+    BOOST_REQUIRE(h.has_value());
+    BOOST_TEST((h->state == oar::HealthState::degraded));
+    BOOST_TEST(h->fault_code == net::net_fault_mtu);  // the peer is up; only the size fails
+
+    // Once the path carries full-size datagrams, the next probe clears it.
+    one.wire.path_limit = SIZE_MAX;
+    two.wire.path_limit = SIZE_MAX;
+    for (auto t = t0 + grace + (2 * keepalive);
+         t <= t0 + grace + keepalive + net::VtepConfig{}.probe_interval; t += keepalive) {
+        exchange(one, two, t);
+    }
+    h = one.role->health();
+    BOOST_TEST((h->state == oar::HealthState::ok));
+    BOOST_TEST(h->fault_code == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(guests_talk_through_the_wireguard_tunnel,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Board one{server_one, self_tail, Encryption::wireguard};
+    Board two{server_two, peer_tail, Encryption::wireguard};
+    BOOST_REQUIRE(one.role->tunnel() != nullptr);
+    // Until helm keys it, the role says so.
+    auto h = one.role->health();
+    BOOST_TEST((h->state == oar::HealthState::degraded));
+    BOOST_TEST(h->fault_code == net::net_fault_no_tunnel_key);
+
+    // helm delivers each role its private key (from its TunnelKeyring)...
+    const auto k1 = net::wg::generate_private_key();
+    const auto k2 = net::wg::generate_private_key();
+    BOOST_REQUIRE(k1.has_value());
+    BOOST_REQUIRE(k2.has_value());
+    const auto p1 = net::wg::public_key(k1->span());
+    const auto p2 = net::wg::public_key(k2->span());
+    BOOST_REQUIRE(p1.has_value());
+    BOOST_REQUIRE(p2.has_value());
+    BOOST_TEST((one.role->set_tunnel_key({.private_key = k1->span()}) == Status::ok));
+    BOOST_TEST((two.role->set_tunnel_key({.private_key = k2->span()}) == Status::ok));
+    const net::wg::Key zero{};
+    BOOST_TEST((one.role->set_tunnel_key({.private_key = zero}) == Status::failed));
+    BOOST_TEST(one.role->counters().tunnel_keys_refused == 1U);
+    BOOST_TEST((one.role->tunnel()->public_key() == *p1));  // the refused key changed nothing
+
+    // ...and forwards the controller's peer sets, which the roles verify.
+    auto forged = signed_peers(server_one, self_tail, 1, peer_tail, *p2);
+    forged.back() ^= std::byte{1};
+    BOOST_TEST((one.role->tunnel_peers(forged) == Status::failed));
+    BOOST_TEST((one.role->tunnel_peers(signed_peers(server_two, self_tail, 1, peer_tail, *p2)) ==
+                Status::failed));  // for another server
+    BOOST_TEST((one.role->tunnel_peers(signed_peers(server_one, self_tail, 1, peer_tail, *p2)) ==
+                Status::ok));
+    BOOST_TEST((one.role->tunnel_peers(signed_peers(server_one, self_tail, 1, peer_tail, *p2)) ==
+                Status::ok));  // re-delivered after a sideband reconnect
+    BOOST_TEST((two.role->tunnel_peers(signed_peers(server_two, peer_tail, 1, self_tail, *p1)) ==
+                Status::ok));
+    BOOST_TEST(one.role->peer_set()->version() == 1U);
+    BOOST_TEST(one.role->peer_set()->counters().bad_signature == 1U);
+    BOOST_TEST(one.role->peer_set()->counters().wrong_target == 1U);
+    BOOST_TEST(
+        (one.role->set_tunnel_peer({.vtep = vtep(self_tail), .public_key = *p2, .psk = zero}) ==
+         Status::bad_request));  // never its own peer
+
+    BOOST_REQUIRE(one.role->map_update(signed_map(
+                      server_one, 1, {{nic_a, self_tail}, {nic_c, peer_tail}}, {nic_a, nic_c})) ==
+                  Status::ok);
+    BOOST_REQUIRE(two.role->map_update(signed_map(
+                      server_two, 1, {{nic_a, self_tail}, {nic_c, peer_tail}}, {nic_a, nic_c})) ==
+                  Status::ok);
+    BOOST_REQUIRE(one.prepare(fn0, nic_a) == Status::ok);
+    BOOST_REQUIRE(two.prepare(fn1, nic_c) == Status::ok);
+    one.driver(fn0);
+    two.driver(fn1);
+
+    // The keepalives start the handshake; a second round runs over the session.
+    const auto t0 = net::VtepClock::now();
+    exchange(one, two, t0);
+    exchange(one, two, t0 + keepalive);
+    BOOST_TEST(one.role->tunnel()->counters().sessions_established >= 1U);
+    const auto peers = one.role->vtep().peers();
+    BOOST_REQUIRE(peers.size() == 1U);
+    BOOST_TEST((peers[0].state == net::PeerState::up));
+
+    // A full-size guest frame crosses inside one WireGuard transport message.
+    const auto buf = two.post_rx(fn1);
+    const auto mtu = one.role->function(fn0)->identity().mtu;
+    const auto f = frame(nic_c, nic_a, mtu);
+    one.send(fn0, f);
+    BOOST_REQUIRE(one.wire.sent.size() == 1U);
+    BOOST_TEST(one.wire.sent[0].payload.size() ==
+               f.size() + net::geneve_header_size + net::wireguard_overhead);
+    BOOST_TEST(one.wire.sent[0].payload.size() <=
+               underlay_mtu - net::ipv6_header_size - net::udp_header_size);
+    // The message is delivered once; a replayed copy is refused by the
+    // tunnel before Geneve decode ever sees it.
+    auto copy = one.wire.sent[0];
+    const auto rx_before = two.role->vtep().counters().rx_datagrams;
+    BOOST_TEST(deliver(one, two, vtep(self_tail)) == 1U);
+    auto got = two.received(fn1, buf);
+    BOOST_REQUIRE(got.has_value());
+    BOOST_TEST((*got == f));
+    one.wire.sent.push_back(copy);  // replayed
+    BOOST_TEST(deliver(one, two, vtep(self_tail)) == 0U);
+    BOOST_TEST(
+        two.role->tunnel()->counters().rx_drop[static_cast<std::size_t>(net::TunnelDrop::replay)] ==
+        1U);
+    BOOST_TEST(two.role->vtep().counters().rx_datagrams == rx_before + 1);
+
+    // With keys, peers up and probes through the tunnel, the role is healthy.
+    for (auto t = t0 + (2 * keepalive); t <= t0 + net::VtepConfig{}.probe_interval + keepalive;
+         t += keepalive) {
+        exchange(one, two, t);
+    }
+    BOOST_TEST(one.role->vtep().peers()[0].mtu_ok);
+    h = one.role->health();
+    BOOST_TEST((h->state == oar::HealthState::ok));
+    BOOST_TEST(h->fault_code == 0U);
 }
 
 BOOST_FIXTURE_TEST_CASE(clean_returns_to_the_dead_vpc, One,

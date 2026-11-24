@@ -144,10 +144,23 @@
   vendor type 0x0E, chunked), where `TunnelPeerSet`
   (`src/oar/net/tunnel_peers.*`) verifies it and installs the peers;
   `tunnel_peers_test`, `tunnel_keyring_test`, the signed end-to-end case
-  in `tunnel_keys_test`, and `fuzz_tunnel_peers`. Not yet: `NetRole`/`ak-oar-net`
-  are not wired to the Tunnel or a TunnelPeerSet (task 11), nor helm's
-  daemon to the keyring (after helm main);
-  cookie replies under load; IPsec ESP (Requirement 5.1's alternative).
+  in `tunnel_keys_test`, and `fuzz_tunnel_peers`. Wiring: with
+  `NetRoleConfig::tunnel` set, `NetRole` runs a Tunnel between its Vtep and
+  the underlay and a TunnelPeerSet over the same controller keys as its
+  map_updates, answers `set_tunnel_key`, `set_tunnel_peer`,
+  `remove_tunnel_peer` and `tunnel_peers`, and authenticates every datagram
+  in `NetRole::receive`/`pump` before Geneve decode; `ak-oar-net` runs the
+  tunnel unless `--tunnel-overhead 0`. helm's daemon holds the
+  TunnelKeyring: a network role's key pair is made when its sideband
+  first opens, the role is provisioned (key, then the newest peer set) on
+  every attach and retried on check until it takes the key, a role that
+  answers unsupported has its pair dropped, the public keys go in the
+  inventory, and controller peer sets are kept by version and forwarded
+  to their VTEP's role. Tests: `net_role_test`
+  (`guests_talk_through_the_wireguard_tunnel`), `helm_daemon_test`
+  (`net_roles_get_their_tunnel_key_and_peer_sets`, unkeyed and tunnel-less
+  roles). Not yet: cookie replies under load; IPsec ESP (Requirement 5.1's
+  alternative).
 - [ ] 11. MTU computation and advertisement; harbor multi-server tests.
   _Requirements: 6, 9.3_ — Done: `plan_mtu()` (`src/oar/net/mtu.*`)
   turns the underlay MTU and the tunnel's overhead into the guest MTU and
@@ -164,9 +177,17 @@
   `probe_interval` sends each peer an OAM `mtu_probe` padded to exactly
   that size; `UdpEndpoint` sets `IPV6_DONTFRAG`, so a probe arrives whole
   or not at all, and `PeerStatus::mtu_ok` records that full-size
-  datagrams from that peer get through. Not yet: the harbor multi-server
-  tests (cross-server reachability, VPC isolation, forged VNI and NIC IDs,
-  MTU behaviour; tikhov), reporting `mtu_ok` to helm. `NetRole::map_update` hands the
+  datagrams from that peer get through. `NetRole::health` reports it to
+  helm: degraded with `fault_code` bits `net_fault_peer_down`,
+  `net_fault_mtu` (a peer up for `mtu_grace`, default two probe intervals,
+  without `mtu_ok`) and `net_fault_no_tunnel_key`; helm polls every network
+  role's health on each check, degrades the inventory's health while one is
+  degraded, and sends the controller a fresh inventory whenever its VTEPs,
+  tunnel keys or health change (`helm_daemon_test`
+  `a_degraded_net_role_degrades_the_inventory`; `net_role_test`
+  `health_reports_a_path_too_small_for_full_size_frames`). Not yet: the
+  harbor multi-server tests (cross-server reachability, VPC isolation,
+  forged VNI and NIC IDs, MTU behaviour; tikhov). `NetRole::map_update` hands the
   frame's guest addresses (MapUpdate v2) to `VSwitch::set_neighbors` after
   applying the mapping, failing closed (no proxy answers for the VNI) if
   they were ever refused.

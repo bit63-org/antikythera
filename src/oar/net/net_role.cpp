@@ -88,13 +88,38 @@ auto NetRole::create(NetRoleConfig config, const std::vector<NetTransport*>& tra
     if (config.mtu.guest_mtu < min_mtu || config.mtu.max_geneve_payload == 0) {
         return std::unexpected("MTU plan not set (plan_mtu)");
     }
+    if (config.tunnel && config.mtu.tunnel_overhead < wireguard_overhead) {
+        return std::unexpected(
+            std::format("MTU plan reserves {} bytes for the tunnel, WireGuard needs {}",
+                        config.mtu.tunnel_overhead, wireguard_overhead));
+    }
+    if (config.mtu_grace < std::chrono::milliseconds::zero()) {
+        return std::unexpected("negative MTU grace");
+    }
+    if (config.mtu_grace == std::chrono::milliseconds::zero()) {
+        config.mtu_grace = 2 * config.vtep_config.probe_interval;
+    }
     if (!config.clock) {
         config.clock = [] { return NetRoleConfig::Clock::now(); };
     }
     config.vtep_config.max_payload = config.mtu.max_geneve_payload;
 
     std::unique_ptr<NetRole> role{new NetRole{std::move(config), std::move(verifier)}};
-    auto vtep = Vtep::create(role->_mappings, sender, observer, role->_config.vtep_config);
+    DatagramSender* underlay = &sender;
+    if (role->_config.tunnel) {
+        auto tc = *role->_config.tunnel;
+        tc.peer_port = role->_config.vtep_config.peer_port;
+        auto tunnel = Tunnel::create(sender, std::move(tc));
+        if (!tunnel) {
+            return std::unexpected(std::format("tunnel: {}", to_string(tunnel.error())));
+        }
+        role->_tunnel = std::move(*tunnel);
+        // The same controller keys sign MapUpdates and TunnelPeers frames.
+        role->_peer_set = std::make_unique<TunnelPeerSet>(*role->_tunnel, role->_config.server_id,
+                                                          role->_config.vtep, role->_verifier);
+        underlay = role->_tunnel.get();
+    }
+    auto vtep = Vtep::create(role->_mappings, *underlay, observer, role->_config.vtep_config);
     if (!vtep) {
         return std::unexpected(std::format("vtep: {}", to_string(vtep.error())));
     }
@@ -250,12 +275,98 @@ auto NetRole::health() -> std::expected<oar::Health, oar::Status> {
     const auto up = std::chrono::duration_cast<std::chrono::seconds>(_config.clock() - _started);
     const auto secs = static_cast<std::uint64_t>(std::max<std::int64_t>(0, up.count()));
     const auto peers = _vtep->peers();
-    const bool any_down =
-        std::ranges::any_of(peers, [](const PeerStatus& p) { return p.state == PeerState::down; });
-    return oar::Health{.state = any_down ? oar::HealthState::degraded : oar::HealthState::ok,
-                       .fault_code = 0,
+    std::uint16_t faults = 0;
+    if (std::ranges::any_of(peers,
+                            [](const PeerStatus& p) { return p.state == PeerState::down; })) {
+        faults |= net_fault_peer_down;
+    }
+    // A peer counts while it is still up without mtu_ok and tick() has seen
+    // it so for the whole grace; a probe that arrived since the last tick
+    // clears it at once.
+    if (std::ranges::any_of(peers, [this](const PeerStatus& p) {
+            if (p.state != PeerState::up || p.mtu_ok) {
+                return false;
+            }
+            const auto it = _mtu_unproven.find(p.vtep);
+            return it != _mtu_unproven.end() && _last_tick - it->second >= _config.mtu_grace;
+        })) {
+        faults |= net_fault_mtu;
+    }
+    if (_tunnel && !_tunnel->public_key()) {
+        faults |= net_fault_no_tunnel_key;
+    }
+    return oar::Health{.state = faults != 0 ? oar::HealthState::degraded : oar::HealthState::ok,
+                       .fault_code = faults,
                        .uptime_seconds = static_cast<std::uint32_t>(std::min<std::uint64_t>(
                            secs, std::numeric_limits<std::uint32_t>::max()))};
+}
+
+auto NetRole::set_tunnel_key(const oar::SetTunnelKey& request) -> oar::Status {
+    if (!_tunnel) {
+        return oar::Status::unsupported;
+    }
+    if (!_tunnel->set_private_key(request.private_key)) {
+        ++_counters.tunnel_keys_refused;
+        return oar::Status::failed;
+    }
+    return oar::Status::ok;
+}
+
+auto NetRole::set_tunnel_peer(const oar::SetTunnelPeer& request) -> oar::Status {
+    if (!_tunnel) {
+        return oar::Status::unsupported;
+    }
+    if (request.vtep == _config.vtep) {
+        return oar::Status::bad_request;  // a VTEP is never its own peer
+    }
+    if (!_tunnel->set_peer(request.vtep, request.public_key, request.psk)) {
+        ++_counters.tunnel_keys_refused;
+        return oar::Status::failed;
+    }
+    return oar::Status::ok;
+}
+
+auto NetRole::remove_tunnel_peer(const oar::RemoveTunnelPeer& request) -> oar::Status {
+    if (!_tunnel) {
+        return oar::Status::unsupported;
+    }
+    return _tunnel->remove_peer(request.vtep) ? oar::Status::ok : oar::Status::failed;
+}
+
+auto NetRole::tunnel_peers(std::span<const std::byte> frame) -> oar::Status {
+    if (!_peer_set) {
+        return oar::Status::unsupported;
+    }
+    const auto r = _peer_set->apply(frame);
+    if (accepted(r)) {
+        return oar::Status::ok;
+    }
+    return r == PeersResult::unsupported ? oar::Status::unsupported : oar::Status::failed;
+}
+
+auto NetRole::receive(std::span<const std::byte> datagram, const Ipv6Address& outer_src,
+                      VtepClock::time_point now) -> bool {
+    Ipv6Address src = outer_src;
+    if (_tunnel) {
+        auto opened = _tunnel->receive(datagram, outer_src);
+        if (!opened) {
+            return false;  // a handshake message, a keepalive, or dropped and counted
+        }
+        datagram = opened->payload;
+        src = opened->peer;
+    }
+    auto packet = _vtep->receive(datagram, src, now);
+    if (!packet) {
+        return false;
+    }
+    static_cast<void>(_vswitch->receive(*packet, src));
+    return true;
+}
+
+auto NetRole::pump(UdpEndpoint& endpoint, std::span<std::byte> buffer, std::size_t budget,
+                   VtepClock::time_point now) -> std::size_t {
+    return _tunnel ? net::pump(endpoint, *_tunnel, *_vtep, *_vswitch, buffer, budget, now)
+                   : net::pump(endpoint, *_vtep, *_vswitch, buffer, budget, now);
 }
 
 auto NetRole::poll() -> bool {
@@ -267,7 +378,24 @@ auto NetRole::poll() -> bool {
 }
 
 auto NetRole::tick(VtepClock::time_point now) -> VtepClock::time_point {
-    return _vtep->tick(now);
+    auto next = _vtep->tick(now);
+    if (_tunnel) {
+        next = std::min(next, _tunnel->tick());
+    }
+    track_mtu(now);
+    return next;
+}
+
+auto NetRole::track_mtu(VtepClock::time_point now) -> void {
+    _last_tick = now;
+    std::map<Ipv6Address, VtepClock::time_point> unproven;
+    for (const auto& p : _vtep->peers()) {
+        if (p.state == PeerState::up && !p.mtu_ok) {
+            const auto it = _mtu_unproven.find(p.vtep);
+            unproven.emplace(p.vtep, it == _mtu_unproven.end() ? now : it->second);
+        }
+    }
+    _mtu_unproven = std::move(unproven);
 }
 
 }  // namespace ak::oar::net

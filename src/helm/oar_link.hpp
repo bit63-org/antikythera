@@ -153,6 +153,10 @@ public:
     };
     auto group_membership(std::optional<std::uint32_t> since)
         -> std::expected<std::optional<Memberships>, LinkError>;
+    // Sends one controller InstanceMetadata frame in chunks, like
+    // tunnel_peers; fails without sending if it is empty or larger than
+    // oar::max_instance_metadata_frame.
+    auto instance_metadata(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
     // Forwards one controller VpcConfig frame (min_vpc_config_frame to
     // max_vpc_config_frame bytes) to a network role.
     auto vpc_config(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
@@ -276,6 +280,12 @@ public:
         -> std::expected<oar::MembershipPage, oar::Status> {
         return std::unexpected(oar::Status::unsupported);
     }
+    // A NIC's instance metadata record, which only the network role keeps
+    // (oar-net Requirement 13.4): whole and reassembled, not yet decoded
+    // or verified, valid only during the call.
+    virtual auto instance_metadata(std::span<const std::byte> /*frame*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
     // A VPC's gateway configuration, which only the network role keeps
     // (oar-net Requirement 12). `frame` is not yet decoded or verified and
     // is valid only during the call.
@@ -334,8 +344,8 @@ public:
 private:
     auto dispatch(OarHandler& handler, mctp::VendorType type, std::span<const std::byte> body)
         -> std::vector<std::byte>;
-    // One chunk of a map_update, tunnel_peers, group_members or
-    // role_certificate transfer.
+    // One chunk of a map_update, tunnel_peers, group_members,
+    // instance_metadata or role_certificate transfer.
     auto frame_chunk(OarHandler& handler, mctp::VendorType type, std::span<const std::byte> body)
         -> oar::Status;
     auto reset_frame() noexcept -> void;

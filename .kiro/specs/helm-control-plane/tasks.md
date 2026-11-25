@@ -74,9 +74,13 @@
   every `DaemonConfig::membership_interval` (one second) each network
   role is asked for its joins with the generation last read, reported
   whole as `group_membership` when changed.
-- [ ] 14. OarLink `instance_metadata` (chunked), newest frame per NIC
+- [x] 14. OarLink `instance_metadata` (chunked), newest frame per NIC
   kept until detach, forwarded to the NIC's network role and replayed
   when a role's sideband reopens. _Requirements: 12_ (oar-net task 21.3)
+  — vendor type 0x1B through `send_chunked`; `SlotPort` sends the kept
+  frame ahead of a NicConfig prepare and drops it after a successful
+  `reset_nic_vf` clean. Only the hosting role gets a NIC's frame, not
+  every network role, so roles never hold records for NICs elsewhere.
 
 Wiring (not a numbered task): `HelmDaemon` and `ak-helm` join the
 ControllerLink, CommandRouter, PowerSequencer and per-slot OarLinks into

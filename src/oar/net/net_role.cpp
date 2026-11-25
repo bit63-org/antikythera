@@ -182,6 +182,10 @@ auto NetRole::create(NetRoleConfig config, const std::vector<NetTransport*>& tra
     role->_vswitch = std::make_unique<VSwitch>(role->_mappings, *role->_vtep);
     role->_started = role->_config.clock();
     role->_slots.resize(transports.size());
+    // One record per NIC the role can host; the same controller keys sign
+    // MapUpdates and InstanceMetadata frames.
+    role->_metadata = std::make_unique<MetadataStore>(role->_config.server_id, transports.size(),
+                                                      role->_verifier);
     for (std::size_t i = 0; i < transports.size(); ++i) {
         NetTransport* t = transports[i];
         if (t == nullptr) {
@@ -263,6 +267,7 @@ auto NetRole::prepare_function(const oar::PrepareFunction& request) -> oar::Stat
 auto NetRole::release(oar::FunctionNumber fn, Slot& s) -> bool {
     if (s.nic) {
         static_cast<void>(_vswitch->detach(*s.nic));
+        static_cast<void>(_metadata->drop(s.nic->value));
         s.nic.reset();
     }
     // Resets the function (queues, interrupts, driver state) even if it was
@@ -462,6 +467,10 @@ auto NetRole::group_members(std::span<const std::byte> frame) -> oar::Status {
     _members_versions.insert_or_assign(members->vni, members->members_version);
     ++_counters.members_applied;
     return oar::Status::ok;
+}
+
+auto NetRole::instance_metadata(std::span<const std::byte> frame) -> oar::Status {
+    return accepted(_metadata->put(frame)) ? oar::Status::ok : oar::Status::failed;
 }
 
 auto NetRole::group_membership(const oar::MembershipRequest& request)

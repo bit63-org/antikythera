@@ -55,6 +55,7 @@
 //   vpc_config          0  frame (proto::VpcConfigFrame, signed; min_vpc_config_frame
 //                          to max_vpc_config_frame bytes)
 //   group_members       0  total u32 | 4  offset u32 | 8  chunk (as map_update)
+//   instance_metadata   0  total u32 | 4  offset u32 | 8  chunk (as map_update)
 //   group_membership    0  cursor u16 | 2  flags u16 (bit 0: `since` is set)
 //                       4  since u32 (the generation helm last read whole)
 //
@@ -278,6 +279,10 @@ inline constexpr std::size_t max_vpc_config_frame =
 // pinned the same way.
 inline constexpr std::size_t max_group_members_frame = 0x20 + (512 * 0x18) + (4096 * 0x10) + 64;
 static_assert(max_group_members_frame <= max_map_frame);
+// Largest InstanceMetadata frame (proto::max_instance_metadata_size: a
+// 56-byte header, nine strings of up to 255 bytes with their sizes, 16 KiB
+// of user data, a 64-byte signature), pinned the same way.
+inline constexpr std::size_t max_instance_metadata_frame = 0x38 + (9 * 256) + 16384 + 64;
 inline constexpr std::size_t membership_request_size = 8;
 inline constexpr std::size_t membership_head_size = 12;
 inline constexpr std::size_t membership_entry_size = 32;

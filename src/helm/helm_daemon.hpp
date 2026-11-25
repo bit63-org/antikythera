@@ -83,6 +83,18 @@
 // which the ControllerSession resends until acknowledged (Requirement
 // 11.3).
 //
+// Instance metadata (Requirement 12, oar-net task 21). helm keeps the
+// newest InstanceMetadata frame per NIC (by version) and never reads it.
+// The record goes to the network role about to host the NIC, just before
+// the prepare_function that plugs it (SlotPort::prepare_function), and
+// again on every newer version while the NIC is plugged there. When the
+// NIC's detach completes (a successful reset_nic_vf clean) the record is
+// dropped. A net role whose sideband reopens gets the records of the NICs
+// plugged on it before the router registers its functions. Sending a
+// record only to the NIC's own role, rather than to every net role as for
+// VpcConfig, keeps a role from holding records (with up to 16 KiB of user
+// data each) for NICs it never hosts.
+//
 // Block volumes (.kiro/specs/block-volume-service/ task 12). ReplicaConfig
 // and VolumeOp frames go unmodified to every hold role, which verifies
 // them, and so do the controller's lease acknowledgements. helm keeps the
@@ -193,6 +205,11 @@ struct DaemonStats {
     std::uint64_t vpc_configs{0};          // kept: newer than the last for the VNI
     std::uint64_t vpc_configs_stale{0};    // not newer: dropped
     std::uint64_t vpc_configs_refused{0};  // a net role refused or missed one
+    // Instance metadata records (Requirement 12).
+    std::uint64_t instance_metadata{0};          // kept: newer than the last for the NIC
+    std::uint64_t instance_metadata_stale{0};    // not newer: dropped
+    std::uint64_t instance_metadata_refused{0};  // the NIC's net role refused or missed one
+    std::uint64_t instance_metadata_dropped{0};  // removed when the NIC's detach completed
     std::uint64_t inbox_dropped{0};
     std::uint64_t sideband_failures{0};  // a slot's sideband or inventory could not be read
     // Block volumes.
@@ -288,6 +305,8 @@ public:
         -> void override;
     auto on_group_members(const proto::GroupMembers& members, std::span<const std::byte> frame)
         -> void override;
+    auto on_instance_metadata(const proto::InstanceMetadata& metadata,
+                              std::span<const std::byte> frame) -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
     // The newest published snapshot (ControllerSession's InventorySource).
@@ -337,9 +356,20 @@ private:
         proto::GroupMembers members;
         std::vector<std::byte> frame;
     };
+    struct MetadataFrame {
+        std::uint64_t nic_id{0};
+        std::uint64_t metadata_version{0};
+        std::vector<std::byte> frame;
+    };
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
                               proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
-                              ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame>;
+                              ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame, MetadataFrame>;
+    // Where a NIC with a kept record is plugged: its network role's slot
+    // and function.
+    struct MetadataHome {
+        SlotNumber slot{0};
+        oar::FunctionNumber fn{0};
+    };
 
     struct SlotState;
 
@@ -407,6 +437,13 @@ private:
     auto forward_vpc_config(VpcFrame& config) -> void;
     auto replay_vpc_configs(SlotState& slot) -> void;
     auto count_vpc_refusal(const std::expected<void, LinkError>& r) -> void;
+    // Instance metadata: kept per NIC, sent to the NIC's net role before
+    // the prepare that plugs it, dropped when its detach completes.
+    auto keep_metadata(MetadataFrame& metadata) -> void;
+    auto plug_metadata(SlotState& slot, oar::FunctionNumber fn, std::uint64_t nic_id) -> void;
+    auto unplug_metadata(SlotNumber slot, oar::FunctionNumber fn) -> void;
+    auto replay_metadata(SlotState& slot) -> void;
+    auto count_metadata_refusal(const std::expected<void, LinkError>& r) -> void;
     // Block volumes: to every attached hold role.
     [[nodiscard]] static auto is_hold(const SlotState& slot) -> bool;
     [[nodiscard]] static auto is_blk(const SlotState& slot) -> bool;
@@ -445,7 +482,9 @@ private:
     Clock::time_point _next_identity;
     std::map<std::uint64_t, ConfigFrame> _volume_configs;  // the newest, by volume
     TunnelKeyring _keyring;
-    std::map<std::uint32_t, VpcFrame> _vpc_configs;  // the newest, by VNI
+    std::map<std::uint32_t, VpcFrame> _vpc_configs;         // the newest, by VNI
+    std::map<std::uint64_t, MetadataFrame> _metadata;       // the newest, by NIC ID
+    std::map<std::uint64_t, MetadataHome> _metadata_homes;  // by NIC ID
     GroupUsageReporter _groups;
 
     mutable std::mutex _inbox_mutex;

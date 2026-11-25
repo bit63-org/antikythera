@@ -19,6 +19,7 @@
 
 #include "helm/oar_protocol.hpp"
 #include "proto/group_policy.hpp"
+#include "proto/instance_metadata.hpp"
 #include "proto/link.hpp"
 #include "proto/map_update.hpp"
 #include "proto/replica_config.hpp"
@@ -967,6 +968,7 @@ auto join(std::uint64_t nic, bool ipv6, std::uint8_t last) -> oar::MembershipEnt
 
 BOOST_AUTO_TEST_CASE(membership_mirrors_match_proto) {
     BOOST_TEST(oar::max_group_members_frame == ak::proto::max_group_members_size);
+    BOOST_TEST(oar::max_instance_metadata_frame == ak::proto::max_instance_metadata_size);
     BOOST_TEST(oar::max_memberships == ak::proto::max_group_membership_entries);
     BOOST_TEST(oar::membership_entry_size == ak::proto::group_membership_entry_size);
     // A full page fits one message.

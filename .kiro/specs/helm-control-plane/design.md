@@ -226,10 +226,17 @@ health is sent to the controller as a fresh inventory report.
 `instance_metadata` (vendor type 0x1B, after task 14.2's 0x19
 `group_members` and 0x1A `group_membership`) forwards a controller InstanceMetadata
 frame (up to 18,808 bytes) to a network role in the same chunk format as
-`map_update`. helm keeps the newest frame per NIC and drops it when the
-NIC's detach completes; it replays all of them, in NIC ID order, to a
-network role whose sideband reopens, before the router can prepare a NIC
-there (Requirement 12). The role answers the guest's metadata requests
+`map_update`. helm keeps the newest frame per NIC and sends it only to
+the network role that hosts the NIC: just before the `prepare_function`
+that plugs it, and again straight away when a newer version arrives
+while it is plugged. A frame for a NIC not plugged anywhere waits for
+its plug, so no role holds records (up to 16 KiB of user data each) for
+NICs it never hosts. A successful `reset_nic_vf` clean drops the frame;
+a network role whose sideband reopens gets the frames of the NICs
+plugged there again, in NIC ID order, before the router can prepare
+another NIC (Requirement 12). The role's `MetadataStore` verifies each
+frame, keeps one per NIC up to one per function, and drops the NIC's on
+its clean. The role answers the guest's metadata requests
 itself (oar-net design "Metadata service").
 
 `create_volume`, `delete_volume` and `rewrap_volume` are the storage

@@ -325,9 +325,10 @@
     Requirements 13.4 to 13.8 here.
   - [x] 21.2 `InstanceMetadata` codec and link record
     (controller-interface task 16).
-  - [ ] 21.3 helm forwards and replays records (helm-control-plane task
+  - [x] 21.3 helm forwards and replays records (helm-control-plane task
     14); `NetRole` verifies and keeps them (`metadata_store`), dropping
-    a NIC's on clean.
+    a NIC's on clean. The store holds one record per function at most
+    and refuses a record for a new NIC when full.
   - [ ] 21.4 HTTP layer with IMDSv2 tokens and the path table
     (`metadata_http`), over socket pairs in tests.
   - [ ] 21.5 TAP endpoint and alias translation (`metadata_nat`), with a

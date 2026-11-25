@@ -28,6 +28,22 @@ constexpr auto bad_response() noexcept -> LinkError {
     return {.code = LinkErrc::bad_response};
 }
 
+// The largest whole frame each chunked transfer type may announce.
+constexpr auto frame_limit(mctp::VendorType type) noexcept -> std::size_t {
+    switch (type) {
+        case mctp::VendorType::map_update:
+            return oar::max_map_frame;
+        case mctp::VendorType::tunnel_peers:
+            return oar::max_tunnel_peers_frame;
+        case mctp::VendorType::group_members:
+            return oar::max_group_members_frame;
+        case mctp::VendorType::instance_metadata:
+            return oar::max_instance_metadata_frame;
+        default:
+            return oar::max_cert_chain;
+    }
+}
+
 // Whether a decoded packet travels from `from` to `to` on this segment.
 auto addressed(const mctp::Packet& p, std::uint8_t from, std::uint8_t to) noexcept -> bool {
     return p.src_addr == from && p.dest_addr == to;
@@ -235,6 +251,14 @@ auto OarLink::group_members(std::span<const std::byte> frame) -> std::expected<v
         return std::unexpected(bad_request());
     }
     return send_chunked(mctp::VendorType::group_members, frame);
+}
+
+auto OarLink::instance_metadata(std::span<const std::byte> frame)
+    -> std::expected<void, LinkError> {
+    if (frame.empty() || frame.size() > oar::max_instance_metadata_frame) {
+        return std::unexpected(bad_request());
+    }
+    return send_chunked(mctp::VendorType::instance_metadata, frame);
 }
 
 auto OarLink::group_membership(std::optional<std::uint32_t> since)
@@ -688,6 +712,7 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
         case mctp::VendorType::map_update:
         case mctp::VendorType::tunnel_peers:
         case mctp::VendorType::group_members:
+        case mctp::VendorType::instance_metadata:
         case mctp::VendorType::role_certificate:
             return status_only(frame_chunk(handler, type, body));
         case mctp::VendorType::group_membership: {
@@ -790,11 +815,7 @@ auto OarEndpoint::frame_chunk(OarHandler& handler, mctp::VendorType type,
         reset_frame();
         return oar::Status::bad_request;
     }
-    const std::size_t limit = type == mctp::VendorType::map_update     ? oar::max_map_frame
-                              : type == mctp::VendorType::tunnel_peers ? oar::max_tunnel_peers_frame
-                              : type == mctp::VendorType::group_members
-                                  ? oar::max_group_members_frame
-                                  : oar::max_cert_chain;
+    const std::size_t limit = frame_limit(type);
     if (chunk->offset == 0) {
         // A new transfer; whatever was in progress is abandoned.
         reset_frame();
@@ -813,11 +834,24 @@ auto OarEndpoint::frame_chunk(OarHandler& handler, mctp::VendorType type,
     if (_frame.size() < _frame_total) {
         return oar::Status::ok;
     }
-    const auto status = type == mctp::VendorType::map_update     ? handler.map_update(_frame)
-                        : type == mctp::VendorType::tunnel_peers ? handler.tunnel_peers(_frame)
-                        : type == mctp::VendorType::group_members
-                            ? handler.group_members(_frame)
-                            : handler.role_certificate(_frame);
+    oar::Status status = oar::Status::bad_request;
+    switch (type) {
+        case mctp::VendorType::map_update:
+            status = handler.map_update(_frame);
+            break;
+        case mctp::VendorType::tunnel_peers:
+            status = handler.tunnel_peers(_frame);
+            break;
+        case mctp::VendorType::group_members:
+            status = handler.group_members(_frame);
+            break;
+        case mctp::VendorType::instance_metadata:
+            status = handler.instance_metadata(_frame);
+            break;
+        default:
+            status = handler.role_certificate(_frame);
+            break;
+    }
     reset_frame();
     return status;
 }

@@ -35,6 +35,7 @@
 #include "oar/net/net_role.hpp"
 #include "proto/group_members.hpp"
 #include "proto/group_policy.hpp"
+#include "proto/instance_metadata.hpp"
 #include "proto/map_update.hpp"
 #include "proto/tunnel_peers.hpp"
 #include "proto/vpc_config.hpp"
@@ -220,6 +221,31 @@ auto signed_members(std::uint64_t server, std::uint64_t version) -> std::vector<
     BOOST_REQUIRE(bytes.has_value());
     const auto sig = signer().sign(proto::group_members_signed_bytes(*bytes));
     proto::set_group_members_signature(*bytes, sig);
+    return *bytes;
+}
+
+// An InstanceMetadata record for `nic`, signed like the controller signs it.
+auto signed_metadata(std::uint64_t server, std::uint64_t nic, std::uint64_t version)
+    -> std::vector<std::byte> {
+    proto::InstanceMetadata m{};
+    m.server_id = server;
+    m.key_id = key_id;
+    m.nic_id = nic;
+    m.metadata_version = version;
+    m.vni = vpc;
+    m.instance_id = "i-0abc";
+    m.image_id = "ami-0abc";
+    m.instance_type = "m5.large";
+    m.account_id = "123456789012";
+    m.local_hostname = "ip-10-0-0-17.ec2.internal";
+    m.availability_zone = "harbor-1a";
+    m.region = "harbor-1";
+    m.interface_id = "eni-0abc";
+    m.vpc_id = "vpc-0abc";
+    auto bytes = proto::encode_instance_metadata(m);
+    BOOST_REQUIRE(bytes.has_value());
+    const auto sig = signer().sign(proto::instance_metadata_signed_bytes(*bytes));
+    proto::set_instance_metadata_signature(*bytes, sig);
     return *bytes;
 }
 
@@ -1130,6 +1156,31 @@ BOOST_FIXTURE_TEST_CASE(group_membership_lists_snooped_joins, One,
     BOOST_TEST(page->unchanged);
     BOOST_TEST(
         (role->group_membership({.cursor = 1, .since = now}).error() == Status::bad_request));
+}
+
+// Requirement 13.4: a verified record is kept for its NIC from before the
+// attach until the NIC is cleaned.
+BOOST_FIXTURE_TEST_CASE(instance_metadata_lives_until_the_nic_is_cleaned, One,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_TEST((role->instance_metadata(signed_metadata(server_two, nic_a, 1)) == Status::failed));
+    auto tampered = signed_metadata(server_one, nic_a, 1);
+    tampered[0x24] = std::byte{0};  // http_endpoint disabled after signing
+    BOOST_TEST((role->instance_metadata(tampered) == Status::failed));
+    BOOST_TEST(role->metadata().find(nic_a) == nullptr);
+
+    BOOST_TEST((role->instance_metadata(signed_metadata(server_one, nic_a, 2)) == Status::ok));
+    BOOST_TEST((role->instance_metadata(signed_metadata(server_one, nic_a, 2)) == Status::ok));
+    BOOST_TEST((role->instance_metadata(signed_metadata(server_one, nic_a, 1)) == Status::failed));
+    BOOST_REQUIRE(role->metadata().find(nic_a) != nullptr);
+    BOOST_TEST(role->metadata().find(nic_a)->metadata_version == 2U);
+    BOOST_TEST(role->metadata().capacity() == role->function_count());
+
+    BOOST_REQUIRE(prepare(fn0, nic_a) == Status::ok);
+    BOOST_TEST(role->metadata().find(nic_a) != nullptr);  // the attach keeps it
+    BOOST_REQUIRE(role->clean_function(
+                      {.fn = fn0, .action = ak::helm::CleaningAction::reset_nic_vf}) == Status::ok);
+    BOOST_TEST(role->metadata().find(nic_a) == nullptr);
+    BOOST_TEST(role->metadata().counters().dropped == 1U);
 }
 
 BOOST_FIXTURE_TEST_CASE(helm_drives_the_role_over_the_sideband, One,

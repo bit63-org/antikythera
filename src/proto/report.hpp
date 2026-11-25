@@ -96,6 +96,29 @@
 //     bytes_uploaded u64 | state u8 | slot u8 | rsvd [6]
 //     manifest_name [32] (non-zero exactly when completed)
 //
+// khold reports (kythira .kiro/specs/khold-block-service/ design "Running
+// on antikythera", Requirements 4.6, 7.3, 9 and 12), from a khold role
+// through helm. `slot` is the reporting role's data-plane slot.
+//   group_status  -- a snapshot of the stripe group members a khold role keeps
+//     slot u8 | rsvd u8 | count u16 | rsvd u32
+//     entries  count x 64, strictly increasing (volume_id, group_id):
+//       volume_id u64 | group_id u64 | epoch u64 (applied layout epoch)
+//       term u64 | commit_index u64 | applied_index u64 (<= commit_index)
+//       kind u8 (MemberKind) | state u8 (GroupMemberState) | lagging u8
+//       (members the group has recorded as lagging) | drive u8 | rsvd u32
+//       allocated_bytes u64 (0 for a witness)
+//   capacity  -- the role's drives and link, whole (Requirements 4.6, 12.1)
+//     slot u8 | rsvd u8 | count u16 | link_mbps u32
+//     entries  count x 56, strictly increasing drive:
+//       drive u8 | state u8 (DriveState) | rsvd [6]
+//       capacity_bytes u64 | allocated_bytes u64 (<= capacity) | reserved_bytes u64
+//       read_iops u32 | write_iops u32 | read_mib_per_s u32 | write_mib_per_s u32
+//       replicas u32 | rsvd u32
+//   group_fault  -- what a khold member saw go wrong in one stripe group
+//     volume_id u64 | group_id u64 | epoch u64 | term u64
+//     suspect u64 (server ID; required except for no_space)
+//     kind u8 (GroupFaultKind) | slot u8 | drive u8 | rsvd [5]
+//
 // Enrollment (block-volume-service task 12, design "Keys and crypto-erase"
 // and "hold wire protocol"):
 //   enrollment  -- helm's secure-element transport key, sent after the
@@ -221,10 +244,19 @@ inline constexpr std::size_t max_group_membership_entries = 1024;  // per networ
 inline constexpr std::size_t max_group_membership_size =
     group_membership_fixed_size + (max_group_membership_entries * group_membership_entry_size);
 inline constexpr std::size_t max_csr_size = 4096;
+inline constexpr std::size_t group_status_fixed_size = 8;
+inline constexpr std::size_t group_status_entry_size = 64;
+inline constexpr std::size_t max_group_status_entries = 1024;  // more members: several reports
+inline constexpr std::size_t max_group_status_size =
+    group_status_fixed_size + (max_group_status_entries * group_status_entry_size);
+inline constexpr std::size_t capacity_fixed_size = 8;
+inline constexpr std::size_t capacity_entry_size = 56;
+inline constexpr std::size_t max_capacity_drives = 64;
+inline constexpr std::size_t group_fault_size = 48;
 
 inline constexpr std::size_t max_report_size =
-    report_header_size +
-    std::max({max_inventory_size, max_group_usage_size, max_replica_status_size});
+    report_header_size + std::max({max_inventory_size, max_group_usage_size,
+                                   max_replica_status_size, max_group_status_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class ReportKind : std::uint16_t {
@@ -244,12 +276,43 @@ enum class ReportKind : std::uint16_t {
     enrollment = 14,
     cert_request = 15,
     group_membership = 16,
+    group_status = 17,
+    capacity = 18,
+    group_fault = 19,
 };
 
 // Which storage role a certificate is for.
 enum class StorageRole : std::uint8_t {
     hold = 1,
     initiator = 2,  // oar-blk
+    khold = 3,      // a khold node (kythira khold-block-service)
+};
+
+// A khold member's state in its stripe group (group_status).
+enum class GroupMemberState : std::uint8_t {
+    leader = 1,
+    follower = 2,      // in sync
+    lagging = 3,       // recorded lagging by a committed entry; catching up
+    learner = 4,       // being rebuilt
+    store_failed = 5,  // its block store failed; refusing requests
+    unavailable = 6,   // the group cannot commit (no up-to-date data replica)
+};
+
+// A khold drive's state (capacity).
+enum class DriveState : std::uint8_t {
+    ok = 1,
+    warning = 2,  // physical use above the warning watermark
+    full = 3,     // above the refusal watermark: place nothing new here
+    failed = 4,
+};
+
+enum class GroupFaultKind : std::uint8_t {
+    lagging = 1,      // the leader recorded `suspect` lagging (missed the member deadline)
+    caught_up = 2,    // the leader recorded `suspect` in sync again
+    media_error = 3,  // `suspect`'s block store failed (EIO on a write, metadata, fsync or log)
+    fail_slow = 4,    // `suspect` stayed slow against its peers for the slow window
+    no_space = 5,     // a write needed space an overcommitted drive lacks
+    checksum_unrepairable = 6,
 };
 
 enum class ReplicaState : std::uint8_t {
@@ -571,6 +634,60 @@ struct SnapshotProgress {
     friend auto operator==(const SnapshotProgress&, const SnapshotProgress&) -> bool = default;
 };
 
+struct GroupStatusEntry {
+    std::uint64_t volume_id{0};
+    std::uint64_t group_id{0};
+    std::uint64_t epoch{0};
+    std::uint64_t term{0};
+    std::uint64_t commit_index{0};
+    std::uint64_t applied_index{0};
+    std::uint8_t kind{1};  // volume_layout.hpp MemberKind
+    GroupMemberState state{GroupMemberState::follower};
+    std::uint8_t lagging{0};
+    std::uint8_t drive{0};
+    std::uint64_t allocated_bytes{0};
+    friend auto operator==(const GroupStatusEntry&, const GroupStatusEntry&) -> bool = default;
+};
+
+struct GroupStatus {
+    std::uint8_t slot{0};
+    std::vector<GroupStatusEntry> entries;
+    friend auto operator==(const GroupStatus&, const GroupStatus&) -> bool = default;
+};
+
+struct DriveCapacity {
+    std::uint8_t drive{0};
+    DriveState state{DriveState::ok};
+    std::uint64_t capacity_bytes{0};
+    std::uint64_t allocated_bytes{0};
+    std::uint64_t reserved_bytes{0};
+    std::uint32_t read_iops{0};
+    std::uint32_t write_iops{0};
+    std::uint32_t read_mib_per_s{0};
+    std::uint32_t write_mib_per_s{0};
+    std::uint32_t replicas{0};
+    friend auto operator==(const DriveCapacity&, const DriveCapacity&) -> bool = default;
+};
+
+struct Capacity {
+    std::uint8_t slot{0};
+    std::uint32_t link_mbps{0};
+    std::vector<DriveCapacity> drives;  // strictly increasing drive
+    friend auto operator==(const Capacity&, const Capacity&) -> bool = default;
+};
+
+struct GroupFault {
+    std::uint64_t volume_id{0};
+    std::uint64_t group_id{0};
+    std::uint64_t epoch{0};
+    std::uint64_t term{0};
+    std::uint64_t suspect{0};
+    GroupFaultKind kind{GroupFaultKind::lagging};
+    std::uint8_t slot{0};
+    std::uint8_t drive{0};
+    friend auto operator==(const GroupFault&, const GroupFault&) -> bool = default;
+};
+
 using TransportKey = std::array<std::byte, transport_key_size>;
 
 struct Enrollment {
@@ -586,10 +703,11 @@ struct CertRequest {
     friend auto operator==(const CertRequest&, const CertRequest&) -> bool = default;
 };
 
-using ReportBody = std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport,
-                                MapApplied, HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault,
-                                AttachmentStatus, DemotionConfirmed, OpOutcome, SnapshotProgress,
-                                Enrollment, CertRequest, GroupMembership>;
+using ReportBody =
+    std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport, MapApplied,
+                 HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault, AttachmentStatus,
+                 DemotionConfirmed, OpOutcome, SnapshotProgress, Enrollment, CertRequest,
+                 GroupMembership, GroupStatus, Capacity, GroupFault>;
 
 struct Report {
     std::uint64_t server_id{0};
@@ -602,8 +720,7 @@ struct Report {
 [[nodiscard]] inline auto report_kind(const ReportBody& body) noexcept -> ReportKind {
     return static_cast<ReportKind>(body.index() + 1);
 }
-static_assert(std::variant_size_v<ReportBody> ==
-              static_cast<std::size_t>(ReportKind::group_membership));
+static_assert(std::variant_size_v<ReportBody> == static_cast<std::size_t>(ReportKind::group_fault));
 
 namespace detail {
 
@@ -644,7 +761,21 @@ namespace detail {
     return s >= SnapshotState::frozen && s <= SnapshotState::failed;
 }
 [[nodiscard]] constexpr auto known(StorageRole r) noexcept -> bool {
-    return r == StorageRole::hold || r == StorageRole::initiator;
+    return r >= StorageRole::hold && r <= StorageRole::khold;
+}
+[[nodiscard]] constexpr auto known(GroupMemberState s) noexcept -> bool {
+    return s >= GroupMemberState::leader && s <= GroupMemberState::unavailable;
+}
+[[nodiscard]] constexpr auto known(DriveState s) noexcept -> bool {
+    return s >= DriveState::ok && s <= DriveState::failed;
+}
+[[nodiscard]] constexpr auto known(GroupFaultKind k) noexcept -> bool {
+    return k >= GroupFaultKind::lagging && k <= GroupFaultKind::checksum_unrepairable;
+}
+[[nodiscard]] constexpr auto known_member_kind(std::uint8_t k) noexcept -> bool {
+    // volume_layout.hpp's MemberKind (data 1, witness 2, learner 3); the
+    // report stays independent of the layout header.
+    return k >= 1 && k <= 3;
 }
 [[nodiscard]] constexpr auto has_owner(FunctionState s) noexcept -> bool {
     return s == FunctionState::assigned || s == FunctionState::releasing;
@@ -967,6 +1098,71 @@ namespace detail {
     }
     if (auto n = der_sequences(c.csr, 1); !n) {
         return std::unexpected(n.error());
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const GroupStatus& s) noexcept
+    -> std::expected<void, DecodeError> {
+    if (s.entries.size() > max_group_status_entries) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    for (const auto& e : s.entries) {
+        if (!known_member_kind(e.kind) || !known(e.state)) {
+            return std::unexpected(DecodeError::unknown_value);
+        }
+        if (e.volume_id == 0 || e.group_id == 0) {
+            return std::unexpected(DecodeError::bad_id);
+        }
+        if (e.epoch == 0) {
+            return std::unexpected(DecodeError::bad_epoch);
+        }
+        if (e.applied_index > e.commit_index) {
+            return std::unexpected(DecodeError::bad_capacity);
+        }
+    }
+    const auto key = [](const GroupStatusEntry& e) { return std::tuple{e.volume_id, e.group_id}; };
+    if (std::ranges::adjacent_find(s.entries, [&](const auto& a, const auto& b) {
+            return key(a) >= key(b);
+        }) != s.entries.end()) {
+        return std::unexpected(DecodeError::not_ascending);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const Capacity& c) noexcept
+    -> std::expected<void, DecodeError> {
+    if (c.drives.size() > max_capacity_drives) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    for (const auto& d : c.drives) {
+        if (!known(d.state)) {
+            return std::unexpected(DecodeError::unknown_value);
+        }
+        if (d.allocated_bytes > d.capacity_bytes) {
+            return std::unexpected(DecodeError::bad_capacity);
+        }
+    }
+    if (std::ranges::adjacent_find(c.drives, std::ranges::greater_equal{}, &DriveCapacity::drive) !=
+        c.drives.end()) {
+        return std::unexpected(DecodeError::not_ascending);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const GroupFault& f) noexcept
+    -> std::expected<void, DecodeError> {
+    if (!known(f.kind)) {
+        return std::unexpected(DecodeError::unknown_value);
+    }
+    if (f.volume_id == 0 || f.group_id == 0) {
+        return std::unexpected(DecodeError::bad_id);
+    }
+    if (f.epoch == 0) {
+        return std::unexpected(DecodeError::bad_epoch);
+    }
+    if (f.suspect == 0 && f.kind != GroupFaultKind::no_space) {
+        return std::unexpected(DecodeError::bad_server_id);
     }
     return {};
 }
@@ -1609,6 +1805,181 @@ inline auto write_volume_event(wire::Writer& w, const SnapshotProgress& b) -> vo
     return out;
 }
 
+[[nodiscard]] inline auto decode_group_status(std::span<const std::byte> body)
+    -> std::expected<GroupStatus, DecodeError> {
+    BodyReader in{.r = wire::Reader{body}};
+    GroupStatus s{.slot = in.u8(), .entries = {}};
+    bool zero = in.zeros(1);
+    const std::size_t count = in.le16();
+    zero = in.zeros(4) && zero;
+    if (!in.ok) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (count > max_group_status_entries) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    const std::size_t want = group_status_fixed_size + (count * group_status_entry_size);
+    if (body.size() < want) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (body.size() > want) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    s.entries.resize(count);
+    for (auto& e : s.entries) {
+        e.volume_id = in.le64();
+        e.group_id = in.le64();
+        e.epoch = in.le64();
+        e.term = in.le64();
+        e.commit_index = in.le64();
+        e.applied_index = in.le64();
+        e.kind = in.u8();
+        e.state = static_cast<GroupMemberState>(in.u8());
+        e.lagging = in.u8();
+        e.drive = in.u8();
+        zero = in.zeros(4) && zero;
+        e.allocated_bytes = in.le64();
+    }
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (auto ok = check_body(s); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return s;
+}
+
+[[nodiscard]] inline auto decode_capacity(std::span<const std::byte> body)
+    -> std::expected<Capacity, DecodeError> {
+    BodyReader in{.r = wire::Reader{body}};
+    Capacity c{.slot = in.u8(), .link_mbps = 0, .drives = {}};
+    bool zero = in.zeros(1);
+    const std::size_t count = in.le16();
+    c.link_mbps = in.le32();
+    if (!in.ok) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (count > max_capacity_drives) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    const std::size_t want = capacity_fixed_size + (count * capacity_entry_size);
+    if (body.size() < want) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (body.size() > want) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    c.drives.resize(count);
+    for (auto& d : c.drives) {
+        d.drive = in.u8();
+        d.state = static_cast<DriveState>(in.u8());
+        zero = in.zeros(6) && zero;
+        d.capacity_bytes = in.le64();
+        d.allocated_bytes = in.le64();
+        d.reserved_bytes = in.le64();
+        d.read_iops = in.le32();
+        d.write_iops = in.le32();
+        d.read_mib_per_s = in.le32();
+        d.write_mib_per_s = in.le32();
+        d.replicas = in.le32();
+        zero = in.zeros(4) && zero;
+    }
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (auto ok = check_body(c); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return c;
+}
+
+[[nodiscard]] inline auto decode_group_fault(std::span<const std::byte> body)
+    -> std::expected<GroupFault, DecodeError> {
+    if (body.size() < group_fault_size) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (body.size() > group_fault_size) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    BodyReader in{.r = wire::Reader{body}};
+    GroupFault f{};
+    f.volume_id = in.le64();
+    f.group_id = in.le64();
+    f.epoch = in.le64();
+    f.term = in.le64();
+    f.suspect = in.le64();
+    f.kind = static_cast<GroupFaultKind>(in.u8());
+    f.slot = in.u8();
+    f.drive = in.u8();
+    if (!in.zeros(5)) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (auto ok = check_body(f); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return f;
+}
+
+inline auto write_khold_body(wire::Writer& w, const GroupStatus& s) -> void {
+    w.u8(s.slot);
+    w.u8(0);
+    w.le16(static_cast<std::uint16_t>(s.entries.size()));
+    w.le32(0);
+    for (const auto& e : s.entries) {
+        w.le64(e.volume_id);
+        w.le64(e.group_id);
+        w.le64(e.epoch);
+        w.le64(e.term);
+        w.le64(e.commit_index);
+        w.le64(e.applied_index);
+        w.u8(e.kind);
+        w.u8(static_cast<std::uint8_t>(e.state));
+        w.u8(e.lagging);
+        w.u8(e.drive);
+        w.le32(0);
+        w.le64(e.allocated_bytes);
+    }
+}
+
+inline auto write_khold_body(wire::Writer& w, const Capacity& c) -> void {
+    w.u8(c.slot);
+    w.u8(0);
+    w.le16(static_cast<std::uint16_t>(c.drives.size()));
+    w.le32(c.link_mbps);
+    for (const auto& d : c.drives) {
+        w.u8(d.drive);
+        w.u8(static_cast<std::uint8_t>(d.state));
+        w.bytes(std::array<std::byte, 6>{});
+        w.le64(d.capacity_bytes);
+        w.le64(d.allocated_bytes);
+        w.le64(d.reserved_bytes);
+        w.le32(d.read_iops);
+        w.le32(d.write_iops);
+        w.le32(d.read_mib_per_s);
+        w.le32(d.write_mib_per_s);
+        w.le32(d.replicas);
+        w.le32(0);
+    }
+}
+
+inline auto write_khold_body(wire::Writer& w, const GroupFault& f) -> void {
+    w.le64(f.volume_id);
+    w.le64(f.group_id);
+    w.le64(f.epoch);
+    w.le64(f.term);
+    w.le64(f.suspect);
+    w.u8(static_cast<std::uint8_t>(f.kind));
+    w.u8(f.slot);
+    w.u8(f.drive);
+    w.bytes(std::array<std::byte, 5>{});
+}
+
 inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
     std::visit(
         [&w]<typename T>(const T& b) {
@@ -1656,6 +2027,9 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
                 }
             } else if constexpr (std::is_same_v<T, ReplicaStatus>) {
                 write_replica_status(w, b);
+            } else if constexpr (std::is_same_v<T, GroupStatus> || std::is_same_v<T, Capacity> ||
+                                 std::is_same_v<T, GroupFault>) {
+                write_khold_body(w, b);
             } else if constexpr (volume_event_size<T> != 0) {
                 write_volume_event(w, b);
             } else if constexpr (std::is_same_v<T, Enrollment>) {
@@ -1760,6 +2134,12 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
             return wrap(detail::decode_cert_request(body));
         case ReportKind::group_membership:
             return wrap(detail::decode_group_membership(body));
+        case ReportKind::group_status:
+            return wrap(detail::decode_group_status(body));
+        case ReportKind::capacity:
+            return wrap(detail::decode_capacity(body));
+        case ReportKind::group_fault:
+            return wrap(detail::decode_group_fault(body));
     }
     return std::unexpected(DecodeError::unknown_value);
 }

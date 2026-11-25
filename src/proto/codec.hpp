@@ -86,6 +86,10 @@ enum class DecodeError : std::uint8_t {
     bad_group,                // a group address that is not a replicable multicast group
     bad_metadata_version,     // instance metadata version 0 (versions start at 1)
     bad_metadata,             // an instance metadata string, option or user data outside its rules
+    bad_stripe,               // a stripe unit or stripe width outside its bounds
+    bad_redirect,             // a hold v2 redirect whose leader fields disagree with each other
+    bad_group_members,        // a stripe group's member kinds break the layout rules
+    bad_mirror,               // mirror fields that disagree with the mirror flags
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -200,6 +204,14 @@ enum class DecodeError : std::uint8_t {
             return "instance metadata version 0";
         case DecodeError::bad_metadata:
             return "instance metadata field outside its rules";
+        case DecodeError::bad_stripe:
+            return "stripe unit or stripe width outside its bounds";
+        case DecodeError::bad_redirect:
+            return "redirect leader fields disagree";
+        case DecodeError::bad_group_members:
+            return "stripe group member kinds break the layout rules";
+        case DecodeError::bad_mirror:
+            return "mirror fields disagree with the mirror flags";
     }
     return "unknown";
 }

@@ -704,6 +704,9 @@ constexpr std::array kind_names{
     std::pair{"enrollment", proto::ReportKind::enrollment},
     std::pair{"cert_request", proto::ReportKind::cert_request},
     std::pair{"group_membership", proto::ReportKind::group_membership},
+    std::pair{"group_status", proto::ReportKind::group_status},
+    std::pair{"capacity", proto::ReportKind::capacity},
+    std::pair{"group_fault", proto::ReportKind::group_fault},
 };
 
 template<typename T, std::size_t N>
@@ -1146,6 +1149,20 @@ auto to_string(const proto::Report& report) -> std::string {
                    << " csr=" << b.csr.size();
             } else if constexpr (std::is_same_v<T, proto::GroupMembership>) {
                 os << " slot=" << int{b.slot} << " joins=" << b.entries.size();
+            } else if constexpr (std::is_same_v<T, proto::GroupStatus>) {
+                os << " slot=" << int{b.slot} << " entries=" << b.entries.size();
+                for (const auto& e : b.entries) {
+                    os << " [volume=" << e.volume_id << " group=" << e.group_id
+                       << " epoch=" << e.epoch << " term=" << e.term
+                       << " state=" << static_cast<int>(e.state) << " commit=" << e.commit_index
+                       << "]";
+                }
+            } else if constexpr (std::is_same_v<T, proto::Capacity>) {
+                os << " slot=" << int{b.slot} << " link_mbps=" << b.link_mbps
+                   << " drives=" << b.drives.size();
+            } else if constexpr (std::is_same_v<T, proto::GroupFault>) {
+                os << " volume=" << b.volume_id << " group=" << b.group_id
+                   << " fault=" << static_cast<int>(b.kind) << " suspect=" << b.suspect;
             } else {
                 static_assert(std::is_same_v<T, proto::SnapshotProgress>);
                 os << " volume=" << b.volume_id << " cut=" << b.cut_id

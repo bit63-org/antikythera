@@ -296,6 +296,20 @@ reconcile, resync and hydration need operations those protocols do not
 have. An NVMe/TCP front for third-party initiators can be added later over
 the same store.
 
+**Version 2 (khold).** kythira's khold block service
+(`.kiro/specs/khold-block-service/` in kythira) serves network volumes
+from Raft stripe groups beside hold. Its frames are hold wire version 2
+(`src/proto/hold_wire_v2.hpp`): same magic, version byte 2, an 88-byte
+header that adds the stripe `group_id` and the sender's `term`, only the
+initiator-facing opcodes, a `REDIRECT` naming the group leader's server,
+endpoint and term, and the statuses `not_leader` (version 1's
+`not_primary`), `no_space`, `repairing` and `unknown_group`. A khold
+volume is described by a signed `VolumeLayout` (`src/proto/volume_layout.hpp`)
+instead of a `ReplicaConfig`, and khold roles report `group_status`,
+`capacity` and `group_fault` (`src/proto/report.hpp`). Version 1 is
+unchanged; a server peeks the version byte (`hold_frame_version`) to pick
+the decoder, and each decoder refuses the other version.
+
 ## ReplicaStore (hold)
 
 One directory per replica, `vol-<id>.<replica_gen>/`:

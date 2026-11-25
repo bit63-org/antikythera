@@ -128,6 +128,22 @@ auto HelmDaemon::SlotPort::group_usage() -> std::expected<std::vector<oar::Usage
     return _slot->link->group_usage();
 }
 
+auto HelmDaemon::SlotPort::group_members(std::span<const std::byte> frame)
+    -> std::expected<void, LinkError> {
+    if (!_slot->link) {
+        return disconnected();
+    }
+    return _slot->link->group_members(frame);
+}
+
+auto HelmDaemon::SlotPort::group_membership(std::optional<std::uint32_t> since)
+    -> std::expected<std::optional<OarLink::Memberships>, LinkError> {
+    if (!_slot->link) {
+        return disconnected();
+    }
+    return _slot->link->group_membership(since);
+}
+
 // ---- HelmDaemon ---------------------------------------------------------------
 
 HelmDaemon::HelmDaemon(DaemonConfig config, KeyStore& keys, AuditLog& audit, HostPort& host,
@@ -138,7 +154,10 @@ HelmDaemon::HelmDaemon(DaemonConfig config, KeyStore& keys, AuditLog& audit, Hos
       _reports{std::move(reports)},
       _router{_config.router, _pool, keys, host, *this, audit},
       _sequencer{sequencer_config(_config), backplane, *this},
-      _groups{{.interval = _config.group_usage_interval, .clock = _config.clock}, *this} {
+      _groups{{.interval = _config.group_usage_interval,
+               .membership_interval = _config.membership_interval,
+               .clock = _config.clock},
+              *this} {
     for (const auto& s : _config.slots) {
         _slots.try_emplace(s.slot, std::make_unique<SlotState>(s.slot, s.link, *this));
     }
@@ -296,6 +315,11 @@ auto HelmDaemon::on_group_policy(const proto::GroupPolicy& policy, std::span<con
     enqueue(PolicyFrame{.policy = policy, .frame = {frame.begin(), frame.end()}});
 }
 
+auto HelmDaemon::on_group_members(const proto::GroupMembers& members,
+                                  std::span<const std::byte> frame) -> void {
+    enqueue(MembersFrame{.members = members, .frame = {frame.begin(), frame.end()}});
+}
+
 auto HelmDaemon::post_host_slot(const mailbox::Slot& slot) -> void {
     enqueue(slot);
 }
@@ -366,6 +390,8 @@ auto HelmDaemon::handle(Item& item) -> void {
         forward_peers(*peers);
     } else if (const auto* policy = std::get_if<PolicyFrame>(&item)) {
         _groups.on_group_policy(policy->policy, policy->frame);
+    } else if (const auto* members = std::get_if<MembersFrame>(&item)) {
+        _groups.on_group_members(members->members, members->frame);
     } else if (auto* vpc = std::get_if<VpcFrame>(&item)) {
         forward_vpc_config(*vpc);
     }

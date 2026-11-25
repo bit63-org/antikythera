@@ -41,6 +41,7 @@
 #include "helm/sideband_binding.hpp"
 #include "helm/volume_key_seal.hpp"
 #include "hull/signature_verifier.hpp"
+#include "proto/group_members.hpp"
 #include "proto/group_policy.hpp"
 #include "proto/test_vectors.hpp"
 #include "proto/tunnel_peers.hpp"
@@ -234,6 +235,40 @@ public:
         });
     }
 
+    // Snooping: GroupMembers frames in, joins out (answered like NetRole
+    // once `snoops` is set; until then unsupported, so other tests see no
+    // membership reports).
+    std::atomic<bool> snoops{false};
+    [[nodiscard]] auto members() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _members;
+    }
+    auto set_joins(std::vector<oar::MembershipEntry> joins) -> void {
+        const std::scoped_lock lock{_mutex};
+        _joins = std::move(joins);
+        ++_join_generation;
+    }
+    [[nodiscard]] auto join_snapshots() const -> std::size_t {
+        const std::scoped_lock lock{_mutex};
+        return _join_snapshots;
+    }
+    auto group_members(std::span<const std::byte> frame) -> oar::Status override {
+        const std::scoped_lock lock{_mutex};
+        _members.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
+    }
+    auto group_membership(const oar::MembershipRequest& request)
+        -> std::expected<oar::MembershipPage, oar::Status> override {
+        if (!snoops.load()) {
+            return std::unexpected(oar::Status::unsupported);
+        }
+        const std::scoped_lock lock{_mutex};
+        return _membership.page(request, _join_generation, [this] {
+            ++_join_snapshots;
+            return _joins;
+        });
+    }
+
     // A hold role's side.
     std::atomic<oar::Status> config_status{oar::Status::ok};
     [[nodiscard]] auto configs() const -> std::vector<std::vector<std::byte>> {
@@ -315,6 +350,11 @@ private:
     std::vector<oar::UsageEntry> _usage;
     oar::UsagePager _pager;
     std::size_t _usage_reads{0};
+    std::vector<std::vector<std::byte>> _members;
+    std::vector<oar::MembershipEntry> _joins;
+    std::uint32_t _join_generation{0};
+    std::size_t _join_snapshots{0};
+    oar::MembershipPager _membership;
     std::size_t _cleaned{0};
     oar::Health _health{};
     std::vector<std::vector<std::byte>> _tunnel_keys;
@@ -540,6 +580,7 @@ struct Rig {
         // Group meters are read on the first pass and after a NIC detach:
         // the tests never wait out an interval.
         c.group_usage_interval = 1h;
+        c.membership_interval = 0ms;  // every pass asks for joins
         return c;
     }
 
@@ -606,6 +647,15 @@ auto policy_frame(std::uint64_t version) -> std::pair<proto::GroupPolicy, std::v
     auto bytes = proto::encode_group_policy(p);
     BOOST_REQUIRE(bytes.has_value());
     return {p, *bytes};
+}
+
+// A GroupMembers frame as the ControllerSession hands it over.
+auto members_frame(std::uint64_t version)
+    -> std::pair<proto::GroupMembers, std::vector<std::byte>> {
+    proto::GroupMembers m{.server_id = server, .key_id = 1, .vni = vni, .members_version = version};
+    auto bytes = proto::encode_group_members(m);
+    BOOST_REQUIRE(bytes.has_value());
+    return {m, *bytes};
 }
 
 auto usage_entry(std::uint64_t nic, std::uint64_t frames, bool detached = false)
@@ -849,6 +899,62 @@ BOOST_AUTO_TEST_CASE(group_policies_reach_net_roles_and_follow_a_restart) {
     BOOST_REQUIRE(r.net.role.policies().size() == 3U);
     BOOST_TEST((r.net.role.policies()[2] == frame2));
     BOOST_TEST(r.daemon.group_usage().policies_forwarded == 3U);
+}
+
+// oar-net task 14.2: member lists follow policies to net roles, and each
+// role's joins are reported when they change, empty when it goes away.
+BOOST_AUTO_TEST_CASE(member_lists_and_joins_cross_helm) {
+    Rig r;
+    oar::MembershipEntry joined{.nic_id = nic_id, .vni = vni, .ipv6 = false, .group = {}};
+    joined.group[0] = std::byte{239};
+    joined.group[3] = std::byte{9};
+    r.net.role.set_joins({joined});
+    r.net.role.snoops = true;
+    (void)r.daemon.boot();
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.count<proto::GroupMembership>() == 1U);
+    auto m = r.last<proto::GroupMembership>();
+    BOOST_TEST(m.slot == net_slot);
+    BOOST_REQUIRE(m.entries.size() == 1U);
+    BOOST_TEST(m.entries[0].nic_id == nic_id);
+    BOOST_TEST((m.entries[0].family == proto::RouteFamily::ipv4));
+    BOOST_TEST((m.entries[0].group[3] == std::byte{9}));
+
+    // Unchanged passes ask cheaply and report nothing.
+    r.daemon.run_once(0ms);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.count<proto::GroupMembership>() == 1U);
+    BOOST_TEST(r.net.role.join_snapshots() == 1U);
+
+    const auto [v1, frame1] = members_frame(1);
+    std::thread{[&] { r.daemon.on_group_members(v1, frame1); }}.join();
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.role.members().size() == 1U);
+    BOOST_TEST((r.net.role.members()[0] == frame1));  // unmodified
+    BOOST_TEST(r.blk.role.members().empty());
+    r.daemon.on_group_members(v1, frame1);  // not newer
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.net.role.members().size() == 1U);
+    BOOST_TEST(r.daemon.group_usage().members_stale == 1U);
+
+    // The role restarts: its joins are reported empty, it gets the kept
+    // list again, and its (new) list is read afresh.
+    r.backplane.dropped.insert(net_slot);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.connects.load() == 2);
+    BOOST_REQUIRE(r.net.role.members().size() == 2U);
+    BOOST_TEST((r.net.role.members()[1] == frame1));
+    BOOST_REQUIRE(r.count<proto::GroupMembership>() >= 2U);
+    bool emptied = false;
+    for (const auto& b : r.reports) {
+        if (const auto* g = std::get_if<proto::GroupMembership>(&b)) {
+            emptied = emptied || g->entries.empty();
+        }
+    }
+    BOOST_TEST(emptied);
+    r.daemon.run_once(0ms);
+    m = r.last<proto::GroupMembership>();
+    BOOST_TEST(m.entries.size() == 1U);  // read again from the restarted role
 }
 
 BOOST_AUTO_TEST_CASE(group_meters_are_reported_and_read_after_a_detach) {

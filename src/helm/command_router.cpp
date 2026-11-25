@@ -107,6 +107,16 @@ auto OarLinkPort::group_usage() -> std::expected<std::vector<oar::UsageEntry>, L
     return _link->group_usage();
 }
 
+auto OarLinkPort::group_members(std::span<const std::byte> frame)
+    -> std::expected<void, LinkError> {
+    return _link->group_members(frame);
+}
+
+auto OarLinkPort::group_membership(std::optional<std::uint32_t> since)
+    -> std::expected<std::optional<OarLink::Memberships>, LinkError> {
+    return _link->group_membership(since);
+}
+
 auto OarLinkPort::deliver_key(oar::FunctionNumber fn, VolumeId volume, ScopedKey key,
                               std::optional<ScopedKey> image_key)
     -> std::expected<void, LinkError> {

@@ -84,6 +84,8 @@ constexpr auto known_vendor_type(std::uint8_t raw) noexcept -> bool {
         case VendorType::role_certificate:
         case VendorType::eject:
         case VendorType::vpc_config:
+        case VendorType::group_members:
+        case VendorType::group_membership:
             return true;
     }
     return false;

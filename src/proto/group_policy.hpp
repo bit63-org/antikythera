@@ -28,13 +28,15 @@
 //   0x28  rate_bytes        u64  replicated bytes per second, per source NIC
 //   0x30  burst_bytes       u64  bucket depth in bytes
 //   0x38  max_remote_vteps  u32  flood-list cap
-//   0x3C  max_groups_per_nic u16 snooped-group cap (0 until snooping exists)
+//   0x3C  max_groups_per_nic u16 snooped joins per NIC, at most 256; 0 refuses
+//                                every join
 //   0x3E  reserved          2 bytes, zero
 //   0x40  signature         64 bytes, Ed25519 over every byte before it
 //
 // A `drop` policy (the default every VPC starts with) has every limit zero.
 // A `multicast` policy has every rate, burst and the flood-list cap
-// non-zero and within the bounds below; max_groups_per_nic may be zero.
+// non-zero and within the bounds below; max_groups_per_nic may be zero
+// (no NIC in the VPC may join a group).
 // The bounds are oar-net's (vswitch.hpp group_*_max), mirrored so this
 // header depends on nothing else.
 
@@ -62,6 +64,7 @@ inline constexpr std::uint32_t max_group_burst_frames = 1U << 20U;
 inline constexpr std::uint64_t max_group_rate_bytes = std::uint64_t{1} << 37U;
 inline constexpr std::uint64_t max_group_burst_bytes = std::uint64_t{1} << 32U;
 inline constexpr std::uint32_t max_group_remote_vteps = 1U << 16U;
+inline constexpr std::uint16_t max_group_groups_per_nic = 256;
 
 // Values are part of the wire protocol: never renumber.
 enum class GroupMode : std::uint8_t {
@@ -128,7 +131,8 @@ namespace detail {
                 p.burst_bytes == 0 || p.max_remote_vteps == 0 ||
                 p.rate_frames > max_group_rate_frames || p.burst_frames > max_group_burst_frames ||
                 p.rate_bytes > max_group_rate_bytes || p.burst_bytes > max_group_burst_bytes ||
-                p.max_remote_vteps > max_group_remote_vteps) {
+                p.max_remote_vteps > max_group_remote_vteps ||
+                p.max_groups_per_nic > max_group_groups_per_nic) {
                 return std::unexpected(DecodeError::bad_group_limits);
             }
             return {};

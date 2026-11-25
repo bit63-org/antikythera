@@ -162,7 +162,7 @@ non-regular file, group/other permission bits, or the wrong size.
 One per data-plane role. MCTP message types (vendor-defined) for:
 `function_inventory`, `prepare_function`, `clean_function`,
 `deliver_key`, `drop_key`, `map_update`, `group_policy`, `group_usage`,
-`health`. Transport binding:
+`group_members`, `group_membership`, `health`. Transport binding:
 `SmbusBinding` (hardware), `I3cBinding` (later), `SocketBinding` (harbor,
 one Unix socket per slot), `InProcessBinding` (combined placement).
 
@@ -193,6 +193,14 @@ wraps in a report header and sends (Requirement 11). The role keeps a
 detached NIC's final meter until it has answered one `group_usage`; helm
 then keeps it until the controller acknowledges that report.
 
+`group_members` forwards the controller's GroupMembers frame (per-group
+VTEP lists for one multicast VPC, up to 77,920 bytes) in the same chunk
+format as `map_update`. `group_membership` reads a network role's snooped
+joins in pages of 120, from one snapshot. helm sends the generation it
+last read whole; a role whose list is still that generation answers
+"unchanged" with no entries, so helm can ask every second and the list
+crosses the link only when it changed (oar-net task 14.2).
+
 `tunnel_peers` forwards a controller TunnelPeers frame (a VTEP's
 WireGuard peers and their public keys) the same way and in the same chunk
 format; a chunk of one transfer type never continues the other.
@@ -215,8 +223,8 @@ a path that fails the MTU probes, an unkeyed tunnel) degrades the
 inventory's health, and a change to the inventory's VTEPs, tunnel keys or
 health is sent to the controller as a fresh inventory report.
 
-`instance_metadata` (vendor type 0x1B; 0x19 and 0x1A are planned for
-oar-net task 14.2's group members) forwards a controller InstanceMetadata
+`instance_metadata` (vendor type 0x1B, after task 14.2's 0x19
+`group_members` and 0x1A `group_membership`) forwards a controller InstanceMetadata
 frame (up to 18,808 bytes) to a network role in the same chunk format as
 `map_update`. helm keeps the newest frame per NIC and drops it when the
 NIC's detach completes; it replays all of them, in NIC ID order, to a

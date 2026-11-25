@@ -54,6 +54,9 @@
 //   eject               0  fn u16 | 2  op u8 (EjectOp) | 3  reserved u8
 //   vpc_config          0  frame (proto::VpcConfigFrame, signed; min_vpc_config_frame
 //                          to max_vpc_config_frame bytes)
+//   group_members       0  total u32 | 4  offset u32 | 8  chunk (as map_update)
+//   group_membership    0  cursor u16 | 2  flags u16 (bit 0: `since` is set)
+//                       4  since u32 (the generation helm last read whole)
 //
 // The tunnel requests deliver the network role's WireGuard keys (oar-net
 // Requirement 5.2): its own static X25519 private key, and for each peer
@@ -161,6 +164,14 @@
 //                          drop_rate, drop_fanout: u64 each
 //                       entries [cursor, cursor + count) of the snapshot, which
 //                       is in strictly increasing (nic_id, attachment) order
+//   group_membership    2  generation u32 | 6  total u16 | 8  count u16
+//                       10 flags u8 (bit 0: unchanged) | 11 reserved [3]
+//                       14 count x 32 (the proto group_membership report entry):
+//                          nic_id u64 | vni u32 | family u8 (4, 6) | reserved [3]
+//                          | group [16] (IPv4 in the first four bytes)
+//                       entries [cursor, cursor + count) of the snapshot, in
+//                       strictly increasing (nic_id, family, group) order;
+//                       an unchanged answer has total and count zero
 //
 // Every decoder here is strict (exact length, zero reserved bytes, known
 // enum values, non-zero identifiers) and every encoder enforces the same
@@ -262,6 +273,20 @@ inline constexpr std::size_t max_replica_config_frame = 0x88 + (5 * 0x20) + (16 
 inline constexpr std::size_t min_vpc_config_frame = 0x48 + 64;
 inline constexpr std::size_t max_vpc_config_frame =
     0x48 + (4 * 4) + (4 * 16) + (100 * 0x20) + 253 + 64;
+// Largest GroupMembers frame (proto::max_group_members_size: 32-byte
+// header, 512 groups of 24 bytes, 4096 VTEPs of 16, 64-byte signature),
+// pinned the same way.
+inline constexpr std::size_t max_group_members_frame = 0x20 + (512 * 0x18) + (4096 * 0x10) + 64;
+static_assert(max_group_members_frame <= max_map_frame);
+inline constexpr std::size_t membership_request_size = 8;
+inline constexpr std::size_t membership_head_size = 12;
+inline constexpr std::size_t membership_entry_size = 32;
+inline constexpr std::size_t max_membership_page = 120;  // 3854 bytes: one message
+// oar-net's max_role_memberships and proto::max_group_membership_entries,
+// mirrored: one role never reports more joins.
+inline constexpr std::size_t max_memberships = 1024;
+inline constexpr std::uint16_t membership_since = 0x0001;
+inline constexpr std::uint8_t membership_unchanged = 0x01;
 inline constexpr std::size_t volume_op_frame_size = 0x30 + 0x30 + 64;  // proto::volume_op_size
 inline constexpr std::size_t lease_grant_size = 16;
 inline constexpr std::size_t report_request_size = 16;
@@ -346,6 +371,7 @@ enum class BodyError : std::uint8_t {
     zero_key,           // a tunnel private or public key is all zero
     bad_image,          // an image volume's image name is all zero
     bad_csr,            // a certificate request longer than max_csr
+    bad_group,          // a membership's family is not 4 or 6, or an IPv4 group has a tail
 };
 
 [[nodiscard]] auto to_string(BodyError e) noexcept -> const char*;
@@ -677,6 +703,66 @@ private:
     bool _open{false};  // a snapshot whose last page has not been served
 };
 
+// One NIC's snooped join of one multicast group (oar-net VSwitch
+// Membership), as group_membership lists it.
+struct MembershipEntry {
+    NicId nic_id{0};
+    std::uint32_t vni{0};
+    bool ipv6{false};
+    std::array<std::byte, 16> group{};  // IPv4 in the first four bytes, the rest zero
+
+    friend auto operator==(const MembershipEntry&, const MembershipEntry&) -> bool = default;
+};
+
+struct MembershipRequest {
+    std::uint16_t cursor{0};
+    // The generation helm last read whole; cursor 0 with a matching
+    // generation is answered "unchanged" without a snapshot.
+    std::optional<std::uint32_t> since;
+
+    friend auto operator==(const MembershipRequest&, const MembershipRequest&) -> bool = default;
+};
+
+struct MembershipPage {
+    std::uint32_t generation{0};  // of the snapshot the page is from
+    bool unchanged{false};        // only on cursor 0: total and entries are empty
+    std::uint16_t total{0};
+    std::vector<MembershipEntry> entries;
+
+    friend auto operator==(const MembershipPage&, const MembershipPage&) -> bool = default;
+};
+
+// The role's side of group_membership paging. `generation` names the
+// role's current join list (it changes whenever the list does); cursor 0
+// answers unchanged when it equals the request's `since`, and otherwise
+// takes a fresh snapshot from `snapshot`, which later pages are served
+// from. A snapshot larger than max_memberships is cut to it.
+class MembershipPager {
+public:
+    using Snapshot = std::vector<MembershipEntry>;
+
+    template<typename F>
+    auto page(const MembershipRequest& request, std::uint32_t generation, F&& snapshot)
+        -> std::expected<MembershipPage, Status> {
+        if (request.cursor == 0) {
+            if (request.since == generation) {
+                return MembershipPage{
+                    .generation = generation, .unchanged = true, .total = 0, .entries = {}};
+            }
+            take(generation, std::forward<F>(snapshot)());
+        }
+        return serve(request.cursor);
+    }
+
+private:
+    auto take(std::uint32_t generation, Snapshot fresh) -> void;
+    auto serve(std::uint16_t cursor) -> std::expected<MembershipPage, Status>;
+
+    std::uint32_t _generation{0};
+    Snapshot _snapshot;
+    bool _open{false};
+};
+
 // The role's side of hold_reports: the reports it has not yet seen helm
 // read whole, oldest first, at most `limit` (older ones are dropped and
 // counted: a status report supersedes them, and faults repeat).
@@ -728,6 +814,17 @@ struct ResponseView {
     -> std::expected<std::vector<std::byte>, BodyError>;
 [[nodiscard]] auto decode_usage_page(std::span<const std::byte> body, std::uint16_t cursor)
     -> std::expected<UsagePage, BodyError>;
+// group_membership bodies. decode_membership_page checks the page against
+// the cursor that asked for it.
+[[nodiscard]] auto encode_membership_request(const MembershipRequest& request)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_membership_request(std::span<const std::byte> body) noexcept
+    -> std::expected<MembershipRequest, BodyError>;
+[[nodiscard]] auto encode_membership_page(const MembershipPage& page, std::uint16_t cursor)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_membership_page(std::span<const std::byte> body, std::uint16_t cursor)
+    -> std::expected<MembershipPage, BodyError>;
+// group_members chunks use the map_update chunk format (MapChunk).
 
 // hold_reports chunk bodies.
 [[nodiscard]] auto encode_report_chunk(const ReportChunk& c)

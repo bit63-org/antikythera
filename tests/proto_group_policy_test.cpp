@@ -136,7 +136,7 @@ BOOST_AUTO_TEST_CASE(rules_are_enforced_both_ways) {
     BOOST_TEST((encode_error(p) == DecodeError::unknown_value));
 
     // multicast: every limit set and bounded; the group cap may be zero.
-    for (int field = 0; field < 10; ++field) {
+    for (int field = 0; field < 11; ++field) {
         p = multicast();
         switch (field) {
             case 0:
@@ -166,12 +166,18 @@ BOOST_AUTO_TEST_CASE(rules_are_enforced_both_ways) {
             case 8:
                 p.burst_bytes = proto::max_group_burst_bytes + 1;
                 break;
-            default:
+            case 9:
                 p.max_remote_vteps = proto::max_group_remote_vteps + 1;
+                break;
+            default:
+                p.max_groups_per_nic = proto::max_group_groups_per_nic + 1;
                 break;
         }
         BOOST_TEST((encode_error(p) == DecodeError::bad_group_limits));
     }
+    p = multicast();
+    p.max_groups_per_nic = proto::max_group_groups_per_nic;
+    BOOST_TEST(proto::encode_group_policy(p).has_value());
     // drop: no limits at all.
     p = drop();
     p.max_groups_per_nic = 1;

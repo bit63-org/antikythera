@@ -69,6 +69,11 @@
   which is where a detach's final reading appears). Final readings are
   held by the ControllerSession's unacknowledged-report replay
   (Requirement 11.3), so the reporter does not keep them itself.
+  oar-net task 14.2 extends it (Requirement 11.4): GroupMembers frames
+  are kept and fanned out like policies (after them on a reopen), and
+  every `DaemonConfig::membership_interval` (one second) each network
+  role is asked for its joins with the generation last read, reported
+  whole as `group_membership` when changed.
 - [ ] 14. OarLink `instance_metadata` (chunked), newest frame per NIC
   kept until detach, forwarded to the NIC's network role and replayed
   when a role's sideband reopens. _Requirements: 12_ (oar-net task 21.3)

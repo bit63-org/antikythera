@@ -107,6 +107,30 @@ As built (task 8):
   Hypervisor exits cleanly when the guest powers off), any other exit or a
   signal as `vmm_failure` with the exit code or 128 + signal.
 
+As built (task 9):
+
+- A function's VFIO group node is handed to the VM's UID (0600) for
+  exactly as long as the VM holds it, and back to root afterwards; this
+  is what confines the VMM to its own functions inside the jail's
+  `/dev/vfio` rule.
+- The VM boots right after its first storage function is attached:
+  before that the firmware has nothing to boot. Functions attached
+  before boot are cold-plugged into the configuration; after, hot-plugged.
+- Detach on a running VM answers `accepted`; completion is the
+  `DEVICE_RELEASED` event, sent once `vm.info` no longer lists the
+  function. helm waits `timeout_s` beyond its `release_timeout` for it.
+- Cloud Hypervisor has no surprise removal: `vm.remove-device` only asks
+  the guest, and a function leaves a running VMM only when the guest
+  ejects it. So `force` cannot free the function on time. At the timeout
+  the agent resets it in place (the guest loses the device's state and
+  sees a function that no longer answers as before) and releases it when
+  the guest finally ejects it or the VM ends; until then it stays booked
+  to that VM and no other VM can be given it. `destroy_vm` is the policy
+  that frees a function on time. A real forced unplug needs upstream
+  Cloud Hypervisor support.
+- `destroy_vm` reports the VM it killed with `VM_EXITED` (`vmm_failure`,
+  128 + SIGKILL), the only event that tells helm a VM is gone.
+
 ### Reset
 
 - Whole-slot functions: secondary bus reset through the downstream port's

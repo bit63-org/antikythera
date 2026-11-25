@@ -1,6 +1,6 @@
 # Implementation Plan — hull: the minimal host and its agent
 
-## Status: 7/11 tasks complete
+## Status: 8/11 tasks complete
 
 ## Tasks
 
@@ -80,8 +80,30 @@
   and answers its API, inside real jails (root in kernel-interop,
   unprivileged in ctest). A created VM boots once task 9 attaches its
   volume; the real Cloud Hypervisor runs in harbor (phase 3).
-- [ ] 9. Attach/detach via the VMM API socket with eject timeout policy.
-  _Requirements: 7_
+- [x] 9. Attach/detach via the VMM API socket with eject timeout policy.
+  _Requirements: 7_ — `src/hull/vm_supervisor.*`: `ATTACH_DEVICE` and
+  `ATTACH_VOLUME` check the boot inventory (slot, type, function) and
+  that no VM holds the function, hand its VFIO group node to the VM's UID
+  (`VmmHandle::grant_group`, chown 0600, refusing anything but a
+  character device), then `vm.add-device`: a cold-plug before boot, a
+  hot-plug after. The first storage function attached to a created VM is
+  its boot volume and the VM boots right after (Requirement 6.2). A
+  timed-out add is resolved from `vm.info`, so a function the VMM did
+  take is never booked as free. `DETACH_DEVICE` and `DETACH_VOLUME` send
+  `vm.remove-device`; before boot that releases at once (`ok`), after it
+  the agent answers `accepted` and `poll_detaches()` releases the
+  function once it leaves `vm.info` (the guest ejected it). At the
+  timeout `destroy_vm` kills the VM (`VM_EXITED`, then every function
+  released); `force` resets the function in place, because Cloud
+  Hypervisor cannot hot-unplug without the guest, and releases it when
+  the guest ejects it or the VM ends. Every release revokes the group
+  node, resets the function and sends `DEVICE_RELEASED`. helm now waits
+  `timeout_s` longer than `release_timeout` for that event after a
+  detach. Tested with fakes and end to end against `tests/fake_vmm`;
+  the group-node handover is tested on real device nodes as root.
+  `DetachPolicy::wait` (block-volume task 13) gets no deadline: helm
+  relays it only after the guest let go, so the agent releases the
+  function whenever the eject completes and never forces it.
 - [ ] 10. UKI build, Secure Boot signing and measured boot in harbor (OVMF
   with Secure Boot at L0). _Requirements: 1_
 - [ ] 11. Host overhead measurement and documentation. _Requirements: 8.2_

@@ -259,6 +259,46 @@ Clearing a VPC's configuration is not a frame: a VPC keeps one from its
 first NIC's attach until it is deleted, and a server that no longer hosts
 the VPC drops it with the VNI's mapping.
 
+## InstanceMetadata
+
+Requirement 11 and oar-net Requirement 13. One frame per attached NIC,
+sent to the server hosting it. The record holds only what the server
+cannot derive: the NIC's MAC and addresses come from its signed mapping
+entry and the subnet's prefix from `VpcConfig`, so the metadata service
+answers them from the same frames the data plane enforces.
+
+```
+InstanceMetadata {            // controller -> helm -> oar-net, signed;
+                              // src/proto/instance_metadata.hpp, LE
+  0x00 magic 'AKIM' u32, 0x04 version u16 (1), 0x06 key_id u16,
+  0x08 server_id u64, 0x10 nic_id u64, 0x18 metadata_version u64,
+  0x20 vni u32, 0x24 http_endpoint u8 (0 disabled, 1 enabled),
+  0x25 http_tokens u8 (0 optional, 1 required),
+  0x26 put_hop_limit u8 (1..64), 0x27 device_index u8,
+  0x28 launch_index u32, 0x2C user_data_size u16 (<= 16384),
+  0x2E reserved u16, 0x30 pending_time u64 (Unix seconds),
+  0x38 strings: instance_id, image_id, instance_type, account_id,
+       local_hostname, availability_zone, region, interface_id, vpc_id,
+       each { size u8 | bytes },
+       user_data [user_data_size],
+       signature [64]         // Ed25519 over every byte before it
+}
+```
+
+Strings are 1 to 255 printable ASCII bytes without spaces, except that
+`local_hostname` follows RFC 1123 host name syntax. The IDs keep EC2's
+prefixes (`i-`, `ami-`, `eni-`, `vpc-`) because guests parse them. User
+data is opaque bytes, served verbatim. The largest frame is 18,808 bytes
+(nine 255-byte strings and 16 KiB of user data), so helm forwards it as
+consecutive chunks like `MapUpdate`. The link record is type 16 (15 is
+`group_members`).
+
+A NIC keeps a record from before its attach until its detach, and a
+server drops the NIC's record when the NIC is cleaned, so there is no
+delete frame. An interface moved to another instance gets a new record
+with a higher version before it is attached there; the server where it
+was attached has dropped the old one at detach.
+
 ## TunnelPeers
 
 oar-net carries VTEP-to-VTEP traffic inside WireGuard (oar-net
@@ -328,8 +368,9 @@ block volume records `replica_config`, `volume_op`, `volume_key`, `lease_grant` 
 `role_certificate` (types 8 to 12, `.kiro/specs/block-volume-service/`),
 `image_key` (type 13, an encrypted image's key for the image volume a
 CREATE_VOLUME is about to create, `.kiro/specs/oar-blk-data-plane/` task 15),
-`vpc_config` (type 14, a VpcConfig frame) and `group_members` (type 15,
-a GroupMembers frame). Helm to controller: `hello` (`server_id u64 |
+`vpc_config` (type 14, a VpcConfig frame), `group_members` (type 15,
+a GroupMembers frame) and `instance_metadata` (type 16, an
+InstanceMetadata frame). Helm to controller: `hello` (`server_id u64 |
 boot_id u64`, the first record on every connection) and `report`. Report sequence
 numbers restart when helm reboots, so the controller keys them by the
 connection's boot ID and drops any `(boot_id, report_seq)` it has already
@@ -389,6 +430,7 @@ controller                       helm                hull
   CREATE_VOLUME (root)  ───────►  oar-blk prepares
   CREATE_VM             ───────►  ───────────────────► start VMM (paused)
   ATTACH_VOLUME         ───────►  deliver key ───────► hot-plug blk fn
+  InstanceMetadata      ───────►  to the NIC's network role
   ATTACH_DEVICE (NIC)   ───────►  set VPC/MAC/NIC ID ► hot-plug VF
   MAP_UPDATE (VPC peers)
   start                  ───────────────────────────► resume VM

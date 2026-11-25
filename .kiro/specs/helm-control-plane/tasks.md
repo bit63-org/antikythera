@@ -69,6 +69,9 @@
   which is where a detach's final reading appears). Final readings are
   held by the ControllerSession's unacknowledged-report replay
   (Requirement 11.3), so the reporter does not keep them itself.
+- [ ] 14. OarLink `instance_metadata` (chunked), newest frame per NIC
+  kept until detach, forwarded to the NIC's network role and replayed
+  when a role's sideband reopens. _Requirements: 12_ (oar-net task 21.3)
 
 Wiring (not a numbered task): `HelmDaemon` and `ak-helm` join the
 ControllerLink, CommandRouter, PowerSequencer and per-slot OarLinks into

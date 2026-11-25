@@ -309,9 +309,21 @@
   an older one fails) and applies it with `VSwitch::set_vpc_config`; a
   frame the VSwitch refuses leaves the previous config. Routes are
   applied by task 22.
-- [ ] 21. Metadata service: the endpoint on the oar-net board, helm's
-  service keyed by NIC ID, IMDSv2 tokens (helm and controller specs).
-  _Requirements: 13.4_
+- [ ] 21. Metadata service, answered on the oar-net board from the
+  controller's signed per-NIC records (see design "Metadata service").
+  _Requirements: 13.4-13.8_
+  - [x] 21.1 Spec: controller-interface Requirement 11 and the
+    `InstanceMetadata` frame, helm-control-plane Requirement 12, and
+    Requirements 13.4 to 13.8 here.
+  - [ ] 21.2 `InstanceMetadata` codec and link record
+    (controller-interface task 16).
+  - [ ] 21.3 helm forwards and replays records (helm-control-plane task
+    14); `NetRole` verifies and keeps them (`metadata_store`), dropping
+    a NIC's on clean.
+  - [ ] 21.4 HTTP layer with IMDSv2 tokens and the path table
+    (`metadata_http`), over socket pairs in tests.
+  - [ ] 21.5 TAP endpoint and alias translation (`metadata_nat`), with a
+    fuzz target, wired as the role's `MetadataEndpoint`.
 - [x] 22. Per-NIC source/destination check opt-out, with route-table
   targets that name a NIC (VPC step 3). _Requirements: 11.10, 12.7_ —
   MapUpdate format v3 carries the opt-out in each entry's flags byte

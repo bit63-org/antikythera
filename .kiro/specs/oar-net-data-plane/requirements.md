@@ -322,7 +322,27 @@ its own metadata, whatever it puts in its packets.
 3. Packets the endpoint injects for a NIC SHALL be delivered to that NIC
    only, and only when their source is the metadata address and their
    destination is one of that NIC's guest addresses.
-4. The metadata service itself (HTTP, IMDSv2 session tokens, and the path
-   from the endpoint through helm to the controller's records) SHALL be
-   specified with it; until then a VNI without an endpoint drops these
-   packets and counts them.
+4. The network role SHALL answer intercepted requests itself, from the
+   NIC's signed `InstanceMetadata` record (controller-interface
+   Requirement 11), its mapping entry and its VPC's `VpcConfig`. A NIC
+   without a record, or in a VNI the role has no endpoint for, SHALL get
+   no answer: its packets are dropped and counted.
+5. Only TCP to port 80 SHALL reach the service; other intercepted
+   packets SHALL be dropped and counted. Each NIC SHALL be limited to a
+   bounded number of open connections, and each connection to bounded
+   request sizes and read deadlines.
+6. The service SHALL implement IMDSv2 as EC2 does: `PUT
+   /latest/api/token` with `X-aws-ec2-metadata-token-ttl-seconds` from 1
+   to 21600 returns a session token; a token SHALL be valid only for the
+   NIC and instance it was issued to and only until it expires, and
+   SHALL be refused on any other NIC; a token request carrying
+   `X-Forwarded-For` SHALL be refused; the token response SHALL leave
+   with an IP TTL or hop limit equal to the record's
+   `HttpPutResponseHopLimit`.
+7. With `HttpTokens` required, a request without a valid token SHALL be
+   answered 401; with it optional, a request with no token is served and
+   one with an invalid token is answered 401. With `HttpEndpoint`
+   disabled, connections from the NIC SHALL be reset.
+8. Tokens SHALL be authenticated with a key the role generates when it
+   starts and never exports, so they die with the role, as EC2 tokens die
+   with a stop; guests fetch a new one on 401.

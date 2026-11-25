@@ -215,6 +215,15 @@ a path that fails the MTU probes, an unkeyed tunnel) degrades the
 inventory's health, and a change to the inventory's VTEPs, tunnel keys or
 health is sent to the controller as a fresh inventory report.
 
+`instance_metadata` (vendor type 0x1B; 0x19 and 0x1A are planned for
+oar-net task 14.2's group members) forwards a controller InstanceMetadata
+frame (up to 18,808 bytes) to a network role in the same chunk format as
+`map_update`. helm keeps the newest frame per NIC and drops it when the
+NIC's detach completes; it replays all of them, in NIC ID order, to a
+network role whose sideband reopens, before the router can prepare a NIC
+there (Requirement 12). The role answers the guest's metadata requests
+itself (oar-net design "Metadata service").
+
 `create_volume`, `delete_volume` and `rewrap_volume` are the storage
 role's half of the volume commands: the role keeps the wrapped key (opaque
 to it) in the volume's metadata and releases the space on delete. Other

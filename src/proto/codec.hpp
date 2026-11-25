@@ -84,6 +84,8 @@ enum class DecodeError : std::uint8_t {
     bad_route,                // a route prefix with host bits set or too long for its family
     bad_members_version,      // group member list version 0 (versions start at 1)
     bad_group,                // a group address that is not a replicable multicast group
+    bad_metadata_version,     // instance metadata version 0 (versions start at 1)
+    bad_metadata,             // an instance metadata string, option or user data outside its rules
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -194,6 +196,10 @@ enum class DecodeError : std::uint8_t {
             return "group members version 0";
         case DecodeError::bad_group:
             return "not a replicable multicast group";
+        case DecodeError::bad_metadata_version:
+            return "instance metadata version 0";
+        case DecodeError::bad_metadata:
+            return "instance metadata field outside its rules";
     }
     return "unknown";
 }

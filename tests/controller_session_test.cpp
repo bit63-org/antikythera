@@ -19,6 +19,7 @@
 #include "proto/group_policy.hpp"
 #include "proto/link.hpp"
 #include "proto/group_members.hpp"
+#include "proto/instance_metadata.hpp"
 #include "proto/vpc_config.hpp"
 #include "test_support.hpp"
 
@@ -48,6 +49,7 @@ struct RecordingSink final : helm::ControllerSink {
     std::vector<proto::LeaseGrant> grants;
     std::vector<std::pair<proto::VpcConfigFrame, std::vector<std::byte>>> vpc_configs;
     std::vector<std::pair<proto::GroupMembers, std::vector<std::byte>>> members;
+    std::vector<std::pair<proto::InstanceMetadata, std::vector<std::byte>>> metadata;
 
     auto on_envelope(const proto::Envelope& e) -> void override { envelopes.push_back(e); }
     auto on_map_update(const proto::MapUpdate& u, std::span<const std::byte> frame)
@@ -84,6 +86,10 @@ struct RecordingSink final : helm::ControllerSink {
     auto on_group_members(const proto::GroupMembers& m, std::span<const std::byte> frame)
         -> void override {
         members.emplace_back(m, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
+    auto on_instance_metadata(const proto::InstanceMetadata& m, std::span<const std::byte> frame)
+        -> void override {
+        metadata.emplace_back(m, std::vector<std::byte>{frame.begin(), frame.end()});
     }
     std::vector<proto::RoleCertificate> certificates;
     auto on_role_certificate(const proto::RoleCertificate& c) -> void override {
@@ -271,6 +277,27 @@ auto group_members_record(std::uint64_t to) -> std::vector<std::byte> {
     auto b = proto::encode_group_members(m);
     BOOST_REQUIRE(b.has_value());
     return framed(RecordType::group_members, *b);
+}
+
+auto instance_metadata_record(std::uint64_t to) -> std::vector<std::byte> {
+    proto::InstanceMetadata m{};
+    m.server_id = to;
+    m.key_id = key;
+    m.nic_id = 0x11;
+    m.metadata_version = 6;
+    m.vni = 5;
+    m.instance_id = "i-0abc";
+    m.image_id = "ami-0abc";
+    m.instance_type = "m5.large";
+    m.account_id = "123456789012";
+    m.local_hostname = "ip-10-0-0-17.ec2.internal";
+    m.availability_zone = "harbor-1a";
+    m.region = "harbor-1";
+    m.interface_id = "eni-0abc";
+    m.vpc_id = "vpc-0abc";
+    auto b = proto::encode_instance_metadata(m);
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::instance_metadata, *b);
 }
 
 auto tunnel_peers_record(std::uint64_t to) -> std::vector<std::byte> {
@@ -575,6 +602,8 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
     bad_vpc[proto::record_header_size] = std::byte{0};  // VpcConfig magic
     auto bad_members = group_members_record(server);
     bad_members[proto::record_header_size] = std::byte{0};  // GroupMembers magic
+    auto bad_metadata = instance_metadata_record(server);
+    bad_metadata[proto::record_header_size] = std::byte{0};  // InstanceMetadata magic
     const Case cases[] = {
         {envelope_record(other_server, 10), SessionError::wrong_server},
         {map_update_record(other_server), SessionError::wrong_server},
@@ -585,6 +614,8 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
         {bad_vpc, SessionError::bad_record},
         {group_members_record(other_server), SessionError::wrong_server},
         {bad_members, SessionError::bad_record},
+        {instance_metadata_record(other_server), SessionError::wrong_server},
+        {bad_metadata, SessionError::bad_record},
         {bad_envelope, SessionError::bad_record},
         {bad_peers, SessionError::bad_record},
         {framed(RecordType::report, *report_payload), SessionError::wrong_direction},
@@ -604,7 +635,32 @@ BOOST_FIXTURE_TEST_CASE(protocol_violations_end_the_connection, Fixture) {
         BOOST_TEST(f.sink.policies.empty());
         BOOST_TEST(f.sink.vpc_configs.empty());
         BOOST_TEST(f.sink.members.empty());
+        BOOST_TEST(f.sink.metadata.empty());
     }
+}
+
+// Requirement 11.4: a NIC's InstanceMetadata for this server reaches the
+// sink as its exact frame, for helm to forward unmodified.
+BOOST_FIXTURE_TEST_CASE(instance_metadata_reaches_the_sink_unmodified, Fixture) {
+    session.on_connected();
+    const auto rec = instance_metadata_record(server);
+    BOOST_REQUIRE(session.on_bytes(rec).has_value());
+    BOOST_REQUIRE(sink.metadata.size() == 1U);
+    BOOST_TEST(sink.metadata[0].first.nic_id == 0x11U);
+    BOOST_TEST(sink.metadata[0].first.metadata_version == 6U);
+    BOOST_TEST(std::ranges::equal(sink.metadata[0].second,
+                                  std::span{rec}.subspan(proto::record_header_size)));
+    // A sink that predates it drops it quietly.
+    DefaultSink quiet;
+    helm::ControllerSession other{server, boot,
+                                  [] {
+                                      proto::Inventory inv;
+                                      inv.boot_id = 1;
+                                      return inv;
+                                  },
+                                  quiet};
+    other.on_connected();
+    BOOST_TEST(other.on_bytes(rec).has_value());
 }
 
 // Requirement 7.9: a GroupMembers frame for this server reaches the sink as

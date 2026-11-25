@@ -153,6 +153,20 @@ auto Signer::vpc_config(const proto::VpcConfigFrame& config) const
     return *frame;
 }
 
+auto Signer::instance_metadata(const proto::InstanceMetadata& metadata) const
+    -> std::optional<std::vector<std::byte>> {
+    auto frame = proto::encode_instance_metadata(metadata);
+    if (!frame) {
+        return std::nullopt;
+    }
+    const auto sig = sign(proto::instance_metadata_signed_bytes(*frame));
+    if (!sig) {
+        return std::nullopt;
+    }
+    proto::set_instance_metadata_signature(*frame, *sig);
+    return std::move(*frame);
+}
+
 auto Signer::group_members(const proto::GroupMembers& members) const
     -> std::optional<std::vector<std::byte>> {
     auto frame = proto::encode_group_members(members);
@@ -531,6 +545,100 @@ auto group_members(std::span<const std::string_view> args)
     check.key_id = 1;
     if (auto ok = proto::encode_group_members(check); !ok) {
         return std::unexpected(std::string{"group-members: "} + proto::to_string(ok.error()));
+    }
+    return out;
+}
+
+// instance-metadata NIC VNI VERSION INSTANCE_ID then KEY=VALUE overrides
+// of a sample record.
+auto instance_metadata(std::span<const std::string_view> args)
+    -> std::expected<SendInstanceMetadata, std::string> {
+    if (args.size() < 4) {
+        return std::unexpected(
+            "instance-metadata: want NIC VNI VERSION INSTANCE_ID [KEY=VALUE ...]");
+    }
+    auto nic = number<std::uint64_t>(args[0], "NIC ID");
+    auto vni = number<std::uint32_t>(args[1], "VNI");
+    auto version = number<std::uint64_t>(args[2], "metadata version");
+    if (!nic) {
+        return std::unexpected(nic.error());
+    }
+    if (!vni) {
+        return std::unexpected(vni.error());
+    }
+    if (!version) {
+        return std::unexpected(version.error());
+    }
+    SendInstanceMetadata out{};
+    auto& m = out.metadata;
+    m.nic_id = *nic;
+    m.vni = *vni;
+    m.metadata_version = *version;
+    m.instance_id = std::string{args[3]};
+    m.image_id = "ami-0123456789abcdef0";
+    m.instance_type = "m5.large";
+    m.account_id = "123456789012";
+    m.local_hostname = "ip-10-0-0-17.ec2.internal";
+    m.availability_zone = "harbor-1a";
+    m.region = "harbor-1";
+    m.interface_id = "eni-0123456789abcdef0";
+    m.vpc_id = "vpc-0123456789abcdef0";
+    for (const auto arg : args.subspan(4)) {
+        const auto eq = arg.find('=');
+        if (eq == std::string_view::npos) {
+            return std::unexpected("instance-metadata: an option wants KEY=VALUE");
+        }
+        const auto key = arg.substr(0, eq);
+        const auto value = arg.substr(eq + 1);
+        using Named = std::pair<std::string_view, std::string*>;
+        const std::array<Named, 8> strings{{{"image", &m.image_id},
+                                            {"type", &m.instance_type},
+                                            {"account", &m.account_id},
+                                            {"hostname", &m.local_hostname},
+                                            {"az", &m.availability_zone},
+                                            {"region", &m.region},
+                                            {"eni", &m.interface_id},
+                                            {"vpc", &m.vpc_id}}};
+        if (const auto* const s = std::ranges::find(strings, key, &Named::first);
+            s != strings.end()) {
+            *s->second = std::string{value};
+        } else if (key == "user-data") {
+            m.user_data.resize(value.size());
+            std::ranges::transform(value, m.user_data.begin(),
+                                   [](char c) { return static_cast<std::byte>(c); });
+        } else if (key == "endpoint" && (value == "enabled" || value == "disabled")) {
+            m.http_endpoint = value == "enabled" ? proto::MetadataEndpoint::enabled
+                                                 : proto::MetadataEndpoint::disabled;
+        } else if (key == "tokens" && (value == "optional" || value == "required")) {
+            m.http_tokens = value == "required" ? proto::MetadataTokens::required
+                                                : proto::MetadataTokens::optional;
+        } else if (key == "hop" || key == "device") {
+            auto n = number<std::uint8_t>(value, "hop limit or device index");
+            if (!n) {
+                return std::unexpected(n.error());
+            }
+            (key == "hop" ? m.put_hop_limit : m.device_index) = *n;
+        } else if (key == "launch") {
+            auto n = number<std::uint32_t>(value, "launch index");
+            if (!n) {
+                return std::unexpected(n.error());
+            }
+            m.launch_index = *n;
+        } else if (key == "pending") {
+            auto n = number<std::uint64_t>(value, "pending time");
+            if (!n) {
+                return std::unexpected(n.error());
+            }
+            m.pending_time = *n;
+        } else {
+            return std::unexpected("instance-metadata: unknown option " + std::string{arg});
+        }
+    }
+    auto check = m;
+    check.server_id = 1;
+    check.key_id = 1;
+    if (auto ok = proto::encode_instance_metadata(check); !ok) {
+        return std::unexpected(std::string{"instance-metadata: "} + proto::to_string(ok.error()));
     }
     return out;
 }
@@ -923,6 +1031,13 @@ auto parse_line(std::string_view line) -> std::expected<std::optional<Action>, s
         }
         return std::optional<Action>{std::move(*m)};
     }
+    if (verb == "instance-metadata") {
+        auto m = instance_metadata(args);
+        if (!m) {
+            return std::unexpected(m.error());
+        }
+        return std::optional<Action>{std::move(*m)};
+    }
     if (verb == "vpc-config") {
         auto c = vpc_config(args);
         if (!c) {
@@ -1139,6 +1254,7 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::image_key:
         case proto::RecordType::vpc_config:
         case proto::RecordType::group_members:
+        case proto::RecordType::instance_metadata:
             break;
     }
     return std::unexpected("helm sent a controller-only record");
@@ -1277,6 +1393,15 @@ auto TestController::run(const Action& action) -> std::expected<void, std::strin
                     return std::unexpected("could not encode or sign the group members");
                 }
                 return send(proto::RecordType::group_members, *frame);
+            } else if constexpr (std::is_same_v<T, SendInstanceMetadata>) {
+                auto m = a.metadata;
+                m.server_id = _options.server_id;
+                m.key_id = _options.key_id;
+                auto frame = _signer.instance_metadata(m);
+                if (!frame) {
+                    return std::unexpected("could not encode or sign the instance metadata");
+                }
+                return send(proto::RecordType::instance_metadata, *frame);
             } else if constexpr (std::is_same_v<T, SendTunnelPeers>) {
                 const proto::TunnelPeers t{.server_id = _options.server_id,
                                            .key_id = _options.key_id,

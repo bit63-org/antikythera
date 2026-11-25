@@ -317,6 +317,39 @@ BOOST_AUTO_TEST_CASE(group_members_parse_and_sort) {
                    .find("group-members") != std::string::npos);
 }
 
+BOOST_AUTO_TEST_CASE(instance_metadata_parses_with_sample_defaults) {
+    auto a = action(
+        "instance-metadata 17 100 3 i-0123456789abcdef0 tokens=required hop=2 "
+        "endpoint=disabled user-data=echo-hi device=1 launch=4 pending=1700000000 "
+        "region=harbor-2 az=harbor-2b");
+    BOOST_REQUIRE(std::holds_alternative<harbor::SendInstanceMetadata>(a));
+    const auto& m = std::get<harbor::SendInstanceMetadata>(a).metadata;
+    BOOST_TEST(m.nic_id == 17U);
+    BOOST_TEST(m.vni == 100U);
+    BOOST_TEST(m.metadata_version == 3U);
+    BOOST_TEST(m.instance_id == "i-0123456789abcdef0");
+    BOOST_TEST((m.http_tokens == proto::MetadataTokens::required));
+    BOOST_TEST((m.http_endpoint == proto::MetadataEndpoint::disabled));
+    BOOST_TEST(m.put_hop_limit == 2U);
+    BOOST_TEST(m.device_index == 1U);
+    BOOST_TEST(m.launch_index == 4U);
+    BOOST_TEST(m.pending_time == 1'700'000'000U);
+    BOOST_TEST(m.region == "harbor-2");
+    BOOST_TEST(m.availability_zone == "harbor-2b");
+    BOOST_TEST(m.user_data.size() == 7U);
+    BOOST_TEST(m.vpc_id.starts_with("vpc-"));  // a sample default
+
+    BOOST_TEST(parse_error("instance-metadata 17 100 3").find("want NIC") != std::string::npos);
+    BOOST_TEST(parse_error("instance-metadata 17 100 3 x-1").find("instance-metadata") !=
+               std::string::npos);
+    BOOST_TEST(parse_error("instance-metadata 17 100 3 i-1 hop=0").find("instance-metadata") !=
+               std::string::npos);
+    BOOST_TEST(parse_error("instance-metadata 17 100 3 i-1 color=red").find("unknown option") !=
+               std::string::npos);
+    BOOST_TEST(parse_error("instance-metadata 17 100 3 i-1 tokens=maybe").find("unknown option") !=
+               std::string::npos);
+}
+
 BOOST_AUTO_TEST_CASE(expectations_parse) {
     auto e = action("expect stale_sequence");
     BOOST_TEST((std::get<harbor::ExpectOutcome>(e).status == proto::CommandStatus::stale_sequence));

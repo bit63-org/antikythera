@@ -731,6 +731,11 @@ public:
             return all;
         });
     }
+    std::vector<std::vector<std::byte>> records;
+    auto instance_metadata(std::span<const std::byte> frame) -> oar::Status override {
+        records.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
+    }
     std::vector<std::vector<std::byte>> members;
     auto group_members(std::span<const std::byte> frame) -> oar::Status override {
         members.emplace_back(frame.begin(), frame.end());
@@ -833,6 +838,37 @@ BOOST_AUTO_TEST_CASE(group_members_are_forwarded_in_chunks) {
     BOOST_REQUIRE(role.members.size() == 2U);
     BOOST_TEST(role.members[0] == small);
     BOOST_TEST(role.members[1] == largest);
+}
+
+BOOST_AUTO_TEST_CASE(instance_metadata_is_forwarded_in_chunks) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    MeterRole role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const auto small = pattern(300);
+    const auto largest = pattern(oar::max_instance_metadata_frame);  // five chunks
+    {
+        const Server server{endpoint, role};
+        BOOST_TEST(link.instance_metadata(small).has_value());
+        BOOST_TEST(link.instance_metadata(largest).has_value());
+        BOOST_TEST((link.instance_metadata({}).error().code == LinkErrc::bad_request));
+        BOOST_TEST(
+            (link.instance_metadata(pattern(oar::max_instance_metadata_frame + 1)).error().code ==
+             LinkErrc::bad_request));
+    }
+    BOOST_REQUIRE(role.records.size() == 2U);
+    BOOST_TEST(role.records[0] == small);
+    BOOST_TEST(role.records[1] == largest);
+
+    // A role that keeps no records (the default) answers unsupported.
+    auto [helm_c, oar_c] = InProcessBinding::make_pair();
+    FakeOar fake;
+    OarEndpoint other{*oar_c, oar_config()};
+    OarLink other_link{*helm_c, config()};
+    const Server server{other, fake};
+    const auto refused = other_link.instance_metadata(small);
+    BOOST_REQUIRE(!refused.has_value());
+    BOOST_TEST((refused.error().status == oar::Status::unsupported));
 }
 
 namespace {

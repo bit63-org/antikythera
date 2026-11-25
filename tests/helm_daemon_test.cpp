@@ -45,6 +45,7 @@
 #include "proto/group_policy.hpp"
 #include "proto/test_vectors.hpp"
 #include "proto/tunnel_peers.hpp"
+#include "proto/instance_metadata.hpp"
 #include "proto/vpc_config.hpp"
 #include "test_support.hpp"
 #include "tls_test_support.hpp"
@@ -206,6 +207,24 @@ public:
         return vpc_status.load();
     }
 
+    // A network role's instance metadata records, each with the number of
+    // prepares the role had seen when it arrived.
+    struct Metadata {
+        std::vector<std::byte> frame;
+        std::size_t prepares_before;
+    };
+    std::atomic<oar::Status> metadata_status{oar::Status::ok};
+    [[nodiscard]] auto metadata() const -> std::vector<Metadata> {
+        const std::scoped_lock lock{_mutex};
+        return _metadata;
+    }
+    auto instance_metadata(std::span<const std::byte> frame) -> oar::Status override {
+        const std::scoped_lock lock{_mutex};
+        _metadata.push_back(
+            {.frame = {frame.begin(), frame.end()}, .prepares_before = _prepared.size()});
+        return metadata_status.load();
+    }
+
     // A network role's group policy and meters.
     [[nodiscard]] auto policies() const -> std::vector<std::vector<std::byte>> {
         const std::scoped_lock lock{_mutex};
@@ -362,6 +381,7 @@ private:
     std::vector<oar::PrepareFunction> _prepared;
     std::vector<std::vector<std::byte>> _frames;
     std::vector<std::vector<std::byte>> _vpc_configs;
+    std::vector<Metadata> _metadata;
 };
 
 // One slot's board: every connect() opens a fresh in-process sideband and
@@ -1005,6 +1025,104 @@ BOOST_AUTO_TEST_CASE(group_meters_are_reported_and_read_after_a_detach) {
     BOOST_TEST(usage.entries[0].detached);
     BOOST_TEST(usage.entries[0].frames == 7U);
     BOOST_TEST(r.daemon.group_usage().read_failures == 0U);
+}
+
+namespace {
+
+auto metadata_frame(std::uint64_t nic, std::uint64_t version)
+    -> std::pair<proto::InstanceMetadata, std::vector<std::byte>> {
+    proto::InstanceMetadata m;
+    m.key_id = 1;
+    m.server_id = server;
+    m.nic_id = nic;
+    m.metadata_version = version;
+    m.vni = vni;
+    m.instance_id = "i-0123456789abcdef0";
+    m.image_id = "ami-0123456789abcdef0";
+    m.instance_type = "m1.small";
+    m.account_id = "123456789012";
+    m.local_hostname = "ip-10-0-0-5.internal";
+    m.availability_zone = "zone-a";
+    m.region = "region-1";
+    m.interface_id = "eni-0123456789abcdef0";
+    m.vpc_id = "vpc-0123456789abcdef0";
+    auto b = proto::encode_instance_metadata(m);
+    BOOST_REQUIRE(b.has_value());
+    return {m, std::move(*b)};
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(instance_metadata_goes_to_the_nic_s_role_before_its_prepare) {
+    Rig r;
+    (void)r.daemon.boot();
+    const auto [m1, frame1] = metadata_frame(nic_id, 1);
+    std::thread{[&] { r.daemon.on_instance_metadata(m1, frame1); }}.join();
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.net.role.metadata().empty());  // kept until the NIC is plugged
+    const auto [old, old_frame] = metadata_frame(nic_id, 1);
+    r.daemon.on_instance_metadata(old, old_frame);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().instance_metadata_stale == 1U);
+
+    r.daemon.on_envelope(
+        envelope(1, mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib}));
+    r.daemon.run_once(0ms);
+    r.daemon.post_host_slot(response(1, mb::Type::create_vm));
+    const mb::DeviceRef device{.slot = net_slot, .type = mb::DeviceType::nic_vf, .function = 0};
+    mb::AttachDevice attach{
+        .vm_id = vm_one, .device = device, .vni = vni, .nic_id = nic_id, .mac = {}};
+    attach.mac[0] = std::byte{0x02};
+    r.daemon.on_envelope(envelope(2, attach));
+    r.daemon.run_once(0ms);
+    r.daemon.post_host_slot(response(2, mb::Type::attach_device));
+    r.daemon.run_once(0ms);
+    const auto prepares = r.net.role.prepared().size();
+    BOOST_REQUIRE(prepares >= 1U);
+    auto got = r.net.role.metadata();
+    BOOST_REQUIRE(got.size() == 1U);
+    BOOST_TEST((got[0].frame == frame1));                // unmodified
+    BOOST_TEST(got[0].prepares_before == prepares - 1);  // ahead of the NIC's prepare
+    BOOST_TEST(r.blk.role.metadata().empty());
+
+    // A newer record goes straight to the plugged NIC's role; a refusal
+    // is counted.
+    const auto [m2, frame2] = metadata_frame(nic_id, 2);
+    r.daemon.on_instance_metadata(m2, frame2);
+    r.daemon.run_once(0ms);
+    r.net.role.metadata_status = oar::Status::failed;
+    const auto [m3, frame3] = metadata_frame(nic_id, 3);
+    r.daemon.on_instance_metadata(m3, frame3);
+    r.daemon.run_once(0ms);
+    r.net.role.metadata_status = oar::Status::ok;
+    got = r.net.role.metadata();
+    BOOST_REQUIRE(got.size() == 3U);
+    BOOST_TEST((got[1].frame == frame2));
+    BOOST_TEST(r.daemon.stats().instance_metadata == 3U);
+    BOOST_TEST(r.daemon.stats().instance_metadata_refused == 1U);
+
+    // A restarted role gets the plugged NIC's newest record again.
+    r.backplane.dropped.insert(net_slot);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.connects.load() == 2);
+    got = r.net.role.metadata();
+    BOOST_REQUIRE(got.size() == 4U);
+    BOOST_TEST((got[3].frame == frame3));
+
+    // Detach and clean: the record is dropped, and a later record waits
+    // for the next plug instead of reaching the role.
+    r.daemon.on_envelope(envelope(3, mb::DetachDevice{.vm_id = vm_one, .device = device}));
+    r.daemon.run_once(0ms);
+    r.daemon.post_host_slot(response(3, mb::Type::detach_device));
+    r.daemon.run_once(0ms);
+    r.daemon.post_host_slot(
+        event(mb::DeviceReleased{.vm_id = vm_one, .device = device, .reset = mb::ResetResult::ok}));
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().instance_metadata_dropped == 1U);
+    const auto [m4, frame4] = metadata_frame(nic_id, 4);
+    r.daemon.on_instance_metadata(m4, frame4);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.net.role.metadata().size() == 4U);
 }
 
 BOOST_AUTO_TEST_CASE(block_volume_frames_reach_hold_roles_only) {

@@ -48,6 +48,11 @@ auto HelmDaemon::SlotPort::prepare_function(const oar::PrepareFunction& request)
     if (!_slot->link) {
         return disconnected();
     }
+    if (const auto* nic = std::get_if<oar::NicConfig>(&request.config)) {
+        // The record first, so the role can answer the guest's first
+        // metadata request (Requirement 12.1).
+        _daemon->plug_metadata(*_slot, request.fn, nic->nic_id);
+    }
     return _slot->link->prepare_function(request);
 }
 
@@ -58,6 +63,7 @@ auto HelmDaemon::SlotPort::clean_function(const oar::CleanFunction& request)
     }
     auto cleaned = _slot->link->clean_function(request);
     if (cleaned && request.action == CleaningAction::reset_nic_vf) {
+        _daemon->unplug_metadata(_slot->number, request.fn);
         // A detached NIC's final group meter waits in the role: read it on
         // the next pass, not at the next interval (Requirement 11.2).
         _daemon->_groups.nic_detached();
@@ -320,6 +326,13 @@ auto HelmDaemon::on_group_members(const proto::GroupMembers& members,
     enqueue(MembersFrame{.members = members, .frame = {frame.begin(), frame.end()}});
 }
 
+auto HelmDaemon::on_instance_metadata(const proto::InstanceMetadata& metadata,
+                                      std::span<const std::byte> frame) -> void {
+    enqueue(MetadataFrame{.nic_id = metadata.nic_id,
+                          .metadata_version = metadata.metadata_version,
+                          .frame = {frame.begin(), frame.end()}});
+}
+
 auto HelmDaemon::post_host_slot(const mailbox::Slot& slot) -> void {
     enqueue(slot);
 }
@@ -390,6 +403,8 @@ auto HelmDaemon::handle(Item& item) -> void {
         forward_peers(*peers);
     } else if (const auto* policy = std::get_if<PolicyFrame>(&item)) {
         _groups.on_group_policy(policy->policy, policy->frame);
+    } else if (auto* metadata = std::get_if<MetadataFrame>(&item)) {
+        keep_metadata(*metadata);
     } else if (const auto* members = std::get_if<MembersFrame>(&item)) {
         _groups.on_group_members(members->members, members->frame);
     } else if (auto* vpc = std::get_if<VpcFrame>(&item)) {
@@ -435,6 +450,77 @@ auto HelmDaemon::replay_vpc_configs(SlotState& slot) -> void {
     }
     for (const auto& [vni, config] : _vpc_configs) {
         count_vpc_refusal(slot.link->vpc_config(config.frame));
+    }
+}
+
+// ---- instance metadata ------------------------------------------------------------
+
+auto HelmDaemon::count_metadata_refusal(const std::expected<void, LinkError>& r) -> void {
+    if (!r) {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.instance_metadata_refused;
+    }
+}
+
+auto HelmDaemon::keep_metadata(MetadataFrame& metadata) -> void {
+    const auto kept = _metadata.find(metadata.nic_id);
+    if (kept != _metadata.end() && metadata.metadata_version <= kept->second.metadata_version) {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.instance_metadata_stale;
+        return;
+    }
+    {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.instance_metadata;
+    }
+    const auto nic = metadata.nic_id;
+    const auto& frame = _metadata.insert_or_assign(nic, std::move(metadata)).first->second;
+    const auto home = _metadata_homes.find(nic);
+    if (home == _metadata_homes.end()) {
+        return;  // sent with the prepare that plugs the NIC
+    }
+    auto* slot = slot_state(home->second.slot);
+    if (slot != nullptr && is_net_role(*slot)) {
+        count_metadata_refusal(slot->link->instance_metadata(frame.frame));
+    }
+}
+
+auto HelmDaemon::plug_metadata(SlotState& slot, oar::FunctionNumber fn, std::uint64_t nic_id)
+    -> void {
+    if (!is_net_role(slot)) {
+        return;
+    }
+    _metadata_homes.insert_or_assign(nic_id, MetadataHome{.slot = slot.number, .fn = fn});
+    if (const auto kept = _metadata.find(nic_id); kept != _metadata.end()) {
+        count_metadata_refusal(slot.link->instance_metadata(kept->second.frame));
+    }
+}
+
+auto HelmDaemon::unplug_metadata(SlotNumber slot, oar::FunctionNumber fn) -> void {
+    const auto home = std::ranges::find_if(_metadata_homes, [&](const auto& kv) {
+        return kv.second.slot == slot && kv.second.fn == fn;
+    });
+    if (home == _metadata_homes.end()) {
+        return;
+    }
+    if (_metadata.erase(home->first) != 0) {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.instance_metadata_dropped;
+    }
+    _metadata_homes.erase(home);
+}
+
+auto HelmDaemon::replay_metadata(SlotState& slot) -> void {
+    if (!is_net_role(slot)) {
+        return;
+    }
+    for (const auto& [nic, home] : _metadata_homes) {
+        if (home.slot != slot.number) {
+            continue;
+        }
+        if (const auto kept = _metadata.find(nic); kept != _metadata.end()) {
+            count_metadata_refusal(slot.link->instance_metadata(kept->second.frame));
+        }
     }
 }
 
@@ -715,6 +801,7 @@ auto HelmDaemon::attach(SlotState& slot) -> bool {
         return true;
     }
     replay_vpc_configs(slot);  // before the router can prepare a NIC here
+    replay_metadata(slot);     // the records of NICs plugged here, in NIC ID order
     if (inv->role == oar::Role::net) {
         // Every kept group policy before the router can prepare a NIC here.
         _groups.add_slot(slot.number, slot.port);

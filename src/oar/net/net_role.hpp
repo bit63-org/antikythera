@@ -44,6 +44,9 @@
 //                       VTEP lists in the VSwitch (Requirement 10.5, task 14)
 //   group_membership    page through the VSwitch's snooped joins, or answer
 //                       unchanged when helm already has this generation
+//   instance_metadata   verify the controller's InstanceMetadata frame and
+//                       keep it for its NIC (MetadataStore, Requirement 13.4,
+//                       task 21); clean_function drops the NIC's record
 //
 // Volume keys and volumes are not the network role's: deliver_key, drop_key
 // and the volume requests answer unsupported.
@@ -137,6 +140,7 @@
 
 #include "helm/oar_link.hpp"
 #include "oar/net/mapping_table.hpp"
+#include "oar/net/metadata_store.hpp"
 #include "oar/net/mtu.hpp"
 #include "oar/net/tunnel.hpp"
 #include "oar/net/tunnel_peers.hpp"
@@ -289,6 +293,7 @@ public:
     auto group_usage(std::uint16_t cursor)
         -> std::expected<helm::oar::UsagePage, helm::oar::Status> override;
     auto group_members(std::span<const std::byte> frame) -> helm::oar::Status override;
+    auto instance_metadata(std::span<const std::byte> frame) -> helm::oar::Status override;
     auto group_membership(const helm::oar::MembershipRequest& request)
         -> std::expected<helm::oar::MembershipPage, helm::oar::Status> override;
 
@@ -311,6 +316,8 @@ public:
     [[nodiscard]] auto tunnel() -> Tunnel* { return _tunnel.get(); }
     [[nodiscard]] auto peer_set() -> TunnelPeerSet* { return _peer_set.get(); }
     [[nodiscard]] auto counters() const noexcept -> const RoleCounters& { return _counters; }
+    // The NICs' instance metadata records (one per function at most).
+    [[nodiscard]] auto metadata() const noexcept -> const MetadataStore& { return *_metadata; }
 
 private:
     struct Slot {
@@ -347,6 +354,7 @@ private:
     helm::oar::UsagePager _usage;
     std::map<std::uint32_t, std::uint64_t> _members_versions;  // applied members version, by VNI
     helm::oar::MembershipPager _membership;
+    std::unique_ptr<MetadataStore> _metadata;
     RoleCounters _counters;
 };
 

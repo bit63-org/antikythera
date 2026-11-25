@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // .kiro/specs/controller-interface/ Requirements 1.1 and 5.2 and
-// .kiro/specs/block-volume-service/ Requirement 13.4: the signing test
+// .kiro/specs/block-volume-service/ Requirement 13.4 (and kythira's khold
+// Requirement 11.5 for the volume layout): the signing test
 // vectors in src/proto/test_vectors.hpp. For each vector this checks
 // that encoding the listed fields and signing with the listed RFC 8032 key
 // reproduces the bytes exactly, that the frame decodes back to the fields,
@@ -24,6 +25,7 @@
 #include "proto/map_update.hpp"
 #include "proto/replica_config.hpp"
 #include "proto/test_vectors.hpp"
+#include "proto/volume_layout.hpp"
 #include "proto/volume_op.hpp"
 #include "test_support.hpp"
 
@@ -44,6 +46,7 @@ constexpr std::size_t last = 15;
 constexpr std::uint8_t guest_net = 10;
 constexpr std::uint8_t guest_ula_second = 0x12;
 constexpr std::uint16_t rcfg4_port = 7300;
+constexpr std::uint16_t layout6_port = 7400;
 
 auto verifier() -> ak::hull::SignatureVerifier {
     const std::array keys{ak::test::controller_key(vec::envelope1_key_id, vec::key1_public),
@@ -140,6 +143,15 @@ auto check_signed_vector(std::string_view frame_hex, std::string_view sig_hex, c
 auto rcfg4_member(std::uint64_t server, proto::ReplicaRole role) -> proto::ReplicaMember {
     proto::ReplicaMember m{
         .server_id = server, .endpoint = {}, .port = rcfg4_port, .role = role, .replica_gen = 1};
+    m.endpoint[0] = std::byte{ula_prefix};
+    m.endpoint[last] = std::byte{static_cast<std::uint8_t>(server)};
+    return m;
+}
+
+auto layout6_member(std::uint64_t server, proto::MemberKind kind, std::uint8_t drive)
+    -> proto::LayoutMember {
+    proto::LayoutMember m{
+        .server_id = server, .endpoint = {}, .port = layout6_port, .kind = kind, .drive = drive};
     m.endpoint[0] = std::byte{ula_prefix};
     m.endpoint[last] = std::byte{static_cast<std::uint8_t>(server)};
     return m;
@@ -269,6 +281,45 @@ BOOST_AUTO_TEST_CASE(vop5_reproduces_and_verifies) {
         [](std::span<const std::byte> b) { return proto::decode_volume_op(b); },
         [](std::span<const std::byte> b) { return proto::volume_op_signed_bytes(b); },
         [](std::span<std::byte> b, const auto& sig) { proto::set_volume_op_signature(b, sig); });
+}
+
+BOOST_AUTO_TEST_CASE(layout6_reproduces_and_verifies) {
+    using K = proto::MemberKind;
+    const proto::VolumeLayout fields{
+        .key_id = vec::layout6_key_id,
+        .server_id = vec::layout6_server_id,
+        .volume_id = vec::layout6_volume_id,
+        .epoch = vec::layout6_epoch,
+        .lineage_id = 0x2EE,
+        .capacity_blocks = 1U << 20,
+        .block_size = proto::block_size_4096,
+        .stripe_unit = 1U << 20,
+        .flags = 0,
+        .commit_rule = proto::CommitRule::all_in_sync,
+        .group_skew_pct = 10,
+        .qos = {.iops = 3000, .mib_per_s = 125, .burst_iops = 16000, .burst_mib = 1000},
+        .timings = {.member_deadline_ms = 1000, .election_min_ms = 1000, .resync_window_s = 900},
+        .mirror = {},
+        .groups = {{.group_id = 0x5001,
+                    .members = {layout6_member(0x21, K::data, 0), layout6_member(0x22, K::data, 1),
+                                layout6_member(0x23, K::witness, 0)}},
+                   {.group_id = 0x5002,
+                    .members = {layout6_member(0x22, K::data, 0), layout6_member(0x23, K::data, 1),
+                                layout6_member(0x24, K::witness, 0)}}},
+        .gateways = {},
+        .attachments = {{.attachment_id = 0xA1,
+                         .server_id = 7,
+                         .generation = 2,
+                         .mode = proto::AttachMode::rw}},
+        .signature = {}};
+    check_signed_vector(
+        vec::layout6, vec::layout6_signature, fields, TestSigner{vec::key1_secret},
+        [](const proto::VolumeLayout& l) { return proto::encode_volume_layout(l); },
+        [](std::span<const std::byte> b) { return proto::decode_volume_layout(b); },
+        [](std::span<const std::byte> b) { return proto::volume_layout_signed_bytes(b); },
+        [](std::span<std::byte> b, const auto& sig) {
+            proto::set_volume_layout_signature(b, sig);
+        });
 }
 
 BOOST_AUTO_TEST_SUITE_END()

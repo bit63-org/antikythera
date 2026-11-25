@@ -4,7 +4,7 @@
 #pragma once
 
 // Signing test vectors for the controller wire formats. Any controller
-// implementation (kythira's EC2 module) must reproduce these bytes exactly:
+// implementation (kythira's EC2 and khold modules) must reproduce these bytes exactly:
 // encode the listed fields, sign with the listed RFC 8032 section 7.1 test
 // key, and compare. Ed25519 is deterministic, so the signatures are fixed.
 // tests/proto_vectors_test.cpp checks antikythera against them, including
@@ -128,5 +128,88 @@ inline constexpr std::string_view vop5 =
 inline constexpr std::string_view vop5_signature =
     "20cb5073f3685e09b14ab126d8e2a9901ad23310e03c5dd751b7819d629a0a14094074ca9cd484d6e506f165"
     "0ccfc942a1c72d55992f059f6b5eb9dccfc6dd0d";
+
+// Vectors 6 to 11: khold (kythira .kiro/specs/khold-block-service/). The
+// hold wire version 2 frames and the reports are unsigned; they pin the
+// layout, the header CRC32C and the payloads byte for byte.
+//
+// Vector 6: a VolumeLayout (format v1) for server 0x21, signed with key 1
+// (key_id 1): volume 0x200 at epoch 3, lineage 0x2EE, 2^20 blocks of 4096
+// bytes, stripe unit 1 MiB, commit rule all_in_sync, group skew 10 %, QoS
+// 3000 IOPS / 125 MiB/s (burst 16000 / 1000), member deadline 1000 ms,
+// election minimum 1000 ms, resync window 900 s, no flags, no mirror, no
+// gateways; endpoints fd00::<server> port 7400;
+//   group 0x5001: 0x21 data drive 0, 0x22 data drive 1, 0x23 witness drive 0
+//   group 0x5002: 0x22 data drive 0, 0x23 data drive 1, 0x24 witness drive 0
+//   attachment 0xA1 on server 7 generation 2 rw
+inline constexpr std::uint64_t layout6_server_id = 0x21;
+inline constexpr std::uint16_t layout6_key_id = 1;
+inline constexpr std::uint64_t layout6_volume_id = 0x200;
+inline constexpr std::uint64_t layout6_epoch = 3;
+inline constexpr std::string_view layout6 =
+    "414b564c415900000100010002000001210000000000000000020000000000000300000000000000ee020000"
+    "000000000000100000000000001000000000100000000000010a0000b80b00007d000000803e0000e8030000"
+    "e8030000e8030000840300000000000000000000000000000000000000000000015000000000000003000000"
+    "000000002100000000000000fd000000000000000000000000000021e81c0100000000002200000000000000"
+    "fd000000000000000000000000000022e81c0101000000002300000000000000fd0000000000000000000000"
+    "00000023e81c020000000000025000000000000003000000000000002200000000000000fd00000000000000"
+    "0000000000000022e81c0100000000002300000000000000fd000000000000000000000000000023e81c0101"
+    "000000002400000000000000fd000000000000000000000000000024e81c020000000000a100000000000000"
+    "0700000000000000020000000100000053f9be2f5b21570c923182a0188a0c9c3b98ebdf5ea68324fe92ba18"
+    "543cb5bf0f9001c59e6b1a7f2d54f8d9ec429e2228618387c35509c74c34c27d8879ed0a";
+inline constexpr std::string_view layout6_signature =
+    "53f9be2f5b21570c923182a0188a0c9c3b98ebdf5ea68324fe92ba18543cb5bf0f9001c59e6b1a7f2d54f8d9"
+    "ec429e2228618387c35509c74c34c27d8879ed0a";
+
+// Vector 7: a hold v2 write request: request 77, volume 0x200, epoch 3,
+// attachment 0xA1 generation 2, group 0x5001, term 4, one 512-byte block
+// at LBA 0x1000 whose byte i is (i * 13 + 1) mod 256.
+inline constexpr std::string_view hold_v2_write7 =
+    "414b48570204000004020000000000004d0000000000000000020000000000000300000000000000a1000000"
+    "0000000002000000010000000010000000000000015000000000000004000000000000000000000055f02a80"
+    "da2a7083010e1b2835424f5c697683909daab7c4d1deebf805121f2c394653606d7a8794a1aebbc8d5e2effc"
+    "091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b38"
+    "45525f6c798693a0adbac7d4e1eefb0815222f3c495663707d8a97a4b1becbd8e5f2ff0c192633404d5a6774"
+    "818e9ba8b5c2cfdce9f603101d2a3744515e6b7885929facb9c6d3e0edfa0714212e3b4855626f7c8996a3b0"
+    "bdcad7e4f1fe0b1825323f4c596673808d9aa7b4c1cedbe8f5020f1c293643505d6a7784919eabb8c5d2dfec"
+    "f90613202d3a4754616e7b8895a2afbcc9d6e3f0fd0a1724313e4b5865727f8c99a6b3c0cddae7f4010e1b28"
+    "35424f5c697683909daab7c4d1deebf805121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764"
+    "717e8b98a5b2bfccd9e6f3000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b3845525f6c798693a0"
+    "adbac7d4e1eefb0815222f3c495663707d8a97a4b1becbd8e5f2ff0c192633404d5a6774818e9ba8b5c2cfdc"
+    "e9f603101d2a3744515e6b7885929facb9c6d3e0edfa0714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b18"
+    "25323f4c596673808d9aa7b4c1cedbe8f5020f1c293643505d6a7784919eabb8c5d2dfecf90613202d3a4754"
+    "616e7b8895a2afbcc9d6e3f0fd0a1724313e4b5865727f8c99a6b3c0cddae7f4";
+
+// Vector 8: a hold v2 redirect answering request 78 (status not_leader):
+// volume 0x200, epoch 3, attachment 0xA1 generation 2, group 0x5001,
+// responder term 5; leader server 0x22 at fd00::22 port 7400, term 5.
+inline constexpr std::string_view hold_v2_redirect8 =
+    "414b4857020e010028000000030000004e0000000000000000020000000000000300000000000000a1000000"
+    "000000000200000000000000000000000000000001500000000000000500000000000000000000003ebcd961"
+    "2200000000000000fd000000000000000000000000000022e81c0000000000000500000000000000";
+
+// Vector 9: a hold v2 hello_ok answering request 1: volume 0x200, epoch 3,
+// attachment 0xA1 generation 2, block size 4096, 2^20 blocks, stripe unit
+// 1 MiB, stripe width 2.
+inline constexpr std::string_view hold_v2_hello_ok9 =
+    "414b4857020201001800000000000000010000000000000000020000000000000300000000000000a1000000"
+    "0000000002000000000000000000000000000000000000000000000000000000000000000000000079b52a85"
+    "001000000000000000001000000000000000100002000000";
+
+// Vector 10: an unsigned group_status report (format v2) from server 0x21,
+// report_seq 5: slot 3, one member: volume 0x200, group 0x5001, epoch 3,
+// term 4, commit index 90, applied index 88, kind data, state leader, one
+// lagging member, drive 0, 1 GiB allocated.
+inline constexpr std::string_view report_group_status10 =
+    "414b525002001100210000000000000005000000000000004800000000000000030001000000000000020000"
+    "000000000150000000000000030000000000000004000000000000005a000000000000005800000000000000"
+    "01010100000000000000004000000000";
+
+// Vector 11: an unsigned group_fault report (format v2) from server 0x21,
+// report_seq 6: volume 0x200, group 0x5001, epoch 3, term 4, suspect 0x22,
+// kind lagging, slot 3, drive 0.
+inline constexpr std::string_view report_group_fault11 =
+    "414b525002001300210000000000000006000000000000003000000000000000000200000000000001500000"
+    "000000000300000000000000040000000000000022000000000000000103000000000000";
 
 }  // namespace ak::proto::vectors

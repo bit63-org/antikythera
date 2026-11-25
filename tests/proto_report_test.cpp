@@ -22,6 +22,7 @@
 #include "helm/device_pool.hpp"
 #include "helm/mailbox.hpp"
 #include "proto/report.hpp"
+#include "proto/test_vectors.hpp"
 #include "test_support.hpp"
 
 namespace mb = ak::helm::mailbox;
@@ -346,6 +347,76 @@ auto sample_membership() -> proto::GroupMembership {
                         join(0x22, proto::RouteFamily::ipv4, 224, 251)}};
 }
 
+auto sample_group_status() -> proto::GroupStatus {
+    return {.slot = 3,
+            .entries = {{.volume_id = 0x200,
+                         .group_id = 0x5001,
+                         .epoch = 3,
+                         .term = 4,
+                         .commit_index = 90,
+                         .applied_index = 88,
+                         .kind = 1,
+                         .state = proto::GroupMemberState::leader,
+                         .lagging = 1,
+                         .drive = 2,
+                         .allocated_bytes = 1U << 30},
+                        {.volume_id = 0x200,
+                         .group_id = 0x5002,
+                         .epoch = 3,
+                         .term = 2,
+                         .commit_index = 7,
+                         .applied_index = 7,
+                         .kind = 2,
+                         .state = proto::GroupMemberState::follower,
+                         .lagging = 0,
+                         .drive = 0,
+                         .allocated_bytes = 0}}};
+}
+
+auto sample_capacity() -> proto::Capacity {
+    return {.slot = 3,
+            .link_mbps = 25000,
+            .drives = {
+                {.drive = 0,
+                 .state = proto::DriveState::ok,
+                 .capacity_bytes = 4ULL << 40U,
+                 .allocated_bytes = 1ULL << 40U,
+                 .reserved_bytes = 3ULL << 40U,
+                 .read_iops = 900000,
+                 .write_iops = 250000,
+                 .read_mib_per_s = 6800,
+                 .write_mib_per_s = 4000,
+                 .replicas = 120},
+                {.drive = 1, .state = proto::DriveState::failed, .capacity_bytes = 4ULL << 40U}}};
+}
+
+auto sample_group_fault() -> proto::GroupFault {
+    return {.volume_id = 0x200,
+            .group_id = 0x5001,
+            .epoch = 3,
+            .term = 4,
+            .suspect = 0x22,
+            .kind = proto::GroupFaultKind::lagging,
+            .slot = 3,
+            .drive = 1};
+}
+
+auto khold_bodies() -> std::vector<proto::ReportBody> {
+    return {sample_group_status(),
+            proto::GroupStatus{.slot = 1, .entries = {}},
+            sample_capacity(),
+            proto::Capacity{.slot = 1, .link_mbps = 1000, .drives = {}},
+            sample_group_fault(),
+            proto::GroupFault{.volume_id = 1,
+                              .group_id = 2,
+                              .epoch = 1,
+                              .term = 0,
+                              .suspect = 0,
+                              .kind = proto::GroupFaultKind::no_space,
+                              .slot = 0,
+                              .drive = 0}};
+}
+
 auto every_body() -> std::vector<proto::ReportBody> {
     auto all = all_bodies();
     std::ranges::move(volume_bodies(), std::back_inserter(all));
@@ -355,6 +426,9 @@ auto every_body() -> std::vector<proto::ReportBody> {
         proto::CertRequest{.slot = 0, .role = proto::StorageRole::initiator, .csr = der_seq(0)});
     all.emplace_back(sample_membership());
     all.emplace_back(proto::GroupMembership{.slot = 1, .entries = {}});
+    all.emplace_back(
+        proto::CertRequest{.slot = 4, .role = proto::StorageRole::khold, .csr = der_seq(0)});
+    std::ranges::move(khold_bodies(), std::back_inserter(all));
     return all;
 }
 
@@ -472,7 +546,7 @@ BOOST_AUTO_TEST_CASE(header_rules) {
     b = good;
     set_le16(b, off_kind, 0);
     BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
-    set_le16(b, off_kind, 17);
+    set_le16(b, off_kind, 20);
     BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
     b = good;
     b[off_reserved + 3] = std::byte{1};
@@ -968,7 +1042,7 @@ BOOST_AUTO_TEST_CASE(cert_request_layout_and_rules) {
     BOOST_TEST(std::to_integer<int>(b[body + 8]) == 0x30);  // the CSR's SEQUENCE
 
     auto bad_role = req;
-    bad_role.role = static_cast<proto::StorageRole>(3);
+    bad_role.role = static_cast<proto::StorageRole>(4);
     BOOST_TEST((encode_error(make_report(bad_role)) == DecodeError::unknown_value));
     for (const auto& csr : std::vector<std::vector<std::byte>>{
              {},                                                   // empty
@@ -1067,6 +1141,146 @@ BOOST_AUTO_TEST_CASE(group_membership_layout_and_rules) {
     bad = b;
     set_le16(bad, body + 2, 3);
     BOOST_TEST((decode_error(bad) == DecodeError::trailing_bytes));
+}
+
+BOOST_AUTO_TEST_CASE(khold_kinds_are_numbered_by_the_spec) {
+    const std::pair<proto::ReportBody, std::uint16_t> cases[] = {
+        {sample_group_status(), 17}, {sample_capacity(), 18}, {sample_group_fault(), 19}};
+    for (const auto& [b, kind] : cases) {
+        BOOST_TEST(static_cast<std::uint16_t>(proto::report_kind(b)) == kind);
+        const auto bytes = encoded(make_report(b));
+        BOOST_TEST(std::to_integer<int>(bytes[off_kind]) == kind);
+    }
+    BOOST_TEST(static_cast<int>(proto::StorageRole::khold) == 3);
+}
+
+BOOST_AUTO_TEST_CASE(khold_report_vectors_reproduce) {
+    const auto hex = [](std::string_view h) {
+        std::vector<std::byte> out;
+        for (std::size_t i = 0; i + 1 < h.size(); i += 2) {
+            const auto nib = [](char c) {
+                return c <= '9' ? static_cast<unsigned>(c - '0')
+                                : static_cast<unsigned>(c - 'a' + 10);
+            };
+            out.push_back(std::byte{static_cast<std::uint8_t>((nib(h[i]) << 4U) | nib(h[i + 1]))});
+        }
+        return out;
+    };
+    namespace vec = ak::proto::vectors;
+    auto status = sample_group_status();
+    status.entries.resize(1);
+    status.entries[0].drive = 0;
+    const proto::Report s{.server_id = 0x21, .report_seq = 5, .body = status};
+    BOOST_TEST((encoded(s) == hex(vec::report_group_status10)));
+    const proto::Report f{.server_id = 0x21,
+                          .report_seq = 6,
+                          .body = proto::GroupFault{.volume_id = 0x200,
+                                                    .group_id = 0x5001,
+                                                    .epoch = 3,
+                                                    .term = 4,
+                                                    .suspect = 0x22,
+                                                    .kind = proto::GroupFaultKind::lagging,
+                                                    .slot = 3,
+                                                    .drive = 0}};
+    BOOST_TEST((encoded(f) == hex(vec::report_group_fault11)));
+    for (auto h : {vec::report_group_status10, vec::report_group_fault11}) {
+        auto back = proto::decode_report(hex(h));
+        BOOST_REQUIRE(back.has_value());
+        BOOST_TEST((encoded(*back) == hex(h)));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(khold_report_layouts) {
+    auto b = encoded(make_report(sample_group_status()));
+    BOOST_TEST(b.size() ==
+               body + proto::group_status_fixed_size + (2 * proto::group_status_entry_size));
+    BOOST_TEST(std::to_integer<int>(b[body]) == 3);      // slot
+    BOOST_TEST(std::to_integer<int>(b[body + 2]) == 2);  // count
+    constexpr std::size_t e = body + proto::group_status_fixed_size;
+    BOOST_TEST(le64_at(b, e) == 0x200U);
+    BOOST_TEST(le64_at(b, e + 8) == 0x5001U);
+    BOOST_TEST(le64_at(b, e + 32) == 90U);
+    BOOST_TEST(std::to_integer<int>(b[e + 48]) == 1);  // kind data
+    BOOST_TEST(std::to_integer<int>(b[e + 49]) == 1);  // leader
+    BOOST_TEST(le64_at(b, e + 56) == (1U << 30));
+
+    b = encoded(make_report(sample_capacity()));
+    BOOST_TEST(b.size() == body + proto::capacity_fixed_size + (2 * proto::capacity_entry_size));
+    constexpr std::size_t d = body + proto::capacity_fixed_size;
+    BOOST_TEST(le64_at(b, d + 8) == (4ULL << 40U));
+    BOOST_TEST(std::to_integer<int>(b[d + proto::capacity_entry_size + 1]) == 4);  // failed
+
+    b = encoded(make_report(sample_group_fault()));
+    BOOST_TEST(b.size() == body + proto::group_fault_size);
+    BOOST_TEST(le64_at(b, body + 32) == 0x22U);
+    BOOST_TEST(std::to_integer<int>(b[body + 40]) == 1);  // lagging
+}
+
+BOOST_AUTO_TEST_CASE(khold_rules_are_enforced_both_ways) {
+    const auto refused = [](const proto::ReportBody& b, DecodeError want) {
+        auto r = proto::encode_report(make_report(b));
+        BOOST_REQUIRE(!r.has_value());
+        BOOST_TEST((r.error() == want), proto::to_string(r.error()));
+    };
+    auto s = sample_group_status();
+    s.entries[1].group_id = 0x5001;  // not ascending
+    refused(s, DecodeError::not_ascending);
+    s = sample_group_status();
+    s.entries[0].applied_index = 91;
+    refused(s, DecodeError::bad_capacity);
+    s = sample_group_status();
+    s.entries[0].kind = 4;
+    refused(s, DecodeError::unknown_value);
+    s = sample_group_status();
+    s.entries[0].state = static_cast<proto::GroupMemberState>(7);
+    refused(s, DecodeError::unknown_value);
+    s = sample_group_status();
+    s.entries[0].group_id = 0;
+    refused(s, DecodeError::bad_id);
+    s = sample_group_status();
+    s.entries[0].epoch = 0;
+    refused(s, DecodeError::bad_epoch);
+
+    auto c = sample_capacity();
+    c.drives[0].allocated_bytes = c.drives[0].capacity_bytes + 1;
+    refused(c, DecodeError::bad_capacity);
+    c = sample_capacity();
+    c.drives[1].drive = 0;
+    refused(c, DecodeError::not_ascending);
+    c = sample_capacity();
+    c.drives[0].state = static_cast<proto::DriveState>(0);
+    refused(c, DecodeError::unknown_value);
+    c = sample_capacity();
+    c.drives.resize(proto::max_capacity_drives + 1);
+    refused(c, DecodeError::too_many_entries);
+
+    auto f = sample_group_fault();
+    f.suspect = 0;
+    refused(f, DecodeError::bad_server_id);
+    f = sample_group_fault();
+    f.kind = static_cast<proto::GroupFaultKind>(7);
+    refused(f, DecodeError::unknown_value);
+    f = sample_group_fault();
+    f.group_id = 0;
+    refused(f, DecodeError::bad_id);
+
+    // The decoder makes the same checks, and reserved bytes must be zero.
+    auto b = encoded(make_report(sample_group_status()));
+    b[body + 1] = std::byte{1};
+    BOOST_TEST((proto::decode_report(b).error() == DecodeError::reserved_not_zero));
+    b = encoded(make_report(sample_group_status()));
+    b[body + proto::group_status_fixed_size + 52] = std::byte{1};
+    BOOST_TEST((proto::decode_report(b).error() == DecodeError::reserved_not_zero));
+    b = encoded(make_report(sample_capacity()));
+    b[body + proto::capacity_fixed_size + 2] = std::byte{1};
+    BOOST_TEST((proto::decode_report(b).error() == DecodeError::reserved_not_zero));
+    b = encoded(make_report(sample_group_fault()));
+    b[body + 47] = std::byte{1};
+    BOOST_TEST((proto::decode_report(b).error() == DecodeError::reserved_not_zero));
+    b = encoded(make_report(sample_group_status()));
+    b[body + 2] = std::byte{0xFF};
+    b[body + 3] = std::byte{0xFF};
+    BOOST_TEST((proto::decode_report(b).error() == DecodeError::too_many_entries));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

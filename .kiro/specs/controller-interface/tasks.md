@@ -74,6 +74,10 @@
   (`ControllerSink::on_group_members`; the default drops it), report kind
   16 (one role's whole join list), `ak-test-controller group-members`,
   `fuzz_group_members`. The oar-net side is task 14.
+- [ ] 16. `InstanceMetadata` codec in `src/proto/`, `instance_metadata`
+  link record (type 16), tests, fuzz; `ak-test-controller` can send it.
+  _Requirements: 11_ (helm's side is helm-control-plane task 14, the
+  network role's oar-net task 21.)
 - [ ] 6. Draft the kythira `ec2-compatible-api` spec in the kythira
   repository, from Requirements 6 and 9 (network volumes ported from
   `ak_hold_master`). _Requirements: 6, 9_

@@ -313,3 +313,44 @@ every server answers the same way (oar-net Requirement 12).
    and counted) rather than refuse the whole frame, so mapping and
    configuration updates need not arrive in a fixed order.
 
+### Requirement 11: Instance metadata
+
+**User Story:** As a kythira user, I want `curl http://169.254.169.254/`
+and the AWS SDKs' instance metadata clients to work in my instances,
+IMDSv2 included; as the operator, I want each instance to read only its
+own record (oar-net Requirement 13).
+
+#### Acceptance Criteria
+
+1. The controller SHALL keep one instance metadata record per attached
+   NIC: the instance ID, image ID, instance type, account ID, local
+   hostname, availability zone and region, the interface ID, VPC ID and
+   device index, the launch index and pending time, the user data (at
+   most 16,384 bytes, EC2's limit), and the instance's metadata options:
+   `HttpEndpoint` (enabled or disabled), `HttpTokens` (optional or
+   required) and `HttpPutResponseHopLimit` (1 to 64), with EC2's
+   defaults (enabled, optional, 1).
+2. The NIC's MAC and guest addresses and the VPC's IPv4 prefix SHALL NOT
+   be repeated in the record: the server answers them from the NIC's
+   mapping entry and the VPC's `VpcConfig`, so the three can never
+   disagree.
+3. The controller SHALL deliver the record as a signed, versioned
+   `InstanceMetadata` frame naming its target server, key and NIC, to the
+   server hosting the NIC, before the `ATTACH_DEVICE` that plugs the NIC
+   and again whenever the record changes (`ModifyInstanceMetadataOptions`,
+   user data changed while stopped, an interface moved to another
+   instance). Versions are per NIC and strictly increasing.
+4. helm SHALL forward `InstanceMetadata` frames unmodified, keep the
+   newest per NIC until the NIC is detached, and resend them to a network
+   role whose sideband reopens before any NIC is prepared there; the
+   network role SHALL verify the signature, target and version, keep the
+   record for the NIC until the NIC is cleaned, and leave the previous
+   record in place when a frame is refused.
+5. The EC2 module SHALL accept `MetadataOptions` on `RunInstances` and
+   implement `ModifyInstanceMetadataOptions`. Instance profile
+   credentials (`iam/`), signed identity documents and instance tags in
+   metadata come with IAM instance profiles, a controller signing key for
+   identity documents, and tags; until then those paths answer 404 and
+   `InstanceMetadataTags` other than disabled is refused with
+   `UnsupportedOperation`.
+

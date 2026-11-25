@@ -323,10 +323,80 @@ The endpoint receives the IP packet (no Ethernet header) and the trusted
 NIC ID. `inject_metadata` wraps a reply in Ethernet (gateway MAC → NIC
 MAC) after checking Requirement 13.3. A per-NIC token bucket (the group
 policy's integer bucket, frames only; default 1024 packets/s, burst 256)
-bounds intercepted packets (`metadata_drop_rate`). The first endpoint
-(later task) is expected to be a TAP device into the oar-net board's own
-kernel, one source address per NIC ID, relaying HTTP to helm's metadata
-service keyed by NIC ID.
+bounds intercepted packets (`metadata_drop_rate`).
+
+### Metadata service
+
+Requirement 13.4 to 13.8, controller-interface Requirement 11 and design
+"InstanceMetadata". The network role answers metadata requests itself;
+helm only forwards the signed per-NIC records. The first sketch relayed
+each HTTP request over the sideband to a service in helm, but OarLink is
+an SMBus link with one helm-initiated request outstanding, so every guest
+request would wait on a helm poll and compete with mapping updates. The
+records change rarely, are signed by the controller, and the role already
+holds the NIC ID that identifies the caller, so serving on the board is
+both faster and no less trusted.
+
+Three parts, each testable alone:
+
+- **Records** (`src/oar/net/metadata_store.*`). `NetRole` verifies an
+  `InstanceMetadata` frame (server, signature, then version per NIC: the
+  same version answers ok untouched, an older one fails) and keeps it
+  for the NIC. `clean_function` drops the NIC's record, and a record for
+  a NIC that is not plugged is kept for its attach. At most one record
+  per NIC the role can host.
+- **Translation** (`src/oar/net/metadata_nat.*`, pure functions with a
+  fuzz target). The board's kernel does TCP for the service through a
+  TAP device, `akmd0`, in the role's own network namespace, holding
+  `169.254.169.254/32` and `fd00:ec2::254/128`. Guests in different VPCs
+  may share addresses, so each (NIC, guest address) pair gets an alias:
+  `100.64.0.0/10` for IPv4 and `fd00:ec2:1::/96` for IPv6, routed to the
+  TAP. A packet from `MetadataEndpoint::deliver` has its source rewritten
+  to the pair's alias (IP and TCP checksums updated as in RFC 1624) and
+  is written to the TAP; a packet read from the TAP to an alias has its
+  destination rewritten back and goes to `VSwitch::inject_metadata` for
+  that NIC. Only TCP to port 80 is written; anything else, and anything
+  from the kernel that is not TCP from port 80 (ICMP errors included), is
+  dropped and counted. A NIC has at most 16 aliases (least recently used
+  replaced); a NIC's aliases are released when it is cleaned, and an
+  alias is not reused for another NIC while the kernel may still hold a
+  connection for it (a 2-minute quarantine, longer than TIME_WAIT).
+- **HTTP** (`src/oar/net/metadata_http.*`). An accept loop on port 80
+  in the namespace maps each peer alias back to its NIC and serves
+  HTTP/1.0 and 1.1 (keep-alive, one request at a time) from the NIC's
+  record. Limits: request line 2 KiB, headers 8 KiB and 32 fields in
+  all, no body except an empty one on the token `PUT`, 2 s to read a
+  request, 5 s idle, 16 connections per NIC and 1,024 per role. `GET`,
+  `HEAD` and the token `PUT` are served; other methods get 405.
+
+Paths, for `latest` and for any dated version from `2007-01-19` on
+(answered the same): `/` lists `latest`; `meta-data/` lists its keys;
+`ami-id`, `ami-launch-index`, `hostname` and `local-hostname`,
+`instance-id`, `instance-type`, `local-ipv4` (the NIC's first IPv4
+address), `mac`, `placement/availability-zone`, `placement/region`,
+`network/interfaces/macs/<mac>/` (`device-number`, `interface-id`,
+`local-ipv4s`, `ipv6s`, `mac`, `subnet-ipv4-cidr-block`, `vpc-id`);
+`user-data` (404 when empty); `dynamic/instance-identity/document` (the
+JSON document, unsigned: `signature`, `pkcs7` and `rsa2048` answer 404
+until the controller signs documents); `iam/` answers 404 until instance
+profiles exist. Anything else is 404.
+
+Tokens are `base64url(version u8 | nic_id u64 | expiry u64 | nonce [16]
+| HMAC-SHA256 [32])`, the MAC over everything before it and the record's
+instance ID, under a 32-byte key from the OpenSSL RNG made when the role
+starts and held in `SecretBytes`. A token presented on another NIC, after
+its expiry, or after its NIC's interface moved to another instance fails
+the check. The token `PUT` response's socket gets `IP_TTL` or
+`IPV6_UNICAST_HOPS` set to the record's hop limit before it is written,
+so a container behind a NAT on the guest (one hop more) never sees it
+when the limit is 1, as in EC2. `HttpEndpoint` disabled makes the accept
+loop close the NIC's connections with `SO_LINGER` 0 (a reset).
+
+The TAP needs `CAP_NET_ADMIN` in the role's namespace on the board,
+which is its own machine; nothing on the host is involved. Harbor's
+in-process placement and the unit tests run the HTTP layer over socket
+pairs and the translation layer on byte buffers; a test that needs a real
+TAP skips where namespaces are unavailable, like `jail_test`.
 
 ## Data models
 

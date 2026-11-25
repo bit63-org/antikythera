@@ -217,3 +217,21 @@ controller allows it, and every replica it causes billed.
 3. helm SHALL keep a detached NIC's final reading until the controller
    acknowledges the report that carries it.
 
+### Requirement 12: Instance metadata records
+
+**User Story:** As the operator, I want each network role to answer its
+NICs' metadata requests from the controller's signed records, without
+helm in the request path (oar-net Requirement 13).
+
+#### Acceptance Criteria
+
+1. helm SHALL forward each controller `InstanceMetadata` frame,
+   unmodified, to the network role that hosts or is about to host its
+   NIC, before the `prepare_function` that plugs that NIC.
+2. helm SHALL keep the newest frame per NIC (by version; an older or
+   equal one is not forwarded) until the NIC is detached, and SHALL
+   resend every frame it holds to a network role whose sideband
+   reopens, before the router registers that role's functions.
+3. helm SHALL NOT read, change or answer from a record; the network role
+   verifies it.
+

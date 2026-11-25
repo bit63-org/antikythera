@@ -22,25 +22,30 @@ auto just(mb::Status s) -> CommandOutcome {
 }  // namespace
 
 auto AgentHandler::handle(const mb::Message& /*msg*/, const mb::Body& body) -> CommandOutcome {
-    return std::visit(Overloaded{
-                          [&](const mb::CreateVm& c) { return just(_supervisor->create(c)); },
-                          [&](const mb::DestroyVm& c) { return just(_supervisor->destroy(c)); },
-                          [&](const mb::ListVms&) { return _supervisor->list(); },
-                          [&](const mb::VmStatus& c) { return _supervisor->status(c); },
-                          [](const mb::AttachDevice&) { return just(mb::Status::unsupported); },
-                          [](const mb::DetachDevice&) { return just(mb::Status::unsupported); },
-                          [](const mb::AttachVolume&) { return just(mb::Status::unsupported); },
-                          [](const mb::DetachVolume&) { return just(mb::Status::unsupported); },
-                          [](const mb::CreateVolume&) { return just(mb::Status::ok); },
-                          [](const mb::DeleteVolume&) { return just(mb::Status::ok); },
-                          [](const mb::RewrapVolume&) { return just(mb::Status::ok); },
-                          [](const mb::CreateNetwork&) { return just(mb::Status::ok); },
-                          [](const mb::DeleteNetwork&) { return just(mb::Status::ok); },
-                          // Responses and events never reach a handler (the client only
-                          // passes commands); answer defensively all the same.
-                          [](const auto&) { return just(mb::Status::malformed); },
-                      },
-                      body);
+    return std::visit(
+        Overloaded{
+            [&](const mb::CreateVm& c) { return just(_supervisor->create(c)); },
+            [&](const mb::DestroyVm& c) { return just(_supervisor->destroy(c)); },
+            [&](const mb::ListVms&) { return _supervisor->list(); },
+            [&](const mb::VmStatus& c) { return _supervisor->status(c); },
+            [&](const mb::AttachDevice& c) { return just(_supervisor->attach(c.vm_id, c.device)); },
+            [&](const mb::AttachVolume& c) { return just(_supervisor->attach(c.vm_id, c.device)); },
+            [&](const mb::DetachDevice& c) {
+                return just(_supervisor->detach(c.vm_id, c.device, c.timeout_s, c.policy));
+            },
+            [&](const mb::DetachVolume& c) {
+                return just(_supervisor->detach(c.vm_id, c.device, c.timeout_s, c.policy));
+            },
+            [](const mb::CreateVolume&) { return just(mb::Status::ok); },
+            [](const mb::DeleteVolume&) { return just(mb::Status::ok); },
+            [](const mb::RewrapVolume&) { return just(mb::Status::ok); },
+            [](const mb::CreateNetwork&) { return just(mb::Status::ok); },
+            [](const mb::DeleteNetwork&) { return just(mb::Status::ok); },
+            // Responses and events never reach a handler (the client only
+            // passes commands); answer defensively all the same.
+            [](const auto&) { return just(mb::Status::malformed); },
+        },
+        body);
 }
 
 }  // namespace ak::hull

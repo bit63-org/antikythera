@@ -18,11 +18,14 @@
 #include <boost/test/unit_test.hpp>
 
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <utility>
 #include <optional>
 #include <string>
 #include <thread>
@@ -105,6 +108,7 @@ auto test_config(const fs::path& run_dir) -> VmmLaunchConfig {
     // Raising RLIMIT_MEMLOCK needs CAP_SYS_RESOURCE, which a container's
     // root may lack; jail_test covers the limit itself.
     c.set_memlock = false;
+    c.vfio_dir.clear();  // no VFIO here: group grants are no-ops
     c.start_timeout = std::chrono::seconds{10};
     c.api_timeout = std::chrono::seconds{5};
     return c;
@@ -223,7 +227,12 @@ BOOST_AUTO_TEST_CASE(supervisor_end_to_end, *boost::unit_test::timeout(unit_time
 
     const auto topo = ak::hull::CpuTopology::from_cores({{0}, {1}, {2}}).value();
     ak::hull::ResourceAllocator allocator{topo, std::vector<ak::hull::CpuId>{0, 1, 2}, 3};
-    const ak::hull::DeviceInventory inventory;
+    constexpr mb::DeviceRef blk{.slot = 4, .type = mb::DeviceType::blk_fn, .function = 0};
+    const ak::hull::DeviceInventory inventory{
+        std::vector<ak::hull::InventoryEntry>{{.ref = blk,
+                                               .bdf = "0000:04:00.0",
+                                               .iommu_group = 12,
+                                               .reset = ak::hull::ResetMethod::bus}}};
     struct NoReset final : ak::hull::FunctionResetter {
         auto reset(const ak::hull::InventoryEntry&) -> bool override { return true; }
     } resetter;
@@ -277,10 +286,75 @@ BOOST_AUTO_TEST_CASE(supervisor_end_to_end, *boost::unit_test::timeout(unit_time
 
     BOOST_TEST_REQUIRE(
         (sup.create({.vm_id = 3, .vcpus = 1, .memory_mib = 1024}) == mb::Status::ok));
+    // Attach its boot volume: cold-plugged, then booted. Detach it again:
+    // the stand-in ejects at once, and the next poll releases it.
+    BOOST_TEST((sup.attach(3, blk) == mb::Status::ok));
+    BOOST_TEST((mb::decode_vm_status_payload(sup.status({.vm_id = 3}).payload)->state ==
+                mb::VmRunState::running));
+    BOOST_TEST((sup.detach(3, blk, 30, mb::DetachPolicy::force) == mb::Status::accepted));
+    BOOST_TEST(sup.poll_detaches() == 1U);
+    const auto released = sup.take_events();
+    BOOST_TEST_REQUIRE(released.size() == 1U);
+    BOOST_TEST((std::get<mb::DeviceReleased>(released[0]).device == blk));
+
     // Destroy the last one: killed, no VM_EXITED, everything released.
     BOOST_TEST((sup.destroy({.vm_id = 3}) == mb::Status::ok));
     BOOST_TEST(sup.take_events().empty());
     BOOST_TEST(!fs::exists(run.path() / "vm-3"));
     BOOST_TEST(pool.in_use() == 0U);
     BOOST_TEST(allocator.free_cores() == 3U);
+}
+
+BOOST_AUTO_TEST_CASE(group_nodes_follow_the_assignment,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    if (::geteuid() != 0) {
+        BOOST_TEST_MESSAGE("skipped: chown of device nodes needs root");
+        return;
+    }
+    const RunDir run;
+    const auto vfio = run.path() / "vfio";
+    fs::create_directories(vfio);
+    // Stand-in group nodes: character devices (the same numbers as
+    // /dev/null), a regular file and a symlink, which must be refused.
+    if (::mknod((vfio / "12").c_str(), S_IFCHR | 0600, makedev(1, 3)) != 0) {
+        BOOST_TEST_MESSAGE("skipped: mknod refused here");
+        return;
+    }
+    BOOST_TEST_REQUIRE(::mknod((vfio / "13").c_str(), S_IFCHR | 0600, makedev(1, 3)) == 0);
+    {
+        std::ofstream{vfio / "14"} << "x";
+    }
+    fs::create_symlink(vfio / "12", vfio / "15");
+
+    auto pool = make_pool();
+    auto config = test_config(run.path());
+    config.vfio_dir = vfio;
+    JailedVmmLauncher launcher{config, pool};
+    auto vmm = launcher.launch(one_core);
+    if (!vmm) {
+        const auto why = jail_refused(vmm.error());
+        BOOST_TEST_REQUIRE(why.has_value(), to_string(vmm.error().error));
+        BOOST_TEST_MESSAGE("skipped: " << *why);
+        return;
+    }
+    const auto uid = pool.find(1)->uid;
+    auto owner = [&](const char* name) {
+        struct stat st{};
+        BOOST_TEST_REQUIRE(::lstat((vfio / name).c_str(), &st) == 0);
+        return std::pair{st.st_uid, st.st_mode & 07777};
+    };
+
+    BOOST_TEST((*vmm)->grant_group(12));
+    BOOST_TEST((owner("12") == std::pair{uid, mode_t{0600}}));
+    BOOST_TEST(!(*vmm)->grant_group(14));  // not a device node
+    BOOST_TEST(!(*vmm)->grant_group(15));  // a link
+    BOOST_TEST(!(*vmm)->grant_group(16));  // missing
+    BOOST_TEST((*vmm)->revoke_group(12));
+    BOOST_TEST((owner("12") == std::pair{uid_t{0}, mode_t{0600}}));
+
+    // A grant still held when the VMM goes is revoked with it.
+    BOOST_TEST((*vmm)->grant_group(13));
+    BOOST_TEST(owner("13").first == uid);
+    vmm->reset();
+    BOOST_TEST(owner("13").first == 0U);
 }

@@ -10,7 +10,6 @@
 
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <poll.h>
 #include <unistd.h>
 
 namespace ak::oar::net {
@@ -227,17 +226,21 @@ auto MetadataServer::read_ready(Connection& c, MetadataClock::time_point now) ->
     return serve(c, now);
 }
 
+auto MetadataServer::append_poll_fds(std::vector<pollfd>& out) const -> void {
+    for (const auto& c : _connections) {
+        const short events = c->written < c->out.size() ? POLLOUT : POLLIN;
+        out.push_back({.fd = c->fd, .events = events, .revents = 0});
+    }
+    if (_listen_fd >= 0) {
+        out.push_back({.fd = _listen_fd, .events = POLLIN, .revents = 0});
+    }
+}
+
 auto MetadataServer::run_once(MetadataClock::time_point now, std::chrono::milliseconds timeout)
     -> void {
     std::vector<pollfd> fds;
     fds.reserve(_connections.size() + 1);
-    for (const auto& c : _connections) {
-        const short events = c->written < c->out.size() ? POLLOUT : POLLIN;
-        fds.push_back({.fd = c->fd, .events = events, .revents = 0});
-    }
-    if (_listen_fd >= 0) {
-        fds.push_back({.fd = _listen_fd, .events = POLLIN, .revents = 0});
-    }
+    append_poll_fds(fds);
     if (!fds.empty()) {
         (void)::poll(fds.data(), fds.size(), static_cast<int>(timeout.count()));
     }

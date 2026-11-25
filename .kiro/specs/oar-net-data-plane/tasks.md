@@ -317,7 +317,7 @@
   an older one fails) and applies it with `VSwitch::set_vpc_config`; a
   frame the VSwitch refuses leaves the previous config. Routes are
   applied by task 22.
-- [ ] 21. Metadata service, answered on the oar-net board from the
+- [x] 21. Metadata service, answered on the oar-net board from the
   controller's signed per-NIC records (see design "Metadata service").
   _Requirements: 13.4-13.8_
   - [x] 21.1 Spec: controller-interface Requirement 11 and the
@@ -336,8 +336,11 @@
     the connections, limits, deadlines and the token answer's hop
     limit, accepting through a `PeerResolver` that task 21.5 backs with
     the TAP aliases.
-  - [ ] 21.5 TAP endpoint and alias translation (`metadata_nat`), with a
-    fuzz target, wired as the role's `MetadataEndpoint`.
+  - [x] 21.5 TAP endpoint and alias translation (`metadata_nat`), with a
+    fuzz target, wired as the role's `MetadataEndpoint`. The device is a
+    TUN (`metadata_tap`, `ak-oar-net --metadata`); `fuzz_metadata_nat`
+    checks that a request's echo returns to its NIC with the guest's
+    address restored.
 - [x] 22. Per-NIC source/destination check opt-out, with route-table
   targets that name a NIC (VPC step 3). _Requirements: 11.10, 12.7_ —
   MapUpdate format v3 carries the opt-out in each entry's flags byte

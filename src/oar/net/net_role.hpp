@@ -140,7 +140,9 @@
 
 #include "helm/oar_link.hpp"
 #include "oar/net/mapping_table.hpp"
+#include "oar/net/metadata_server.hpp"
 #include "oar/net/metadata_store.hpp"
+#include "oar/net/metadata_tap.hpp"
 #include "oar/net/mtu.hpp"
 #include "oar/net/tunnel.hpp"
 #include "oar/net/tunnel_peers.hpp"
@@ -203,6 +205,16 @@ struct NetRoleConfig {
     std::chrono::milliseconds mtu_grace{0};
     // Empty: steady_clock::now (health's uptime).
     std::function<Clock::time_point()> clock;
+    // The metadata service (Requirement 13.4, task 21.5), owned by the role
+    // from create(): a TUN from open_metadata_tun() (in tests, any
+    // descriptor that passes one IP packet per read and write) and a
+    // listening socket from open_metadata_listener() (-1: none). Absent:
+    // intercepted metadata packets are dropped and counted.
+    struct Metadata {
+        int tun_fd{-1};
+        int listen_fd{-1};
+    };
+    std::optional<Metadata> metadata;
 };
 
 struct RoleCounters {
@@ -318,6 +330,15 @@ public:
     [[nodiscard]] auto counters() const noexcept -> const RoleCounters& { return _counters; }
     // The NICs' instance metadata records (one per function at most).
     [[nodiscard]] auto metadata() const noexcept -> const MetadataStore& { return *_metadata; }
+    // The metadata service's parts; null without NetRoleConfig::metadata.
+    [[nodiscard]] auto metadata_server() noexcept -> MetadataServer* { return _md_server.get(); }
+    [[nodiscard]] auto metadata_tap() noexcept -> MetadataTap* { return _md_tap.get(); }
+    [[nodiscard]] auto metadata_aliases() noexcept -> AliasTable* { return _aliases.get(); }
+    // What the metadata service answers a NIC from (Requirement 13.4).
+    [[nodiscard]] auto metadata_view(std::uint64_t nic_id) const -> MetadataView;
+    // Appends the metadata service's descriptors, so the caller's poll
+    // wakes for them; poll() then serves them.
+    auto metadata_poll_fds(std::vector<pollfd>& out) const -> void;
 
 private:
     struct Slot {
@@ -330,6 +351,7 @@ private:
     [[nodiscard]] auto slot(helm::oar::FunctionNumber fn) -> Slot*;
     // Disconnects the slot's NIC and puts its placeholder back.
     auto release(helm::oar::FunctionNumber fn, Slot& s) -> bool;
+    auto start_metadata() -> std::expected<void, std::string>;
     // Notes which up peers still lack mtu_ok, and since when.
     auto track_mtu(VtepClock::time_point now) -> void;
     // The VSwitch's meters as group_usage entries (UsagePager's snapshot).
@@ -355,6 +377,9 @@ private:
     std::map<std::uint32_t, std::uint64_t> _members_versions;  // applied members version, by VNI
     helm::oar::MembershipPager _membership;
     std::unique_ptr<MetadataStore> _metadata;
+    std::unique_ptr<AliasTable> _aliases;
+    std::unique_ptr<MetadataServer> _md_server;
+    std::unique_ptr<MetadataTap> _md_tap;
     RoleCounters _counters;
 };
 

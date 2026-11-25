@@ -10,7 +10,13 @@
 //              --controller-key ID:HEX [--controller-key ID:HEX ...]
 //              --sideband PATH --addr A --helm-addr A --eid E --helm-eid E
 //              --function SOCKET [--function SOCKET ...]
-//              [--port P] [--source-ports N] [--scope IFINDEX]
+//              [--port P] [--source-ports N] [--scope IFINDEX] [--metadata TUN]
+//
+// --metadata serves the instance metadata service (oar-net Requirement 13,
+// metadata_tap.hpp): it makes the TUN device of that name (usually akmd0)
+// holding 169.254.169.254 and fd00:ec2::254, and listens on port 80 in this
+// process's network namespace, which needs CAP_NET_ADMIN there. Without it
+// guests' metadata requests are dropped.
 //
 // --vtep is this board's underlay IPv6 address; the Vtep listens on it at
 // --port (6081) and sends from --source-ports sockets (0: the listening one)
@@ -336,6 +342,7 @@ constexpr std::string_view arg_function = "--function";
 constexpr std::string_view arg_port = "--port";
 constexpr std::string_view arg_source_ports = "--source-ports";
 constexpr std::string_view arg_scope = "--scope";
+constexpr std::string_view arg_metadata = "--metadata";
 constexpr std::string_view role_log = "ak-oar-net";
 constexpr std::uint64_t max_bus_addr = 0x7F;
 constexpr std::uint64_t max_eid = 0xFE;
@@ -347,12 +354,13 @@ constexpr auto no_wait = std::chrono::milliseconds{0};
 auto role_usage() -> int {
     std::println(stderr,
                  "usage: {} {} ADDR {} N {} N [{} N] {} ID:HEX [...] {} PATH {} A {} A {} E {} E "
-                 "{} SOCKET [...] [{} P] [{} N] [{} IFINDEX]\n"
+                 "{} SOCKET [...] [{} P] [{} N] [{} IFINDEX] [{} TUN]\n"
                  "   or: {} {} PATH {} ID {} MAC ({} N | {} N [{} N]) [{} IFNAME]",
                  role_log, arg_vtep, arg_server_id, arg_underlay_mtu, arg_tunnel_overhead,
                  arg_controller_key, arg_sideband, arg_addr, arg_helm_addr, arg_eid, arg_helm_eid,
-                 arg_function, arg_port, arg_source_ports, arg_scope, role_log, arg_socket,
-                 arg_nic_id, arg_mac, arg_mtu, arg_underlay_mtu, arg_tunnel_overhead, arg_tap);
+                 arg_function, arg_port, arg_source_ports, arg_scope, arg_metadata, role_log,
+                 arg_socket, arg_nic_id, arg_mac, arg_mtu, arg_underlay_mtu, arg_tunnel_overhead,
+                 arg_tap);
     return exit_usage;
 }
 
@@ -420,6 +428,7 @@ struct RoleOptions {
     std::uint64_t port{net::geneve::udp_port};
     std::uint64_t source_ports{0};
     std::uint64_t scope{0};
+    std::optional<std::string> metadata;  // the TUN's name
 };
 
 auto parse_role(int argc, char** argv) -> std::optional<RoleOptions> {
@@ -470,6 +479,11 @@ auto parse_role(int argc, char** argv) -> std::optional<RoleOptions> {
             if (!assign(o.scope, value, UINT32_MAX)) {
                 return std::nullopt;
             }
+        } else if (arg == arg_metadata) {
+            if (value.empty() || value.size() >= IFNAMSIZ) {
+                return std::nullopt;
+            }
+            o.metadata = value;
         } else {
             return std::nullopt;
         }
@@ -563,6 +577,23 @@ auto run_role(const RoleOptions& opts) -> int {
     }
     PeerLog peer_log;
     const bool tunnel = opts.tunnel_overhead != 0;
+    std::optional<net::NetRoleConfig::Metadata> metadata;
+    if (opts.metadata) {
+        auto tun = net::open_metadata_tun(*opts.metadata);
+        if (!tun) {
+            std::println(stderr, "{}: metadata TUN {}: {}", role_log, *opts.metadata, tun.error());
+            return EXIT_FAILURE;
+        }
+        auto listener = net::open_metadata_listener();
+        if (!listener) {
+            ::close(tun->fd);
+            std::println(stderr, "{}: metadata listener: {}", role_log, listener.error());
+            return EXIT_FAILURE;
+        }
+        metadata = net::NetRoleConfig::Metadata{.tun_fd = tun->fd, .listen_fd = *listener};
+        std::println(stderr, "{}: metadata service on {}{}", role_log, *opts.metadata,
+                     tun->ipv6 ? "" : " (IPv4 only)");
+    }
     auto role = net::NetRole::create(
         {.vtep = *opts.vtep,
          .server_id = *opts.server_id,
@@ -572,7 +603,8 @@ auto run_role(const RoleOptions& opts) -> int {
          .vtep_config = {},
          .tunnel = tunnel ? std::optional<net::TunnelConfig>{net::TunnelConfig{}} : std::nullopt,
          .mtu_grace = {},
-         .clock = {}},
+         .clock = {},
+         .metadata = metadata},
         raw,
         [verifier](std::span<const std::byte> msg, std::span<const std::byte, 64> sig,
                    std::uint16_t key_id) { return verifier->verify(msg, sig, key_id).has_value(); },
@@ -617,6 +649,7 @@ auto run_role(const RoleOptions& opts) -> int {
             fds[i + fixed] = {
                 .fd = transports[i]->binding().poll_fd(), .events = POLLIN, .revents = 0};
         }
+        (*role)->metadata_poll_fds(fds);  // after the rest: served by poll() below
         const auto wait =
             std::chrono::ceil<std::chrono::milliseconds>(next_tick - net::VtepClock::now());
         const int timeout =

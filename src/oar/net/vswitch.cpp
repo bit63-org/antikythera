@@ -490,6 +490,26 @@ auto VSwitch::vpc_config(std::uint32_t vni) const -> const VpcConfig* {
     return it == _vpc_configs.end() ? nullptr : &it->second;
 }
 
+auto VSwitch::nic_addresses(std::uint32_t vni, geneve::NicId nic) const
+    -> std::pair<std::vector<neighbor::Ipv4Address>, std::vector<Ipv6Address>> {
+    std::pair<std::vector<neighbor::Ipv4Address>, std::vector<Ipv6Address>> out;
+    const VpcNeighbors* const table = neighbors(vni);
+    if (table == nullptr) {
+        return out;
+    }
+    for (const auto& [ip, owner] : table->ipv4) {
+        if (owner == nic) {
+            out.first.push_back(ip);
+        }
+    }
+    for (const auto& [ip, owner] : table->ipv6) {
+        if (owner == nic) {
+            out.second.push_back(ip);
+        }
+    }
+    return out;
+}
+
 auto VSwitch::dhcp4_address(std::uint32_t vni, geneve::NicId nic, const Ipv4Prefix& prefix) const
     -> std::optional<neighbor::Ipv4Address> {
     const VpcNeighbors* const table = neighbors(vni);

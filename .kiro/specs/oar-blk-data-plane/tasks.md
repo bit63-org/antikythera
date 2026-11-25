@@ -1,6 +1,6 @@
 # Implementation Plan — oar-blk: the storage data plane
 
-## Status: 12/16 tasks complete
+## Status: 13/16 tasks complete
 
 ## Tasks
 

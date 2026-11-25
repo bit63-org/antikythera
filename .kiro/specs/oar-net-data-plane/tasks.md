@@ -323,7 +323,7 @@
   - [x] 21.1 Spec: controller-interface Requirement 11 and the
     `InstanceMetadata` frame, helm-control-plane Requirement 12, and
     Requirements 13.4 to 13.8 here.
-  - [ ] 21.2 `InstanceMetadata` codec and link record
+  - [x] 21.2 `InstanceMetadata` codec and link record
     (controller-interface task 16).
   - [ ] 21.3 helm forwards and replays records (helm-control-plane task
     14); `NetRole` verifies and keeps them (`metadata_store`), dropping

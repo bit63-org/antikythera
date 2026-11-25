@@ -37,6 +37,9 @@
 //   image_key     controller -> helm   an ImageKey (image_key.hpp)
 //   vpc_config    controller -> helm   a VpcConfig (vpc_config.hpp)
 //   group_members controller -> helm   a GroupMembers (group_members.hpp)
+//   instance_metadata controller -> helm an InstanceMetadata
+//                                      (instance_metadata.hpp), for the
+//                                      NIC's network role
 //
 // The block volume records (.kiro/specs/block-volume-service/ task 12):
 // helm forwards replica_config, volume_op and lease_grant to its storage
@@ -86,6 +89,7 @@
 #include "proto/group_members.hpp"
 #include "proto/group_policy.hpp"
 #include "proto/image_key.hpp"
+#include "proto/instance_metadata.hpp"
 #include "proto/map_update.hpp"
 #include "proto/replica_config.hpp"
 #include "proto/report.hpp"
@@ -103,11 +107,11 @@ inline constexpr std::size_t lease_grant_size = 24;
 inline constexpr std::size_t role_certificate_fixed_size = 16;
 inline constexpr std::size_t max_cert_chain_size = 16384;
 inline constexpr std::size_t max_cert_chain_certs = 4;
-inline constexpr std::size_t max_record_payload =
-    std::max({envelope_size, max_map_update_size, max_report_size, report_ack_size, hello_size,
-              group_policy_size, max_tunnel_peers_size, max_replica_config_size, volume_op_size,
-              volume_key_size, lease_grant_size, role_certificate_fixed_size + max_cert_chain_size,
-              image_key_size, max_vpc_config_size, max_group_members_size});
+inline constexpr std::size_t max_record_payload = std::max(
+    {envelope_size, max_map_update_size, max_report_size, report_ack_size, hello_size,
+     group_policy_size, max_tunnel_peers_size, max_replica_config_size, volume_op_size,
+     volume_key_size, lease_grant_size, role_certificate_fixed_size + max_cert_chain_size,
+     image_key_size, max_vpc_config_size, max_group_members_size, max_instance_metadata_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class RecordType : std::uint16_t {
@@ -126,6 +130,7 @@ enum class RecordType : std::uint16_t {
     image_key = 13,
     vpc_config = 14,
     group_members = 15,
+    instance_metadata = 16,
 };
 
 struct Record {
@@ -163,7 +168,7 @@ struct RoleCertificate {
 namespace detail {
 
 [[nodiscard]] constexpr auto known(RecordType t) noexcept -> bool {
-    return t >= RecordType::envelope && t <= RecordType::group_members;
+    return t >= RecordType::envelope && t <= RecordType::instance_metadata;
 }
 
 }  // namespace detail

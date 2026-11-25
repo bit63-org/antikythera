@@ -60,6 +60,14 @@
 //                        a multicast VPC's per-group VTEP lists (oar-net
 //                        Requirement 10.5), e.g. group-members 100 2
 //                        239.1.2.3=fd00::1,fd00::2 ff05::42=fd00::2
+//   instance-metadata NIC VNI VERSION INSTANCE_ID [KEY=VALUE ...]
+//                        a NIC's signed instance metadata record (oar-net
+//                        Requirement 13.4); keys image, type, account,
+//                        hostname, az, region, eni, vpc, endpoint
+//                        (enabled|disabled), tokens (optional|required), hop,
+//                        device, launch, pending, user-data, each with a
+//                        sample default, e.g. instance-metadata 17 100 1
+//                        i-0123456789abcdef0 tokens=required hop=2
 //   tunnel-peers VTEP VERSION [PEER_VTEP,KEY ...]
 //                        the WireGuard peers of this server's VTEP; KEY is the
 //                        peer's X25519 public key as 64 hex digits
@@ -96,6 +104,7 @@
 #include "proto/report.hpp"
 #include "proto/tunnel_peers.hpp"
 #include "proto/group_members.hpp"
+#include "proto/instance_metadata.hpp"
 #include "proto/vpc_config.hpp"
 #include "tls/tls.hpp"
 
@@ -135,6 +144,9 @@ public:
         -> std::optional<std::vector<std::byte>>;
     // `members` encoded and signed (its signature field is ignored).
     [[nodiscard]] auto group_members(const proto::GroupMembers& members) const
+        -> std::optional<std::vector<std::byte>>;
+    // `metadata` encoded and signed (its signature field is ignored).
+    [[nodiscard]] auto instance_metadata(const proto::InstanceMetadata& metadata) const
         -> std::optional<std::vector<std::byte>>;
     // `peers` encoded and signed (its signature field is ignored).
     [[nodiscard]] auto tunnel_peers(const proto::TunnelPeers& peers) const
@@ -183,6 +195,10 @@ struct SendVpcConfig {
 struct SendGroupMembers {
     proto::GroupMembers members;
 };
+// Every field of the frame but the server and key.
+struct SendInstanceMetadata {
+    proto::InstanceMetadata metadata;
+};
 struct ExpectOutcome {
     proto::CommandStatus status{proto::CommandStatus::ok};
 };
@@ -190,8 +206,9 @@ struct WaitReport {
     proto::ReportKind kind{proto::ReportKind::inventory};
 };
 
-using Action = std::variant<SendCommand, SendMapUpdate, SendGroupPolicy, SendTunnelPeers,
-                            SendVpcConfig, SendGroupMembers, ExpectOutcome, WaitReport>;
+using Action =
+    std::variant<SendCommand, SendMapUpdate, SendGroupPolicy, SendTunnelPeers, SendVpcConfig,
+                 SendGroupMembers, SendInstanceMetadata, ExpectOutcome, WaitReport>;
 
 // One script line: an action, nothing (blank or comment), or a message
 // saying what is wrong with it.

@@ -74,10 +74,16 @@
   (`ControllerSink::on_group_members`; the default drops it), report kind
   16 (one role's whole join list), `ak-test-controller group-members`,
   `fuzz_group_members`. The oar-net side is task 14.
-- [ ] 16. `InstanceMetadata` codec in `src/proto/`, `instance_metadata`
+- [x] 16. `InstanceMetadata` codec in `src/proto/`, `instance_metadata`
   link record (type 16), tests, fuzz; `ak-test-controller` can send it.
   _Requirements: 11_ (helm's side is helm-control-plane task 14, the
-  network role's oar-net task 21.)
+  network role's oar-net task 21.) — `src/proto/instance_metadata.hpp`
+  (`proto_instance_metadata_test`, `fuzz_instance_metadata`) also checks
+  EC2's ID prefixes (`i-`, `ami-`, `eni-`, `vpc-`). The ControllerSession
+  checks a record's shape and server and hands it to
+  `ControllerSink::on_instance_metadata`, which drops it until helm keeps
+  records (helm-control-plane task 14). `ak-test-controller` sends it with
+  `instance-metadata NIC VNI VERSION INSTANCE_ID [KEY=VALUE ...]`.
 - [ ] 6. Draft the kythira `ec2-compatible-api` spec in the kythira
   repository, from Requirements 6 and 9 (network volumes ported from
   `ak_hold_master`). _Requirements: 6, 9_

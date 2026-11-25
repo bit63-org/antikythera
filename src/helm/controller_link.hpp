@@ -77,6 +77,7 @@
 #include "proto/report.hpp"
 #include "proto/tunnel_peers.hpp"
 #include "proto/group_members.hpp"
+#include "proto/instance_metadata.hpp"
 #include "proto/vpc_config.hpp"
 #include "tls/tls.hpp"
 
@@ -119,6 +120,11 @@ public:
     // unmodified. The default drops it, for sinks that run no network role.
     virtual auto on_group_members(const proto::GroupMembers& /*members*/,
                                   std::span<const std::byte> /*frame*/) -> void {}
+    // A NIC's instance metadata record for this server; `frame` is its
+    // exact encoding, which helm forwards unmodified to the NIC's network
+    // role (oar-net task 21). The default drops it.
+    virtual auto on_instance_metadata(const proto::InstanceMetadata& /*metadata*/,
+                                      std::span<const std::byte> /*frame*/) -> void {}
     // Block volumes (.kiro/specs/block-volume-service/ task 12). A volume's
     // replica set and attachments at one epoch; `frame` is its exact
     // encoding, which the storage roles verify.

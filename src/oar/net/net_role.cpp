@@ -9,6 +9,9 @@
 #include <utility>
 #include <variant>
 
+#include <poll.h>
+#include <unistd.h>
+
 #include "proto/group_members.hpp"
 #include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
@@ -25,6 +28,24 @@ namespace oar = helm::oar;
 // bottom, and a placeholder is never connected anyway; the range only keeps
 // the IDs valid and distinct.
 constexpr std::uint64_t placeholder_nic_base = 0xFFFF'FFFE'0000'0000;
+// Metadata packets read from the TUN per poll().
+constexpr std::size_t metadata_budget = 64;
+
+auto ipv4_value(const neighbor::Ipv4Address& a) -> std::uint32_t {
+    std::uint32_t v = 0;
+    for (const auto b : a) {
+        v = (v << 8U) | std::to_integer<std::uint32_t>(b);
+    }
+    return v;
+}
+
+auto in_ipv4_prefix(const Ipv4Prefix& p, const neighbor::Ipv4Address& a) -> bool {
+    if (p.length == 0) {
+        return true;
+    }
+    const std::uint32_t mask = ~std::uint32_t{0} << (32U - p.length);
+    return (ipv4_value(a) & mask) == (ipv4_value(p.address) & mask);
+}
 constexpr std::byte placeholder_mac_head{0x02};  // locally administered unicast
 constexpr std::byte placeholder_mac_fill{0xFF};
 constexpr unsigned byte_bits = 8;
@@ -186,6 +207,11 @@ auto NetRole::create(NetRoleConfig config, const std::vector<NetTransport*>& tra
     // MapUpdates and InstanceMetadata frames.
     role->_metadata = std::make_unique<MetadataStore>(role->_config.server_id, transports.size(),
                                                       role->_verifier);
+    if (role->_config.metadata) {
+        if (auto r = role->start_metadata(); !r) {
+            return std::unexpected(std::format("metadata: {}", r.error()));
+        }
+    }
     for (std::size_t i = 0; i < transports.size(); ++i) {
         NetTransport* t = transports[i];
         if (t == nullptr) {
@@ -264,10 +290,86 @@ auto NetRole::prepare_function(const oar::PrepareFunction& request) -> oar::Stat
     return oar::Status::ok;
 }
 
+auto NetRole::start_metadata() -> std::expected<void, std::string> {
+    const auto plumbing = *_config.metadata;
+    _config.metadata->tun_fd = -1;  // owned below, or closed on failure
+    _config.metadata->listen_fd = -1;
+    auto key = TokenKey::generate();
+    if (!key || plumbing.tun_fd < 0) {
+        if (plumbing.tun_fd >= 0) {
+            ::close(plumbing.tun_fd);
+        }
+        if (plumbing.listen_fd >= 0) {
+            ::close(plumbing.listen_fd);
+        }
+        return std::unexpected(key ? "no TUN" : "token key: RNG failed");
+    }
+    _aliases = std::make_unique<AliasTable>();
+    _md_server = std::make_unique<MetadataServer>(
+        std::move(*key), [this](std::uint64_t nic) { return metadata_view(nic); });
+    if (plumbing.listen_fd >= 0) {
+        _md_server->listen(plumbing.listen_fd,
+                           [this](const sockaddr_storage& peer, socklen_t length) {
+                               return resolve_peer(*_aliases, peer, length);
+                           });
+    }
+    _md_tap = std::make_unique<MetadataTap>(
+        plumbing.tun_fd, *_aliases,
+        [this](geneve::NicId nic) {
+            const auto* r = _metadata->find(nic.value);
+            return r != nullptr && r->http_endpoint == proto::MetadataEndpoint::enabled;
+        },
+        [this](geneve::NicId nic, std::span<const std::byte> packet) {
+            return _vswitch->inject_metadata(nic, packet);
+        },
+        _config.clock);
+    _vswitch->set_metadata_endpoint(_md_tap.get());
+    return {};
+}
+
+auto NetRole::metadata_view(std::uint64_t nic_id) const -> MetadataView {
+    MetadataView view;
+    view.record = _metadata->find(nic_id);
+    if (view.record == nullptr) {
+        return view;
+    }
+    const geneve::NicId nic{nic_id};
+    const auto binding = _mappings.snapshot()->lookup(nic);
+    if (!binding) {
+        return view;
+    }
+    view.network.mac = binding->mac;
+    auto [ipv4, ipv6] = _vswitch->nic_addresses(binding->vni, nic);
+    if (const VpcConfig* cfg = _vswitch->vpc_config(binding->vni); cfg != nullptr) {
+        view.network.subnet4 = cfg->ipv4.address;
+        view.network.subnet4_length = cfg->ipv4.length;
+        // local-ipv4 is the address DHCP hands out: the lowest in the prefix.
+        const auto inside = std::ranges::find_if(
+            ipv4, [&](const neighbor::Ipv4Address& a) { return in_ipv4_prefix(cfg->ipv4, a); });
+        if (inside != ipv4.end()) {
+            std::rotate(ipv4.begin(), inside, inside + 1);
+        }
+    }
+    view.network.ipv4 = std::move(ipv4);
+    view.network.ipv6 = std::move(ipv6);
+    return view;
+}
+
+auto NetRole::metadata_poll_fds(std::vector<pollfd>& out) const -> void {
+    if (_md_tap) {
+        out.push_back({.fd = _md_tap->fd(), .events = POLLIN, .revents = 0});
+        _md_server->append_poll_fds(out);
+    }
+}
+
 auto NetRole::release(oar::FunctionNumber fn, Slot& s) -> bool {
     if (s.nic) {
         static_cast<void>(_vswitch->detach(*s.nic));
         static_cast<void>(_metadata->drop(s.nic->value));
+        if (_md_server) {
+            _md_server->reset_nic(s.nic->value);
+            _aliases->release(*s.nic, _config.clock());
+        }
         s.nic.reset();
     }
     // Resets the function (queues, interrupts, driver state) even if it was
@@ -590,6 +692,11 @@ auto NetRole::poll() -> bool {
     bool more = false;
     for (auto& s : _slots) {
         more = s.function->pci().poll() || more;
+    }
+    if (_md_tap) {
+        // The kernel's replies first, then the connections they feed.
+        more = _md_tap->poll(metadata_budget) || more;
+        _md_server->run_once(_config.clock(), std::chrono::milliseconds::zero());
     }
     return more;
 }

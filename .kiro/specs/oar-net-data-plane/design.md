@@ -346,14 +346,16 @@ Three parts, each testable alone:
   a NIC that is not plugged is kept for its attach. At most one record
   per NIC the role can host.
 - **Translation** (`src/oar/net/metadata_nat.*`, pure functions with a
-  fuzz target). The board's kernel does TCP for the service through a
-  TAP device, `akmd0`, in the role's own network namespace, holding
+  fuzz target; the endpoint in `src/oar/net/metadata_tap.*`). The board's
+  kernel does TCP for the service through a TUN device, `akmd0` (IP
+  packets only, so no ARP or ND on it), in the role's own network
+  namespace, holding
   `169.254.169.254/32` and `fd00:ec2::254/128`. Guests in different VPCs
   may share addresses, so each (NIC, guest address) pair gets an alias:
   `100.64.0.0/10` for IPv4 and `fd00:ec2:1::/96` for IPv6, routed to the
-  TAP. A packet from `MetadataEndpoint::deliver` has its source rewritten
+  TUN. A packet from `MetadataEndpoint::deliver` has its source rewritten
   to the pair's alias (IP and TCP checksums updated as in RFC 1624) and
-  is written to the TAP; a packet read from the TAP to an alias has its
+  is written to the TUN; a packet read from the TUN to an alias has its
   destination rewritten back and goes to `VSwitch::inject_metadata` for
   that NIC. Only TCP to port 80 is written; anything else, and anything
   from the kernel that is not TCP from port 80 (ICMP errors included), is
@@ -398,11 +400,21 @@ expiry is on the role's steady clock, and a request carrying a token
 gets the seconds it has left in `X-aws-ec2-metadata-token-ttl-seconds`. `HttpEndpoint` disabled makes the accept
 loop close the NIC's connections with `SO_LINGER` 0 (a reset).
 
-The TAP needs `CAP_NET_ADMIN` in the role's namespace on the board,
-which is its own machine; nothing on the host is involved. Harbor's
-in-process placement and the unit tests run the HTTP layer over socket
-pairs and the translation layer on byte buffers; a test that needs a real
-TAP skips where namespaces are unavailable, like `jail_test`.
+The TUN needs `CAP_NET_ADMIN` in the role's namespace on the board,
+which is its own machine; nothing on the host is involved. `ak-oar-net
+--metadata akmd0` makes it with ioctls (`open_metadata_tun`: address,
+netmask, up, and the alias routes; the IPv6 half is skipped where IPv6
+is off) and listens on port 80 (dual-stack when it can). The endpoint
+runs on the role's data-plane thread: `NetRole::poll()` reads the TUN
+and runs the connections, and `metadata_poll_fds()` lets the caller's
+poll wake for them. A NIC with no record, or with its endpoint
+disabled, gets no answer: `deliver()` drops its packets before they
+reach the kernel, and connections already open are reset at their next
+request (or close at the idle deadline). Harbor's in-process placement
+and the unit tests run the HTTP layer over socket pairs and the
+translation layer on byte buffers, with a datagram socket pair standing
+in for the TUN; the test that needs a real TUN runs in a fresh user and
+network namespace and skips where those are unavailable.
 
 ## Data models
 

@@ -491,6 +491,10 @@ public:
         -> std::expected<void, VpcConfigError>;
     auto clear_vpc_config(std::uint32_t vni) -> void;
     [[nodiscard]] auto vpc_config(std::uint32_t vni) const -> const VpcConfig*;
+    // A NIC's own addresses in `vni` from the set_neighbors() tables, each
+    // family in ascending order (the metadata service's local-ipv4s).
+    [[nodiscard]] auto nic_addresses(std::uint32_t vni, geneve::NicId nic) const
+        -> std::pair<std::vector<neighbor::Ipv4Address>, std::vector<Ipv6Address>>;
 
     // Sets one VNI's group policy, validated as a whole; a bad policy changes
     // nothing. A drop policy restores the default. Existing rate buckets keep

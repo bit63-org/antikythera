@@ -44,6 +44,7 @@
 #include <string>
 #include <vector>
 
+#include <poll.h>
 #include <sys/socket.h>
 
 #include "oar/net/metadata_http.hpp"
@@ -114,6 +115,10 @@ public:
     auto reset_nic(std::uint64_t nic_id) -> void;
 
     auto set_hop_limit_setter(HopLimitSetter setter) -> void { _set_hops = std::move(setter); }
+
+    // Appends the descriptors run_once() would wait on, for a caller that
+    // polls them itself and then calls run_once() with no timeout.
+    auto append_poll_fds(std::vector<pollfd>& out) const -> void;
 
     [[nodiscard]] auto connections() const noexcept -> std::size_t { return _connections.size(); }
     [[nodiscard]] auto connections(std::uint64_t nic_id) const -> std::size_t;

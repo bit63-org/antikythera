@@ -23,8 +23,10 @@ add_library(ak_oar_net
   oar/net/igmp.cpp
   oar/net/mapping_table.cpp
   oar/net/metadata_http.cpp
+  oar/net/metadata_nat.cpp
   oar/net/metadata_server.cpp
   oar/net/metadata_store.cpp
+  oar/net/metadata_tap.cpp
   oar/net/mtu.cpp
   oar/net/neighbor.cpp
   oar/net/oam.cpp

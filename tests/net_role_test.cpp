@@ -27,10 +27,14 @@
 #include <thread>
 #include <vector>
 
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include "ed25519_test_support.hpp"
 #include "helm/oar_link.hpp"
 #include "helm/sideband_binding.hpp"
 #include "hull/signature_verifier.hpp"
+#include "metadata_packets.hpp"
 #include "net_frames.hpp"
 #include "oar/net/net_role.hpp"
 #include "proto/group_members.hpp"
@@ -340,7 +344,16 @@ enum class Encryption : std::uint8_t {
 // One VTEP: a role over `function_count` fake transports, and a guest
 // driver per function.
 struct Board {
-    explicit Board(std::uint64_t server, std::uint8_t tail, Encryption enc = Encryption::none) {
+    explicit Board(std::uint64_t server, std::uint8_t tail, Encryption enc = Encryption::none,
+                   bool metadata = false) {
+        std::optional<net::NetRoleConfig::Metadata> plumbing;
+        if (metadata) {
+            // The role's TUN is one end of a datagram pair; the test is the kernel.
+            std::array<int, 2> fds{};
+            BOOST_REQUIRE(::socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, fds.data()) == 0);
+            plumbing = net::NetRoleConfig::Metadata{.tun_fd = fds[0], .listen_fd = -1};
+            kernel = fds[1];
+        }
         auto plan = net::plan_mtu(underlay_mtu,
                                   enc == Encryption::wireguard
                                       ? static_cast<std::uint32_t>(net::tunnel_overhead_budget)
@@ -361,7 +374,8 @@ struct Board {
                            ? std::optional<net::TunnelConfig>{net::TunnelConfig{}}
                            : std::nullopt,
              .mtu_grace = {},
-             .clock = {}},
+             .clock = {},
+             .metadata = plumbing},
             raw, verifier(), wire, nullptr);
         BOOST_REQUIRE_MESSAGE(r.has_value(), r.error());
         role = std::move(*r);
@@ -413,7 +427,18 @@ struct Board {
         return bytes;
     }
 
+    Board(const Board&) = delete;
+    auto operator=(const Board&) -> Board& = delete;
+    Board(Board&&) = delete;
+    auto operator=(Board&&) -> Board& = delete;
+    ~Board() {
+        if (kernel >= 0) {
+            ::close(kernel);
+        }
+    }
+
     std::array<FakeTransport, function_count> transports;
+    int kernel{-1};  // the metadata TUN's other end
     Wire wire;
     std::unique_ptr<net::NetRole> role;
     std::array<std::unique_ptr<VirtioDriver>, function_count> drivers;
@@ -1181,6 +1206,76 @@ BOOST_FIXTURE_TEST_CASE(instance_metadata_lives_until_the_nic_is_cleaned, One,
                       {.fn = fn0, .action = ak::helm::CleaningAction::reset_nic_vf}) == Status::ok);
     BOOST_TEST(role->metadata().find(nic_a) == nullptr);
     BOOST_TEST(role->metadata().counters().dropped == 1U);
+}
+
+struct WithMetadata : Board {
+    WithMetadata() : Board(server_one, self_tail, Encryption::none, true) {}
+};
+
+// A guest's metadata request reaches the board's kernel from an alias, and
+// the kernel's reply reaches the guest (Requirements 13.1, 13.3, 13.4).
+BOOST_FIXTURE_TEST_CASE(metadata_requests_go_through_the_tun_and_back, WithMetadata,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    namespace pk = ak::test::metadata;
+    BOOST_REQUIRE(role->map_update(signed_map(server_one, 1, {{nic_a, self_tail}}, {nic_a})) ==
+                  Status::ok);
+    BOOST_REQUIRE(role->vpc_config(signed_vpc(server_one, 1)) == Status::ok);
+    BOOST_REQUIRE(prepare(fn0, nic_a) == Status::ok);
+    driver(fn0);
+    const net::MacAddress gateway{std::byte{0x02}, std::byte{0}, std::byte{0},
+                                  std::byte{0},    std::byte{0}, std::byte{0xFE}};
+    const auto syn = pk::tcp4(guest_ip(nic_a), net::metadata_ipv4, 40000, 80);
+    const auto frame = net::packet::build_ethernet(gateway, mac_of(nic_a), syn);
+
+    // No record yet: no answer at all.
+    send(fn0, frame);
+    BOOST_REQUIRE(role->metadata_tap() != nullptr);
+    BOOST_TEST(role->metadata_tap()->counters().no_record == 1U);
+
+    BOOST_REQUIRE(role->instance_metadata(signed_metadata(server_one, nic_a, 1)) == Status::ok);
+    send(fn0, frame);
+    BOOST_TEST(role->metadata_tap()->counters().to_kernel == 1U);
+    std::array<std::byte, 2048> buf{};
+    const auto n = ::recv(kernel, buf.data(), buf.size(), MSG_DONTWAIT);
+    BOOST_REQUIRE(n == static_cast<ssize_t>(syn.size()));
+    BOOST_TEST(pk::checksums_ok(std::span{buf}.first(syn.size())));
+    pk::Ipv4 alias{};
+    std::copy_n(buf.begin() + 12, 4, alias.begin());
+    BOOST_TEST(std::to_integer<unsigned>(alias[0]) == 100U);
+    BOOST_TEST(role->metadata_aliases()->lookup(net::IpAddress::from(alias))->first.value == nic_a);
+
+    // The kernel answers the alias; the guest sees it from 169.254.169.254.
+    const auto rx_buffer = post_rx(fn0);
+    const auto reply = pk::tcp4(net::metadata_ipv4, alias, 80, 40000, pk::tcp_syn | pk::tcp_ack);
+    BOOST_REQUIRE(::send(kernel, reply.data(), reply.size(), 0) ==
+                  static_cast<ssize_t>(reply.size()));
+    static_cast<void>(role->poll());
+    const auto got = received(fn0, rx_buffer);
+    BOOST_REQUIRE(got.has_value());
+    const auto ip = std::span{*got}.subspan(14);
+    BOOST_TEST(std::ranges::equal(std::span{*got}.first(6), mac_of(nic_a)));
+    BOOST_TEST(std::ranges::equal(ip.subspan(12, 4), net::metadata_ipv4));
+    BOOST_TEST(std::ranges::equal(ip.subspan(16, 4), guest_ip(nic_a)));
+    BOOST_TEST(pk::checksums_ok(ip.first(reply.size())));
+    BOOST_TEST(role->metadata_tap()->counters().to_guest == 1U);
+
+    // What the HTTP layer answers from.
+    const auto view = role->metadata_view(nic_a);
+    BOOST_REQUIRE(view.record != nullptr);
+    BOOST_TEST(view.record->instance_id == "i-0abc");
+    BOOST_TEST((view.network.mac == mac_of(nic_a)));
+    BOOST_REQUIRE(view.network.ipv4.size() == 1U);
+    BOOST_TEST((view.network.ipv4[0] == guest_ip(nic_a)));
+    BOOST_TEST(view.network.subnet4_length == 24U);
+    BOOST_TEST(role->metadata_view(nic_b).record == nullptr);
+
+    // Cleaning the NIC releases its aliases.
+    BOOST_REQUIRE(role->clean_function(
+                      {.fn = fn0, .action = ak::helm::CleaningAction::reset_nic_vf}) == Status::ok);
+    BOOST_TEST(role->metadata_aliases()->size() == 0U);
+    std::vector<pollfd> fds;
+    role->metadata_poll_fds(fds);
+    BOOST_TEST(fds.size() == 1U);  // the TUN; no listener in this rig
 }
 
 BOOST_FIXTURE_TEST_CASE(helm_drives_the_role_over_the_sideband, One,

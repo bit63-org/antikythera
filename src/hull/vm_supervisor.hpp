@@ -23,6 +23,40 @@
 //   LIST_VMS    the VMs by ID (mailbox.hpp, VmList).
 //   VM_STATUS   one VM's state, vCPUs, pages and device count.
 //
+// Attach and detach (task 9, Requirement 7):
+//
+//   ATTACH_DEVICE / ATTACH_VOLUME
+//               the function must be in the boot inventory with the type
+//               the command names (unknown_device) and held by no VM
+//               (conflict). The agent hands its VFIO group node to the
+//               VM's UID, then vm.add-device: a cold-plug while the VM is
+//               `created`, a hot-plug once it runs. The first storage
+//               function attached to a created VM is its boot volume: the
+//               agent boots the VM right after (Requirement 6.2). ok once
+//               the VMM has the function open. A failure undoes the grant
+//               (and the add, if the boot failed).
+//   DETACH_DEVICE / DETACH_VOLUME
+//               vm.remove-device. A created VM drops the function from its
+//               configuration at once: reset, DEVICE_RELEASED, ok. A running
+//               VM is asked to eject it (ACPI), and the agent answers
+//               `accepted` and polls vm.info (poll_detaches). When the
+//               function leaves the VM's configuration -- the guest
+//               ejected it -- it is reset and released. If timeout_s passes
+//               first, the command's policy applies:
+//                 destroy_vm  the VM is killed: VM_EXITED (vmm_failure,
+//                             128 + SIGKILL), then every function it held is
+//                             reset and released;
+//                 force       Cloud Hypervisor has no surprise removal, so
+//                             the function cannot leave a running VMM
+//                             without the guest. The agent resets it in
+//                             place, which takes the device's state away
+//                             from the guest, and releases it only when the
+//                             guest finally ejects it or the VM ends; until
+//                             then no other VM can be given it.
+//               DETACH_VOLUME under `wait` (block-volume task 13) reaches
+//               hull only after the guest released the disk: the timeout
+//               and policy do not apply and the agent waits for the eject.
+//
 // Events are queued, never sent from inside a command: the mailbox client
 // writes the command's response first, and only then does the agent's loop
 // send what take_events() returns. helm therefore sees DESTROY_VM's ok
@@ -32,8 +66,10 @@
 // poll_exits() whenever a VMM's pidfd is readable (or on a timer), then
 // sends take_events().
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -55,6 +91,10 @@ struct SupervisorStats {
     std::uint64_t launch_failures{0};
     std::uint64_t api_failures{0};
     std::uint64_t reset_failures{0};
+    std::uint64_t attached{0};
+    std::uint64_t detached{0};         // functions released after a detach
+    std::uint64_t detach_timeouts{0};  // policies applied
+    std::uint64_t forced_in_place{0};  // force: reset while the guest still holds it
 };
 
 class VmSupervisor {
@@ -76,12 +116,28 @@ public:
 
     [[nodiscard]] auto create(const helm::mailbox::CreateVm& cmd) -> helm::mailbox::Status;
     [[nodiscard]] auto destroy(const helm::mailbox::DestroyVm& cmd) -> helm::mailbox::Status;
+    [[nodiscard]] auto attach(std::uint64_t vm_id, const helm::mailbox::DeviceRef& ref)
+        -> helm::mailbox::Status;
+    [[nodiscard]] auto detach(std::uint64_t vm_id, const helm::mailbox::DeviceRef& ref,
+                              std::uint16_t timeout_s, helm::mailbox::DetachPolicy policy)
+        -> helm::mailbox::Status;
     [[nodiscard]] auto list() const -> CommandOutcome;
     [[nodiscard]] auto status(const helm::mailbox::VmStatus& cmd) const -> CommandOutcome;
 
     // Handles every VMM that has exited since the last call: VM_EXITED, then
     // resets and releases. Returns how many it found.
     auto poll_exits() -> std::size_t;
+
+    // Checks every pending detach once (one vm.info per VM that has one):
+    // releases what the guest ejected and applies the policy of each
+    // detach whose timeout has passed. Returns how many functions it
+    // released. Call it periodically while has_pending_detaches().
+    auto poll_detaches() -> std::size_t;
+    [[nodiscard]] auto has_pending_detaches() const noexcept -> bool;
+
+    using Clock = std::chrono::steady_clock;
+    // For tests: the clock detach deadlines are measured on.
+    auto set_clock(std::function<Clock::time_point()> now) -> void { _now = std::move(now); }
 
     // The VMMs' pidfds, for the agent's poll set.
     [[nodiscard]] auto exit_fds() const -> std::vector<int>;
@@ -96,6 +152,14 @@ public:
     [[nodiscard]] auto stats() const noexcept -> const SupervisorStats& { return _stats; }
 
 private:
+    // A detach the guest has been asked to complete.
+    struct PendingDetach {
+        helm::mailbox::DeviceRef ref;
+        std::optional<Clock::time_point> deadline;  // none: wait for the eject
+        helm::mailbox::DetachPolicy policy{helm::mailbox::DetachPolicy::force};
+        bool forced{false};  // reset in place already
+    };
+
     // What the supervisor keeps per VM. Task 9's attach and detach add and
     // remove functions; the state moves to running at boot.
     struct Vm {
@@ -103,11 +167,19 @@ private:
         Allocation allocation;
         helm::mailbox::VmRunState state{helm::mailbox::VmRunState::created};
         std::vector<helm::mailbox::DeviceRef> devices;  // in attach order
+        std::vector<PendingDetach> pending;
     };
 
     // Resets and releases every function `vm` held (DEVICE_RELEASED each),
     // then returns its resources. `vm` must already be dead and reaped.
     auto release_vm(std::uint64_t vm_id, Vm& vm) -> void;
+    // Takes one function back from a VM whose VMM no longer has it:
+    // revokes its group, resets it, queues DEVICE_RELEASED.
+    auto release_function(std::uint64_t vm_id, Vm& vm, const helm::mailbox::DeviceRef& ref) -> void;
+    // Kills a VM the agent decided to end (destroy_vm policy): VM_EXITED,
+    // then release_vm. Erases it from _vms.
+    auto kill_vm(std::map<std::uint64_t, Vm>::iterator it) -> void;
+    [[nodiscard]] auto holder_of(const helm::mailbox::DeviceRef& ref) const -> const Vm*;
     auto queue_event(helm::mailbox::Body event) -> void { _events.push_back(std::move(event)); }
 
     ResourceAllocator* _allocator;
@@ -118,6 +190,7 @@ private:
     std::map<std::uint64_t, Vm> _vms;
     std::deque<helm::mailbox::Body> _events;
     SupervisorStats _stats;
+    std::function<Clock::time_point()> _now{[] { return Clock::now(); }};
 };
 
 // The exit reason and status VM_EXITED reports for a VMM wait status: a

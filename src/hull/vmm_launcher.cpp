@@ -3,12 +3,14 @@
 
 #include "hull/vmm_launcher.hpp"
 
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <csignal>
+#include <set>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -24,8 +26,14 @@ using Clock = std::chrono::steady_clock;
 // Everything one launch took, released in reverse order on destruction.
 class JailedVmm final : public VmmHandle {
 public:
-    JailedVmm(UidPool& uids, VmId vm, std::filesystem::path dir, std::chrono::milliseconds timeout)
-        : _uids{&uids}, _vm{vm}, _dir{std::move(dir)}, _api{_dir / "api.sock", timeout} {}
+    JailedVmm(UidPool& uids, VmId vm, JailIds ids, std::filesystem::path dir,
+              std::filesystem::path vfio_dir, std::chrono::milliseconds timeout)
+        : _uids{&uids},
+          _vm{vm},
+          _ids{ids},
+          _dir{std::move(dir)},
+          _vfio_dir{std::move(vfio_dir)},
+          _api{_dir / "api.sock", timeout} {}
 
     JailedVmm(const JailedVmm&) = delete;
     auto operator=(const JailedVmm&) -> JailedVmm& = delete;
@@ -34,6 +42,9 @@ public:
 
     ~JailedVmm() override {
         _process.reset();  // SIGKILL and reap before the cgroup can go
+        for (const auto group : std::vector<std::uint32_t>{_granted.begin(), _granted.end()}) {
+            (void)revoke_group(group);
+        }
         if (_cgroup) {
             (void)_cgroup->remove();
             _cgroup.reset();
@@ -47,6 +58,17 @@ public:
         return _process ? _process->pidfd() : -1;
     }
     [[nodiscard]] auto api() -> VmmApi& override { return _api; }
+    [[nodiscard]] auto grant_group(std::uint32_t group) -> bool override {
+        if (!_vfio_dir.empty() && !own(group, _ids.uid, _ids.gid)) {
+            return false;
+        }
+        _granted.insert(group);
+        return true;
+    }
+    auto revoke_group(std::uint32_t group) -> bool override {
+        _granted.erase(group);
+        return _vfio_dir.empty() || own(group, 0, 0);
+    }
     auto kill() -> void override {
         if (_process) {
             (void)_process->signal(SIGKILL);
@@ -65,10 +87,28 @@ public:
     std::optional<JailedProcess> _process;
 
 private:
+    // chown and chmod 0600 the group's node, without following a link.
+    [[nodiscard]] auto own(std::uint32_t group, uid_t uid, gid_t gid) const -> bool {
+        const auto node = _vfio_dir / std::to_string(group);
+        const int fd = ::open(node.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) {
+            return false;
+        }
+        struct stat st{};
+        const bool ok = ::fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) &&
+                        ::fchownat(fd, "", uid, gid, AT_EMPTY_PATH) == 0 &&
+                        ::chmod(("/proc/self/fd/" + std::to_string(fd)).c_str(), 0600) == 0;
+        ::close(fd);
+        return ok;
+    }
+
     UidPool* _uids;
     VmId _vm;
+    JailIds _ids;
     std::filesystem::path _dir;
+    std::filesystem::path _vfio_dir;
     ChApiClient _api;
+    std::set<std::uint32_t> _granted;
 };
 
 auto exited(int pidfd) -> bool {
@@ -113,7 +153,8 @@ auto JailedVmmLauncher::launch(const Allocation& allocation)
     }
     const auto dir = _config.run_dir / ("vm-" + std::to_string(allocation.vm_id));
     // From here the handle owns the UID and the directory.
-    auto vmm = std::make_unique<JailedVmm>(*_uids, allocation.vm_id, dir, _config.api_timeout);
+    auto vmm = std::make_unique<JailedVmm>(*_uids, allocation.vm_id, *ids, dir, _config.vfio_dir,
+                                           _config.api_timeout);
 
     // A directory left by a VM of the same ID from before an agent restart
     // holds nothing anyone needs.

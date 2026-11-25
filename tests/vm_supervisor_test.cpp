@@ -65,6 +65,11 @@ class FakeApi final : public VmmApi {
 public:
     explicit FakeApi(VmmLog& log) : _log{&log} {}
     bool fail_create{false};
+    bool fail_boot{false};
+    std::optional<VmmApiError> fail_add;  // with timed_out, the add still happens
+    bool eject_at_once{false};            // a running guest ejects on request
+    std::vector<std::string> devices;
+    bool running{false};
 
     auto create(std::string_view config) -> Result override {
         _log->calls.emplace_back("create");
@@ -77,20 +82,45 @@ public:
     }
     auto boot() -> Result override {
         _log->calls.emplace_back("boot");
+        if (fail_boot) {
+            return std::unexpected(
+                VmmApiFailure{.error = VmmApiError::refused, .http_status = 500});
+        }
+        running = true;
         return {};
     }
-    auto add_device(std::string_view id, const std::filesystem::path&) -> Result override {
-        _log->calls.push_back("add " + std::string{id});
+    auto add_device(std::string_view id, const std::filesystem::path& path) -> Result override {
+        _log->calls.push_back("add " + std::string{id} + " " + path.native());
+        if (fail_add == VmmApiError::refused) {
+            return std::unexpected(
+                VmmApiFailure{.error = VmmApiError::refused, .http_status = 500});
+        }
+        devices.emplace_back(id);
+        if (fail_add) {
+            return std::unexpected(VmmApiFailure{.error = *fail_add});
+        }
         return {};
     }
     auto remove_device(std::string_view id) -> Result override {
         _log->calls.push_back("remove " + std::string{id});
+        const auto it = std::ranges::find(devices, id);
+        if (it == devices.end()) {
+            return std::unexpected(
+                VmmApiFailure{.error = VmmApiError::refused, .http_status = 404});
+        }
+        if (!running || eject_at_once) {
+            devices.erase(it);
+        }
         return {};
     }
     auto info() -> std::expected<VmmInfo, VmmApiFailure> override {
-        return VmmInfo{.state = VmmState::created, .device_ids = {}};
+        return VmmInfo{.state = running ? VmmState::running : VmmState::created,
+                       .device_ids = devices};
     }
     auto shutdown_vmm() -> Result override { return {}; }
+
+    // The guest acknowledges an eject request.
+    auto guest_ejects(const std::string& id) -> void { std::erase(devices, id); }
 
 private:
     VmmLog* _log;
@@ -120,6 +150,14 @@ public:
         exit_now(SIGKILL);  // what the kernel reports for a SIGKILLed process
     }
     auto wait() -> std::expected<int, int> override { return _status; }
+    auto grant_group(std::uint32_t g) -> bool override {
+        _log->calls.push_back("grant " + std::to_string(g));
+        return true;
+    }
+    auto revoke_group(std::uint32_t g) -> bool override {
+        _log->calls.push_back("revoke " + std::to_string(g));
+        return true;
+    }
 
     auto exit_now(int wait_status) -> void {
         _status = wait_status;
@@ -409,13 +447,296 @@ BOOST_AUTO_TEST_CASE(handler_dispatches_every_command,
     BOOST_TEST(h.supervisor.contains(1));
     BOOST_TEST((handler.handle(msg, mb::ListVms{}).payload.size() == mb::vm_list_fixed_size + 8));
     BOOST_TEST((status(mb::VmStatus{.vm_id = 1}) == mb::Status::ok));
+    BOOST_TEST((status(mb::AttachDevice{
+                    .vm_id = 1, .device = Harness::nic, .vni = 1, .nic_id = 1, .mac = {}}) ==
+                mb::Status::ok));
+    BOOST_TEST((status(mb::AttachVolume{.volume_id = 3, .vm_id = 1, .device = Harness::blk}) ==
+                mb::Status::ok));
     BOOST_TEST(
-        (status(mb::AttachDevice{.vm_id = 1, .device = Harness::nic, .vni = 1, .nic_id = 1}) ==
-         mb::Status::unsupported));
+        (status(mb::DetachDevice{.vm_id = 1,
+                                 .device = Harness::nic,
+                                 .timeout_s = 5,
+                                 .policy = mb::DetachPolicy::force}) == mb::Status::accepted));
+    BOOST_TEST(
+        (status(mb::DetachVolume{.volume_id = 3,
+                                 .vm_id = 1,
+                                 .device = Harness::blk,
+                                 .timeout_s = 5,
+                                 .policy = mb::DetachPolicy::force}) == mb::Status::accepted));
     BOOST_TEST(
         (status(mb::CreateVolume{.volume_id = 1, .owner_vm = 1, .size_gib = 1}) == mb::Status::ok));
     BOOST_TEST((status(mb::CreateNetwork{.vni = 7}) == mb::Status::ok));
     BOOST_TEST((status(mb::DestroyVm{.vm_id = 1}) == mb::Status::ok));
     BOOST_TEST(!h.supervisor.contains(1));
     BOOST_TEST((status(mb::VmExited{.vm_id = 1}) == mb::Status::malformed));
+}
+
+// --- Attach and detach (task 9) -------------------------------------------------
+
+namespace {
+
+auto calls(Harness& h, std::uint64_t vm) -> const std::vector<std::string>& {
+    return h.launcher.logs[vm].calls;
+}
+
+auto released(const mb::Body& e) -> mb::DeviceReleased {
+    return std::get<mb::DeviceReleased>(e);
+}
+
+// A harness clock the test moves by hand.
+struct ManualClock {
+    VmSupervisor::Clock::time_point t{};
+    auto operator()() const { return t; }
+};
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(attach_cold_plugs_and_boots_on_the_volume,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Harness h;
+    BOOST_TEST_REQUIRE(
+        (h.supervisor.create({.vm_id = 1, .vcpus = 2, .memory_mib = 1024}) == mb::Status::ok));
+    // A NIC first: cold-plugged, nothing boots.
+    BOOST_TEST((h.supervisor.attach(1, Harness::nic) == mb::Status::ok));
+    auto st = mb::decode_vm_status_payload(h.supervisor.status({.vm_id = 1}).payload).value();
+    BOOST_TEST((st.state == mb::VmRunState::created));
+    BOOST_TEST(st.devices == 1U);
+    // The volume: cold-plugged, then the VM boots from it.
+    BOOST_TEST((h.supervisor.attach(1, Harness::blk) == mb::Status::ok));
+    st = mb::decode_vm_status_payload(h.supervisor.status({.vm_id = 1}).payload).value();
+    BOOST_TEST((st.state == mb::VmRunState::running));
+    BOOST_TEST((calls(h, 1) == std::vector<std::string>{
+                                   "create",
+                                   "grant 11",
+                                   "add ak-s3-nic-f1 /sys/bus/pci/devices/0000:03:00.1",
+                                   "grant 12",
+                                   "add ak-s4-blk-f0 /sys/bus/pci/devices/0000:04:00.0",
+                                   "boot",
+                               }));
+    BOOST_TEST(h.supervisor.stats().attached == 2U);
+}
+
+BOOST_AUTO_TEST_CASE(attach_checks_vm_inventory_and_ownership,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Harness h;
+    BOOST_TEST_REQUIRE(
+        (h.supervisor.create({.vm_id = 1, .vcpus = 2, .memory_mib = 1024}) == mb::Status::ok));
+    BOOST_TEST_REQUIRE(
+        (h.supervisor.create({.vm_id = 2, .vcpus = 2, .memory_mib = 1024}) == mb::Status::ok));
+    BOOST_TEST((h.supervisor.attach(7, Harness::nic) == mb::Status::unknown_vm));
+    // Not in the inventory, and in it but under another type.
+    BOOST_TEST(
+        (h.supervisor.attach(1, {.slot = 9, .type = mb::DeviceType::nic_vf, .function = 0}) ==
+         mb::Status::unknown_device));
+    BOOST_TEST(
+        (h.supervisor.attach(1, {.slot = 3, .type = mb::DeviceType::gpu_vf, .function = 1}) ==
+         mb::Status::unknown_device));
+    BOOST_TEST((h.supervisor.attach(1, Harness::nic) == mb::Status::ok));
+    BOOST_TEST((h.supervisor.attach(2, Harness::nic) == mb::Status::conflict));
+    BOOST_TEST((h.supervisor.attach(1, Harness::nic) == mb::Status::conflict));
+}
+
+BOOST_AUTO_TEST_CASE(attach_failures_undo_the_grant,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Harness h;
+    BOOST_TEST_REQUIRE(
+        (h.supervisor.create({.vm_id = 1, .vcpus = 2, .memory_mib = 1024}) == mb::Status::ok));
+    auto& api = h.launcher.live[1]->fake_api();
+
+    api.fail_add = VmmApiError::refused;
+    BOOST_TEST((h.supervisor.attach(1, Harness::nic) == mb::Status::internal_error));
+    BOOST_TEST(calls(h, 1).back() == "revoke 11");
+
+    // A timeout after which the VMM does list the device: it is attached.
+    api.fail_add = VmmApiError::timed_out;
+    BOOST_TEST((h.supervisor.attach(1, Harness::nic) == mb::Status::ok));
+    api.fail_add.reset();
+
+    // The boot fails: the volume comes out of the configuration again.
+    api.fail_boot = true;
+    BOOST_TEST((h.supervisor.attach(1, Harness::blk) == mb::Status::internal_error));
+    BOOST_TEST(calls(h, 1).back() == "revoke 12");
+    BOOST_TEST((api.devices == std::vector<std::string>{"ak-s3-nic-f1"}));
+    BOOST_TEST((mb::decode_vm_status_payload(h.supervisor.status({.vm_id = 1}).payload)->state ==
+                mb::VmRunState::created));
+}
+
+BOOST_AUTO_TEST_CASE(detach_before_boot_releases_at_once,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Harness h;
+    BOOST_TEST_REQUIRE(
+        (h.supervisor.create({.vm_id = 1, .vcpus = 2, .memory_mib = 1024}) == mb::Status::ok));
+    BOOST_TEST_REQUIRE((h.supervisor.attach(1, Harness::nic) == mb::Status::ok));
+    BOOST_TEST(
+        (h.supervisor.detach(1, Harness::nic, 10, mb::DetachPolicy::force) == mb::Status::ok));
+    const auto events = h.supervisor.take_events();
+    BOOST_TEST_REQUIRE(events.size() == 1U);
+    BOOST_TEST(
+        (released(events[0]) ==
+         mb::DeviceReleased{.vm_id = 1, .device = Harness::nic, .reset = mb::ResetResult::ok}));
+    BOOST_TEST((h.resetter.resets == std::vector<std::string>{"0000:03:00.1"}));
+    BOOST_TEST(calls(h, 1).back() == "revoke 11");
+    BOOST_TEST(!h.supervisor.has_pending_detaches());
+    BOOST_TEST((h.supervisor.detach(1, Harness::nic, 10, mb::DetachPolicy::force) ==
+                mb::Status::unknown_device));
+    BOOST_TEST((h.supervisor.detach(5, Harness::nic, 10, mb::DetachPolicy::force) ==
+                mb::Status::unknown_vm));
+}
+
+BOOST_AUTO_TEST_CASE(detach_waits_for_the_guest_to_eject,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Harness h;
+    ManualClock clock;
+    h.supervisor.set_clock(std::ref(clock));
+    BOOST_TEST_REQUIRE(
+        (h.supervisor.create({.vm_id = 1, .vcpus = 2, .memory_mib = 1024}) == mb::Status::ok));
+    BOOST_TEST_REQUIRE((h.supervisor.attach(1, Harness::blk) == mb::Status::ok));  // boots
+    BOOST_TEST_REQUIRE((h.supervisor.attach(1, Harness::nic) == mb::Status::ok));  // hot-plug
+    auto& api = h.launcher.live[1]->fake_api();
+
+    BOOST_TEST((h.supervisor.detach(1, Harness::nic, 30, mb::DetachPolicy::force) ==
+                mb::Status::accepted));
+    BOOST_TEST((h.supervisor.detach(1, Harness::nic, 30, mb::DetachPolicy::force) ==
+                mb::Status::conflict));  // already under way
+    BOOST_TEST(h.supervisor.has_pending_detaches());
+    clock.t += std::chrono::seconds{10};
+    BOOST_TEST(h.supervisor.poll_detaches() == 0U);
+    BOOST_TEST(h.supervisor.take_events().empty());
+
+    api.guest_ejects("ak-s3-nic-f1");
+    BOOST_TEST(h.supervisor.poll_detaches() == 1U);
+    const auto events = h.supervisor.take_events();
+    BOOST_TEST_REQUIRE(events.size() == 1U);
+    BOOST_TEST((released(events[0]).device == Harness::nic));
+    BOOST_TEST(!h.supervisor.has_pending_detaches());
+    BOOST_TEST(h.supervisor.stats().detached == 1U);
+    BOOST_TEST(h.supervisor.stats().detach_timeouts == 0U);
+    // The function can go to another VM now.
+    BOOST_TEST_REQUIRE(
+        (h.supervisor.create({.vm_id = 2, .vcpus = 2, .memory_mib = 1024}) == mb::Status::ok));
+    BOOST_TEST((h.supervisor.attach(2, Harness::nic) == mb::Status::ok));
+}
+
+BOOST_AUTO_TEST_CASE(detach_timeout_destroys_the_vm,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Harness h;
+    ManualClock clock;
+    h.supervisor.set_clock(std::ref(clock));
+    BOOST_TEST_REQUIRE(
+        (h.supervisor.create({.vm_id = 1, .vcpus = 2, .memory_mib = 1024}) == mb::Status::ok));
+    BOOST_TEST_REQUIRE((h.supervisor.attach(1, Harness::blk) == mb::Status::ok));
+    BOOST_TEST_REQUIRE((h.supervisor.attach(1, Harness::nic) == mb::Status::ok));
+    BOOST_TEST((h.supervisor.detach(1, Harness::nic, 30, mb::DetachPolicy::destroy_vm) ==
+                mb::Status::accepted));
+    clock.t += std::chrono::seconds{29};
+    BOOST_TEST(h.supervisor.poll_detaches() == 0U);
+    BOOST_TEST(h.supervisor.contains(1));
+    clock.t += std::chrono::seconds{1};
+    BOOST_TEST(h.supervisor.poll_detaches() == 2U);
+    BOOST_TEST(!h.supervisor.contains(1));
+    BOOST_TEST(h.launcher.logs[1].killed);
+    const auto events = h.supervisor.take_events();
+    BOOST_TEST_REQUIRE(events.size() == 3U);
+    BOOST_TEST(
+        (std::get<mb::VmExited>(events[0]) == mb::VmExited{.vm_id = 1,
+                                                           .exit_status = 128 + SIGKILL,
+                                                           .reason = mb::ExitReason::vmm_failure}));
+    BOOST_TEST((released(events[1]).device == Harness::blk));
+    BOOST_TEST((released(events[2]).device == Harness::nic));
+    BOOST_TEST(h.allocator.free_cores() == 4U);
+    BOOST_TEST(h.supervisor.stats().detach_timeouts == 1U);
+}
+
+// `wait` reaches hull only after helm saw the guest release the volume
+// (Requirement 7.2), so there is no deadline: the function is released
+// whenever the guest's eject completes, however long that takes.
+BOOST_AUTO_TEST_CASE(detach_wait_has_no_deadline,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Harness h;
+    ManualClock clock;
+    h.supervisor.set_clock(std::ref(clock));
+    BOOST_TEST_REQUIRE(
+        (h.supervisor.create({.vm_id = 1, .vcpus = 2, .memory_mib = 1024}) == mb::Status::ok));
+    BOOST_TEST_REQUIRE((h.supervisor.attach(1, Harness::blk) == mb::Status::ok));
+    BOOST_TEST(
+        (h.supervisor.detach(1, Harness::blk, 5, mb::DetachPolicy::wait) == mb::Status::accepted));
+    clock.t += std::chrono::hours{1};
+    BOOST_TEST(h.supervisor.poll_detaches() == 0U);
+    BOOST_TEST(h.supervisor.contains(1));
+    BOOST_TEST(h.resetter.resets.empty());
+    BOOST_TEST(h.supervisor.stats().detach_timeouts == 0U);
+    h.launcher.live[1]->fake_api().guest_ejects("ak-s4-blk-f0");
+    BOOST_TEST(h.supervisor.poll_detaches() == 1U);
+    const auto events = h.supervisor.take_events();
+    BOOST_TEST_REQUIRE(events.size() == 1U);
+    BOOST_TEST((released(events[0]).device == Harness::blk));
+}
+
+BOOST_AUTO_TEST_CASE(detach_timeout_forces_in_place,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Harness h;
+    ManualClock clock;
+    h.supervisor.set_clock(std::ref(clock));
+    BOOST_TEST_REQUIRE(
+        (h.supervisor.create({.vm_id = 1, .vcpus = 2, .memory_mib = 1024}) == mb::Status::ok));
+    BOOST_TEST_REQUIRE((h.supervisor.attach(1, Harness::blk) == mb::Status::ok));
+    BOOST_TEST_REQUIRE((h.supervisor.attach(1, Harness::nic) == mb::Status::ok));
+    BOOST_TEST(
+        (h.supervisor.detach(1, Harness::nic, 5, mb::DetachPolicy::force) == mb::Status::accepted));
+    clock.t += std::chrono::seconds{6};
+    BOOST_TEST(h.supervisor.poll_detaches() == 0U);
+    // Reset in place, not released: the VMM still has it open.
+    BOOST_TEST((h.resetter.resets == std::vector<std::string>{"0000:03:00.1"}));
+    BOOST_TEST(h.supervisor.take_events().empty());
+    BOOST_TEST(h.supervisor.stats().forced_in_place == 1U);
+    BOOST_TEST((h.supervisor.attach(1, Harness::nic) == mb::Status::conflict));
+    // Polling again does not reset it again.
+    clock.t += std::chrono::seconds{60};
+    BOOST_TEST(h.supervisor.poll_detaches() == 0U);
+    BOOST_TEST(h.resetter.resets.size() == 1U);
+
+    // The guest ejects it at last: reset again (the guest may have touched
+    // it since) and released.
+    h.launcher.live[1]->fake_api().guest_ejects("ak-s3-nic-f1");
+    BOOST_TEST(h.supervisor.poll_detaches() == 1U);
+    BOOST_TEST(h.resetter.resets.size() == 2U);
+    const auto events = h.supervisor.take_events();
+    BOOST_TEST_REQUIRE(events.size() == 1U);
+    BOOST_TEST((released(events[0]).device == Harness::nic));
+}
+
+BOOST_AUTO_TEST_CASE(destroy_and_exit_release_held_functions,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Harness h;
+    h.resetter.failing.insert("0000:04:00.0");
+    BOOST_TEST_REQUIRE(
+        (h.supervisor.create({.vm_id = 1, .vcpus = 2, .memory_mib = 1024}) == mb::Status::ok));
+    BOOST_TEST_REQUIRE((h.supervisor.attach(1, Harness::blk) == mb::Status::ok));
+    BOOST_TEST_REQUIRE((h.supervisor.attach(1, Harness::nic) == mb::Status::ok));
+    BOOST_TEST(
+        (h.supervisor.detach(1, Harness::nic, 5, mb::DetachPolicy::force) == mb::Status::accepted));
+    // Destroy while the NIC's detach is still pending.
+    BOOST_TEST((h.supervisor.destroy({.vm_id = 1}) == mb::Status::ok));
+    auto events = h.supervisor.take_events();
+    BOOST_TEST_REQUIRE(events.size() == 2U);
+    BOOST_TEST(
+        (released(events[0]) ==
+         mb::DeviceReleased{.vm_id = 1, .device = Harness::blk, .reset = mb::ResetResult::failed}));
+    BOOST_TEST(
+        (released(events[1]) ==
+         mb::DeviceReleased{.vm_id = 1, .device = Harness::nic, .reset = mb::ResetResult::ok}));
+    BOOST_TEST(!h.supervisor.has_pending_detaches());
+    BOOST_TEST(h.supervisor.stats().reset_failures == 1U);
+
+    // An unexpected exit: VM_EXITED, then the releases.
+    h.resetter.failing.clear();
+    BOOST_TEST_REQUIRE(
+        (h.supervisor.create({.vm_id = 2, .vcpus = 2, .memory_mib = 1024}) == mb::Status::ok));
+    BOOST_TEST_REQUIRE((h.supervisor.attach(2, Harness::blk) == mb::Status::ok));
+    h.launcher.live[2]->exit_now(0);
+    BOOST_TEST(h.supervisor.poll_exits() == 1U);
+    events = h.supervisor.take_events();
+    BOOST_TEST_REQUIRE(events.size() == 2U);
+    BOOST_TEST(std::holds_alternative<mb::VmExited>(events[0]));
+    BOOST_TEST((released(events[1]).vm_id == 2U));
 }

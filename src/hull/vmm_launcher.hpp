@@ -65,6 +65,12 @@ public:
     // Readable once the VMM has exited (poll(2)); -1 if there is none.
     [[nodiscard]] virtual auto pidfd() const noexcept -> int = 0;
     [[nodiscard]] virtual auto api() -> VmmApi& = 0;
+    // Hands the VFIO group node of a function being assigned to the VM's
+    // UID (0600), or back to root once the VMM no longer holds it. The jail
+    // lets the VMM reach /dev/vfio as a whole; this ownership is what
+    // limits it to its own functions.
+    [[nodiscard]] virtual auto grant_group(std::uint32_t iommu_group) -> bool = 0;
+    virtual auto revoke_group(std::uint32_t iommu_group) -> bool = 0;
     // SIGKILL; harmless if it already exited.
     virtual auto kill() -> void = 0;
     // Blocks until the VMM exits and reaps it: its wait status in
@@ -111,6 +117,9 @@ struct VmmLaunchConfig {
     std::filesystem::path cloud_hypervisor{"/usr/bin/cloud-hypervisor"};
     BootPayload payload;  // its files become read-only rules
     std::filesystem::path run_dir{"/run/hull"};
+    // Where VFIO group nodes live; empty: grant_group and revoke_group do
+    // nothing (tests without VFIO).
+    std::filesystem::path vfio_dir{"/dev/vfio"};
     std::vector<PathRule> paths{default_vmm_paths()};  // tests replace these
     std::vector<PathRule> extra_paths;                 // e.g. shared libraries of a dynamic VMM
 

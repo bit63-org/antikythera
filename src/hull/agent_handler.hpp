@@ -8,7 +8,10 @@
 //
 //   CREATE_VM, DESTROY_VM, LIST_VMS, VM_STATUS   the VmSupervisor
 //   ATTACH_DEVICE, DETACH_DEVICE,
-//   ATTACH_VOLUME, DETACH_VOLUME                 unsupported until task 9
+//   ATTACH_VOLUME, DETACH_VOLUME                 the VmSupervisor (task 9); the
+//                                                volume key and the network
+//                                                identity are helm's, so hull
+//                                                sees only the function
 //   CREATE_VOLUME, DELETE_VOLUME, REWRAP_VOLUME,
 //   CREATE_NETWORK, DELETE_NETWORK               ok: the work is helm's and
 //                                                the data-plane roles'. hull's

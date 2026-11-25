@@ -329,8 +329,13 @@
     14); `NetRole` verifies and keeps them (`metadata_store`), dropping
     a NIC's on clean. The store holds one record per function at most
     and refuses a record for a new NIC when full.
-  - [ ] 21.4 HTTP layer with IMDSv2 tokens and the path table
-    (`metadata_http`), over socket pairs in tests.
+  - [x] 21.4 HTTP layer with IMDSv2 tokens and the path table
+    (`metadata_http`), over socket pairs in tests. The parser, tokens
+    and path table are pure functions (`metadata_http`, fuzzed by
+    `fuzz_metadata_http`); `MetadataServer` (`metadata_server`) owns
+    the connections, limits, deadlines and the token answer's hop
+    limit, accepting through a `PeerResolver` that task 21.5 backs with
+    the TAP aliases.
   - [ ] 21.5 TAP endpoint and alias translation (`metadata_nat`), with a
     fuzz target, wired as the role's `MetadataEndpoint`.
 - [x] 22. Per-NIC source/destination check opt-out, with route-table

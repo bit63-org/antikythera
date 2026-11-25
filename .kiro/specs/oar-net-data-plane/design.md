@@ -361,7 +361,9 @@ Three parts, each testable alone:
   replaced); a NIC's aliases are released when it is cleaned, and an
   alias is not reused for another NIC while the kernel may still hold a
   connection for it (a 2-minute quarantine, longer than TIME_WAIT).
-- **HTTP** (`src/oar/net/metadata_http.*`). An accept loop on port 80
+- **HTTP** (`src/oar/net/metadata_http.*` for the parser, tokens and
+  path table as pure functions; `src/oar/net/metadata_server.*` for the
+  connections). An accept loop on port 80
   in the namespace maps each peer alias back to its NIC and serves
   HTTP/1.0 and 1.1 (keep-alive, one request at a time) from the NIC's
   record. Limits: request line 2 KiB, headers 8 KiB and 32 fields in
@@ -389,7 +391,11 @@ its expiry, or after its NIC's interface moved to another instance fails
 the check. The token `PUT` response's socket gets `IP_TTL` or
 `IPV6_UNICAST_HOPS` set to the record's hop limit before it is written,
 so a container behind a NAT on the guest (one hop more) never sees it
-when the limit is 1, as in EC2. `HttpEndpoint` disabled makes the accept
+when the limit is 1, as in EC2. The socket keeps that limit for the
+rest of the connection, since every later answer goes to the same peer;
+if it cannot be set, the token is not sent (500 and close). Token
+expiry is on the role's steady clock, and a request carrying a token
+gets the seconds it has left in `X-aws-ec2-metadata-token-ttl-seconds`. `HttpEndpoint` disabled makes the accept
 loop close the NIC's connections with `SO_LINGER` 0 (a reset).
 
 The TAP needs `CAP_NET_ADMIN` in the role's namespace on the board,

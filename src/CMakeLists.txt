@@ -22,6 +22,8 @@ add_library(ak_oar_net
   oar/net/geneve.cpp
   oar/net/igmp.cpp
   oar/net/mapping_table.cpp
+  oar/net/metadata_http.cpp
+  oar/net/metadata_server.cpp
   oar/net/metadata_store.cpp
   oar/net/mtu.cpp
   oar/net/neighbor.cpp

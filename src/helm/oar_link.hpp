@@ -139,6 +139,20 @@ public:
     // (nic_id, attachment) order. A page that disagrees with the first
     // page's total, or a role that never finishes, is a bad_response.
     auto group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError>;
+    // Sends one controller GroupMembers frame in chunks, like tunnel_peers;
+    // fails without sending if it is empty or larger than
+    // oar::max_group_members_frame.
+    auto group_members(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
+    // The role's snooped joins: nullopt when they are still the list of
+    // generation `since`, otherwise every page of one snapshot. Pages that
+    // disagree on the generation or total, or break the order, are a
+    // bad_response.
+    struct Memberships {
+        std::uint32_t generation{0};
+        std::vector<oar::MembershipEntry> entries;
+    };
+    auto group_membership(std::optional<std::uint32_t> since)
+        -> std::expected<std::optional<Memberships>, LinkError>;
     // Forwards one controller VpcConfig frame (min_vpc_config_frame to
     // max_vpc_config_frame bytes) to a network role.
     auto vpc_config(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
@@ -252,6 +266,16 @@ public:
     virtual auto tunnel_peers(std::span<const std::byte> /*frame*/) -> oar::Status {
         return oar::Status::unsupported;
     }
+    // Snooping, which only the network role does (oar-net Requirement
+    // 10.5): a whole, reassembled GroupMembers frame, not yet decoded or
+    // verified, and one page of the role's join list (oar::MembershipPager).
+    virtual auto group_members(std::span<const std::byte> /*frame*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    virtual auto group_membership(const oar::MembershipRequest& /*request*/)
+        -> std::expected<oar::MembershipPage, oar::Status> {
+        return std::unexpected(oar::Status::unsupported);
+    }
     // A VPC's gateway configuration, which only the network role keeps
     // (oar-net Requirement 12). `frame` is not yet decoded or verified and
     // is valid only during the call.
@@ -310,7 +334,8 @@ public:
 private:
     auto dispatch(OarHandler& handler, mctp::VendorType type, std::span<const std::byte> body)
         -> std::vector<std::byte>;
-    // One chunk of a map_update, tunnel_peers or role_certificate transfer.
+    // One chunk of a map_update, tunnel_peers, group_members or
+    // role_certificate transfer.
     auto frame_chunk(OarHandler& handler, mctp::VendorType type, std::span<const std::byte> body)
         -> oar::Status;
     auto reset_frame() noexcept -> void;

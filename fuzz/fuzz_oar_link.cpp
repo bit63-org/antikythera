@@ -116,6 +116,14 @@ auto decoders(std::span<const std::byte> body) -> void {
             same(body, oar::encode_usage_page(*u, cursor));
         }
     }
+    if (auto m = oar::decode_membership_request(body)) {
+        same(body, oar::encode_membership_request(*m));
+    }
+    for (const std::uint16_t cursor : {std::uint16_t{0}, std::uint16_t{oar::max_membership_page}}) {
+        if (auto m = oar::decode_membership_page(body, cursor)) {
+            same(body, oar::encode_membership_page(*m, cursor));
+        }
+    }
 }
 
 // Accepts whatever helm asks for; map frames are only counted.

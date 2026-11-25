@@ -4,6 +4,7 @@
 #include "helm/oar_protocol.hpp"
 
 #include <algorithm>
+#include <tuple>
 #include <utility>
 
 #include "common/wire.hpp"
@@ -1271,6 +1272,185 @@ auto decode_usage_page(std::span<const std::byte> body, std::uint16_t cursor)
     return page;
 }
 
+namespace {
+
+auto membership_key(const MembershipEntry& e) noexcept {
+    return std::tuple{e.nic_id, e.ipv6, e.group};
+}
+
+auto check_membership_entries(std::span<const MembershipEntry> entries) noexcept
+    -> std::expected<void, BodyError> {
+    for (const auto& e : entries) {
+        if (e.nic_id == 0) {
+            return std::unexpected(BodyError::zero_id);
+        }
+        if (e.vni == 0 || e.vni > max_vni) {
+            return std::unexpected(BodyError::bad_vni);
+        }
+        if (!e.ipv6 && std::ranges::any_of(std::span{e.group}.subspan(4),
+                                           [](std::byte b) { return b != std::byte{0}; })) {
+            return std::unexpected(BodyError::bad_group);
+        }
+    }
+    if (std::ranges::adjacent_find(entries, [](const auto& a, const auto& b) {
+            return membership_key(a) >= membership_key(b);
+        }) != entries.end()) {
+        return std::unexpected(BodyError::not_increasing);
+    }
+    return {};
+}
+
+constexpr std::uint8_t family_ipv4 = 4;
+constexpr std::uint8_t family_ipv6 = 6;
+
+}  // namespace
+
+auto MembershipPager::take(std::uint32_t generation, Snapshot fresh) -> void {
+    std::ranges::sort(fresh, {}, membership_key);
+    const auto dup = std::ranges::unique(fresh, {}, membership_key);
+    fresh.erase(dup.begin(), dup.end());
+    if (fresh.size() > max_memberships) {
+        fresh.resize(max_memberships);
+    }
+    _generation = generation;
+    _snapshot = std::move(fresh);
+    _open = true;
+}
+
+auto MembershipPager::serve(std::uint16_t cursor) -> std::expected<MembershipPage, Status> {
+    const std::size_t total = _snapshot.size();
+    if (!_open || cursor > total || (cursor == total && cursor != 0)) {
+        return std::unexpected(Status::bad_request);
+    }
+    const std::size_t count = std::min(max_membership_page, total - cursor);
+    MembershipPage page{.generation = _generation,
+                        .unchanged = false,
+                        .total = static_cast<std::uint16_t>(total),
+                        .entries = {}};
+    const auto first = _snapshot.begin() + cursor;
+    page.entries.assign(first, first + static_cast<std::ptrdiff_t>(count));
+    if (cursor + count == total) {
+        _open = false;
+    }
+    return page;
+}
+
+auto encode_membership_request(const MembershipRequest& request)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    std::vector<std::byte> out;
+    out.reserve(membership_request_size);
+    wire::Writer w{out};
+    w.le16(request.cursor);
+    w.le16(request.since ? membership_since : std::uint16_t{0});
+    w.le32(request.since.value_or(0));
+    return out;
+}
+
+auto decode_membership_request(std::span<const std::byte> body) noexcept
+    -> std::expected<MembershipRequest, BodyError> {
+    if (auto ok = check_size(body, membership_request_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    wire::Reader r{body};
+    MembershipRequest request;
+    request.cursor = r.le16().value_or(0);
+    const auto flags = r.le16().value_or(0);
+    const auto since = r.le32().value_or(0);
+    if ((flags & ~membership_since) != 0 || ((flags & membership_since) == 0 && since != 0)) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    if ((flags & membership_since) != 0) {
+        request.since = since;
+    }
+    return request;
+}
+
+auto encode_membership_page(const MembershipPage& page, std::uint16_t cursor)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (page.total > max_memberships || page.entries.size() > max_membership_page) {
+        return std::unexpected(BodyError::too_many_entries);
+    }
+    if ((page.unchanged && (cursor != 0 || page.total != 0 || !page.entries.empty())) ||
+        std::size_t{cursor} + page.entries.size() > page.total ||
+        (page.entries.empty() && page.total != 0)) {
+        return std::unexpected(BodyError::bad_chunk);
+    }
+    if (auto ok = check_membership_entries(page.entries); !ok) {
+        return std::unexpected(ok.error());
+    }
+    std::vector<std::byte> out;
+    out.reserve(membership_head_size + (page.entries.size() * membership_entry_size));
+    wire::Writer w{out};
+    w.le32(page.generation);
+    w.le16(page.total);
+    w.le16(static_cast<std::uint16_t>(page.entries.size()));
+    w.u8(page.unchanged ? membership_unchanged : zero8);
+    w.u8(zero8);
+    w.le16(0);
+    for (const auto& e : page.entries) {
+        w.le64(e.nic_id);
+        w.le32(e.vni);
+        w.u8(e.ipv6 ? family_ipv6 : family_ipv4);
+        w.u8(zero8);
+        w.le16(0);
+        w.bytes(e.group);
+    }
+    return out;
+}
+
+auto decode_membership_page(std::span<const std::byte> body, std::uint16_t cursor)
+    -> std::expected<MembershipPage, BodyError> {
+    if (body.size() < membership_head_size) {
+        return std::unexpected(BodyError::truncated);
+    }
+    wire::Reader r{body};
+    MembershipPage page;
+    page.generation = r.le32().value_or(0);
+    page.total = r.le16().value_or(0);
+    const std::size_t count = r.le16().value_or(0);
+    const auto flags = r.u8().value_or(0xFF);
+    const auto pad8 = r.u8().value_or(1);
+    const auto pad16 = r.le16().value_or(1);
+    if ((flags & ~membership_unchanged) != 0 || pad8 != 0 || pad16 != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    page.unchanged = (flags & membership_unchanged) != 0;
+    if (page.total > max_memberships || count > max_membership_page) {
+        return std::unexpected(BodyError::too_many_entries);
+    }
+    if (auto ok = check_size(body, membership_head_size + (count * membership_entry_size)); !ok) {
+        return std::unexpected(ok.error());
+    }
+    if ((page.unchanged && (cursor != 0 || page.total != 0 || count != 0)) ||
+        std::size_t{cursor} + count > page.total || (count == 0 && page.total != 0)) {
+        return std::unexpected(BodyError::bad_chunk);
+    }
+    page.entries.resize(count);
+    for (auto& e : page.entries) {
+        e.nic_id = r.le64().value_or(0);
+        e.vni = r.le32().value_or(0);
+        const auto family = r.u8().value_or(0);
+        const auto p8 = r.u8().value_or(1);
+        const auto p16 = r.le16().value_or(1);
+        if (p8 != 0 || p16 != 0) {
+            return std::unexpected(BodyError::reserved_not_zero);
+        }
+        if (family != family_ipv4 && family != family_ipv6) {
+            return std::unexpected(BodyError::bad_group);
+        }
+        e.ipv6 = family == family_ipv6;
+        const auto group = r.bytes(e.group.size());
+        if (!group) {
+            return std::unexpected(BodyError::truncated);
+        }
+        std::ranges::copy(*group, e.group.begin());
+    }
+    if (auto ok = check_membership_entries(page.entries); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return page;
+}
+
 auto encode_health(const Health& h) -> std::expected<std::vector<std::byte>, BodyError> {
     if (!known_health(std::to_underlying(h.state))) {
         return std::unexpected(BodyError::unknown_enum);
@@ -1389,6 +1569,8 @@ auto to_string(BodyError e) noexcept -> const char* {
             return "bad_image";
         case BodyError::bad_csr:
             return "bad_csr";
+        case BodyError::bad_group:
+            return "bad_group";
         case BodyError::status_with_body:
             return "status_with_body";
     }

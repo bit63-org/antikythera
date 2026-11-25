@@ -954,8 +954,168 @@ BOOST_AUTO_TEST_CASE(pager_carries_unread_final_readings) {
     BOOST_TEST(pager.page(0, snap).value().total == 1);
 }
 
+namespace {
+
+auto join(std::uint64_t nic, bool ipv6, std::uint8_t last) -> oar::MembershipEntry {
+    oar::MembershipEntry e{.nic_id = nic, .vni = 7, .ipv6 = ipv6, .group = {}};
+    e.group[0] = ipv6 ? std::byte{0xFF} : std::byte{239};
+    e.group[ipv6 ? 15 : 3] = std::byte{last};
+    return e;
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(membership_mirrors_match_proto) {
+    BOOST_TEST(oar::max_group_members_frame == ak::proto::max_group_members_size);
+    BOOST_TEST(oar::max_memberships == ak::proto::max_group_membership_entries);
+    BOOST_TEST(oar::membership_entry_size == ak::proto::group_membership_entry_size);
+    // A full page fits one message.
+    BOOST_TEST(oar::response_head_size + oar::membership_head_size +
+                   (oar::max_membership_page * oar::membership_entry_size) <=
+               oar::max_body_size);
+}
+
+BOOST_AUTO_TEST_CASE(membership_request_round_trip_and_rules) {
+    const oar::MembershipRequest first{.cursor = 0, .since = std::nullopt};
+    const oar::MembershipRequest again{.cursor = 0, .since = 0};  // generation 0 is a value
+    const oar::MembershipRequest next{.cursor = 120, .since = 0xDEAD'BEEF};
+    for (const auto& r : {first, again, next}) {
+        auto body = oar::encode_membership_request(r);
+        BOOST_REQUIRE(body.has_value());
+        BOOST_TEST(body->size() == oar::membership_request_size);
+        BOOST_TEST((oar::decode_membership_request(*body).value() == r));
+    }
+    // A generation without the flag, an unknown flag, the wrong length.
+    BOOST_TEST((oar::decode_membership_request(bytes_of(0, 0, 0, 0, 1, 0, 0, 0)).error() ==
+                BodyError::reserved_not_zero));
+    BOOST_TEST((oar::decode_membership_request(bytes_of(0, 0, 3, 0, 0, 0, 0, 0)).error() ==
+                BodyError::reserved_not_zero));
+    BOOST_TEST(
+        (oar::decode_membership_request(bytes_of(0, 0, 1, 0)).error() == BodyError::truncated));
+}
+
+BOOST_AUTO_TEST_CASE(membership_page_round_trip_and_rules) {
+    const oar::MembershipPage page{
+        .generation = 9,
+        .unchanged = false,
+        .total = 5,
+        .entries = {join(1, false, 1), join(1, true, 1), join(2, false, 1)}};
+    auto body = oar::encode_membership_page(page, 2);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::membership_head_size + (3 * oar::membership_entry_size));
+    BOOST_TEST((oar::decode_membership_page(*body, 2).value() == page));
+    // The page must fit the cursor it answers.
+    BOOST_TEST((oar::decode_membership_page(*body, 3).error() == BodyError::bad_chunk));
+    BOOST_TEST((oar::encode_membership_page(page, 3).error() == BodyError::bad_chunk));
+    BOOST_TEST((oar::encode_membership_page(
+                    {.generation = 1, .unchanged = false, .total = 2, .entries = {}}, 0)
+                    .error() == BodyError::bad_chunk));
+
+    // Unchanged: cursor 0, nothing listed.
+    const oar::MembershipPage same{.generation = 9, .unchanged = true, .total = 0, .entries = {}};
+    auto unchanged = oar::encode_membership_page(same, 0);
+    BOOST_REQUIRE(unchanged.has_value());
+    BOOST_TEST((oar::decode_membership_page(*unchanged, 0).value() == same));
+    BOOST_TEST((oar::decode_membership_page(*unchanged, 1).error() == BodyError::bad_chunk));
+    auto listed = same;
+    listed.total = 1;
+    listed.entries = {join(1, false, 1)};
+    BOOST_TEST((oar::encode_membership_page(listed, 0).error() == BodyError::bad_chunk));
+
+    auto bad = page;
+    bad.entries[0].nic_id = 0;
+    BOOST_TEST((oar::encode_membership_page(bad, 0).error() == BodyError::zero_id));
+    bad = page;
+    bad.entries[0].vni = 0;
+    BOOST_TEST((oar::encode_membership_page(bad, 0).error() == BodyError::bad_vni));
+    bad = page;
+    bad.entries[0].group[4] = std::byte{1};  // an IPv4 group with a tail
+    BOOST_TEST((oar::encode_membership_page(bad, 0).error() == BodyError::bad_group));
+    bad = page;
+    std::swap(bad.entries[0], bad.entries[1]);  // IPv6 before IPv4 for one NIC
+    BOOST_TEST((oar::encode_membership_page(bad, 0).error() == BodyError::not_increasing));
+    bad = page;
+    bad.entries[1] = bad.entries[0];
+    BOOST_TEST((oar::encode_membership_page(bad, 0).error() == BodyError::not_increasing));
+    bad = {.generation = 1,
+           .unchanged = false,
+           .total = 200,
+           .entries = std::vector<oar::MembershipEntry>(oar::max_membership_page + 1)};
+    BOOST_TEST((oar::encode_membership_page(bad, 0).error() == BodyError::too_many_entries));
+
+    const auto entry = [](std::size_t i) {
+        return oar::membership_head_size + (i * oar::membership_entry_size);
+    };
+    auto b = *body;
+    b[entry(0) + 12] = std::byte{5};  // family
+    BOOST_TEST((oar::decode_membership_page(b, 2).error() == BodyError::bad_group));
+    b = *body;
+    b[entry(1) + 13] = std::byte{1};  // entry reserved
+    BOOST_TEST((oar::decode_membership_page(b, 2).error() == BodyError::reserved_not_zero));
+    b = *body;
+    b[10] = std::byte{2};  // unknown flag
+    BOOST_TEST((oar::decode_membership_page(b, 2).error() == BodyError::reserved_not_zero));
+    b = *body;
+    b[11] = std::byte{1};  // head reserved
+    BOOST_TEST((oar::decode_membership_page(b, 2).error() == BodyError::reserved_not_zero));
+    b = *body;
+    b.pop_back();
+    BOOST_TEST((oar::decode_membership_page(b, 2).error() == BodyError::truncated));
+    b = *body;
+    b.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_membership_page(b, 2).error() == BodyError::trailing_bytes));
+}
+
+BOOST_AUTO_TEST_CASE(membership_pager_answers_unchanged_and_pages_one_snapshot) {
+    oar::MembershipPager pager;
+    int calls = 0;
+    std::vector<oar::MembershipEntry> joins;
+    for (std::uint64_t n = 130; n >= 1; --n) {
+        joins.push_back(join(n, false, 1));
+    }
+    joins.push_back(join(5, false, 1));  // a duplicate is listed once
+    const auto snap = [&] {
+        ++calls;
+        return joins;
+    };
+    // No snapshot yet.
+    BOOST_TEST(
+        (pager.page({.cursor = 4, .since = std::nullopt}, 1, snap).error() == Status::bad_request));
+    auto p0 = pager.page({.cursor = 0, .since = std::nullopt}, 3, snap).value();
+    BOOST_TEST(!p0.unchanged);
+    BOOST_TEST(p0.generation == 3U);
+    BOOST_TEST(p0.total == 130);
+    BOOST_TEST(p0.entries.size() == oar::max_membership_page);
+    BOOST_TEST(p0.entries.front().nic_id == 1U);  // sorted
+    // Later pages come from the snapshot, whatever the generation is now.
+    joins.clear();
+    auto p1 = pager.page({.cursor = 120, .since = std::nullopt}, 4, snap).value();
+    BOOST_TEST(p1.generation == 3U);
+    BOOST_TEST(p1.entries.size() == 10U);
+    BOOST_TEST(calls == 1);
+    BOOST_TEST((pager.page({.cursor = 120, .since = std::nullopt}, 4, snap).error() ==
+                Status::bad_request));
+    // helm has generation 4: unchanged, no snapshot taken.
+    auto same = pager.page({.cursor = 0, .since = 4}, 4, snap).value();
+    BOOST_TEST(same.unchanged);
+    BOOST_TEST(same.total == 0);
+    BOOST_TEST(calls == 1);
+    // Anything else reads afresh; an empty list is one empty page.
+    auto empty = pager.page({.cursor = 0, .since = 3}, 4, snap).value();
+    BOOST_TEST(!empty.unchanged);
+    BOOST_TEST(empty.total == 0);
+    BOOST_TEST(calls == 2);
+    // A list longer than one report carries is cut to it.
+    for (std::uint64_t n = 1; n <= oar::max_memberships + 5; ++n) {
+        joins.push_back(join(n, true, 2));
+    }
+    BOOST_TEST(pager.page({.cursor = 0, .since = std::nullopt}, 5, snap).value().total ==
+               oar::max_memberships);
+}
+
 BOOST_AUTO_TEST_CASE(names) {
     BOOST_TEST(std::string_view{oar::to_string(Status::busy)} == "busy");
+    BOOST_TEST(std::string_view{oar::to_string(BodyError::bad_group)} == "bad_group");
     BOOST_TEST(std::string_view{oar::to_string(oar::Role::gpu)} == "gpu");
     BOOST_TEST(std::string_view{oar::to_string(oar::HealthState::faulted)} == "faulted");
     BOOST_TEST(std::string_view{oar::to_string(BodyError::bad_chunk)} == "bad_chunk");

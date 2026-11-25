@@ -4,6 +4,7 @@
 #include "helm/oar_link.hpp"
 
 #include <algorithm>
+#include <tuple>
 #include <utility>
 
 namespace ak::helm {
@@ -227,6 +228,57 @@ auto OarLink::tunnel_peers(std::span<const std::byte> frame) -> std::expected<vo
         return std::unexpected(bad_request());
     }
     return send_chunked(mctp::VendorType::tunnel_peers, frame);
+}
+
+auto OarLink::group_members(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
+    if (frame.empty() || frame.size() > oar::max_group_members_frame) {
+        return std::unexpected(bad_request());
+    }
+    return send_chunked(mctp::VendorType::group_members, frame);
+}
+
+auto OarLink::group_membership(std::optional<std::uint32_t> since)
+    -> std::expected<std::optional<Memberships>, LinkError> {
+    Memberships out;
+    std::uint16_t total = 0;
+    std::uint16_t cursor = 0;
+    do {
+        auto body = oar::encode_membership_request({.cursor = cursor, .since = since});
+        if (!body) {
+            return std::unexpected(bad_request());
+        }
+        auto response = transact(mctp::VendorType::group_membership, *body);
+        if (!response) {
+            return std::unexpected(response.error());
+        }
+        auto page = oar::decode_membership_page(*response, cursor);
+        if (!page) {
+            return std::unexpected(bad_response());
+        }
+        if (page->unchanged) {
+            if (!since || page->generation != *since) {
+                return std::unexpected(bad_response());
+            }
+            return std::nullopt;
+        }
+        if (cursor != 0 && (page->total != total || page->generation != out.generation)) {
+            return std::unexpected(bad_response());
+        }
+        total = page->total;
+        out.generation = page->generation;
+        if (!out.entries.empty() && !page->entries.empty()) {
+            const auto& a = out.entries.back();
+            const auto& b = page->entries.front();
+            if (std::tuple{b.nic_id, b.ipv6, b.group} <= std::tuple{a.nic_id, a.ipv6, a.group}) {
+                return std::unexpected(bad_response());
+            }
+        }
+        out.entries.insert(out.entries.end(), page->entries.begin(), page->entries.end());
+        cursor = static_cast<std::uint16_t>(out.entries.size());
+        // After the first page the role answers from its snapshot, so
+        // `since` no longer matters.
+    } while (cursor < total);
+    return out;
 }
 
 auto OarLink::role_certificate(std::span<const std::byte> chain) -> std::expected<void, LinkError> {
@@ -635,8 +687,21 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
         }
         case mctp::VendorType::map_update:
         case mctp::VendorType::tunnel_peers:
+        case mctp::VendorType::group_members:
         case mctp::VendorType::role_certificate:
             return status_only(frame_chunk(handler, type, body));
+        case mctp::VendorType::group_membership: {
+            auto req = oar::decode_membership_request(body);
+            if (!req) {
+                return status_only(oar::Status::bad_request);
+            }
+            auto page = handler.group_membership(*req);
+            if (!page) {
+                return status_only(page.error() == oar::Status::ok ? oar::Status::failed
+                                                                   : page.error());
+            }
+            return with_body(oar::encode_membership_page(*page, req->cursor));
+        }
         case mctp::VendorType::cert_request: {
             if (!oar::decode_empty(body)) {
                 return status_only(oar::Status::bad_request);
@@ -727,7 +792,9 @@ auto OarEndpoint::frame_chunk(OarHandler& handler, mctp::VendorType type,
     }
     const std::size_t limit = type == mctp::VendorType::map_update     ? oar::max_map_frame
                               : type == mctp::VendorType::tunnel_peers ? oar::max_tunnel_peers_frame
-                                                                       : oar::max_cert_chain;
+                              : type == mctp::VendorType::group_members
+                                  ? oar::max_group_members_frame
+                                  : oar::max_cert_chain;
     if (chunk->offset == 0) {
         // A new transfer; whatever was in progress is abandoned.
         reset_frame();
@@ -748,7 +815,9 @@ auto OarEndpoint::frame_chunk(OarHandler& handler, mctp::VendorType type,
     }
     const auto status = type == mctp::VendorType::map_update     ? handler.map_update(_frame)
                         : type == mctp::VendorType::tunnel_peers ? handler.tunnel_peers(_frame)
-                                                                 : handler.role_certificate(_frame);
+                        : type == mctp::VendorType::group_members
+                            ? handler.group_members(_frame)
+                            : handler.role_certificate(_frame);
     reset_frame();
     return status;
 }

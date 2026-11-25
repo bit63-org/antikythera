@@ -149,7 +149,7 @@ Like MapUpdate it is a full per-VNI snapshot carrying its own server and
 key IDs inside the signed bytes, so applying it is idempotent and a server
 that missed versions catches up from the newest. A `drop` policy has
 every limit zero; a `multicast` policy has every limit non-zero
-(`max_groups_per_nic` may be zero until snooping is built) and within the
+(`max_groups_per_nic` may be zero, refusing every join) and within the
 oar-net bounds. Per-subnet policies come with subnets: a later version
 carries one entry per subnet.
 

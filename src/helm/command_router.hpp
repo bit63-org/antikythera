@@ -249,6 +249,18 @@ public:
         return std::unexpected(
             LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported});
     }
+    // Snooping (oar-net task 14): a controller GroupMembers frame, and the
+    // role's join list unless it is still generation `since`.
+    virtual auto group_members(std::span<const std::byte> /*frame*/)
+        -> std::expected<void, LinkError> {
+        return std::unexpected(
+            LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported});
+    }
+    virtual auto group_membership(std::optional<std::uint32_t> /*since*/)
+        -> std::expected<std::optional<OarLink::Memberships>, LinkError> {
+        return std::unexpected(
+            LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported});
+    }
     // A network volume's ReplicaConfig, to the storage role that attaches it.
     virtual auto replica_config(std::span<const std::byte> /*frame*/)
         -> std::expected<void, LinkError> {
@@ -278,6 +290,9 @@ public:
     auto rewrap_volume(const oar::RewrapVolume& request) -> std::expected<void, LinkError> override;
     auto group_policy(std::span<const std::byte> frame) -> std::expected<void, LinkError> override;
     auto group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError> override;
+    auto group_members(std::span<const std::byte> frame) -> std::expected<void, LinkError> override;
+    auto group_membership(std::optional<std::uint32_t> since)
+        -> std::expected<std::optional<OarLink::Memberships>, LinkError> override;
     auto replica_config(std::span<const std::byte> frame)
         -> std::expected<void, LinkError> override;
     auto eject(const oar::Eject& request) -> std::expected<oar::EjectState, LinkError> override;

@@ -41,8 +41,9 @@
 // belongs to neighbor discovery and is never replicated. A VTEP is a
 // unicast IPv6 address, as in MapUpdate. The list may name this server's
 // own VTEP; the receiver skips it. At most max_member_vteps VTEP entries
-// in all, so the largest frame (max_group_members_size) fits one OarLink
-// message and helm forwards it without chunking.
+// in all, which bounds the largest frame (max_group_members_size, 77,920
+// bytes); helm forwards it to network roles in OarLink chunks, like
+// TunnelPeers.
 
 #include <algorithm>
 #include <cstddef>

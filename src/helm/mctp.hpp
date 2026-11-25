@@ -260,6 +260,8 @@ enum class VendorType : std::uint8_t {
     role_certificate = 0x16,
     eject = 0x17,
     vpc_config = 0x18,
+    group_members = 0x19,
+    group_membership = 0x1A,
 };
 
 struct VendorHeader {

@@ -3,7 +3,9 @@
 
 // .kiro/specs/helm-control-plane/ Requirement 11 (task 13): helm keeps and
 // fans out the controller's GroupPolicy frames and reports the network
-// roles' multicast meters as group_usage reports.
+// roles' multicast meters as group_usage reports; oar-net task 14.2: it
+// fans out GroupMembers frames the same way and reports each role's
+// snooped joins as group_membership reports when they change.
 
 #define BOOST_TEST_MODULE group_usage_test
 #include <boost/test/unit_test.hpp>
@@ -17,6 +19,7 @@
 #include <vector>
 
 #include "helm/group_usage.hpp"
+#include "proto/group_members.hpp"
 #include "proto/group_policy.hpp"
 #include "proto/report.hpp"
 #include "test_support.hpp"
@@ -79,11 +82,42 @@ struct FakeNet final : helm::OarPort {
         std::erase_if(meters, [](const oar::UsageEntry& e) { return e.detached; });
         return out;
     }
+    std::vector<std::vector<std::byte>> members;
+    auto group_members(std::span<const std::byte> frame)
+        -> std::expected<void, LinkError> override {
+        if (fail_policy) {
+            return std::unexpected(LinkError{.code = helm::LinkErrc::timed_out});
+        }
+        members.emplace_back(frame.begin(), frame.end());
+        return {};
+    }
+    // Snooping, off unless a test turns it on (then the role answers like
+    // NetRole: unchanged when helm already has `generation`).
+    bool snoops = false;
+    std::uint32_t generation = 0;
+    std::vector<oar::MembershipEntry> joins;
+    std::vector<std::optional<std::uint32_t>> asked;  // `since` of every read
+    auto group_membership(std::optional<std::uint32_t> since)
+        -> std::expected<std::optional<helm::OarLink::Memberships>, LinkError> override {
+        asked.push_back(since);
+        if (!snoops || fail_read) {
+            return std::unexpected(LinkError{.code = helm::LinkErrc::timed_out});
+        }
+        if (since == generation) {
+            return std::nullopt;
+        }
+        return helm::OarLink::Memberships{.generation = generation, .entries = joins};
+    }
 };
 
 struct Reports final : helm::ReportSink {
     std::vector<proto::GroupUsage> sent;
+    std::vector<proto::GroupMembership> joins;
     auto report(proto::ReportBody body) -> void override {
+        if (auto* m = std::get_if<proto::GroupMembership>(&body)) {
+            joins.push_back(std::move(*m));
+            return;
+        }
         auto* usage = std::get_if<proto::GroupUsage>(&body);
         BOOST_REQUIRE(usage != nullptr);
         sent.push_back(std::move(*usage));
@@ -93,7 +127,8 @@ struct Reports final : helm::ReportSink {
 struct Fixture {
     helm::GroupUsageConfig::Clock::time_point t{};
     Reports reports;
-    helm::GroupUsageReporter reporter{{.interval = 60s, .clock = [this] { return t; }}, reports};
+    helm::GroupUsageReporter reporter{
+        {.interval = 60s, .membership_interval = 1s, .clock = [this] { return t; }}, reports};
     FakeNet net1;
     FakeNet net2;
 };
@@ -120,6 +155,23 @@ auto meter(oar::NicId nic, std::uint64_t attachment, std::uint64_t frames) -> oa
             .bytes = frames * 100,
             .replicas_remote = frames * 2,
             .replica_bytes_remote = frames * 200};
+}
+
+auto members(std::uint32_t vni, std::uint64_t version) -> proto::GroupMembers {
+    return {.server_id = 1, .key_id = 1, .vni = vni, .members_version = version};
+}
+
+auto frame_of(const proto::GroupMembers& m) -> std::vector<std::byte> {
+    auto b = proto::encode_group_members(m);
+    BOOST_REQUIRE(b.has_value());
+    return *b;
+}
+
+auto join(oar::NicId nic, bool ipv6, std::uint8_t last) -> oar::MembershipEntry {
+    oar::MembershipEntry e{.nic_id = nic, .vni = 5, .ipv6 = ipv6, .group = {}};
+    e.group[0] = ipv6 ? std::byte{0xFF} : std::byte{239};
+    e.group[ipv6 ? 15 : 3] = std::byte{last};
+    return e;
 }
 
 }  // namespace
@@ -268,6 +320,119 @@ BOOST_FIXTURE_TEST_CASE(large_reads_split_into_reports, Fixture) {
         auto b = proto::encode_report({.server_id = 1, .report_seq = 1, .body = r});
         BOOST_TEST(b.has_value());
     }
+}
+
+// GroupMembers frames are kept and fanned out like policies, after them
+// when a role is added.
+BOOST_FIXTURE_TEST_CASE(member_lists_fan_out_and_replay, Fixture) {
+    reporter.add_slot(1, net1);
+    const auto v3 = frame_of(members(5, 3));
+    reporter.on_group_members(members(5, 3), v3);
+    BOOST_REQUIRE(net1.members.size() == 1U);
+    BOOST_TEST((net1.members[0] == v3));
+    reporter.on_group_members(members(5, 3), v3);
+    reporter.on_group_members(members(5, 2), frame_of(members(5, 2)));
+    BOOST_TEST(net1.members.size() == 1U);
+    BOOST_TEST(reporter.stats().members_stale == 2U);
+
+    reporter.on_group_policy(policy(5, 1), frame_of(policy(5, 1)));
+    reporter.add_slot(2, net2);
+    BOOST_TEST(net2.policies.size() == 1U);
+    BOOST_REQUIRE(net2.members.size() == 1U);
+    BOOST_TEST((net2.members[0] == v3));
+    BOOST_TEST(reporter.stats().members_kept == 1U);
+    BOOST_TEST(reporter.stats().members_forwarded == 2U);
+
+    net1.fail_policy = true;
+    reporter.on_group_members(members(5, 4), frame_of(members(5, 4)));
+    BOOST_TEST(reporter.stats().members_forward_failures == 1U);
+    BOOST_TEST(net2.members.size() == 2U);
+}
+
+// The first read after add_slot is reported even when empty; afterwards
+// only a change is, read with the generation last reported.
+BOOST_FIXTURE_TEST_CASE(joins_are_reported_when_they_change, Fixture) {
+    net1.snoops = true;
+    reporter.add_slot(1, net1);
+    reporter.poll();
+    BOOST_REQUIRE(reports.joins.size() == 1U);
+    BOOST_TEST(reports.joins[0].slot == 1U);
+    BOOST_TEST(reports.joins[0].entries.empty());
+    BOOST_TEST((net1.asked.back() == std::nullopt));
+
+    t += 500ms;
+    net1.generation = 1;
+    net1.joins = {join(10, false, 1), join(10, true, 1), join(11, false, 2)};
+    reporter.poll();  // not due
+    BOOST_TEST(net1.asked.size() == 1U);
+
+    t += 500ms;
+    reporter.poll();
+    BOOST_TEST((net1.asked.back() == std::optional<std::uint32_t>{0}));
+    BOOST_REQUIRE(reports.joins.size() == 2U);
+    const auto& e = reports.joins[1].entries;
+    BOOST_REQUIRE(e.size() == 3U);
+    BOOST_TEST(e[0].nic_id == 10U);
+    BOOST_TEST((e[0].family == proto::RouteFamily::ipv4));
+    BOOST_TEST((e[0].group[0] == std::byte{239}));
+    BOOST_TEST((e[1].family == proto::RouteFamily::ipv6));
+    BOOST_TEST((e[1].group[15] == std::byte{1}));
+    BOOST_TEST(e[2].vni == 5U);
+    auto b = proto::encode_report({.server_id = 1, .report_seq = 1, .body = reports.joins[1]});
+    BOOST_TEST(b.has_value());  // the order the report requires
+
+    t += 1s;
+    reporter.poll();  // unchanged
+    BOOST_TEST((net1.asked.back() == std::optional<std::uint32_t>{1}));
+    BOOST_TEST(reports.joins.size() == 2U);
+    BOOST_TEST(reporter.stats().membership_reads == 3U);
+    BOOST_TEST(reporter.stats().membership_reports == 2U);
+    // The meters' own interval is untouched by membership polls.
+    BOOST_TEST(net1.reads == 1);
+}
+
+// A failed read is retried next interval with the same generation.
+BOOST_FIXTURE_TEST_CASE(failed_membership_reads_are_retried, Fixture) {
+    net1.snoops = true;
+    net1.fail_read = true;
+    reporter.add_slot(1, net1);
+    reporter.poll();
+    BOOST_TEST(reporter.stats().membership_read_failures == 1U);
+    BOOST_TEST(reports.joins.empty());
+    net1.fail_read = false;
+    t += 1s;
+    reporter.poll();
+    BOOST_TEST((net1.asked.back() == std::nullopt));
+    BOOST_TEST(reports.joins.size() == 1U);
+}
+
+// A role that had listed joins and goes away is reported empty; one that
+// listed none is not reported again. Re-added, it is read afresh.
+BOOST_FIXTURE_TEST_CASE(removed_roles_report_no_joins, Fixture) {
+    net1.snoops = true;
+    net2.snoops = true;
+    net1.joins = {join(10, false, 1)};
+    net1.generation = 4;
+    reporter.add_slot(1, net1);
+    reporter.add_slot(2, net2);
+    reporter.poll();
+    BOOST_REQUIRE(reports.joins.size() == 2U);
+
+    reporter.remove_slot(2);
+    BOOST_TEST(reports.joins.size() == 2U);
+    reporter.remove_slot(1);
+    BOOST_REQUIRE(reports.joins.size() == 3U);
+    BOOST_TEST(reports.joins[2].slot == 1U);
+    BOOST_TEST(reports.joins[2].entries.empty());
+    reporter.remove_slot(1);  // already gone
+    BOOST_TEST(reports.joins.size() == 3U);
+
+    reporter.add_slot(1, net1);
+    t += 1s;
+    reporter.poll();
+    BOOST_TEST((net1.asked.back() == std::nullopt));
+    BOOST_REQUIRE(reports.joins.size() == 4U);
+    BOOST_TEST(reports.joins[3].entries.size() == 1U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

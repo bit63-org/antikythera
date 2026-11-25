@@ -229,13 +229,21 @@
     lists them (`memberships()`), and prunes listed groups to their VTEPs
     and joined local NICs (`set_group_members`). See design "Multicast
     snooping". The frame and report are controller-interface task 15.
-  - [ ] 14.2 Sideband and helm: OarLink `group_members` (chunked, like
+  - [x] 14.2 Sideband and helm: OarLink `group_members` (chunked, like
     `tunnel_peers`) verified by `NetRole` and applied with
     `set_group_members`, a paged membership read, `max_groups_per_nic`
     carried from the GroupPolicy, and helm keeping the newest frame per
     VNI, forwarding it like a GroupPolicy and reporting each role's list
     as `group_membership` when it changes (an empty one when a role goes
-    away). Builds on task 13's NetRole and HelmDaemon group wiring.
+    away). Builds on task 13's NetRole and HelmDaemon group wiring. —
+    OarLink vendor types 0x19 `group_members` and 0x1A
+    `group_membership`; the read pages one `oar::MembershipPager`
+    snapshot, and helm's `since` (the generation it last read, the low
+    32 bits of `membership_changes()`) gets a one-message "unchanged"
+    answer, so `GroupUsageReporter` asks every second. `NetRole` checks
+    GroupMembers like GroupPolicy (server, signature, then version per
+    VNI). GroupPolicy now bounds `max_groups_per_nic` at 256, the
+    VSwitch's cap, so a valid frame is never refused whole by the role.
 - [x] 15. L3/L4 packet parser (`src/oar/net/packet.*`): untagged
   Ethernet, IPv4 with options, IPv6 with a bounded extension-header walk,
   TCP/UDP/ICMP/ICMPv6 headers, fragments; tests and `fuzz_packet`.

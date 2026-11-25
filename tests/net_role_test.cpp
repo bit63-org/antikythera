@@ -33,6 +33,7 @@
 #include "hull/signature_verifier.hpp"
 #include "net_frames.hpp"
 #include "oar/net/net_role.hpp"
+#include "proto/group_members.hpp"
 #include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
 #include "proto/tunnel_peers.hpp"
@@ -179,8 +180,8 @@ auto signed_vpc(std::uint64_t server, std::uint64_t version, std::uint32_t lease
 
 // A GroupPolicy for `vpc`, signed like the controller signs it. A
 // multicast policy gets small limits that fit the oar-net bounds.
-auto signed_policy(std::uint64_t server, std::uint64_t version, bool multicast)
-    -> std::vector<std::byte> {
+auto signed_policy(std::uint64_t server, std::uint64_t version, bool multicast,
+                   std::uint16_t max_groups = 0) -> std::vector<std::byte> {
     proto::GroupPolicy p{};
     p.server_id = server;
     p.key_id = key_id;
@@ -193,12 +194,53 @@ auto signed_policy(std::uint64_t server, std::uint64_t version, bool multicast)
         p.rate_bytes = 1'000'000;
         p.burst_bytes = 100'000;
         p.max_remote_vteps = 4;
+        p.max_groups_per_nic = max_groups;
     }
     auto bytes = proto::encode_group_policy(p);
     BOOST_REQUIRE(bytes.has_value());
     const auto sig = signer().sign(proto::group_policy_signed_bytes(*bytes));
     proto::set_group_policy_signature(*bytes, sig);
     return *bytes;
+}
+
+// A GroupMembers for `vpc` listing 239.0.0.1 at the peer VTEP, signed
+// like the controller signs it.
+auto signed_members(std::uint64_t server, std::uint64_t version) -> std::vector<std::byte> {
+    proto::GroupMembers m{.server_id = server,
+                          .key_id = key_id,
+                          .vni = vpc,
+                          .members_version = version,
+                          .groups = {}};
+    proto::MemberGroup& g = m.groups.emplace_back();
+    g.family = proto::RouteFamily::ipv4;
+    g.group[0] = std::byte{239};
+    g.group[3] = std::byte{1};
+    g.vteps = {vtep(peer_tail)};
+    auto bytes = proto::encode_group_members(m);
+    BOOST_REQUIRE(bytes.has_value());
+    const auto sig = signer().sign(proto::group_members_signed_bytes(*bytes));
+    proto::set_group_members_signature(*bytes, sig);
+    return *bytes;
+}
+
+// An IGMPv2 membership report for 239.0.0.1 from a guest.
+auto igmp_join(std::uint64_t src) -> std::vector<std::byte> {
+    const net::MacAddress group{std::byte{0x01}, std::byte{0x00}, std::byte{0x5e},
+                                std::byte{0x00}, std::byte{0x00}, std::byte{0x01}};
+    const proto::Ipv4Address group_ip{std::byte{239}, std::byte{0}, std::byte{0}, std::byte{1}};
+    std::vector<std::byte> m{std::byte{0x16}, std::byte{0}, std::byte{0}, std::byte{0}};
+    m.insert(m.end(), group_ip.begin(), group_ip.end());
+    std::uint32_t sum = 0;
+    for (std::size_t i = 0; i + 1 < m.size(); i += 2) {
+        sum +=
+            (std::to_integer<std::uint32_t>(m[i]) << 8U) | std::to_integer<std::uint32_t>(m[i + 1]);
+    }
+    sum = (sum & 0xFFFFU) + (sum >> 16U);
+    const auto c = static_cast<std::uint16_t>(~sum & 0xFFFFU);
+    m[2] = static_cast<std::byte>(c >> 8U);
+    m[3] = static_cast<std::byte>(c & 0xFFU);
+    constexpr std::uint8_t ipproto_igmp = 2;
+    return ak::test::frames::ipv4(group, mac_of(src), guest_ip(src), group_ip, ipproto_igmp, m);
 }
 
 // An IPv4/UDP multicast frame (239.0.0.1) from a guest.
@@ -1016,6 +1058,78 @@ BOOST_FIXTURE_TEST_CASE(group_usage_reads_every_attachment, One,
     BOOST_TEST(page->entries[0].attachment > first);
     BOOST_TEST(page->entries[0].frames == 0U);
     BOOST_TEST(role->counters().usage_unknown_vni == 0U);
+}
+
+BOOST_FIXTURE_TEST_CASE(group_members_are_checked, One,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto good = signed_members(server_one, 2);
+
+    BOOST_TEST((role->group_members(std::span{good}.first(good.size() - 1)) == Status::failed));
+    BOOST_TEST(role->counters().members_undecodable == 1U);
+    BOOST_TEST((role->group_members(signed_members(server_two, 2)) == Status::failed));
+    BOOST_TEST(role->counters().members_wrong_server == 1U);
+    auto tampered = good;
+    tampered[0x18] ^= std::byte{0x01};  // members_version
+    BOOST_TEST((role->group_members(tampered) == Status::failed));
+    BOOST_TEST(role->counters().members_bad_signature == 1U);
+    BOOST_TEST(role->vswitch().group_members(vpc) == nullptr);
+
+    BOOST_TEST((role->group_members(good) == Status::ok));
+    BOOST_TEST(role->counters().members_applied == 1U);
+    const auto* lists = role->vswitch().group_members(vpc);
+    BOOST_REQUIRE(lists != nullptr);
+    BOOST_REQUIRE(lists->size() == 1U);
+    BOOST_TEST(!lists->begin()->first.ipv6);
+    BOOST_TEST((lists->begin()->first.address[0] == std::byte{239}));
+    BOOST_TEST((lists->begin()->second == std::vector{vtep(peer_tail)}));
+
+    // Redelivery answers ok untouched; an older version is refused.
+    BOOST_TEST((role->group_members(good) == Status::ok));
+    BOOST_TEST(role->counters().members_redelivered == 1U);
+    BOOST_TEST((role->group_members(signed_members(server_one, 1)) == Status::failed));
+    BOOST_TEST(role->counters().members_stale == 1U);
+    BOOST_TEST((role->group_members(signed_members(server_one, 3)) == Status::ok));
+    BOOST_TEST(role->counters().members_applied == 2U);
+}
+
+// The policy's group cap reaches the VSwitch, and helm reads the joins
+// it allows once per change.
+BOOST_FIXTURE_TEST_CASE(group_membership_lists_snooped_joins, One,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    BOOST_REQUIRE(role->map_update(signed_map(server_one, 1, {{nic_a, self_tail}}, {nic_a})) ==
+                  Status::ok);
+    BOOST_REQUIRE(role->group_policy(signed_policy(server_one, 1, true, 4)) == Status::ok);
+    BOOST_TEST(role->vswitch().group_policy(vpc).max_groups_per_nic == 4U);
+    BOOST_REQUIRE(prepare(fn0, nic_a) == Status::ok);
+    static_cast<void>(driver(fn0));
+
+    auto page = role->group_membership({.cursor = 0, .since = std::nullopt});
+    BOOST_REQUIRE(page.has_value());
+    BOOST_TEST(!page->unchanged);
+    BOOST_TEST(page->total == 0U);
+    const auto empty = page->generation;
+
+    send(fn0, igmp_join(nic_a));
+    static_cast<void>(role->poll());
+    BOOST_REQUIRE(role->vswitch().memberships().size() == 1U);
+
+    page = role->group_membership({.cursor = 0, .since = empty});
+    BOOST_REQUIRE(page.has_value());
+    BOOST_TEST(!page->unchanged);
+    BOOST_TEST(page->generation != empty);
+    BOOST_REQUIRE(page->entries.size() == 1U);
+    BOOST_TEST(page->entries[0].nic_id == nic_a);
+    BOOST_TEST(page->entries[0].vni == vpc);
+    BOOST_TEST(!page->entries[0].ipv6);
+    BOOST_TEST((page->entries[0].group[0] == std::byte{239}));
+    BOOST_TEST((page->entries[0].group[3] == std::byte{1}));
+
+    const auto now = page->generation;
+    page = role->group_membership({.cursor = 0, .since = now});
+    BOOST_REQUIRE(page.has_value());
+    BOOST_TEST(page->unchanged);
+    BOOST_TEST(
+        (role->group_membership({.cursor = 1, .since = now}).error() == Status::bad_request));
 }
 
 BOOST_FIXTURE_TEST_CASE(helm_drives_the_role_over_the_sideband, One,

@@ -44,14 +44,32 @@ auto GroupUsageReporter::now() const -> Clock::time_point {
 }
 
 auto GroupUsageReporter::add_slot(std::uint8_t slot, OarPort& port) -> void {
-    _slots.insert_or_assign(slot, &port);
+    // A slot added again without remove_slot is a new role: its list is
+    // read afresh, but whether the controller holds joins for the slot
+    // carries over.
+    auto& role = _slots[slot];
+    role.port = &port;
+    role.generation.reset();
     for (const auto& [vni, kept] : _policies) {
         forward(port, kept.frame);
     }
+    for (const auto& [vni, kept] : _members) {
+        forward_members(port, kept.frame);
+    }
 }
 
-auto GroupUsageReporter::remove_slot(std::uint8_t slot) noexcept -> void {
-    _slots.erase(slot);
+auto GroupUsageReporter::remove_slot(std::uint8_t slot) -> void {
+    const auto it = _slots.find(slot);
+    if (it == _slots.end()) {
+        return;
+    }
+    const bool listed = it->second.listed;
+    _slots.erase(it);
+    if (listed) {
+        // Its NICs' joins went with it.
+        ++_stats.membership_reports;
+        _reports->report(proto::GroupMembership{.slot = slot, .entries = {}});
+    }
     // Its attachments are gone with the role's state; a re-added role
     // starts new series.
     std::erase_if(_reported, [slot](const auto& kv) { return std::get<0>(kv.first) == slot; });
@@ -65,6 +83,29 @@ auto GroupUsageReporter::forward(OarPort& port, std::span<const std::byte> frame
     }
 }
 
+auto GroupUsageReporter::forward_members(OarPort& port, std::span<const std::byte> frame) -> void {
+    if (port.group_members(frame)) {
+        ++_stats.members_forwarded;
+    } else {
+        ++_stats.members_forward_failures;
+    }
+}
+
+auto GroupUsageReporter::on_group_members(const proto::GroupMembers& members,
+                                          std::span<const std::byte> frame) -> void {
+    auto& kept = _members[members.vni];
+    if (members.members_version <= kept.version) {
+        ++_stats.members_stale;
+        return;
+    }
+    kept.version = members.members_version;
+    kept.frame.assign(frame.begin(), frame.end());
+    ++_stats.members_kept;
+    for (const auto& [slot, role] : _slots) {
+        forward_members(*role.port, kept.frame);
+    }
+}
+
 auto GroupUsageReporter::on_group_policy(const proto::GroupPolicy& policy,
                                          std::span<const std::byte> frame) -> void {
     auto& kept = _policies[policy.vni];
@@ -75,13 +116,17 @@ auto GroupUsageReporter::on_group_policy(const proto::GroupPolicy& policy,
     kept.version = policy.policy_version;
     kept.frame.assign(frame.begin(), frame.end());
     ++_stats.policies_kept;
-    for (const auto& [slot, port] : _slots) {
-        forward(*port, kept.frame);
+    for (const auto& [slot, role] : _slots) {
+        forward(*role.port, kept.frame);
     }
 }
 
 auto GroupUsageReporter::poll() -> void {
     const auto t = now();
+    if (t >= _next_membership) {
+        _next_membership = t + _config.membership_interval;
+        read_memberships();
+    }
     if (!_read_now && t < _next_read) {
         return;
     }
@@ -92,8 +137,8 @@ auto GroupUsageReporter::poll() -> void {
 
 auto GroupUsageReporter::read_and_report() -> void {
     std::vector<proto::GroupUsageEntry> changed;
-    for (const auto& [slot, port] : _slots) {
-        auto usage = port->group_usage();
+    for (const auto& [slot, role] : _slots) {
+        auto usage = role.port->group_usage();
         if (!usage) {
             ++_stats.read_failures;
             continue;
@@ -128,6 +173,36 @@ auto GroupUsageReporter::read_and_report() -> void {
                             changed.begin() + static_cast<std::ptrdiff_t>(end));
         _stats.entries_reported += body.entries.size();
         ++_stats.reports;
+        _reports->report(std::move(body));
+    }
+}
+
+auto GroupUsageReporter::read_memberships() -> void {
+    for (auto& [slot, role] : _slots) {
+        auto read = role.port->group_membership(role.generation);
+        if (!read) {
+            ++_stats.membership_read_failures;
+            continue;
+        }
+        ++_stats.membership_reads;
+        if (!*read) {
+            continue;  // still the list last reported
+        }
+        auto& list = **read;
+        proto::GroupMembership body{.slot = slot, .entries = {}};
+        body.entries.reserve(list.entries.size());
+        // OarLink checked the order: (nic_id, family, group), as the report
+        // requires.
+        for (const auto& e : list.entries) {
+            proto::GroupMembershipEntry& out = body.entries.emplace_back();
+            out.nic_id = e.nic_id;
+            out.vni = e.vni;
+            out.family = e.ipv6 ? proto::RouteFamily::ipv6 : proto::RouteFamily::ipv4;
+            std::ranges::copy(e.group, out.group.begin());
+        }
+        role.generation = list.generation;
+        role.listed = !body.entries.empty();
+        ++_stats.membership_reports;
         _reports->report(std::move(body));
     }
 }

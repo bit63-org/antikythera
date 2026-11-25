@@ -74,7 +74,9 @@
 // per VNI) and forwarded unmodified to every attached network role, which
 // verifies it. A network role whose sideband (re)opens gets every kept
 // frame before the router registers its functions, so no NIC on it is
-// prepared under a missing policy. Every pass polls the reporter: each
+// prepared under a missing policy. GroupMembers frames (task 14) are kept
+// and forwarded the same way, after the policies. Every pass polls the
+// reporter: each
 // group_usage_interval, and on the pass after a network role cleaned a NIC
 // function (a detach, whose final meter the role now holds), it reads every
 // network role's meters and reports what moved as group_usage reports,
@@ -172,6 +174,9 @@ struct DaemonConfig {
     // How often network roles' group meters are read and reported
     // (Requirement 11.2: at least every minute).
     std::chrono::milliseconds group_usage_interval{std::chrono::minutes{1}};
+    // How often network roles are asked whether their snooped joins
+    // changed (one small message each when they did not).
+    std::chrono::milliseconds membership_interval{std::chrono::seconds{1}};
     // Items waiting for the loop; more are dropped and counted. Only a loop
     // stuck far longer than any timeout fills it.
     std::size_t max_inbox{4096};
@@ -281,6 +286,8 @@ public:
         -> void override;
     auto on_group_policy(const proto::GroupPolicy& policy, std::span<const std::byte> frame)
         -> void override;
+    auto on_group_members(const proto::GroupMembers& members, std::span<const std::byte> frame)
+        -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
     // The newest published snapshot (ControllerSession's InventorySource).
@@ -326,9 +333,13 @@ private:
         proto::GroupPolicy policy;
         std::vector<std::byte> frame;
     };
+    struct MembersFrame {
+        proto::GroupMembers members;
+        std::vector<std::byte> frame;
+    };
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
                               proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
-                              ImageKeyFrame, VpcFrame, PolicyFrame>;
+                              ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame>;
 
     struct SlotState;
 
@@ -357,6 +368,10 @@ private:
         auto group_policy(std::span<const std::byte> frame)
             -> std::expected<void, LinkError> override;
         auto group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError> override;
+        auto group_members(std::span<const std::byte> frame)
+            -> std::expected<void, LinkError> override;
+        auto group_membership(std::optional<std::uint32_t> since)
+            -> std::expected<std::optional<OarLink::Memberships>, LinkError> override;
 
     private:
         SlotState* _slot;

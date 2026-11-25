@@ -216,6 +216,11 @@ controller allows it, and every replica it causes billed.
    controller as `group_usage` reports.
 3. helm SHALL keep a detached NIC's final reading until the controller
    acknowledges the report that carries it.
+4. helm SHALL forward controller `GroupMembers` frames like `GroupPolicy`
+   frames, and SHALL report each network role's snooped joins to the
+   controller as a `group_membership` report within a few seconds of a
+   change, when it first reads a newly attached role, and empty when a
+   role that listed joins goes away.
 
 ### Requirement 12: Instance metadata records
 

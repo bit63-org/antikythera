@@ -39,6 +39,11 @@
 //   group_usage         page through the VSwitch's per-NIC group meters
 //                       (Requirement 10.6), final readings of detached NICs
 //                       included
+//   group_members       decode the controller's GroupMembers frame, check
+//                       it like a map_update, and set the VNI's per-group
+//                       VTEP lists in the VSwitch (Requirement 10.5, task 14)
+//   group_membership    page through the VSwitch's snooped joins, or answer
+//                       unchanged when helm already has this generation
 //
 // Volume keys and volumes are not the network role's: deliver_key, drop_key
 // and the volume requests answer unsupported.
@@ -96,6 +101,17 @@
 // touching the VSwitch (helm replays every kept policy when the sideband
 // reopens), an older one answers failed. A frame that cannot be applied
 // leaves the VNI's previous policy in place, so a VNI never falls open.
+//
+// group_members is checked the same way: this server, a controller
+// signature, then the version per VNI (the version applied answers ok
+// untouched, an older one fails, and lists the VSwitch refuses leave the
+// previous ones in place). The GroupPolicy's max_groups_per_nic reaches
+// the VSwitch with the rest of the policy.
+//
+// group_membership serves helm::oar::MembershipPager pages over
+// VSwitch::memberships(). The generation is the low 32 bits of
+// VSwitch::membership_changes(), so helm asking with the generation it
+// last read gets one small "unchanged" answer until a join or leave.
 //
 // group_usage serves helm::oar::UsagePager pages over VSwitch::group_usage().
 // Each entry carries the VNI helm named in prepare_function for that NIC:
@@ -211,6 +227,14 @@ struct RoleCounters {
     std::uint64_t group_stale{0};        // older than the version applied for the VNI
     std::uint64_t group_rejected{0};     // the VSwitch refused the policy
     std::uint64_t usage_unknown_vni{0};  // a meter whose NIC helm never prepared here: skipped
+    // GroupMembers frames (task 14), counted like map_updates.
+    std::uint64_t members_applied{0};
+    std::uint64_t members_redelivered{0};
+    std::uint64_t members_undecodable{0};
+    std::uint64_t members_wrong_server{0};
+    std::uint64_t members_bad_signature{0};
+    std::uint64_t members_stale{0};
+    std::uint64_t members_rejected{0};  // the VSwitch refused the lists
 };
 
 // The identity a function carries between attachments: never in any
@@ -264,6 +288,9 @@ public:
     auto group_policy(std::span<const std::byte> frame) -> helm::oar::Status override;
     auto group_usage(std::uint16_t cursor)
         -> std::expected<helm::oar::UsagePage, helm::oar::Status> override;
+    auto group_members(std::span<const std::byte> frame) -> helm::oar::Status override;
+    auto group_membership(const helm::oar::MembershipRequest& request)
+        -> std::expected<helm::oar::MembershipPage, helm::oar::Status> override;
 
     // Serves deferred transmit work on every function; true if any still
     // has work (call again soon).
@@ -318,6 +345,8 @@ private:
     std::map<std::uint32_t, std::uint64_t> _group_versions;  // applied policy version, by VNI
     std::map<std::uint64_t, std::uint32_t> _nic_vnis;        // helm's VNI, by NIC ID
     helm::oar::UsagePager _usage;
+    std::map<std::uint32_t, std::uint64_t> _members_versions;  // applied members version, by VNI
+    helm::oar::MembershipPager _membership;
     RoleCounters _counters;
 };
 

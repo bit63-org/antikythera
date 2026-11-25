@@ -9,6 +9,7 @@
 #include <utility>
 #include <variant>
 
+#include "proto/group_members.hpp"
 #include "proto/group_policy.hpp"
 #include "proto/map_update.hpp"
 #include "proto/vpc_config.hpp"
@@ -83,6 +84,8 @@ auto to_neighbors(const proto::MapUpdate& u) -> NeighborUpdate {
     return out;
 }
 
+static_assert(proto::max_group_groups_per_nic == group_max_groups_per_nic_max);
+
 // The VSwitch's policy from a decoded frame. decode_group_policy already
 // checked the mode and limits against the same bounds; the VSwitch checks
 // them again.
@@ -92,7 +95,18 @@ auto to_group_policy(const proto::GroupPolicy& p) -> GroupPolicy {
             .burst_frames = p.burst_frames,
             .rate_bytes = p.rate_bytes,
             .burst_bytes = p.burst_bytes,
-            .max_remote_vteps = p.max_remote_vteps};
+            .max_remote_vteps = p.max_remote_vteps,
+            .max_groups_per_nic = p.max_groups_per_nic};
+}
+
+// The VSwitch's lists from a decoded frame.
+auto to_group_members(const proto::GroupMembers& m) -> GroupMembers {
+    GroupMembers out;
+    for (const auto& g : m.groups) {
+        out.emplace(igmp::Group{.ipv6 = g.family == proto::RouteFamily::ipv6, .address = g.group},
+                    g.vteps);
+    }
+    return out;
 }
 
 }  // namespace
@@ -414,6 +428,55 @@ auto NetRole::usage_snapshot() -> oar::UsagePager::Snapshot {
 
 auto NetRole::group_usage(std::uint16_t cursor) -> std::expected<oar::UsagePage, oar::Status> {
     return _usage.page(cursor, [this] { return usage_snapshot(); });
+}
+
+auto NetRole::group_members(std::span<const std::byte> frame) -> oar::Status {
+    auto members = proto::decode_group_members(frame);
+    if (!members) {
+        ++_counters.members_undecodable;
+        return oar::Status::failed;
+    }
+    if (members->server_id != _config.server_id) {
+        ++_counters.members_wrong_server;
+        return oar::Status::failed;
+    }
+    if (!_verifier(proto::group_members_signed_bytes(frame), members->signature, members->key_id)) {
+        ++_counters.members_bad_signature;
+        return oar::Status::failed;
+    }
+    const auto applied = _members_versions.find(members->vni);
+    if (applied != _members_versions.end()) {
+        if (applied->second == members->members_version) {
+            ++_counters.members_redelivered;
+            return oar::Status::ok;
+        }
+        if (applied->second > members->members_version) {
+            ++_counters.members_stale;
+            return oar::Status::failed;
+        }
+    }
+    if (!_vswitch->set_group_members(members->vni, to_group_members(*members))) {
+        ++_counters.members_rejected;
+        return oar::Status::failed;
+    }
+    _members_versions.insert_or_assign(members->vni, members->members_version);
+    ++_counters.members_applied;
+    return oar::Status::ok;
+}
+
+auto NetRole::group_membership(const oar::MembershipRequest& request)
+    -> std::expected<oar::MembershipPage, oar::Status> {
+    const auto generation = static_cast<std::uint32_t>(_vswitch->membership_changes());
+    return _membership.page(request, generation, [this] {
+        oar::MembershipPager::Snapshot out;
+        for (const auto& m : _vswitch->memberships()) {
+            out.push_back({.nic_id = m.nic.value,
+                           .vni = m.vni,
+                           .ipv6 = m.group.ipv6,
+                           .group = m.group.address});
+        }
+        return out;
+    });
 }
 
 auto NetRole::health() -> std::expected<oar::Health, oar::Status> {

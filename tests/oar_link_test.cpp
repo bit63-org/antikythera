@@ -731,9 +731,30 @@ public:
             return all;
         });
     }
+    std::vector<std::vector<std::byte>> members;
+    auto group_members(std::span<const std::byte> frame) -> oar::Status override {
+        members.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
+    }
+    std::vector<oar::MembershipEntry> joins;
+    std::uint32_t generation{0};
+    int membership_snapshots{0};
+    bool torn{false};  // later pages claim another generation
+    auto group_membership(const oar::MembershipRequest& request)
+        -> std::expected<oar::MembershipPage, oar::Status> override {
+        auto page = _memberships.page(request, generation, [this] {
+            ++membership_snapshots;
+            return joins;
+        });
+        if (page && torn && request.cursor != 0) {
+            ++page->generation;
+        }
+        return page;
+    }
 
 private:
     oar::UsagePager _pager;
+    oar::MembershipPager _memberships;
 };
 
 auto meter(std::uint64_t nic, std::uint64_t attachment, bool detached = false) -> oar::UsageEntry {
@@ -793,6 +814,83 @@ BOOST_AUTO_TEST_CASE(group_policy_is_forwarded_whole) {
     BOOST_TEST(role.policies[0] == frame);
 }
 
+BOOST_AUTO_TEST_CASE(group_members_are_forwarded_in_chunks) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    MeterRole role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const auto small = pattern(200);
+    const auto largest = pattern(oar::max_group_members_frame);  // about 19 chunks
+    {
+        const Server server{endpoint, role};
+        BOOST_TEST(link.group_members(small).has_value());
+        BOOST_TEST(link.group_members(largest).has_value());
+        // Empty or too large never reaches the wire.
+        BOOST_TEST((link.group_members({}).error().code == LinkErrc::bad_request));
+        BOOST_TEST((link.group_members(pattern(oar::max_group_members_frame + 1)).error().code ==
+                    LinkErrc::bad_request));
+    }
+    BOOST_REQUIRE(role.members.size() == 2U);
+    BOOST_TEST(role.members[0] == small);
+    BOOST_TEST(role.members[1] == largest);
+}
+
+namespace {
+
+auto joined(std::uint64_t nic, std::uint8_t last) -> oar::MembershipEntry {
+    oar::MembershipEntry e{.nic_id = nic, .vni = 5, .ipv6 = false, .group = {}};
+    e.group[0] = std::byte{239};
+    e.group[3] = std::byte{last};
+    return e;
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(group_membership_reads_on_change_only) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    MeterRole role;
+    for (std::uint64_t n = 1; n <= 300; ++n) {  // three pages
+        role.joins.push_back(joined(n, 1));
+    }
+    role.generation = 7;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const Server server{endpoint, role};
+
+    auto read = link.group_membership(std::nullopt);
+    BOOST_REQUIRE(read.has_value());
+    BOOST_REQUIRE(read->has_value());
+    BOOST_TEST((*read)->generation == 7U);
+    BOOST_REQUIRE((*read)->entries.size() == 300U);
+    BOOST_TEST(((*read)->entries[150] == joined(151, 1)));
+    BOOST_TEST(role.membership_snapshots == 1);
+
+    // The same generation: one small answer, no snapshot.
+    read = link.group_membership(7);
+    BOOST_REQUIRE(read.has_value());
+    BOOST_TEST(!read->has_value());
+    BOOST_TEST(role.membership_snapshots == 1);
+
+    // A change is read whole; an empty list is a list.
+    role.joins.clear();
+    role.generation = 8;
+    read = link.group_membership(7);
+    BOOST_REQUIRE(read.has_value());
+    BOOST_REQUIRE(read->has_value());
+    BOOST_TEST((*read)->generation == 8U);
+    BOOST_TEST((*read)->entries.empty());
+
+    // Pages from different snapshots are refused.
+    for (std::uint64_t n = 1; n <= 200; ++n) {
+        role.joins.push_back(joined(n, 2));
+    }
+    role.generation = 9;
+    role.torn = true;
+    read = link.group_membership(8);
+    BOOST_REQUIRE(!read.has_value());
+    BOOST_TEST((read.error().code == LinkErrc::bad_response));
+}
+
 BOOST_AUTO_TEST_CASE(vpc_config_is_forwarded_whole) {
     auto [helm_b, oar_b] = InProcessBinding::make_pair();
     MeterRole role;
@@ -837,6 +935,12 @@ BOOST_AUTO_TEST_CASE(roles_without_group_meters_answer_unsupported) {
     const auto usage = link.group_usage();
     BOOST_REQUIRE(!usage.has_value());
     BOOST_TEST((usage.error().status == oar::Status::unsupported));
+    const auto members = link.group_members(pattern(100));
+    BOOST_REQUIRE(!members.has_value());
+    BOOST_TEST((members.error().status == oar::Status::unsupported));
+    const auto joins = link.group_membership(std::nullopt);
+    BOOST_REQUIRE(!joins.has_value());
+    BOOST_TEST((joins.error().status == oar::Status::unsupported));
 }
 
 // A hold role: configs, ops and lease grants in, reports out.

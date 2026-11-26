@@ -460,6 +460,8 @@ auto main(int argc, char** argv) -> int {
                               .verify_config = std::move(verify),
                               .storage_tls = std::move(storage_tls),
                               .initiator = defaults.initiator,
+                              .khold_initiator = defaults.khold_initiator,
+                              .max_trim_bytes = defaults.max_trim_bytes,
                               .clock = {}},
                              raw);
     if (!role) {

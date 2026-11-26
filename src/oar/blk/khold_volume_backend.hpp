@@ -81,8 +81,8 @@ public:
         -> void override;
     // HydrationTarget: refused (io) until khold hydrates restores itself
     // (kythira khold spec phase 2); no layout names an image source yet.
-    auto submit_hydrate(std::uint64_t offset, std::span<const std::byte> in,
-                        BackendCompletion done) -> void override;
+    auto submit_hydrate(std::uint64_t offset, std::span<const std::byte> in, BackendCompletion done)
+        -> void override;
     [[nodiscard]] auto poll() -> bool override;
     [[nodiscard]] auto wake_fd() const noexcept -> int override;
 

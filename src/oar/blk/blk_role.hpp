@@ -96,6 +96,18 @@
 // progress until release forgets it; prepare_function, rewrap_volume and
 // a second copy of either volume are busy meanwhile, and delete_volume of
 // either drops the copy first.
+// khold volumes (kythira .kiro/specs/khold-block-service/ task 16): helm
+// sends each VolumeLayout whose attachments name this server
+// (volume_layout); the role verifies its signature under a controller key
+// as it does a ReplicaConfig, checks that it names this server, and keeps
+// the newest per volume. prepare_function with an attachment serves a
+// volume that has a layout with a KholdVolumeBackend (hold wire version 2,
+// one session per stripe group leader) and one that has a ReplicaConfig
+// with a NetworkVolumeBackend; a later layout re-routes the live
+// attachment (members, fencing, QoS, growth) like a later config. A khold
+// function offers virtio-blk DISCARD and WRITE_ZEROES, ranges of at most
+// RoleConfig::max_trim_bytes.
+//
 // Faults (kythira khold-block-service Requirement 9.9, closing the
 // take_faults() gap for hold volumes too). poll() takes each network
 // attachment's initiator faults and queues them as reports, which helm
@@ -132,9 +144,11 @@
 #include "oar/blk/file_backend.hpp"
 #include "oar/blk/hydrating_backend.hpp"
 #include "oar/blk/lazy_image_backend.hpp"
+#include "oar/blk/khold_volume_backend.hpp"
 #include "oar/blk/network_volume_backend.hpp"
 #include "objstore/object_store.hpp"
 #include "proto/report.hpp"
+#include "proto/volume_layout.hpp"
 #include "oar/blk/virtio_blk_function.hpp"
 #include "oar/blk/volume_copier.hpp"
 
@@ -199,7 +213,10 @@ struct RoleConfig {
     std::function<bool(std::span<const std::byte>, std::span<const std::byte, 64>, std::uint16_t)>
         verify_config;
     std::optional<tls::Config> storage_tls;
-    InitiatorConfig initiator;  // attachment_id is set per attachment
+    InitiatorConfig initiator;             // attachment_id is set per attachment
+    KholdInitiatorConfig khold_initiator;  // likewise, for khold volumes
+    // The longest DISCARD or WRITE_ZEROES range a khold function takes.
+    std::uint32_t max_trim_bytes{std::uint32_t{16} << 20U};
     // Network volumes restored from an image under another key (block
     // volume task 23): regions each one's background walk keeps in flight.
     std::size_t hydrate_max_background{2};
@@ -209,7 +226,8 @@ struct RoleConfig {
     std::function<Clock::time_point()> clock;
 };
 
-// Network volume configs a role keeps at once.
+// Network volume configs (ReplicaConfigs and VolumeLayouts together) a
+// role keeps at once.
 inline constexpr std::size_t max_network_configs = 1024;
 
 // What a GET_ID returns for a volume: "akv-" and its ID in 16 hex digits,
@@ -242,6 +260,7 @@ public:
     auto delete_volume(const helm::oar::DeleteVolume& request) -> helm::oar::Status override;
     auto rewrap_volume(const helm::oar::RewrapVolume& request) -> helm::oar::Status override;
     auto replica_config(std::span<const std::byte> frame) -> helm::oar::Status override;
+    auto volume_layout(std::span<const std::byte> frame) -> helm::oar::Status override;
     auto cert_request() -> std::expected<helm::oar::CertAnswer, helm::oar::Status> override;
     auto role_certificate(std::span<const std::byte> chain) -> helm::oar::Status override;
     auto eject(const helm::oar::Eject& request)
@@ -284,8 +303,9 @@ private:
         std::unique_ptr<VirtioBlkFunction> active;
         std::uint64_t volume{0};
         LazyImageBackend* image{nullptr};  // the active function's backend, for an image volume
-        NetworkVolumeBackend* network{nullptr};  // ... for a network volume
+        NetworkVolumeBackend* network{nullptr};  // ... for a hold network volume
         HydratingBackend* hydrating{nullptr};    // ... in front of it, restoring from an image
+        KholdVolumeBackend* khold{nullptr};      // ... for a khold volume
         std::uint64_t attachment_id{0};          // the network attachment, for reports
         std::uint32_t generation{0};
     };
@@ -311,10 +331,15 @@ private:
         -> std::expected<std::unique_ptr<LazyImageBackend>, std::string>;
     auto prepare_network(Slot& s, const helm::oar::PrepareFunction& request,
                          const helm::oar::BlkConfig& cfg) -> helm::oar::Status;
+    auto prepare_khold(Slot& s, const helm::oar::BlkConfig& cfg) -> helm::oar::Status;
+    // The network attachment's backend, hold or khold; null otherwise.
+    [[nodiscard]] static auto attached_volume(const Slot& s) -> AttachedVolume*;
+    // Grows the slot's function to the backend's capacity, if larger.
+    [[nodiscard]] static auto follow_capacity(Slot& s, const AttachedVolume& v) -> bool;
     // Puts `f` behind the slot's transport (the placeholder back on failure).
     auto serve_active(Slot& s, std::unique_ptr<VirtioBlkFunction> f, std::uint64_t volume,
-                      LazyImageBackend* image, NetworkVolumeBackend* network,
-                      HydratingBackend* hydrating = nullptr) -> helm::oar::Status;
+                      LazyImageBackend* image, HydratingBackend* hydrating = nullptr)
+        -> helm::oar::Status;
     // Queues the initiator faults of a network attachment as reports.
     auto report_faults(const Slot& s, const std::vector<FaultEvent>& faults) -> void;
     auto queue_report(proto::ReportBody body) -> void;
@@ -331,7 +356,8 @@ private:
     RoleConfig _config;
     std::vector<Slot> _slots;
     std::map<std::uint64_t, Copy> _copies;
-    std::map<std::uint64_t, proto::ReplicaConfig> _configs;  // network volumes, newest
+    std::map<std::uint64_t, proto::ReplicaConfig> _configs;  // hold network volumes, newest
+    std::map<std::uint64_t, proto::VolumeLayout> _layouts;   // khold volumes, newest
     RoleConfig::Clock::time_point _started;
     helm::RoleEnrollment* _enrollment{nullptr};
     helm::oar::ReportQueue _reports;

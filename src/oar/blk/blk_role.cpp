@@ -169,6 +169,7 @@ auto BlkRole::close(Slot& s) -> bool {
     s.image = nullptr;
     s.network = nullptr;
     s.hydrating = nullptr;
+    s.khold = nullptr;
     s.attachment_id = 0;
     s.generation = 0;
     s.active.reset();
@@ -303,12 +304,11 @@ auto BlkRole::prepare_function(const oar::PrepareFunction& request) -> oar::Stat
     if (!f) {
         return oar::Status::failed;
     }
-    return serve_active(*s, std::move(*f), cfg->volume_id, image, nullptr);
+    return serve_active(*s, std::move(*f), cfg->volume_id, image);
 }
 
 auto BlkRole::serve_active(Slot& s, std::unique_ptr<VirtioBlkFunction> f, std::uint64_t volume,
-                           LazyImageBackend* image, NetworkVolumeBackend* network,
-                           HydratingBackend* hydrating) -> oar::Status {
+                           LazyImageBackend* image, HydratingBackend* hydrating) -> oar::Status {
     // Until helm's key arrives (after the VMM opened the function), the
     // guest's requests wait in the rings.
     f->await_key();
@@ -320,7 +320,6 @@ auto BlkRole::serve_active(Slot& s, std::unique_ptr<VirtioBlkFunction> f, std::u
     s.active = std::move(f);
     s.volume = volume;
     s.image = image;
-    s.network = network;
     s.hydrating = hydrating;
     return oar::Status::ok;
 }
@@ -332,6 +331,9 @@ auto BlkRole::prepare_network(Slot& s, const oar::PrepareFunction& /*request*/,
     }
     if (!_config.storage_tls) {
         return oar::Status::failed;  // not enrolled yet: no certificate to present
+    }
+    if (_layouts.contains(cfg.volume_id)) {
+        return prepare_khold(s, cfg);
     }
     const auto c = _configs.find(cfg.volume_id);
     if (c == _configs.end()) {
@@ -395,12 +397,71 @@ auto BlkRole::prepare_network(Slot& s, const oar::PrepareFunction& /*request*/,
     if (!f) {
         return oar::Status::failed;
     }
-    const auto st = serve_active(s, std::move(*f), cfg.volume_id, nullptr, network, hydrating);
+    const auto st = serve_active(s, std::move(*f), cfg.volume_id, nullptr, hydrating);
     if (st == oar::Status::ok) {
+        s.network = network;
         s.attachment_id = cfg.attachment_id;
         s.generation = cfg.generation;
     }
     return st;
+}
+
+auto BlkRole::prepare_khold(Slot& s, const oar::BlkConfig& cfg) -> oar::Status {
+    const auto& l = _layouts.at(cfg.volume_id);
+    const auto att = std::ranges::find(l.attachments, cfg.attachment_id,
+                                       &proto::VolumeAttachment::attachment_id);
+    if (att == l.attachments.end() || att->generation != cfg.generation ||
+        att->server_id != _config.server_id) {
+        return oar::Status::failed;
+    }
+    auto initiator = _config.khold_initiator;
+    initiator.attachment_id = cfg.attachment_id;
+    auto backend =
+        KholdVolumeBackend::create({.initiator = initiator,
+                                    .tls = *_config.storage_tls,
+                                    .connect_timeout = KholdVolumeConfig{}.connect_timeout,
+                                    .write_timeout = KholdVolumeConfig{}.write_timeout});
+    if (!backend || !(*backend)->set_layout(l)) {
+        return oar::Status::failed;
+    }
+    KholdVolumeBackend* khold = backend->get();
+    const std::uint32_t sectors_per_block = l.block_size / oar::sector_size;
+    const VolumeGeometry g{
+        .capacity_sectors = l.capacity_blocks * sectors_per_block,
+        .logical_block_size = l.block_size,
+        .read_only = att->mode == proto::AttachMode::ro,
+        .seg_max = _config.seg_max,
+        .max_transfer_bytes = _config.max_transfer_bytes,
+        .trim = true,
+        // Whole logical blocks, at least one.
+        .max_trim_sectors = std::max<std::uint32_t>(
+            sectors_per_block, (_config.max_trim_bytes / l.block_size) * sectors_per_block)};
+    auto f = VirtioBlkFunction::create(
+        params(g, volume_serial(cfg.volume_id), _config.image_max_in_flight), s.transport->memory(),
+        s.transport->interrupts(), std::move(*backend));
+    if (!f) {
+        return oar::Status::failed;
+    }
+    const auto st = serve_active(s, std::move(*f), cfg.volume_id, nullptr);
+    if (st == oar::Status::ok) {
+        s.khold = khold;
+        s.attachment_id = cfg.attachment_id;
+        s.generation = cfg.generation;
+    }
+    return st;
+}
+
+auto BlkRole::attached_volume(const Slot& s) -> AttachedVolume* {
+    if (s.network != nullptr) {
+        return s.network;
+    }
+    return s.khold;
+}
+
+auto BlkRole::follow_capacity(Slot& s, const AttachedVolume& v) -> bool {
+    const std::uint64_t sectors = v.size_bytes() / oar::sector_size;
+    return !s.active || v.fenced() || sectors <= s.active->geometry().capacity_sectors ||
+           s.active->grow(sectors).has_value();
 }
 
 auto BlkRole::cert_request() -> std::expected<oar::CertAnswer, oar::Status> {
@@ -445,8 +506,8 @@ auto BlkRole::role_certificate(std::span<const std::byte> chain) -> oar::Status 
 auto BlkRole::set_storage_tls(const tls::Config& config) -> void {
     _config.storage_tls = config;
     for (auto& s : _slots) {
-        if (s.network != nullptr) {
-            s.network->set_tls(config);
+        if (auto* v = attached_volume(s); v != nullptr) {
+            v->set_tls(config);
         }
     }
     for (auto& [local, copy] : _copies) {
@@ -469,7 +530,7 @@ auto BlkRole::replica_config(std::span<const std::byte> frame) -> oar::Status {
     }
     auto it = _configs.find(c->volume_id);
     if (it == _configs.end()) {
-        if (_configs.size() >= max_network_configs) {
+        if (_configs.size() + _layouts.size() >= max_network_configs) {
             return oar::Status::busy;
         }
     } else if (c->epoch < it->second.epoch) {
@@ -482,9 +543,7 @@ auto BlkRole::replica_config(std::span<const std::byte> frame) -> oar::Status {
         if (!s->network->set_route(*c)) {
             return oar::Status::failed;
         }
-        const std::uint64_t sectors = s->network->size_bytes() / oar::sector_size;
-        if (s->active && !s->network->fenced() &&
-            sectors > s->active->geometry().capacity_sectors && !s->active->grow(sectors)) {
+        if (!follow_capacity(*s, *s->network)) {
             return oar::Status::failed;
         }
     }
@@ -495,6 +554,41 @@ auto BlkRole::replica_config(std::span<const std::byte> frame) -> oar::Status {
         }
     }
     _configs[c->volume_id] = std::move(*c);
+    return oar::Status::ok;
+}
+
+auto BlkRole::volume_layout(std::span<const std::byte> frame) -> oar::Status {
+    static_assert(oar::max_volume_layout_frame == proto::max_volume_layout_size);
+    if (!_config.verify_config) {
+        return oar::Status::unsupported;
+    }
+    auto l = proto::decode_volume_layout(frame);
+    if (!l) {
+        return oar::Status::bad_request;
+    }
+    if (l->server_id != _config.server_id ||
+        !_config.verify_config(proto::volume_layout_signed_bytes(frame), l->signature, l->key_id)) {
+        return oar::Status::failed;
+    }
+    auto it = _layouts.find(l->volume_id);
+    if (it == _layouts.end()) {
+        if (_configs.size() + _layouts.size() >= max_network_configs) {
+            return oar::Status::busy;
+        }
+    } else if (l->epoch < it->second.epoch) {
+        return oar::Status::failed;
+    }
+    // A live attachment follows the new epoch: new members or leaders'
+    // candidates, fencing, QoS, or a larger capacity the guest then sees.
+    if (Slot* s = slot_of_volume(l->volume_id); s != nullptr && s->khold != nullptr) {
+        if (!s->khold->set_layout(*l)) {
+            return oar::Status::failed;
+        }
+        if (!follow_capacity(*s, *s->khold)) {
+            return oar::Status::failed;
+        }
+    }
+    _layouts[l->volume_id] = std::move(*l);
     return oar::Status::ok;
 }
 
@@ -593,8 +687,8 @@ auto BlkRole::poll() -> bool {
             // abandoned by a reset must run even while the driver is not live.
             more = s.active->poll() || more;
         }
-        if (s.network != nullptr) {
-            report_faults(s, s.network->take_faults());
+        if (auto* v = attached_volume(s); v != nullptr) {
+            report_faults(s, v->take_faults());
         }
     }
     for (auto& [local, copy] : _copies) {

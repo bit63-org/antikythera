@@ -14,14 +14,16 @@ Steering that applies to all of them is in `../steering/`.
 | [oar-gpu-data-plane](oar-gpu-data-plane/) | GPUs: designed now, built after network and storage | designed |
 | [harbor-virt-on-virt](harbor-virt-on-virt/) | Nested-KVM prototype of the whole system | 4/10 |
 | [controller-interface](controller-interface/) | Signed commands, mappings, inventory; kythira EC2 mapping | 14/16 |
+| [vpc-subnets-routing](vpc-subnets-routing/) | VPC CIDR blocks, subnets, the distributed implicit router, route tables (`local` and NIC targets) | 0/12 |
+| [vpc-security-groups](vpc-security-groups/) | Stateful security groups: per-NIC connection tracking and rules in oar-net, the signed `SecurityPolicy` frame | 0/13 |
 | [backplane-hardware](backplane-hardware/) | Physical PCIe backplane requirements | deferred |
 | [build-and-ci](build-and-ci/) | Toolchain, vcpkg, caching and CI, following kythira | 9/11 |
 
 Suggested order: build-and-ci → harbor phases 1–2 → helm + hull (phase 3)
 → oar-blk (phase 4) → oar-net (phase 5) → controller-interface → GPU.
 
-The remaining AWS VPC features (subnets, route tables, security groups,
-gateways and more) are mapped against these specs in
+The remaining AWS VPC features (gateways, NACLs, peering and more) are
+mapped against these specs in
 [docs/vpc-gap-analysis.md](../../docs/vpc-gap-analysis.md). The EBS
 features are mapped the same way in
 [docs/ebs-gap-analysis.md](../../docs/ebs-gap-analysis.md).

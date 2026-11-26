@@ -67,9 +67,9 @@ spec).
 | AWS feature | Status | What we have | What is needed |
 |---|---|---|---|
 | VPC (`CreateVpc`, CIDR block) | partial | VNI allocation, `CREATE_NETWORK`/`DELETE_NETWORK` mailbox commands; EC2 mapping in controller Req 6 | A VPC CIDR (IPv4, plus an IPv6 /56) recorded by the controller and enforced: guest addresses must fall inside it. The EC2 module itself (controller task 6, kythira repo) |
-| Subnets | missing | One flat L2 segment per VPC. Controller Req 6.4 refuses subnets beyond one with `UnsupportedOperation` | Subnet CIDRs per VPC, each NIC in one subnet. oar-net becomes the implicit VPC router: it answers ARP/ND for each subnet's gateway address (`.1`) with a virtual router MAC and forwards between subnets by rewriting MACs and decrementing TTL, all local to the source VTEP (AWS-style distributed routing, no hop to a router box). Subnet and router config ride in the MapUpdate (format v3) or a new signed frame |
-| Route tables | missing | None; only the implicit "local" reach within the VNI | Per-subnet route tables (destination prefix → target: local, IGW, NAT GW, peering, TGW, VPN, a NIC for appliances), longest-prefix match in oar-net. A new signed `RouteTable` frame per VPC, versioned like MapUpdate, applied atomically with the mapping |
-| Security groups | missing | Refused by controller Req 6.4 | The single most important gap. Stateful per-NIC allow rules (protocol, port range, CIDR or another SG as source/destination) enforced in oar-net, so neither host nor guest can bypass them. Needs connection tracking per function (TCP/UDP/ICMP state, timeouts, a per-NIC table limit), rule evaluation on egress at the source VTEP and on ingress at the destination VTEP, and SG-to-SG references expanded by the controller into address sets. Distributed as a signed per-VPC `SecurityPolicy` frame. Fuzz target over hostile flows |
+| Subnets | specced | One flat L2 segment per VPC. Controller Req 6.4 refuses subnets beyond one with `UnsupportedOperation`. Spec: `vpc-subnets-routing` (VpcConfig v2, MapUpdate v4) | Subnet CIDRs per VPC, each NIC in one subnet. oar-net becomes the implicit VPC router: it answers ARP/ND for each subnet's gateway address (`.1`) with a virtual router MAC and forwards between subnets by rewriting MACs and decrementing TTL, all local to the source VTEP (AWS-style distributed routing, no hop to a router box). Subnet and router config ride in the MapUpdate (format v3) or a new signed frame |
+| Route tables | specced | NIC-target routes in the per-VPC `VpcConfig` (oar-net 22, #107). Spec: per-subnet tables with `local` and NIC targets in `vpc-subnets-routing`; the frame is VpcConfig v2, not a separate `RouteTable` frame | Per-subnet route tables (destination prefix → target: local, IGW, NAT GW, peering, TGW, VPN, a NIC for appliances), longest-prefix match in oar-net. A new signed `RouteTable` frame per VPC, versioned like MapUpdate, applied atomically with the mapping |
+| Security groups | specced | Refused by controller Req 6.4. Spec: `vpc-security-groups` (per-NIC conntrack and rules at the NIC's own VTEP, `SecurityPolicy` frame; SG references resolved by oar-net from the mapping rather than expanded by the controller) | The single most important gap. Stateful per-NIC allow rules (protocol, port range, CIDR or another SG as source/destination) enforced in oar-net, so neither host nor guest can bypass them. Needs connection tracking per function (TCP/UDP/ICMP state, timeouts, a per-NIC table limit), rule evaluation on egress at the source VTEP and on ingress at the destination VTEP, and SG-to-SG references expanded by the controller into address sets. Distributed as a signed per-VPC `SecurityPolicy` frame. Fuzz target over hostile flows |
 | Network ACLs | missing | None | Stateless, ordered, per-subnet allow/deny rules, evaluated at subnet boundaries. Simpler than SGs once the L3 parser and rule distribution exist; can share the `SecurityPolicy` frame |
 | Source/destination check | done | Source MAC must be the NIC's mapped MAC; ARP sender and NA target checked; IP source and destination checked against the NIC's mapped addresses on transmit and receive, with an EtherType allowlist and per-cause counters (oar-net 16, #61); per-NIC opt-out (AWS `SourceDestCheck=false`) with NIC route targets (oar-net 22, #107) | Route tables themselves (see "Route tables") |
 | Internet gateway | missing | oar-net spec explicitly has no uplink ("no uplink by default") | A gateway role: a VTEP with an external interface that terminates Geneve for VPCs with an IGW attached, does 1:1 NAT between public and private addresses, and advertises public prefixes upstream (BGP). Needs its own spec (placement, HA pairs, capacity) and route-table targets |
@@ -134,9 +134,11 @@ spec).
    controller model that produces the frames lands in kythira.
 4. **Subnets and the implicit router.** Per-subnet gateway addresses,
    distributed routing between subnets at the source VTEP, and route tables
-   with the `local` target only.
+   with the `local` target (plus the NIC targets step 3 built). Specced in
+   `.kiro/specs/vpc-subnets-routing/`.
 5. **Security groups,** with conntrack in oar-net and the `SecurityPolicy`
-   frame. Flow logs right after, since they read the same conntrack.
+   frame. Specced in `.kiro/specs/vpc-security-groups/`. Flow logs right
+   after, since they read the same conntrack.
 6. **NACLs,** reusing the parser and rule distribution.
 7. **Gateway role spec and build:** IGW with Elastic IPs, then NAT gateway
    and the egress-only IGW, then the DNS resolver behind it. Route-table
@@ -203,4 +205,7 @@ and guest:
   uplink, or as a placement option of the existing oar-net boards?
 - Which kythira services get gateway endpoints first?
 - Is security-group state per NIC on the oar-net board small enough for
-  the target hardware, and what is the per-NIC connection limit?
+  the target hardware, and what is the per-NIC connection limit? The spec
+  plans about 96 bytes per flow, a 262,144-flow role budget and 65,536
+  flows per NIC by default, to be set by `vpc-security-groups` task 10's
+  measurement.

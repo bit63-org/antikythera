@@ -17,8 +17,10 @@
 //
 // Offered features: VERSION_1, ACCESS_PLATFORM (descriptors carry IOVAs
 // behind the IOMMU), INDIRECT_DESC, EVENT_IDX, SIZE_MAX, SEG_MAX, BLK_SIZE,
-// FLUSH, plus RO for a read-only attachment and MQ with more than one
-// queue. size_max is max_transfer_bytes / seg_max, so no request the driver
+// FLUSH, plus RO for a read-only attachment, MQ with more than one queue,
+// and DISCARD and WRITE_ZEROES when the geometry offers trim (a backend
+// that frees space: khold volumes, kythira khold-block-service
+// Requirement 4.2). size_max is max_transfer_bytes / seg_max, so no request the driver
 // can build exceeds the transfer cap the parser enforces.
 //
 // Requests are taken from the rings in queue_notified(), up to a budget per
@@ -31,7 +33,17 @@
 //   IN     ciphertext is read into the bounce buffer, decrypted in place,
 //          copied out to the guest, and the bounce buffer is wiped;
 //   FLUSH  forwarded to the backend;
+//   DISCARD, WRITE_ZEROES
+//          the range forwarded to the backend, which frees it; no data
+//          moves, so neither needs the key;
 //   GET_ID the attachment's serial, zero-padded to 20 bytes.
+//
+// With trim offered, a logical block that reads back as all-zero
+// ciphertext is returned to the guest as zeros instead of being
+// decrypted: a freed block (and one never written) is zeros with a CRC of
+// 0 on the backend, and WRITE_ZEROES must read back as zeros. Real
+// ciphertext is all zeros with probability 2^-4096 per 512-byte block.
+// Without trim nothing changes: every block is decrypted.
 //
 // IN, OUT and FLUSH go to the backend asynchronously (BlockBackend above).
 // Each queue has max_in_flight slots, each with its own bounce buffer; a
@@ -129,10 +141,13 @@ inline constexpr unsigned feature_blk_ro = 5;
 inline constexpr unsigned feature_blk_blk_size = 6;
 inline constexpr unsigned feature_blk_flush = 9;
 inline constexpr unsigned feature_blk_mq = 12;
+inline constexpr unsigned feature_blk_discard = 13;
+inline constexpr unsigned feature_blk_write_zeroes = 14;
 
 // struct virtio_blk_config (virtio 1.2 5.2.4), up to and including
-// num_queues; the discard and write-zeroes fields that follow belong to
-// features this function does not offer.
+// num_queues, and with trim the discard and write-zeroes fields after it
+// (trim_size); the secure-erase fields belong to a feature this function
+// does not offer.
 namespace blk_cfg {
 inline constexpr std::uint32_t capacity = 0;     // le64, 512-byte sectors
 inline constexpr std::uint32_t size_max = 8;     // le32
@@ -143,6 +158,13 @@ inline constexpr std::uint32_t topology = 24;    // 8 bytes
 inline constexpr std::uint32_t writeback = 32;   // u8
 inline constexpr std::uint32_t num_queues = 34;  // le16
 inline constexpr std::uint32_t size = 36;
+inline constexpr std::uint32_t max_discard_sectors = 36;       // le32
+inline constexpr std::uint32_t max_discard_seg = 40;           // le32
+inline constexpr std::uint32_t discard_sector_alignment = 44;  // le32
+inline constexpr std::uint32_t max_write_zeroes_sectors = 48;  // le32
+inline constexpr std::uint32_t max_write_zeroes_seg = 52;      // le32
+inline constexpr std::uint32_t write_zeroes_may_unmap = 56;    // u8
+inline constexpr std::uint32_t trim_size = 60;
 }  // namespace blk_cfg
 
 // How long device_status must stay 0, with an eject requested, before the
@@ -207,6 +229,20 @@ public:
                               BackendCompletion done) -> void = 0;
     // Makes every write completed before this submit durable.
     virtual auto submit_flush(BackendCompletion done) -> void = 0;
+    // DISCARD and WRITE_ZEROES, for a backend that frees space (khold
+    // volumes): `length` bytes at `offset`, both whole logical blocks.
+    // After either completes the range reads back as zeros with CRC 0 (the
+    // function returns those blocks to the guest as zeros). Only called
+    // when supports_trim(); the defaults fail.
+    [[nodiscard]] virtual auto supports_trim() const noexcept -> bool { return false; }
+    virtual auto submit_discard(std::uint64_t /*offset*/, std::uint64_t /*length*/,
+                                BackendCompletion done) -> void {
+        done(std::unexpected(BackendError::io));
+    }
+    virtual auto submit_write_zeroes(std::uint64_t /*offset*/, std::uint64_t /*length*/,
+                                     BackendCompletion done) -> void {
+        done(std::unexpected(BackendError::io));
+    }
     // Runs the completions that are ready; true while operations remain in
     // flight. Synchronous backends have none.
     [[nodiscard]] virtual auto poll() -> bool { return false; }
@@ -263,6 +299,7 @@ enum class BlkConfigError : std::uint8_t {
     backend_too_small,  // backend holds less than capacity_sectors * 512 bytes
     key_slot,           // the KeySlot could not be created (mmap/mlock/madvise)
     bad_in_flight,      // max_in_flight 0 or above queue_size
+    trim_unsupported,   // trim offered over a backend that cannot free space
 };
 
 enum class KeyError : std::uint8_t {
@@ -281,8 +318,10 @@ struct BlkCounters {
     std::uint64_t no_key{0};           // IN/OUT refused because no key is held
     std::uint64_t queue_errors{0};     // DEVICE_NEEDS_RESET raised by this device
     std::uint64_t function_resets{0};  // FLRs
-    std::uint64_t parked{0};           // IN/OUT/FLUSH that completed after their submit returned
-    std::uint64_t abandoned{0};        // in flight across a reset; completed into nothing
+    std::uint64_t parked{0};       // backend requests that completed after their submit returned
+    std::uint64_t trims{0};        // DISCARD and WRITE_ZEROES handed to the backend
+    std::uint64_t zero_blocks{0};  // blocks read back as zeros (all-zero ciphertext, trim only)
+    std::uint64_t abandoned{0};    // in flight across a reset; completed into nothing
 };
 
 class VirtioBlkFunction final : public virtio::Device {
@@ -376,7 +415,8 @@ private:
     auto process(std::uint16_t index) -> bool;
     // Serves one chain. Returns false if the function had to fail.
     auto serve(std::uint16_t index, const virtio::Chain& chain) -> bool;
-    // Hands an IN, OUT or FLUSH to the backend in a free slot.
+    // Hands an IN, OUT, FLUSH, DISCARD or WRITE_ZEROES to the backend in a
+    // free slot.
     auto submit(std::uint16_t index, std::size_t slot, const virtio::Chain& chain,
                 const Request& req) -> void;
     // A backend completion for (queue, slot).
@@ -385,6 +425,9 @@ private:
     // translated again; false if they no longer translate.
     auto deliver(const Slot& s, std::span<const std::byte> data, Status st) -> bool;
     auto count(Status st) -> void;
+    // Decrypts a read in place; with trim, all-zero blocks stay zeros.
+    [[nodiscard]] auto decrypt(XtsCipher& cipher, std::uint64_t unit, std::span<std::byte> buf)
+        -> bool;
     auto do_get_id(const Request& req) -> std::uint32_t;
     auto queue_error() -> void;
     auto signal_queues() -> void;
@@ -401,7 +444,8 @@ private:
     bool _in_submit{false};
     std::size_t _budget;
     std::vector<Queue> _queues;
-    std::array<std::byte, blk_cfg::size> _device_config{};
+    std::array<std::byte, blk_cfg::trim_size> _device_config{};
+    std::uint32_t _config_size{blk_cfg::size};  // trim_size with trim
     std::array<std::byte, id_bytes> _serial{};
     bool _awaiting_key{false};
     BlkCounters _counters;

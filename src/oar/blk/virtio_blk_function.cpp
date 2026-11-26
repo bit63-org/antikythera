@@ -40,6 +40,9 @@ auto device_features(const BlkParams& params) -> std::uint64_t {
     if (params.num_queues > 1) {
         f |= feature_bit(feature_blk_mq);
     }
+    if (params.geometry.trim) {
+        f |= feature_bit(feature_blk_discard) | feature_bit(feature_blk_write_zeroes);
+    }
     return f;
 }
 
@@ -87,6 +90,8 @@ auto to_string(BlkConfigError e) noexcept -> const char* {
             return "key_slot";
         case BlkConfigError::bad_in_flight:
             return "bad_in_flight";
+        case BlkConfigError::trim_unsupported:
+            return "trim_unsupported";
     }
     return "unknown";
 }
@@ -128,6 +133,9 @@ auto VirtioBlkFunction::create(const BlkParams& params, const virtio::GuestMemor
     if (!backend) {
         return std::unexpected(BlkConfigError::backend_missing);
     }
+    if (g.trim && !backend->supports_trim()) {
+        return std::unexpected(BlkConfigError::trim_unsupported);
+    }
     if (g.capacity_sectors > std::numeric_limits<std::uint64_t>::max() / sector_size ||
         backend->size_bytes() < g.capacity_sectors * sector_size) {
         return std::unexpected(BlkConfigError::backend_too_small);
@@ -149,7 +157,7 @@ auto VirtioBlkFunction::create(const BlkParams& params, const virtio::GuestMemor
          .device_features = device_features(params),
          .num_queues = params.num_queues,
          .max_queue_size = params.queue_size,
-         .device_config_size = blk_cfg::size,
+         .device_config_size = g.trim ? blk_cfg::trim_size : blk_cfg::size,
          .eject_capability = true});
     if (!pci) {
         return std::unexpected(BlkConfigError::bad_queues);
@@ -188,6 +196,19 @@ VirtioBlkFunction::VirtioBlkFunction(const BlkParams& params, RequestParser pars
     w.u8(0);    // writeback
     w.u8(0);    // unused0
     w.le16(params.num_queues);
+    if (g.trim) {
+        // One range per request; ranges in whole logical blocks.
+        const std::uint32_t align = g.logical_block_size / sector_size;
+        w.le32(g.max_trim_sectors);  // max_discard_sectors
+        w.le32(1);                   // max_discard_seg
+        w.le32(align);               // discard_sector_alignment
+        w.le32(g.max_trim_sectors);  // max_write_zeroes_sectors
+        w.le32(1);                   // max_write_zeroes_seg
+        w.u8(1);                     // write_zeroes_may_unmap: the backend always frees
+        w.u8(0);                     // unused1[3]
+        w.le16(0);
+        _config_size = blk_cfg::trim_size;
+    }
     std::ranges::copy(cfg, _device_config.begin());
 
     std::ranges::copy(std::as_bytes(std::span{params.serial}), _serial.begin());
@@ -213,7 +234,7 @@ auto VirtioBlkFunction::read_config(std::uint32_t offset, std::size_t width) con
     if (offset % width != 0) {
         return std::unexpected(virtio::AccessError::bad_width);
     }
-    if (offset >= blk_cfg::size || width > blk_cfg::size - offset) {
+    if (offset >= _config_size || width > _config_size - offset) {
         return std::unexpected(virtio::AccessError::bad_offset);
     }
     std::uint64_t v = 0;
@@ -443,7 +464,9 @@ auto VirtioBlkFunction::serve(std::uint16_t index, const virtio::Chain& chain) -
         switch (req.type) {
             case RequestType::in:
             case RequestType::out:
-            case RequestType::flush: {
+            case RequestType::flush:
+            case RequestType::discard:
+            case RequestType::write_zeroes: {
                 Queue& q = _queues[index];
                 const auto it =
                     std::ranges::find_if(q.slots, [](const Slot& s) { return !s.busy; });
@@ -507,6 +530,19 @@ auto VirtioBlkFunction::submit(std::uint16_t index, std::size_t slot, const virt
 
     if (req.type == RequestType::flush) {
         _backend->submit_flush(std::move(done));
+        return;
+    }
+    if (req.type == RequestType::discard || req.type == RequestType::write_zeroes) {
+        // No data moves: neither needs the key. The parser admits these
+        // only with trim, which create() allows only over a trim backend.
+        ++_counters.trims;
+        const std::uint64_t at = req.sector * sector_size;
+        const std::uint64_t len = req.sector_count * sector_size;
+        if (req.type == RequestType::discard) {
+            _backend->submit_discard(at, len, std::move(done));
+        } else {
+            _backend->submit_write_zeroes(at, len, std::move(done));
+        }
         return;
     }
     if (!q.cipher) {
@@ -581,7 +617,7 @@ auto VirtioBlkFunction::finish(std::uint16_t index, std::size_t slot, BackendRes
     const std::span<std::byte> buf = std::span{s.bounce}.first(s.data_bytes);
     if (st == Status::ok && s.type == RequestType::in) {
         // The key may have been dropped while the read was in flight.
-        if (!q.cipher || !q.cipher->decrypt(s.unit, buf, buf)) {
+        if (!q.cipher || !decrypt(*q.cipher, s.unit, buf)) {
             st = Status::ioerr;
         }
     }
@@ -602,6 +638,38 @@ auto VirtioBlkFunction::finish(std::uint16_t index, std::size_t slot, BackendRes
         return;
     }
     q.signal = true;
+}
+
+auto VirtioBlkFunction::decrypt(XtsCipher& cipher, std::uint64_t unit, std::span<std::byte> buf)
+    -> bool {
+    if (!_parser.geometry().trim) {
+        return cipher.decrypt(unit, buf, buf).has_value();
+    }
+    // Runs of non-zero blocks are decrypted; all-zero blocks stay zeros
+    // (freed or never written, see the header).
+    const std::size_t lbs = _parser.geometry().logical_block_size;
+    const auto zero = [](std::span<const std::byte> b) {
+        return std::ranges::all_of(b, [](std::byte x) { return x == std::byte{0}; });
+    };
+    const std::size_t blocks = buf.size() / lbs;
+    std::size_t b = 0;
+    while (b < blocks) {
+        if (zero(buf.subspan(b * lbs, lbs))) {
+            ++_counters.zero_blocks;
+            ++b;
+            continue;
+        }
+        std::size_t end = b + 1;
+        while (end < blocks && !zero(buf.subspan(end * lbs, lbs))) {
+            ++end;
+        }
+        const auto run = buf.subspan(b * lbs, (end - b) * lbs);
+        if (!cipher.decrypt(unit + b, run, run)) {
+            return false;
+        }
+        b = end;
+    }
+    return true;
 }
 
 auto VirtioBlkFunction::do_get_id(const Request& req) -> std::uint32_t {

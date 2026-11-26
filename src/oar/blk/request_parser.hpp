@@ -27,14 +27,29 @@
 //
 //   - the chain must have room for the status byte, or there is no way to
 //     report anything (ParseError::no_status_byte);
-//   - the type must be one oar-blk implements (IN, OUT, FLUSH, GET_ID);
+//   - the type must be one oar-blk implements (IN, OUT, FLUSH, GET_ID, and
+//     DISCARD and WRITE_ZEROES when the geometry offers them);
 //   - each type must have exactly the readable/writable shape it implies;
 //   - read/write lengths must be a non-zero multiple of the logical block
 //     size, start on a logical block boundary, and lie entirely inside the
 //     volume, computed without overflow, so an out-of-range sector fails
 //     the request and never wraps (Requirement 6.1);
 //   - segment counts and transfer size are capped so one request cannot
-//     make the device do unbounded work.
+//     make the device do unbounded work;
+//   - DISCARD and WRITE_ZEROES carry exactly one 16-byte range (the device
+//     offers max_discard_seg = max_write_zeroes_seg = 1), copied out of
+//     guest memory once:
+//
+//       struct virtio_blk_discard_write_zeroes {
+//           le64 sector;       // 512-byte units
+//           le32 num_sectors;
+//           le32 flags;        // bit 0: unmap; the rest reserved
+//       };
+//
+//     The range must be whole logical blocks inside the volume and at most
+//     max_trim_sectors long. A DISCARD with unmap set, or either type with
+//     a reserved flag bit, completes with UNSUPP (virtio 1.2 5.2.6.2); the
+//     header's sector field is ignored, as for FLUSH.
 //
 // The chain itself (descriptor flags, guest addresses, readable-before-
 // writable ordering) has already been validated by the shared virtqueue;
@@ -51,7 +66,9 @@ namespace ak::oar::blk {
 inline constexpr std::size_t sector_size = 512;  // unit of virtio_blk_req.sector
 inline constexpr std::size_t header_size = 16;
 inline constexpr std::size_t status_size = 1;
-inline constexpr std::size_t id_bytes = 20;  // VIRTIO_BLK_ID_BYTES
+inline constexpr std::size_t id_bytes = 20;         // VIRTIO_BLK_ID_BYTES
+inline constexpr std::size_t trim_range_size = 16;  // virtio_blk_discard_write_zeroes
+inline constexpr std::uint32_t trim_flag_unmap = 0x1;
 
 // virtio_blk_req.type values (virtio 1.2 5.2.6).
 enum class RequestType : std::uint32_t {
@@ -60,8 +77,8 @@ enum class RequestType : std::uint32_t {
     flush = 4,          // VIRTIO_BLK_T_FLUSH
     get_id = 8,         // VIRTIO_BLK_T_GET_ID: up to 20 bytes of serial
     get_lifetime = 10,  // VIRTIO_BLK_T_GET_LIFETIME (not offered)
-    discard = 11,       // VIRTIO_BLK_T_DISCARD (later)
-    write_zeroes = 13,  // VIRTIO_BLK_T_WRITE_ZEROES (not offered)
+    discard = 11,       // VIRTIO_BLK_T_DISCARD (when VolumeGeometry::trim)
+    write_zeroes = 13,  // VIRTIO_BLK_T_WRITE_ZEROES (when VolumeGeometry::trim)
     secure_erase = 14,  // VIRTIO_BLK_T_SECURE_ERASE (not offered)
 };
 
@@ -81,6 +98,11 @@ struct VolumeGeometry {
     bool read_only{false};                  // VIRTIO_BLK_F_RO offered
     std::uint32_t seg_max{128};             // virtio_blk_config.seg_max: data segments per request
     std::uint32_t max_transfer_bytes{1U << 20U};  // largest IN/OUT the device accepts
+    // DISCARD and WRITE_ZEROES (VIRTIO_BLK_F_DISCARD and _WRITE_ZEROES),
+    // offered only for backends that free space (khold volumes), and the
+    // longest range either may name, in 512-byte sectors.
+    bool trim{false};
+    std::uint32_t max_trim_sectors{0};
 };
 
 enum class GeometryError : std::uint8_t {
@@ -88,6 +110,7 @@ enum class GeometryError : std::uint8_t {
     capacity_unaligned,  // capacity is not a whole number of logical blocks
     bad_seg_max,         // zero
     bad_max_transfer,    // zero or not a multiple of the logical block size
+    bad_max_trim,        // trim offered with max_trim_sectors zero or not whole blocks
 };
 
 [[nodiscard]] auto to_string(GeometryError e) noexcept -> const char*;
@@ -103,21 +126,24 @@ enum class ParseError : std::uint8_t {
     out_of_range,       // IN/OUT runs past the end of the volume
     read_only,          // OUT on a read-only volume
     too_many_segments,  // more data segments than seg_max
-    too_large,          // IN/OUT longer than max_transfer_bytes
+    too_large,          // IN/OUT longer than max_transfer_bytes, or a range past max_trim_sectors
+    bad_flags,          // DISCARD with unmap, or a reserved range flag (UNSUPP)
 };
 
 [[nodiscard]] auto to_string(ParseError e) noexcept -> const char*;
 
 // The status a rejected request completes with: UNSUPP for an unknown or
-// unimplemented type, IOERR for everything else (virtio 1.2 5.2.6.1).
+// unimplemented type or a range flag the device does not take, IOERR for
+// everything else (virtio 1.2 5.2.6.1).
 // Meaningless for no_status_byte, which cannot be completed normally.
 [[nodiscard]] auto status_for(ParseError e) noexcept -> Status;
 
 // A validated request. All spans alias the chain's buffers (guest memory).
 struct Request {
     RequestType type{RequestType::in};
-    std::uint64_t sector{0};        // first 512-byte sector (IN/OUT; 0 otherwise)
-    std::uint64_t sector_count{0};  // 512-byte sectors moved (IN/OUT; 0 otherwise)
+    std::uint64_t sector{0};        // first 512-byte sector (IN/OUT/DISCARD/WRITE_ZEROES)
+    std::uint64_t sector_count{0};  // 512-byte sectors moved or trimmed (likewise; else 0)
+    bool unmap{false};              // WRITE_ZEROES: the device may free the range
     std::uint64_t data_bytes{0};    // bytes in `out_data` or `in_data`
 
     // OUT: the data to write, in order. Empty for every other type.
@@ -161,6 +187,11 @@ public:
 
 private:
     explicit RequestParser(const VolumeGeometry& geometry) noexcept : _geometry{geometry} {}
+
+    // DISCARD and WRITE_ZEROES, after the header (above).
+    [[nodiscard]] auto parse_trim(RequestType type, Request req, std::uint64_t readable_data,
+                                  std::uint64_t writable_data) const
+        -> std::expected<Request, Rejection>;
 
     VolumeGeometry _geometry;
 };

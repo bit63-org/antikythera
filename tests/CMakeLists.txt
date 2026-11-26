@@ -153,6 +153,7 @@ add_test(NAME hold_sim_nightly COMMAND hold_sim_test --run_test=long_sweep CONFI
 set_tests_properties(hold_sim_nightly PROPERTIES LABELS nightly TIMEOUT 7200)
 ak_add_test(hold_node_test        SOURCES hold_node_test.cpp        LIBS ak::hold_server OpenSSL::Crypto)
 ak_add_test(initiator_test        SOURCES initiator_test.cpp        LIBS ak::oar_blk_volume ak::hold_server)
+ak_add_test(khold_initiator_test  SOURCES khold_initiator_test.cpp  LIBS ak::oar_blk_volume)
 ak_add_test(network_volume_test   SOURCES network_volume_test.cpp   LIBS ak::oar_blk_volume ak::hold_role OpenSSL::Crypto)
 ak_add_test(volume_copier_test    SOURCES volume_copier_test.cpp    LIBS ak::oar_blk)
 ak_add_test(hydrating_backend_test SOURCES hydrating_backend_test.cpp LIBS ak::oar_blk_image ak::oar_blk_volume ak::hold_server)

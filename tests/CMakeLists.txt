@@ -214,6 +214,16 @@ add_test(NAME wireguard_interop
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/wireguard_interop.sh $<TARGET_FILE:wireguard_interop_peer>)
 set_tests_properties(wireguard_interop PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 
+# vpc-subnets-routing task 7: two network roles with TAP-backed NICs in
+# network namespaces, real guest stacks routed between subnets. Root
+# only, so an ordinary ctest run skips it; CI runs tests/vpc_netns.sh
+# under sudo.
+add_executable(vpc_netns_role vpc_netns_role.cpp)
+target_link_libraries(vpc_netns_role PRIVATE ak::oar_net_role ak::hull ak::warnings)
+add_test(NAME vpc_netns
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/vpc_netns.sh $<TARGET_FILE:vpc_netns_role>)
+set_tests_properties(vpc_netns PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+
 # The guest's cooperative-detach helper, against a fake sysfs and procfs
 # (block-volume-service task 13, Requirement 3.4).
 add_test(NAME guest_eject_test

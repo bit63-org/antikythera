@@ -271,14 +271,21 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
     net::VSwitch::Clock::time_point now{};
     net::VSwitch sw{table, underlay, [&now] { return now; }};
     // vpc_one opts in to multicast (one remote VTEP, cap 1); vpc_two keeps
-    // the default drop policy.
-    if (!sw.set_group_policy(vpc_one, {.mode = net::GroupMode::multicast,
-                                       .rate_frames = 2,
-                                       .burst_frames = 3,
-                                       .rate_bytes = 512,
-                                       .burst_bytes = 1024,
-                                       .max_remote_vteps = 1,
-                                       .max_groups_per_nic = 2})) {
+    // the default drop policy. Odd-length inputs set the same limits per
+    // subnet instead (GroupPolicy version 2), which must behave alike.
+    const net::GroupPolicy multicast{.mode = net::GroupMode::multicast,
+                                     .rate_frames = 2,
+                                     .burst_frames = 3,
+                                     .rate_bytes = 512,
+                                     .burst_bytes = 1024,
+                                     .max_remote_vteps = 1,
+                                     .max_groups_per_nic = 2};
+    const std::array<net::SubnetGroupPolicy, 3> per_subnet{
+        net::SubnetGroupPolicy{.subnet = subnet_id_base, .policy = multicast},
+        net::SubnetGroupPolicy{.subnet = subnet_id_base + 1, .policy = multicast},
+        net::SubnetGroupPolicy{.subnet = subnet_id_base + 2, .policy = multicast}};
+    if (in.size() % 2 == 1 ? !sw.set_subnet_group_policies(vpc_one, per_subnet)
+                           : !sw.set_group_policy(vpc_one, multicast)) {
         std::abort();
     }
     std::array<Port, nic_count> ports{};

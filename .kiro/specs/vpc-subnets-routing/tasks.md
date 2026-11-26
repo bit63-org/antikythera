@@ -105,6 +105,10 @@ end) for task 11.
   producing VpcConfig version 2 and MapUpdate version 4 frames; the
   subnet ID rendering shared with `src/proto/`. _Requirements: 1, 2.1-2.5,
   4.1-4.3, 7_ (kythira)
+  - Spec amendment: kythira PR #985 (`ec2-compatible-api` Requirement 11
+    rewritten, design "VPCs, subnets and route tables", task 10
+    expanded). The build waits for that spec's tasks 1 to 9 (the EC2
+    module does not exist yet).
 - [ ] 11. End to end from the AWS CLI: `create-vpc`, two
   `create-subnet`s, `create-route-table` and `associate-route-table`,
   `run-instances` into each subnet on harbor, ping and TCP from one to
@@ -121,3 +125,13 @@ end) for task 11.
   VSwitch's policy looked up by the sender's subnet; tests, fuzz, and a
   harbor case where one subnet is opted in and its neighbour is not.
   _Requirements: 6.7_ (cloud, then tikhov)
+  - Cloud part done: the version 2 codec and its rules
+    (`proto_group_policy_test`, `fuzz_group_policy`), the chunked
+    sideband op (`oar_link_test`, `oar_protocol_test`), per-subnet
+    lookups in the VSwitch (`vswitch_test` `multicast_opts_in_per_subnet`,
+    `fuzz_vswitch` on odd-length inputs), `NetRole` applying version 2
+    (`net_role_test` `group_policies_opt_in_per_subnet`), and
+    `ak-test-controller group-policy ... subnets`
+    (`harbor_controller_test`). Billing per subnet-hour is the
+    controller's, from its own record (design "GroupPolicy version 2").
+    The harbor case waits for tikhov with task 9.

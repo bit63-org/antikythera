@@ -780,22 +780,6 @@ auto decode_inventory(std::span<const std::byte> body) -> std::expected<Inventor
     return inv;
 }
 
-auto encode_group_policy_frame(std::span<const std::byte> frame)
-    -> std::expected<std::vector<std::byte>, BodyError> {
-    if (auto ok = check_size(frame, group_policy_frame_size); !ok) {
-        return std::unexpected(ok.error());
-    }
-    return std::vector<std::byte>(frame.begin(), frame.end());
-}
-
-auto decode_group_policy_frame(std::span<const std::byte> body) noexcept
-    -> std::expected<std::span<const std::byte>, BodyError> {
-    if (auto ok = check_size(body, group_policy_frame_size); !ok) {
-        return std::unexpected(ok.error());
-    }
-    return body;
-}
-
 auto encode_replica_config_frame(std::span<const std::byte> frame)
     -> std::expected<std::vector<std::byte>, BodyError> {
     if (auto ok = decode_replica_config_frame(frame); !ok) {

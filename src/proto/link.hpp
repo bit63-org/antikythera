@@ -17,7 +17,7 @@
 //                                      every connection
 //   envelope      controller -> helm   an Envelope (envelope.hpp)
 //   map_update    controller -> helm   a MapUpdate (map_update.hpp)
-//   group_policy  controller -> helm   a GroupPolicy (group_policy.hpp)
+//   group_policy  controller -> helm   a GroupPolicy (group_policy.hpp), version 1 or 2
 //   report        helm -> controller   a Report (report.hpp)
 //   report_ack    controller -> helm   server_id u64 | report_seq u64: every
 //                                      report up to report_seq is processed
@@ -127,7 +127,7 @@ inline constexpr std::size_t max_cert_chain_certs = 4;
 inline constexpr std::size_t self_test_size = 16;
 inline constexpr std::size_t max_record_payload =
     std::max({envelope_size, max_map_update_size, max_report_size, report_ack_size, hello_size,
-              group_policy_size, max_tunnel_peers_size, max_replica_config_size, volume_op_size,
+              max_group_policy_size, max_tunnel_peers_size, max_replica_config_size, volume_op_size,
               volume_key_size, lease_grant_size, role_certificate_fixed_size + max_cert_chain_size,
               image_key_size, max_vpc_config_size, max_group_members_size,
               max_instance_metadata_size, max_volume_layout_size, self_test_size});

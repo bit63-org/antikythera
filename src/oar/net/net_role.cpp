@@ -121,6 +121,23 @@ auto to_group_policy(const proto::GroupPolicy& p) -> GroupPolicy {
             .max_groups_per_nic = p.max_groups_per_nic};
 }
 
+// A version 2 frame's per-subnet policies (vpc-subnets-routing task 12).
+auto to_subnet_policies(const proto::GroupPolicy& p) -> std::vector<SubnetGroupPolicy> {
+    std::vector<SubnetGroupPolicy> out;
+    out.reserve(p.subnets.size());
+    for (const proto::GroupSubnetLimits& s : p.subnets) {
+        out.push_back({.subnet = s.subnet_id,
+                       .policy = {.mode = GroupMode::multicast,
+                                  .rate_frames = s.rate_frames,
+                                  .burst_frames = s.burst_frames,
+                                  .rate_bytes = s.rate_bytes,
+                                  .burst_bytes = s.burst_bytes,
+                                  .max_remote_vteps = s.max_remote_vteps,
+                                  .max_groups_per_nic = s.max_groups_per_nic}});
+    }
+    return out;
+}
+
 // The VSwitch's lists from a decoded frame.
 auto to_group_members(const proto::GroupMembers& m) -> GroupMembers {
     GroupMembers out;
@@ -549,7 +566,12 @@ auto NetRole::group_policy(std::span<const std::byte> frame) -> oar::Status {
             return oar::Status::failed;
         }
     }
-    if (!_vswitch->set_group_policy(policy->vni, to_group_policy(*policy))) {
+    const bool set =
+        policy->format == proto::group_policy_version_subnets
+            ? _vswitch->set_subnet_group_policies(policy->vni, to_subnet_policies(*policy))
+                  .has_value()
+            : _vswitch->set_group_policy(policy->vni, to_group_policy(*policy)).has_value();
+    if (!set) {
         ++_counters.group_rejected;
         return oar::Status::failed;
     }

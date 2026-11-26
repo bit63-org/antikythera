@@ -642,6 +642,9 @@ auto usage(std::uint64_t nic, std::uint64_t attachment, bool detached = false) -
 
 BOOST_AUTO_TEST_CASE(group_mirrors_match_proto) {
     BOOST_TEST(oar::group_policy_frame_size == ak::proto::group_policy_size);
+    BOOST_TEST(oar::min_group_policy_v2_frame == ak::proto::min_group_policy_v2_size);
+    BOOST_TEST(oar::max_group_policy_frame == ak::proto::max_group_policy_size);
+    static_assert(oar::max_group_policy_frame <= oar::max_map_frame);
     BOOST_TEST(oar::usage_entry_size == ak::proto::group_usage_entry_size);
     BOOST_TEST(oar::max_usage_entries == ak::proto::max_group_usage_entries);
     BOOST_TEST(oar::usage_detached == ak::proto::group_usage_detached);
@@ -651,15 +654,7 @@ BOOST_AUTO_TEST_CASE(group_mirrors_match_proto) {
                oar::max_body_size);
 }
 
-BOOST_AUTO_TEST_CASE(group_policy_frame_and_usage_request) {
-    const std::vector<std::byte> frame(oar::group_policy_frame_size, std::byte{3});
-    BOOST_TEST(oar::decode_group_policy_frame(oar::encode_group_policy_frame(frame).value())
-                   .value()
-                   .size() == frame.size());
-    BOOST_TEST((oar::encode_group_policy_frame(std::span{frame}.first(5)).error() ==
-                BodyError::truncated));
-    BOOST_TEST((oar::decode_group_policy_frame(std::vector<std::byte>(129)).error() ==
-                BodyError::trailing_bytes));
+BOOST_AUTO_TEST_CASE(usage_request) {
     BOOST_TEST(oar::decode_usage_request(oar::encode_usage_request(41).value()).value() == 41);
     BOOST_TEST(
         (oar::decode_usage_request(bytes_of(0, 0, 1, 0)).error() == BodyError::reserved_not_zero));

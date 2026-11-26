@@ -813,16 +813,25 @@ BOOST_AUTO_TEST_CASE(group_policy_is_forwarded_whole) {
     MeterRole role;
     OarEndpoint endpoint{*oar_b, oar_config()};
     OarLink link{*helm_b, config()};
+    // Version 1, and the largest version 2 frame, which takes several
+    // chunks (vpc-subnets-routing task 12).
     const auto frame = pattern(oar::group_policy_frame_size);
+    const auto largest = pattern(oar::max_group_policy_frame);
+    BOOST_REQUIRE(largest.size() > oar::max_map_chunk);
     {
         const Server server{endpoint, role};
         BOOST_TEST(link.group_policy(frame).has_value());
+        BOOST_TEST(link.group_policy(largest).has_value());
+        BOOST_TEST(link.group_policy(pattern(oar::min_group_policy_v2_frame)).has_value());
         // Any other length never reaches the wire.
-        BOOST_TEST(
-            (link.group_policy(std::span{frame}.first(10)).error().code == LinkErrc::bad_request));
+        for (const std::size_t bad : {std::size_t{10}, oar::min_group_policy_v2_frame - 1,
+                                      oar::max_group_policy_frame + 1}) {
+            BOOST_TEST((link.group_policy(pattern(bad)).error().code == LinkErrc::bad_request));
+        }
     }
-    BOOST_REQUIRE(role.policies.size() == 1U);
+    BOOST_REQUIRE(role.policies.size() == 3U);
     BOOST_TEST(role.policies[0] == frame);
+    BOOST_TEST(role.policies[1] == largest);
 }
 
 BOOST_AUTO_TEST_CASE(group_members_are_forwarded_in_chunks) {

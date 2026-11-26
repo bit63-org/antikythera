@@ -132,8 +132,10 @@ public:
     // sending if it is empty or larger than oar::max_tunnel_peers_frame.
     auto tunnel_peers(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
     auto health() -> std::expected<oar::Health, LinkError>;
-    // Forwards one controller GroupPolicy frame (exactly
-    // oar::group_policy_frame_size bytes) to a network role.
+    // Forwards one controller GroupPolicy frame to a network role in
+    // chunks, like map_update; fails without sending unless it is
+    // oar::group_policy_frame_size bytes (version 1) or between
+    // oar::min_group_policy_v2_frame and oar::max_group_policy_frame.
     auto group_policy(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
     // Reads every page of the role's group meters: one snapshot, in
     // (nic_id, attachment) order. A page that disagrees with the first

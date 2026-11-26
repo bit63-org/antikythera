@@ -58,6 +58,11 @@
 //   group-policy VNI VERSION multicast RATE_FRAMES BURST_FRAMES RATE_BYTES BURST_BYTES
 //                MAX_REMOTE_VTEPS [MAX_GROUPS_PER_NIC]
 //                        the VPC's broadcast/multicast policy (oar-net Requirement 10)
+//   group-policy VNI VERSION subnets [ID,RATE_FRAMES,BURST_FRAMES,RATE_BYTES,BURST_BYTES,
+//                MAX_REMOTE_VTEPS[,MAX_GROUPS_PER_NIC] ...]
+//                        a multicast policy per opted-in subnet, every other
+//                        subnet in drop (GroupPolicy version 2, vpc-subnets-routing
+//                        task 12), e.g. group-policy 100 4 subnets 7,100,200,65536,131072,4
 //   vpc-config VNI VERSION gateway=MAC block=PREFIX/LEN [block=...] [block6=PREFIX/56]
 //              subnet=ID,PREFIX/LEN[,PREFIX/64],TABLE ... table=N[,main] ...
 //              [route=TABLE,PREFIX/LEN,local|NIC ...] [dns=ADDRESS ...]
@@ -195,6 +200,9 @@ struct SendGroupPolicy {
     std::uint64_t burst_bytes{0};
     std::uint32_t max_remote_vteps{0};
     std::uint16_t max_groups_per_nic{0};
+    // `subnets` form: GroupPolicy version 2, entries by ascending subnet.
+    bool per_subnet{false};
+    std::vector<proto::GroupSubnetLimits> subnets{};
 };
 struct SendTunnelPeers {
     proto::VtepAddress vtep{};

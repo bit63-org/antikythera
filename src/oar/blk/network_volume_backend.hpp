@@ -28,6 +28,11 @@
 //
 // Faults the core reports (primary timeout, fenced, checksum) wait in
 // take_faults() for helm's report path.
+//
+// A volume restored from an image under another key answers reads of
+// blocks not yet hydrated with BackendError::not_hydrated, and takes
+// hydrate writes (submit_hydrate): HydratingBackend (task 23) sits in
+// front of it for such a volume.
 
 #include <cstdint>
 #include <expected>
@@ -35,6 +40,7 @@
 #include <span>
 #include <vector>
 
+#include "oar/blk/hydration_target.hpp"
 #include "oar/blk/initiator.hpp"
 #include "oar/blk/virtio_blk_function.hpp"
 #include "proto/replica_config.hpp"
@@ -56,7 +62,7 @@ enum class NetworkVolumeError : std::uint8_t {
 
 [[nodiscard]] auto to_string(NetworkVolumeError e) noexcept -> const char*;
 
-class NetworkVolumeBackend final : public BlockBackend {
+class NetworkVolumeBackend final : public HydrationTarget {
 public:
     [[nodiscard]] static auto create(NetworkVolumeConfig config)
         -> std::expected<std::unique_ptr<NetworkVolumeBackend>, NetworkVolumeError>;
@@ -86,6 +92,9 @@ public:
     auto submit_write(std::uint64_t offset, std::span<const std::byte> in, BackendCompletion done)
         -> void override;
     auto submit_flush(BackendCompletion done) -> void override;
+    // HydrationTarget: InitiatorCore::submit_hydrate.
+    auto submit_hydrate(std::uint64_t offset, std::span<const std::byte> in, BackendCompletion done)
+        -> void override;
     [[nodiscard]] auto poll() -> bool override;
     [[nodiscard]] auto wake_fd() const noexcept -> int override;
 

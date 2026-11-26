@@ -330,6 +330,12 @@ auto NetworkVolumeBackend::submit_write(std::uint64_t offset, std::span<const st
     publish();
 }
 
+auto NetworkVolumeBackend::submit_hydrate(std::uint64_t offset, std::span<const std::byte> in,
+                                          BackendCompletion done) -> void {
+    _core.submit_hydrate(offset, in, std::move(done), Clock::now());
+    publish();
+}
+
 auto NetworkVolumeBackend::submit_flush(BackendCompletion done) -> void {
     _core.submit_flush(std::move(done));
 }

@@ -181,6 +181,22 @@ repository. Prerequisites outside this spec: oar-blk task 14
   images and re-keyed restores, `not_hydrated` and the `HYDRATE` write
   flag; local ↔ network conversion as a keyed copy. _Requirements: 8.6,
   11.7, 12.5_ (cloud)
+  - [x] 23.1 Foreign-key restore. As built: hold sequences, logs and
+    replicates a `WRITE` with the hydrate flag like any write (a
+    `REPL_WRITE` keeps the flag), storing only blocks still unhydrated in
+    its turn, so every replica orders it with the guest's writes; the
+    intent ring flags hydrate writes so recovery re-marks a block that
+    lost its checksum unhydrated (never one an ordinary write in the ring
+    covers); a read-only attachment may hydrate. `InitiatorCore` sends
+    hydrate writes and reports `not_hydrated` as
+    `BackendError::not_hydrated`. `HydratingBackend` (oar-blk) hydrates
+    the regions (image chunks) a read touches, under K_vol after K_img,
+    and walks the volume from block 0 at the source's
+    `hydrate_mib_per_s`, skipping regions a read finds whole (a later
+    attachment resumes from the hold's bits alone); `BlkRole` puts it in
+    front of the network backend when the config's source is an image.
+  - [ ] 23.2 Local ↔ network conversion as a keyed copy, and
+    `hydrated_bytes` in `replica_status` (still 0).
 - [x] 24. Scrubbing: periodic full read and checksum verification per
   replica within 14 days, repair from peers, reporting.
   _Requirements: 5.5_ (cloud) As built: `scrub` VolumeOp run by

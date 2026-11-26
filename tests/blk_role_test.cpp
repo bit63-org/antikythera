@@ -419,7 +419,9 @@ auto frame_of(const ak::proto::ReplicaConfig& c) -> std::vector<std::byte> {
 // A hold primary on 127.0.0.1, on its own thread.
 class Hold {
 public:
-    explicit Hold(ak::test::TestCa& ca) {
+    // With `source`, the volume is restored from it (block-volume task 23).
+    explicit Hold(ak::test::TestCa& ca,
+                  std::optional<ak::proto::VolumeSource> source = std::nullopt) {
         const auto pem = ca.issue("hold", "IP:127.0.0.1, " + server_san(hold_id));
         auto node = ak::hold::Node::create(
             _files, {.host = "127.0.0.1",
@@ -434,9 +436,11 @@ public:
                      .write_timeout = std::chrono::milliseconds{2000}});
         BOOST_REQUIRE(node.has_value());
         _node = std::move(*node);
-        BOOST_REQUIRE(_node->server()
-                          .apply_config(net_config(hold_id, port()), ak::hold::Clock::now())
-                          .has_value());
+        auto first = net_config(hold_id, port());
+        if (source) {
+            first.source = *source;
+        }
+        BOOST_REQUIRE(_node->server().apply_config(first, ak::hold::Clock::now()).has_value());
         _thread = std::thread{[this] {
             while (!_stop.load()) {
                 {
@@ -1337,6 +1341,108 @@ BOOST_AUTO_TEST_CASE(network_volume_serves_the_guest_through_hold) {
 
     // Detach closes the session and frees the function.
     BOOST_REQUIRE(rig.clean(fn0) == oar::Status::ok);
+    BOOST_TEST(!rig.role->attached(fn0).has_value());
+}
+
+// ---- foreign-key restores (block-volume task 23) ------------------------------
+
+auto image_source(const oar::ImageName& name) -> ak::proto::VolumeSource {
+    ak::proto::VolumeSource src{.kind = ak::proto::SourceKind::image,
+                                .store_id = image_store_id,
+                                .hydrate_mib_per_s = 64,
+                                .manifest_name = {}};
+    std::ranges::copy(name, src.manifest_name.begin());
+    return src;
+}
+
+auto restored_config(std::uint64_t server, std::uint16_t port, const oar::ImageName& name)
+    -> ak::proto::ReplicaConfig {
+    auto c = net_config(server, port);
+    c.source = image_source(name);
+    return c;
+}
+
+auto attach_network(Rig& rig, oar::FunctionNumber fn) -> oar::Status {
+    return rig.role->prepare_function(
+        {.fn = fn,
+         .type = ak::helm::FunctionType::blk_fn,
+         .vm_id = vm_one,
+         .config = oar::BlkConfig{
+             .volume_id = vol_one, .attachment_id = net_attachment, .generation = 1}});
+}
+
+BOOST_AUTO_TEST_CASE(network_volume_restores_from_a_public_image) {
+    ak::test::TestCa ca{"storage CA"};
+    Rig rig{true, compute_tls(ca)};
+    const auto raw = image_raw();
+    const auto name = rig.publish(raw);
+    Hold hold{ca, image_source(name)};
+    BOOST_REQUIRE((rig.role->replica_config(frame_of(
+                       restored_config(compute_id, hold.port(), name))) == oar::Status::ok));
+    BOOST_REQUIRE(attach_network(rig, fn0) == oar::Status::ok);
+    rig.t0.flr();
+    BOOST_REQUIRE(rig.deliver(fn0, vol_one) == oar::Status::ok);
+
+    // The guest sees the image, hydrated under the volume's key as it reads.
+    Guest g{rig.ram0, *rig.t0.served(), rig.role.get()};
+    BOOST_REQUIRE(g.up());
+    BOOST_TEST(g.read(marker_sector) == marker(), boost::test_tools::per_element());
+    BOOST_TEST(g.read(3) == sector_of(raw, 3), boost::test_tools::per_element());
+    BOOST_TEST(g.read(far_sector) == std::vector<std::byte>(blk::sector_size),
+               boost::test_tools::per_element());
+    // Its writes are the volume's: they stay, over a detach and a new
+    // attachment, beside the image's blocks.
+    const std::vector<std::byte> mine(blk::sector_size, std::byte{0xEE});
+    const auto w = g.post(RequestType::out, 130, mine);
+    BOOST_REQUIRE(g.wait(w));
+    BOOST_TEST((g.status(w) == Status::ok));
+    BOOST_TEST(g.read(130) == mine, boost::test_tools::per_element());
+    BOOST_REQUIRE(rig.clean(fn0) == oar::Status::ok);
+
+    BOOST_REQUIRE(attach_network(rig, fn1) == oar::Status::ok);
+    rig.t1.flr();
+    // A plain image takes no image key.
+    const auto k_img = image_key_bytes();
+    BOOST_TEST((rig.deliver(fn1, vol_one, blk::XtsKey{k_img}) == oar::Status::failed));
+    BOOST_REQUIRE(rig.deliver(fn1, vol_one) == oar::Status::ok);
+    Guest g1{rig.ram1, *rig.t1.served(), rig.role.get()};
+    BOOST_REQUIRE(g1.up());
+    BOOST_TEST(g1.read(130) == mine, boost::test_tools::per_element());
+    BOOST_TEST(g1.read(131) == sector_of(raw, 131), boost::test_tools::per_element());
+    BOOST_REQUIRE(rig.clean(fn1) == oar::Status::ok);
+}
+
+BOOST_AUTO_TEST_CASE(network_volume_restores_from_an_encrypted_image) {
+    ak::test::TestCa ca{"storage CA"};
+    Rig rig{true, compute_tls(ca)};
+    const auto raw = image_raw();
+    const auto k_img = image_key_bytes();
+    const auto name = rig.publish(raw, blk::XtsKey{k_img});
+    Hold hold{ca, image_source(name)};
+    BOOST_REQUIRE((rig.role->replica_config(frame_of(
+                       restored_config(compute_id, hold.port(), name))) == oar::Status::ok));
+    BOOST_REQUIRE(attach_network(rig, fn0) == oar::Status::ok);
+    rig.t0.flr();
+    // Without K_img the key is refused and the function stays keyless.
+    BOOST_TEST((rig.deliver(fn0, vol_one) == oar::Status::failed));
+    BOOST_TEST(!rig.role->function(fn0)->holds_key());
+    BOOST_REQUIRE(rig.deliver(fn0, vol_one, blk::XtsKey{k_img}) == oar::Status::ok);
+    Guest g{rig.ram0, *rig.t0.served(), rig.role.get()};
+    BOOST_REQUIRE(g.up());
+    BOOST_TEST(g.read(marker_sector) == marker(), boost::test_tools::per_element());
+    BOOST_TEST(g.read(150) == sector_of(raw, 150), boost::test_tools::per_element());
+    BOOST_REQUIRE(rig.clean(fn0) == oar::Status::ok);
+}
+
+BOOST_AUTO_TEST_CASE(network_volume_refuses_a_missing_source_image) {
+    ak::test::TestCa ca{"storage CA"};
+    Rig rig{true, compute_tls(ca)};
+    oar::ImageName missing{};
+    missing[0] = std::byte{9};
+    Hold hold{ca, image_source(missing)};
+    BOOST_REQUIRE((rig.role->replica_config(frame_of(
+                       restored_config(compute_id, hold.port(), missing))) == oar::Status::ok));
+    BOOST_TEST((attach_network(rig, fn0) == oar::Status::failed));
     BOOST_TEST(!rig.role->attached(fn0).has_value());
 }
 

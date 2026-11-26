@@ -865,6 +865,40 @@ detached, partly hydrated volume resumes on its next attach; the
 controller can also attach it to a utility function with no VM to finish
 hydration (later task).
 
+As built (task 23.1):
+
+- **Hydrate writes are writes.** The primary takes a `WRITE` with the
+  hydrate flag into the same group commit as the guest's writes: it gets
+  a `seq`, an intent (flagged as a hydrate write) and a `REPL_WRITE` that
+  keeps the flag, and is answered once every member holds it. Each
+  replica stores only the blocks still unhydrated when its turn comes
+  (counting earlier writes of the same batch), so all replicas agree on
+  every block whatever the interleaving with the guest's writes, and a
+  resync copies hydrated blocks like written ones. Hydration does not
+  mark chunks changed. A read-only attachment may hydrate: the write
+  only fills in what the volume already holds.
+- **Crash recovery.** A hydrate write's checksums ride the next sync of
+  `meta` like any write's. On open, a block of a hydrate write still in
+  the ring that has no checksum, and that no ordinary write in the ring
+  covers, is marked unhydrated again (oar-blk fetches it once more); a
+  resent hydrate write (`rewrite`) stores just those. A guest write's
+  block is never handed back to the image.
+- **oar-blk.** `HydratingBackend` sits between `VirtioBlkFunction` and
+  the `NetworkVolumeBackend`. A guest read answered `not_hydrated`
+  hydrates every region it touches (one image chunk each: fetched
+  through the shared cache, decrypted with K_img, encrypted with K_vol
+  at each block's number; holes and the part past the image are zeros)
+  and goes again. A background walk from region 0, paced at
+  `hydrate_mib_per_s` with at most one region of burst, first reads each
+  region and skips one already whole, so a detached volume resumes on
+  its next attach with no record but the hold's bits; failures are
+  retried after a backoff. The role builds it when the config's source
+  is an image, and `deliver_key` gives it the volume key and K_img.
+- **Not yet:** blocks past the image but inside the original capacity
+  are hydrated as encrypted zeros (a grown volume's new blocks are not:
+  they read as never written); `replica_status` still reports
+  `hydrated_bytes` 0; local ↔ network conversion (23.2).
+
 **Clones** (Requirement 11.6, EBS `CopyVolumes`): a cut as for a snapshot,
 then each member `FICLONE`s its replica into a new replica directory for
 the new volume ID on the same hold role. The clone is in the same lineage

@@ -224,8 +224,13 @@ struct RoleCounters {
     std::uint64_t vpc_undecodable{0};
     std::uint64_t vpc_wrong_server{0};
     std::uint64_t vpc_bad_signature{0};
-    std::uint64_t vpc_stale{0};         // older than the version applied for the VNI
-    std::uint64_t vpc_rejected{0};      // the VSwitch refused it, or it carries routes
+    std::uint64_t vpc_stale{0};     // older than the version applied for the VNI
+    std::uint64_t vpc_rejected{0};  // the VSwitch refused it
+    // A version 2 frame with more than one subnet, more than one table, or
+    // a route other than `local`: refused whole until the VSwitch applies
+    // subnets and route tables (vpc-subnets-routing tasks 4 and 5), so
+    // nothing half-applies.
+    std::uint64_t vpc_unsupported{0};
     std::uint64_t map_applied{0};       // frames that changed the table
     std::uint64_t map_redelivered{0};   // the version already applied: ok, unchanged
     std::uint64_t map_undecodable{0};   // proto::decode_map_update refused it

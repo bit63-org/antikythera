@@ -965,13 +965,13 @@ BOOST_AUTO_TEST_CASE(group_membership_reads_on_change_only) {
     BOOST_TEST((read.error().code == LinkErrc::bad_response));
 }
 
-BOOST_AUTO_TEST_CASE(vpc_config_is_forwarded_whole) {
+BOOST_AUTO_TEST_CASE(vpc_config_is_forwarded_whole_in_chunks) {
     auto [helm_b, oar_b] = InProcessBinding::make_pair();
     MeterRole role;
     OarEndpoint endpoint{*oar_b, oar_config()};
     OarLink link{*helm_b, config()};
     const auto smallest = pattern(oar::min_vpc_config_frame);
-    const auto largest = pattern(oar::max_vpc_config_frame);
+    const auto largest = pattern(oar::max_vpc_config_frame);  // 35 chunks
     {
         const Server server{endpoint, role};
         BOOST_TEST(link.vpc_config(smallest).has_value());

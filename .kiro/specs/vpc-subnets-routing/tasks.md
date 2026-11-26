@@ -1,6 +1,6 @@
 # Implementation Plan — VPC subnets and the implicit router
 
-## Status: 1/12 tasks complete
+## Status: 3/12 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -24,7 +24,7 @@ end) for task 11.
   `proto_map_update_test` updated; `ak-test-controller map-update` takes
   `subnet=ID` and `sg` per entry. Callers keep compiling with subnet 0.
   _Requirements: 2.4, 5.3, 5.4_ (cloud)
-- [ ] 2. VpcConfig version 2 codec: VPC blocks, subnets, route tables
+- [x] 2. VpcConfig version 2 codec: VPC blocks, subnets, route tables
   with `local` and NIC routes, every rule in design "VpcConfig version
   2", version 1 refused; signing vectors; `fuzz_vpc_config` with a
   re-encode round trip; `ak-test-controller vpc-config` version 2
@@ -32,7 +32,7 @@ end) for task 11.
   have more than one subnet or any route table other than a main table
   holding only `local` routes, so nothing half-applies.
   _Requirements: 1.2, 4.1-4.4, 5.1, 5.4_ (cloud)
-- [ ] 3. helm and OarLink: `vpc_config` sent in chunks
+- [x] 3. helm and OarLink: `vpc_config` sent in chunks
   (`send_chunked`) and reassembled by the role's shared chunk receiver,
   bounded by `max_vpc_config_size`; `helm_daemon_test` replays a
   multi-chunk frame on sideband reopen before any NIC is prepared.

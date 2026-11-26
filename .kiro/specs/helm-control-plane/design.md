@@ -215,6 +215,13 @@ last read whole; a role whose list is still that generation answers
 "unchanged" with no entries, so helm can ask every second and the list
 crosses the link only when it changed (oar-net task 14.2).
 
+`vpc_config` forwards the controller's VpcConfig frame (one VPC's blocks,
+subnets, route tables and DHCP settings, up to 139,581 bytes in version
+2) unmodified, in chunks in the same format as `map_update`
+(vpc-subnets-routing task 3). helm keeps the newest per VNI and resends
+each to a network role whose sideband reopens, before the router can
+prepare a NIC there.
+
 `tunnel_peers` forwards a controller TunnelPeers frame (a VTEP's
 WireGuard peers and their public keys) the same way and in the same chunk
 format; a chunk of one transfer type never continues the other.

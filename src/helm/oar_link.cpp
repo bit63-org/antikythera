@@ -41,6 +41,8 @@ constexpr auto frame_limit(mctp::VendorType type) noexcept -> std::size_t {
             return oar::max_instance_metadata_frame;
         case mctp::VendorType::volume_layout:
             return oar::max_volume_layout_frame;
+        case mctp::VendorType::vpc_config:
+            return oar::max_vpc_config_frame;
         default:
             return oar::max_cert_chain;
     }
@@ -443,11 +445,10 @@ auto OarLink::group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkE
 }
 
 auto OarLink::vpc_config(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
-    auto body = oar::encode_vpc_config_frame(frame);
-    if (!body) {
+    if (frame.size() < oar::min_vpc_config_frame || frame.size() > oar::max_vpc_config_frame) {
         return std::unexpected(bad_request());
     }
-    return expect_empty(transact(mctp::VendorType::vpc_config, *body));
+    return send_chunked(mctp::VendorType::vpc_config, frame);
 }
 
 auto OarLink::replica_config(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
@@ -759,6 +760,7 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
         case mctp::VendorType::group_members:
         case mctp::VendorType::instance_metadata:
         case mctp::VendorType::volume_layout:
+        case mctp::VendorType::vpc_config:
         case mctp::VendorType::role_certificate:
             return status_only(frame_chunk(handler, type, body));
         case mctp::VendorType::group_membership: {
@@ -826,10 +828,6 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
                                                                    : page.error());
             }
             return with_body(oar::encode_usage_page(*page, *cursor));
-        }
-        case mctp::VendorType::vpc_config: {
-            auto frame = oar::decode_vpc_config_frame(body);
-            return status_only(frame ? handler.vpc_config(*frame) : oar::Status::bad_request);
         }
         case mctp::VendorType::replica_config: {
             auto frame = oar::decode_replica_config_frame(body);
@@ -911,6 +909,9 @@ auto OarEndpoint::frame_chunk(OarHandler& handler, mctp::VendorType type,
             break;
         case mctp::VendorType::volume_layout:
             status = handler.volume_layout(_frame);
+            break;
+        case mctp::VendorType::vpc_config:
+            status = handler.vpc_config(_frame);
             break;
         default:
             status = handler.role_certificate(_frame);

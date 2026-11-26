@@ -58,12 +58,19 @@
 //   group-policy VNI VERSION multicast RATE_FRAMES BURST_FRAMES RATE_BYTES BURST_BYTES
 //                MAX_REMOTE_VTEPS [MAX_GROUPS_PER_NIC]
 //                        the VPC's broadcast/multicast policy (oar-net Requirement 10)
-//   vpc-config VNI VERSION GATEWAY_MAC IPV4_PREFIX/LEN IPV4_GATEWAY [ipv6=PREFIX/64]
-//              [dns=ADDRESS ...] [domain=NAME] [lease=SECONDS] [route=PREFIX/LEN,NIC ...]
-//                        the VPC's gateway, DHCP and route configuration (oar-net
-//                        Requirement 12), e.g. vpc-config 100 1 02:00:00:00:ff:01
-//                        10.0.0.0/16 10.0.0.1 ipv6=fd10::/64 dns=10.0.0.2
-//                        domain=ec2.internal; lease defaults to 3600
+//   vpc-config VNI VERSION gateway=MAC block=PREFIX/LEN [block=...] [block6=PREFIX/56]
+//              subnet=ID,PREFIX/LEN[,PREFIX/64],TABLE ... table=N[,main] ...
+//              [route=TABLE,PREFIX/LEN,local|NIC ...] [dns=ADDRESS ...]
+//              [domain=NAME] [lease=SECONDS]
+//                        the VPC's blocks, subnets, route tables, DHCP options
+//                        and gateway (VpcConfig version 2, vpc-subnets-routing
+//                        Requirements 1 to 5), e.g. vpc-config 100 1
+//                        gateway=02:00:00:00:ff:01 block=10.0.0.0/16
+//                        block6=2001:db8:1200::/56
+//                        subnet=7,10.0.1.0/24,2001:db8:1200:1::/64,1 table=1,main
+//                        route=1,10.0.2.0/24,0x21 dns=10.0.0.2 domain=ec2.internal;
+//                        every table gets its blocks' local routes without
+//                        naming them, and lease defaults to 3600
 //   group-members VNI VERSION [GROUP=VTEP[,VTEP ...] ...]
 //                        a multicast VPC's per-group VTEP lists (oar-net
 //                        Requirement 10.5), e.g. group-members 100 2

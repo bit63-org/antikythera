@@ -186,6 +186,12 @@ public:
     // release a function, withdraws that, or looks; the answer is where the
     // function stands.
     auto eject(const oar::Eject& request) -> std::expected<oar::EjectState, LinkError>;
+    // Local <-> network conversion, to a storage role (blk): starts a copy
+    // with both keys (wiped when this returns, like deliver_key's), or
+    // queries or releases one (no keys; `request` carries none either way).
+    auto copy_volume(const oar::CopyVolume& request, std::optional<ScopedKey> local_key = {},
+                     std::optional<ScopedKey> network_key = {})
+        -> std::expected<oar::CopyAnswer, LinkError>;
 
     [[nodiscard]] auto stats() const noexcept -> const LinkStats& { return _stats; }
 
@@ -321,6 +327,13 @@ public:
     // Cooperative detach, which only the storage role (blk) implements.
     virtual auto eject(const oar::Eject& /*request*/)
         -> std::expected<oar::EjectState, oar::Status> {
+        return std::unexpected(oar::Status::unsupported);
+    }
+    // Local <-> network conversion, which only the storage role (blk)
+    // implements. A start's keys view into the request message, which is
+    // wiped after the call: copy them.
+    virtual auto copy_volume(const oar::CopyVolume& /*request*/)
+        -> std::expected<oar::CopyAnswer, oar::Status> {
         return std::unexpected(oar::Status::unsupported);
     }
 };

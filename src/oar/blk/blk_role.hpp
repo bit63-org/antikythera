@@ -80,6 +80,23 @@
 // attachments are refused, and a renewed one goes to every live
 // initiator for its next connection.
 //
+// Local <-> network conversion (.kiro/specs/block-volume-service/
+// Requirement 8.6, task 23.2): copy_volume start copies a detached local
+// volume into a new network volume, or a network volume into a new local
+// one, with a VolumeCopier (volume_copier.hpp) and no function: the local
+// side is the volume file, the network side a NetworkVolumeBackend for
+// the attachment the request names, which the newest ReplicaConfig must
+// list for this server (read-write when it is the target). Both volumes
+// must share a block size, neither may be attached or in another copy, a
+// local volume must be a disk volume (not an image), and a network target
+// must have no source (a restore's blocks await hydration, so it is not
+// new). The copy runs in poll() beside the functions; a later config
+// re-routes its network side as it would an attachment's, and a renewed
+// storage certificate reaches it too. query answers its state and
+// progress until release forgets it; prepare_function, rewrap_volume and
+// a second copy of either volume are busy meanwhile, and delete_volume of
+// either drops the copy first.
+//
 // The volume files are named vol-<16 hex digits>.akv in the volume
 // directory. The role checks a volume's header against the request: a
 // prepare for a VM other than the volume's owner is refused, as helm's
@@ -110,6 +127,7 @@
 #include "oar/blk/network_volume_backend.hpp"
 #include "objstore/object_store.hpp"
 #include "oar/blk/virtio_blk_function.hpp"
+#include "oar/blk/volume_copier.hpp"
 
 namespace ak::oar::blk {
 
@@ -176,6 +194,8 @@ struct RoleConfig {
     // Network volumes restored from an image under another key (block
     // volume task 23): regions each one's background walk keeps in flight.
     std::size_t hydrate_max_background{2};
+    // Local <-> network copies (task 23.2): regions each keeps in flight.
+    std::size_t copy_max_in_flight{2};
     // Empty: steady_clock::now (health's uptime).
     std::function<Clock::time_point()> clock;
 };
@@ -217,6 +237,8 @@ public:
     auto role_certificate(std::span<const std::byte> chain) -> helm::oar::Status override;
     auto eject(const helm::oar::Eject& request)
         -> std::expected<helm::oar::EjectState, helm::oar::Status> override;
+    auto copy_volume(const helm::oar::CopyVolume& request)
+        -> std::expected<helm::oar::CopyAnswer, helm::oar::Status> override;
 
     // Enrollment through `enrollment` (must outlive the role); its Apply
     // should call set_storage_tls.
@@ -241,6 +263,8 @@ public:
     [[nodiscard]] auto attached(helm::oar::FunctionNumber fn) const -> std::optional<std::uint64_t>;
     // The attached function itself (tests, counters); null between attachments.
     [[nodiscard]] auto function(helm::oar::FunctionNumber fn) -> VirtioBlkFunction*;
+    // The copy whose local volume is `local_volume`, if any (tests).
+    [[nodiscard]] auto copier(std::uint64_t local_volume) -> VolumeCopier*;
 
 private:
     struct Slot {
@@ -279,8 +303,18 @@ private:
                       LazyImageBackend* image, NetworkVolumeBackend* network,
                       HydratingBackend* hydrating = nullptr) -> helm::oar::Status;
 
+    // A local <-> network copy, by its local volume.
+    struct Copy {
+        std::uint64_t network_volume{0};
+        NetworkVolumeBackend* network{nullptr};  // the copier's network side
+        std::unique_ptr<VolumeCopier> copier;
+    };
+    [[nodiscard]] auto copying(std::uint64_t volume) const -> bool;
+    [[nodiscard]] auto start_copy(const helm::oar::CopyVolume& request) -> helm::oar::Status;
+
     RoleConfig _config;
     std::vector<Slot> _slots;
+    std::map<std::uint64_t, Copy> _copies;
     std::map<std::uint64_t, proto::ReplicaConfig> _configs;  // network volumes, newest
     RoleConfig::Clock::time_point _started;
     helm::RoleEnrollment* _enrollment{nullptr};

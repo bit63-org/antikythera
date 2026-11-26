@@ -341,6 +341,37 @@ auto OarLink::eject(const oar::Eject& request) -> std::expected<oar::EjectState,
     return *state;
 }
 
+auto OarLink::copy_volume(const oar::CopyVolume& request, std::optional<ScopedKey> local_key,
+                          std::optional<ScopedKey> network_key)
+    -> std::expected<oar::CopyAnswer, LinkError> {
+    // The keys are by-value parameters, so their bytes are wiped when this
+    // returns, whichever path returns.
+    const bool start = request.op == oar::CopyOp::start;
+    if (request.local_key || request.network_key || local_key.has_value() != start ||
+        network_key.has_value() != start ||
+        (start && (!local_key->holds_key() || !network_key->holds_key()))) {
+        return std::unexpected(bad_request());
+    }
+    oar::CopyVolume r = request;
+    if (start) {
+        r.local_key = local_key->bytes();
+        r.network_key = network_key->bytes();
+    }
+    auto body = oar::encode_copy_volume(r);
+    if (!body) {
+        return std::unexpected(bad_request());
+    }
+    auto response = transact(mctp::VendorType::copy_volume, *body, start);
+    if (!response) {
+        return std::unexpected(response.error());
+    }
+    auto answer = oar::decode_copy_answer(*response);
+    if (!answer) {
+        return std::unexpected(LinkError{.code = LinkErrc::bad_response});
+    }
+    return *answer;
+}
+
 auto OarLink::send_chunked(mctp::VendorType type, std::span<const std::byte> frame)
     -> std::expected<void, LinkError> {
     const auto total = static_cast<std::uint32_t>(frame.size());
@@ -749,6 +780,18 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
                                                                     : state.error());
             }
             return with_body(oar::encode_eject_answer(*state));
+        }
+        case mctp::VendorType::copy_volume: {
+            auto req = oar::decode_copy_volume(body);
+            if (!req) {
+                return status_only(oar::Status::bad_request);
+            }
+            auto answer = handler.copy_volume(*req);
+            if (!answer) {
+                return status_only(answer.error() == oar::Status::ok ? oar::Status::failed
+                                                                     : answer.error());
+            }
+            return with_body(oar::encode_copy_answer(*answer));
         }
         case mctp::VendorType::group_policy: {
             auto frame = oar::decode_group_policy_frame(body);

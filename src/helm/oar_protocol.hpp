@@ -58,6 +58,11 @@
 //   instance_metadata   0  total u32 | 4  offset u32 | 8  chunk (as map_update)
 //   group_membership    0  cursor u16 | 2  flags u16 (bit 0: `since` is set)
 //                       4  since u32 (the generation helm last read whole)
+//   copy_volume         0  op u8 (CopyOp) | 1  direction u8 (CopyDirection) | 2  reserved u16
+//                       4  mib_per_s u32 (0: unpaced) | 8  local_volume_id u64
+//                       16 network_volume_id u64 | 24 attachment_id u64 | 32 generation u32
+//                       36 reserved u32
+//                       40 local_key [64] | 104 network_key [64], only for start
 //
 // The tunnel requests deliver the network role's WireGuard keys (oar-net
 // Requirement 5.2): its own static X25519 private key, and for each peer
@@ -140,6 +145,23 @@
 // the device and left it alone long enough, with no request still in the
 // backend). request and cancel are idempotent.
 //
+// Local <-> network conversion (block-volume-service Requirement 8.6,
+// task 23.2), to the storage role (blk): copy_volume copies one detached
+// volume into another on this server, decrypting with the source's key
+// and encrypting with the target's (oar/blk/volume_copier.hpp). The pair
+// is a local volume (the role's volume file) and a network volume, opened
+// through `attachment_id` at `generation`, an attachment for this server
+// in the volume's newest ReplicaConfig (a utility attachment: no VM).
+// to_network copies the local volume into the network one, to_local the
+// other way; the target must be new. start carries both keys (helm's
+// unwrapped local key and the network volume's attachment key) and
+// begins the copy; query reports it; release stops it if it is still
+// running and forgets it. A copy stays queryable until released, so helm
+// reads its outcome however late it polls. Every answer is the copy's
+// state and progress; query and release of a pair with no copy answer
+// state none. The body carries secrets on start, so both ends wipe it,
+// as for deliver_key.
+//
 // Responses (oar -> helm) start with a 2-byte head:
 //
 //   0  status u8 (Status) | 1  reserved u8
@@ -157,6 +179,9 @@
 //   cert_request        2  role u8 (Role: blk or hold) | 3  reserved u8 | 4  csr_len u16
 //                       6  csr [csr_len] (0..max_csr bytes)
 //   eject               2  state u8 (EjectState) | 3  reserved u8
+//   copy_volume         2  state u8 (CopyVolumeState) | 3  failure u8 (CopyVolumeFailure)
+//                       4  reserved [6] | 10 total_bytes u64 | 18 done_bytes u64
+//                       26 written_bytes u64 (done, written <= total)
 //   group_usage         2  total u16 | 4  count u16 | 6  reserved u32
 //                       10 count x 96 (the proto group_usage report entry, slot 0):
 //                          nic_id u64 | vni u32 | flags u8 | reserved [3] | attachment u64
@@ -303,6 +328,9 @@ inline constexpr std::size_t max_role_report = std::size_t{1} << 17U;
 inline constexpr std::size_t cert_answer_head_size = 4;
 inline constexpr std::size_t eject_request_size = 4;
 inline constexpr std::size_t eject_answer_size = 2;
+inline constexpr std::size_t copy_volume_head_size = 40;
+inline constexpr std::size_t copy_volume_start_size = copy_volume_head_size + 2 * volume_key_size;
+inline constexpr std::size_t copy_volume_answer_size = 32;
 // Largest certificate request that fits one cert_request answer (below
 // proto::max_csr_size; a P-256 request is a few hundred bytes).
 inline constexpr std::size_t max_csr = max_body_size - response_head_size - cert_answer_head_size;
@@ -348,6 +376,37 @@ enum class EjectState : std::uint8_t {
     none = 0,       // no eject requested
     requested = 1,  // requested; the guest still holds the device
     released = 2,   // the guest let go
+};
+
+// What a copy_volume request does. Values are wire protocol.
+enum class CopyOp : std::uint8_t {
+    start = 1,
+    query = 2,
+    release = 3,
+};
+
+// Which way a copy_volume goes. Values are wire protocol.
+enum class CopyDirection : std::uint8_t {
+    to_network = 1,  // the local volume into the network volume
+    to_local = 2,    // the network volume into the local volume
+};
+
+// Where a copy stands. Values are wire protocol.
+enum class CopyVolumeState : std::uint8_t {
+    none = 0,  // no copy of this pair (never started, or released)
+    copying = 1,
+    completed = 2,  // every block copied and the target flushed
+    failed = 3,
+};
+
+// Why a copy failed. Values are wire protocol.
+enum class CopyVolumeFailure : std::uint8_t {
+    none = 0,
+    source_io = 1,
+    target_io = 2,
+    not_hydrated = 3,  // the network source still awaits hydration
+    out_of_range = 4,
+    crypto = 5,
 };
 
 [[nodiscard]] auto to_string(Status s) noexcept -> const char*;
@@ -525,6 +584,30 @@ struct Eject {
     EjectOp op{EjectOp::query};
 
     friend auto operator==(const Eject&, const Eject&) -> bool = default;
+};
+
+// copy_volume. The keys are set exactly for start; they view into the
+// caller's buffers when encoding, into the message when decoding.
+struct CopyVolume {
+    CopyOp op{CopyOp::query};
+    CopyDirection direction{CopyDirection::to_network};
+    std::uint32_t mib_per_s{0};
+    VolumeId local_volume_id{0};
+    VolumeId network_volume_id{0};
+    std::uint64_t attachment_id{0};
+    std::uint32_t generation{0};
+    std::optional<std::span<const std::byte, volume_key_size>> local_key;
+    std::optional<std::span<const std::byte, volume_key_size>> network_key;
+};
+
+struct CopyAnswer {
+    CopyVolumeState state{CopyVolumeState::none};
+    CopyVolumeFailure failure{CopyVolumeFailure::none};  // none unless failed
+    std::uint64_t total_bytes{0};
+    std::uint64_t done_bytes{0};
+    std::uint64_t written_bytes{0};
+
+    friend auto operator==(const CopyAnswer&, const CopyAnswer&) -> bool = default;
 };
 
 // One chunk of a MapUpdate frame. `chunk` views into the message.
@@ -845,6 +928,19 @@ struct ResponseView {
     -> std::expected<std::vector<std::byte>, BodyError>;
 [[nodiscard]] auto decode_eject_answer(std::span<const std::byte> body) noexcept
     -> std::expected<EjectState, BodyError>;
+
+// copy_volume requests and answers. A start needs both keys and non-zero
+// IDs, attachment and generation; query and release take no keys. An
+// answer's failure is none unless its state is failed, and its done and
+// written bytes never pass its total.
+[[nodiscard]] auto encode_copy_volume(const CopyVolume& c)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_copy_volume(std::span<const std::byte> body) noexcept
+    -> std::expected<CopyVolume, BodyError>;
+[[nodiscard]] auto encode_copy_answer(const CopyAnswer& a)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_copy_answer(std::span<const std::byte> body) noexcept
+    -> std::expected<CopyAnswer, BodyError>;
 
 // cert_request answer bodies.
 [[nodiscard]] auto encode_cert_answer(const CertAnswer& a)

@@ -70,7 +70,7 @@ private:
     // Only a SecureElement unwraps keys, so only it creates them.
     friend class SecureElement;
     // The single consumer: the sideband link to the storage role
-    // (Requirement 4.4), in OarLink::deliver_key.
+    // (Requirement 4.4), in OarLink::deliver_key and copy_volume.
     friend class OarLink;
     // Unit tests compare unwrapped keys; defined only in tests/.
     friend struct ScopedKeyTestAccess;

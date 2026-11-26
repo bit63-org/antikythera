@@ -43,11 +43,15 @@ public:
 
 // FLR wipes the function's key; for an image volume the backend's copy
 // goes too, and the overlay with it.
-auto on_flr(VirtioBlkFunction& f, LazyImageBackend* image = nullptr) -> std::function<void()> {
-    return [fn = &f, image] {
+auto on_flr(VirtioBlkFunction& f, LazyImageBackend* image = nullptr,
+            HydratingBackend* hydrating = nullptr) -> std::function<void()> {
+    return [fn = &f, image, hydrating] {
         fn->function_reset();
         if (image != nullptr) {
             image->drop_keys();
+        }
+        if (hydrating != nullptr) {
+            hydrating->drop_keys();
         }
     };
 }
@@ -151,6 +155,9 @@ auto BlkRole::close(Slot& s) -> bool {
     if (s.image != nullptr) {
         s.image->drop_keys();
     }
+    if (s.hydrating != nullptr) {
+        s.hydrating->drop_keys();
+    }
     // The placeholder goes back first, so the transport never points at a
     // destroyed function.
     s.placeholder->function_reset();
@@ -159,20 +166,23 @@ auto BlkRole::close(Slot& s) -> bool {
     }
     s.image = nullptr;
     s.network = nullptr;
+    s.hydrating = nullptr;
     s.active.reset();
     s.volume = 0;
     return true;
 }
 
-auto BlkRole::open_image_volume(const VolumeMetadata& m)
-    -> std::expected<std::unique_ptr<LazyImageBackend>, std::string> {
-    const auto store = _config.image_stores.find(m.image->store_id);
+auto BlkRole::open_image(std::uint32_t store_id, const objstore::ImageDigest& name)
+    -> std::expected<OpenedImage, std::string> {
+    const auto store = store_id > std::numeric_limits<std::uint16_t>::max()
+                           ? _config.image_stores.end()
+                           : _config.image_stores.find(static_cast<std::uint16_t>(store_id));
     if (_config.image_cache == nullptr || store == _config.image_stores.end() ||
         store->second.store == nullptr || store->second.fetcher == nullptr) {
-        return std::unexpected(std::format("no image store {}", m.image->store_id));
+        return std::unexpected(std::format("no image store {}", store_id));
     }
     const ImageStore& is = store->second;
-    const std::string hex = objstore::image_name_hex(m.image->name);
+    const std::string hex = objstore::image_name_hex(name);
     const auto deadline = objstore::ObjectStore::Clock::now() + _config.manifest_deadline;
     const auto bytes =
         is.store->get(objstore::image_manifest_key(is.prefix, hex), max_manifest_bytes, deadline);
@@ -180,32 +190,43 @@ auto BlkRole::open_image_volume(const VolumeMetadata& m)
         return std::unexpected(std::format("manifest {}: {}", hex, to_string(bytes.error())));
     }
     // The name pins the manifest: a store that returns another one is caught here.
-    const auto manifest = objstore::decode_named_manifest(*bytes, m.image->name);
+    const auto manifest = objstore::decode_named_manifest(*bytes, name);
     if (!manifest) {
         return std::unexpected(std::format("manifest {}: {}", hex, to_string(manifest.error())));
     }
     if (manifest->chunked) {
         // A snapshot, not an image: restores hydrate through hold
-        // (block-volume-service tasks 22-23), never as an image volume.
+        // (block-volume-service task 22), never from oar-blk.
         return std::unexpected(std::format("image {} is a snapshot", hex));
     }
-    // An encrypted image's volume holds K_img wrapped by helm (task 15),
-    // and a plain image's holds no key: one without the other would only
-    // fail at delivery, after the VMM has the function.
-    if (manifest->encrypted && m.wrapped_key.empty()) {
-        return std::unexpected(std::format("image {} is encrypted and the volume has no key", hex));
-    }
-    if (!manifest->encrypted && !m.wrapped_key.empty()) {
-        return std::unexpected(std::format("image {} is plain and the volume has a key", hex));
-    }
-    auto image = _config.image_cache->open_image(m.image->name, *manifest,
-                                                 objstore::image_data_key(is.prefix, hex));
+    auto image =
+        _config.image_cache->open_image(name, *manifest, objstore::image_data_key(is.prefix, hex));
     if (!image) {
         return std::unexpected(std::format("image {}: cache errno {}", hex, image.error()));
     }
+    return OpenedImage{.image = std::move(*image), .fetcher = is.fetcher};
+}
+
+auto BlkRole::open_image_volume(const VolumeMetadata& m)
+    -> std::expected<std::unique_ptr<LazyImageBackend>, std::string> {
+    auto opened = open_image(m.image->store_id, m.image->name);
+    if (!opened) {
+        return std::unexpected(opened.error());
+    }
+    const std::string hex = objstore::image_name_hex(m.image->name);
+    const objstore::ImageManifest& mf = opened->image->manifest();
+    // An encrypted image's volume holds K_img wrapped by helm (task 15),
+    // and a plain image's holds no key: one without the other would only
+    // fail at delivery, after the VMM has the function.
+    if (mf.encrypted && m.wrapped_key.empty()) {
+        return std::unexpected(std::format("image {} is encrypted and the volume has no key", hex));
+    }
+    if (!mf.encrypted && !m.wrapped_key.empty()) {
+        return std::unexpected(std::format("image {} is plain and the volume has a key", hex));
+    }
     auto backend = LazyImageBackend::create(
-        {.image = std::move(*image),
-         .fetcher = is.fetcher,
+        {.image = std::move(opened->image),
+         .fetcher = opened->fetcher,
          .overlay_dir = _config.overlay_dir.empty() ? _config.volume_dir : _config.overlay_dir,
          .capacity_bytes = m.capacity_sectors * sector_size,
          .logical_block_size = m.logical_block_size,
@@ -282,11 +303,12 @@ auto BlkRole::prepare_function(const oar::PrepareFunction& request) -> oar::Stat
 }
 
 auto BlkRole::serve_active(Slot& s, std::unique_ptr<VirtioBlkFunction> f, std::uint64_t volume,
-                           LazyImageBackend* image, NetworkVolumeBackend* network) -> oar::Status {
+                           LazyImageBackend* image, NetworkVolumeBackend* network,
+                           HydratingBackend* hydrating) -> oar::Status {
     // Until helm's key arrives (after the VMM opened the function), the
     // guest's requests wait in the rings.
     f->await_key();
-    if (auto ok = s.transport->serve(f->pci(), on_flr(*f, image)); !ok) {
+    if (auto ok = s.transport->serve(f->pci(), on_flr(*f, image, hydrating)); !ok) {
         // Back to the placeholder; if even that fails the transport is lost.
         static_cast<void>(s.transport->serve(s.placeholder->pci(), on_flr(*s.placeholder)));
         return oar::Status::failed;
@@ -295,6 +317,7 @@ auto BlkRole::serve_active(Slot& s, std::unique_ptr<VirtioBlkFunction> f, std::u
     s.volume = volume;
     s.image = image;
     s.network = network;
+    s.hydrating = hydrating;
     return oar::Status::ok;
 }
 
@@ -329,6 +352,32 @@ auto BlkRole::prepare_network(Slot& s, const oar::PrepareFunction& /*request*/,
         return oar::Status::failed;
     }
     NetworkVolumeBackend* network = backend->get();
+    // A volume restored from an image under another key (task 23): oar-blk
+    // hydrates it, in front of the network backend.
+    std::unique_ptr<BlockBackend> served = std::move(*backend);
+    HydratingBackend* hydrating = nullptr;
+    if (rc.source.kind == proto::SourceKind::image) {
+        auto opened = open_image(rc.source.store_id, rc.source.manifest_name);
+        if (!opened) {
+            return oar::Status::failed;
+        }
+        std::unique_ptr<HydrationTarget> target{
+            static_cast<NetworkVolumeBackend*>(served.release())};
+        auto h = HydratingBackend::create({.volume = std::move(target),
+                                           .image = std::move(opened->image),
+                                           .fetcher = opened->fetcher,
+                                           .logical_block_size = rc.block_size,
+                                           .hydrate_mib_per_s = rc.source.hydrate_mib_per_s,
+                                           .max_background = _config.hydrate_max_background,
+                                           .max_read_tries = HydratingParams{}.max_read_tries,
+                                           .retry_backoff = HydratingParams{}.retry_backoff,
+                                           .clock = {}});
+        if (!h) {
+            return oar::Status::failed;
+        }
+        hydrating = h->get();
+        served = std::move(*h);
+    }
     const VolumeGeometry g{
         .capacity_sectors = rc.capacity_blocks * (rc.block_size / oar::sector_size),
         .logical_block_size = rc.block_size,
@@ -338,11 +387,11 @@ auto BlkRole::prepare_network(Slot& s, const oar::PrepareFunction& /*request*/,
     // Requests wait on the network: let the rest of the ring go past them.
     auto f = VirtioBlkFunction::create(
         params(g, volume_serial(cfg.volume_id), _config.image_max_in_flight), s.transport->memory(),
-        s.transport->interrupts(), std::move(*backend));
+        s.transport->interrupts(), std::move(served));
     if (!f) {
         return oar::Status::failed;
     }
-    return serve_active(s, std::move(*f), cfg.volume_id, nullptr, network);
+    return serve_active(s, std::move(*f), cfg.volume_id, nullptr, network, hydrating);
 }
 
 auto BlkRole::cert_request() -> std::expected<oar::CertAnswer, oar::Status> {
@@ -450,8 +499,9 @@ auto BlkRole::deliver_key(const oar::DeliverKey& request) -> oar::Status {
     if (!s->active || s->volume != request.volume_id) {
         return oar::Status::busy;
     }
-    // Only an image volume takes an image key.
-    if (request.image_key && s->image == nullptr) {
+    // Only an image volume, or a network volume hydrating from an
+    // encrypted image, takes an image key.
+    if (request.image_key && s->image == nullptr && s->hydrating == nullptr) {
         return oar::Status::failed;
     }
     // The span views helm's message, which OarEndpoint wipes after this
@@ -473,6 +523,14 @@ auto BlkRole::deliver_key(const oar::DeliverKey& request) -> oar::Status {
         s->image->drop_keys();
         return oar::Status::failed;
     }
+    // A hydrating network volume encrypts image blocks under the volume
+    // key the function holds (task 23), decrypting an encrypted image's
+    // with K_img first; the same both-or-neither rule.
+    if (s->hydrating != nullptr && !s->hydrating->load_keys(request.key, image_key)) {
+        s->active->drop_key();
+        s->hydrating->drop_keys();
+        return oar::Status::failed;
+    }
     return oar::Status::ok;
 }
 
@@ -488,6 +546,9 @@ auto BlkRole::drop_key(const oar::DropKey& request) -> oar::Status {
         s->active->drop_key();
         if (s->image != nullptr) {
             s->image->drop_keys();  // and the overlay with it
+        }
+        if (s->hydrating != nullptr) {
+            s->hydrating->drop_keys();
         }
     }
     return oar::Status::ok;

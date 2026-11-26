@@ -165,6 +165,10 @@ inline constexpr std::uint32_t max_bounce_bytes = 16U << 20U;
 enum class BackendError : std::uint8_t {
     io,            // the backing store failed the operation
     out_of_range,  // offset + length past the end of the backing store
+    // A network volume restored from an image under another key: the
+    // range awaits hydration by oar-blk (HydratingBackend), which takes
+    // this from its inner backend and never passes it up.
+    not_hydrated,
 };
 
 [[nodiscard]] auto to_string(BackendError e) noexcept -> const char*;

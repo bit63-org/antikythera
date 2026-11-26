@@ -882,3 +882,68 @@ BOOST_AUTO_TEST_CASE(refuses_routes_it_cannot_follow,
     BOOST_TEST(rig.core.set_route(detached, rig.now).has_value());
     BOOST_TEST(rig.core.fenced());
 }
+
+// Block-volume task 23: a volume restored from an image under another key.
+auto image_config(std::uint64_t epoch, proto::AttachMode mode = proto::AttachMode::rw)
+    -> proto::ReplicaConfig {
+    auto c = config(epoch);
+    c.source = {.kind = proto::SourceKind::image,
+                .store_id = 3,
+                .hydrate_mib_per_s = 50,
+                .manifest_name = {}};
+    c.source.manifest_name[0] = std::byte{1};
+    c.attachments[0].mode = mode;
+    return c;
+}
+
+BOOST_AUTO_TEST_CASE(reports_unhydrated_reads_and_sends_hydrate_writes,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Rig rig;
+    rig.apply(image_config(1));
+    Bytes out(4 * bs);
+    Done r0;
+    rig.read(10, out, r0);
+    BOOST_TEST(r0.failed(BackendError::not_hydrated));
+
+    // The guest writes block 11; a hydrate write of 10-13 then fills the
+    // rest, and the guest's block stays.
+    const auto mine = blocks_of(1, 1);
+    const auto image = blocks_of(2, 4);
+    Done w;
+    Done h;
+    rig.write(11, mine, w);
+    rig.core.submit_hydrate(10 * bs, image, h.fn(), rig.now);
+    rig.step();
+    BOOST_TEST(w.ok());
+    BOOST_TEST(h.ok());
+    const auto it = std::ranges::find_if(rig.sent, [](const proto::HoldHeader& hd) {
+        return hd.opcode == HoldOpcode::write && (hd.flags & proto::hold_flags::hydrate) != 0;
+    });
+    BOOST_REQUIRE(it != rig.sent.end());
+    BOOST_TEST(it->lba == 10U);
+    Done r1;
+    rig.read(10, out, r1);
+    BOOST_TEST(r1.ok());
+    auto expect = image;
+    std::ranges::copy(mine, expect.begin() + bs);
+    BOOST_TEST((out == expect));
+}
+
+BOOST_AUTO_TEST_CASE(hydrates_through_a_read_only_attachment,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Rig rig;
+    rig.apply(image_config(1, proto::AttachMode::ro));
+    Done w;
+    rig.write(4, blocks_of(1, 1), w);
+    BOOST_TEST(w.failed(BackendError::io));  // refused before it leaves
+    const auto image = blocks_of(3, 2);
+    Done h;
+    rig.core.submit_hydrate(4 * bs, image, h.fn(), rig.now);
+    rig.step();
+    BOOST_TEST(h.ok());
+    Bytes out(2 * bs);
+    Done r;
+    rig.read(4, out, r);
+    BOOST_TEST(r.ok());
+    BOOST_TEST((out == image));
+}

@@ -61,6 +61,8 @@ auto to_string(BackendError e) noexcept -> const char* {
             return "io";
         case BackendError::out_of_range:
             return "out_of_range";
+        case BackendError::not_hydrated:
+            return "not_hydrated";
     }
     return "unknown";
 }

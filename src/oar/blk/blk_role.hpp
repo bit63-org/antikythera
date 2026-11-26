@@ -64,7 +64,17 @@
 // function (VirtioBlkFunction::grow), so the guest sees it online.
 // The geometry comes from the config, read-only for an ro attachment. The
 // key helm delivers is the attachment's, opened in its secure element.
-// Without verify_config the role takes no network volumes. Enrollment
+// Without verify_config the role takes no network volumes.
+//
+// Foreign-key restores (.kiro/specs/block-volume-service/ task 23): a
+// config whose source is an image (a public image, or an encrypted one
+// under another key) puts a HydratingBackend in front of the network
+// backend. prepare_function opens the image from the store the source
+// names, as for an image volume; deliver_key gives the volume key (and
+// K_img for an encrypted image) to the function and to the hydrating
+// backend, which fills unhydrated blocks under the volume key as the
+// guest reads them and in the background at the source's rate. Every way
+// the key goes takes the hydrating backend's copies with it. Enrollment
 // (set_enrollment): the role's storage certificate comes from the
 // controller through helm; until it has one (storage_tls empty) network
 // attachments are refused, and a renewed one goes to every live
@@ -95,6 +105,7 @@
 #include "objstore/chunk_cache.hpp"
 #include "objstore/fetcher.hpp"
 #include "oar/blk/file_backend.hpp"
+#include "oar/blk/hydrating_backend.hpp"
 #include "oar/blk/lazy_image_backend.hpp"
 #include "oar/blk/network_volume_backend.hpp"
 #include "objstore/object_store.hpp"
@@ -162,6 +173,9 @@ struct RoleConfig {
         verify_config;
     std::optional<tls::Config> storage_tls;
     InitiatorConfig initiator;  // attachment_id is set per attachment
+    // Network volumes restored from an image under another key (block
+    // volume task 23): regions each one's background walk keeps in flight.
+    std::size_t hydrate_max_background{2};
     // Empty: steady_clock::now (health's uptime).
     std::function<Clock::time_point()> clock;
 };
@@ -236,6 +250,7 @@ private:
         std::uint64_t volume{0};
         LazyImageBackend* image{nullptr};  // the active function's backend, for an image volume
         NetworkVolumeBackend* network{nullptr};  // ... for a network volume
+        HydratingBackend* hydrating{nullptr};    // ... in front of it, restoring from an image
     };
 
     explicit BlkRole(RoleConfig config) : _config{std::move(config)} {}
@@ -246,6 +261,14 @@ private:
                               std::uint16_t max_in_flight = 1) const -> BlkParams;
     // Wipes the key, closes the volume and puts the placeholder back.
     auto close(Slot& s) -> bool;
+    struct OpenedImage {
+        std::shared_ptr<objstore::CachedImage> image;
+        objstore::Fetcher* fetcher{nullptr};
+    };
+    // An image (never a snapshot) from one of the configured stores, its
+    // manifest checked against the name, opened in the chunk cache.
+    [[nodiscard]] auto open_image(std::uint32_t store_id, const objstore::ImageDigest& name)
+        -> std::expected<OpenedImage, std::string>;
     // The backend for an image volume, ready for its key.
     [[nodiscard]] auto open_image_volume(const VolumeMetadata& m)
         -> std::expected<std::unique_ptr<LazyImageBackend>, std::string>;
@@ -253,7 +276,8 @@ private:
                          const helm::oar::BlkConfig& cfg) -> helm::oar::Status;
     // Puts `f` behind the slot's transport (the placeholder back on failure).
     auto serve_active(Slot& s, std::unique_ptr<VirtioBlkFunction> f, std::uint64_t volume,
-                      LazyImageBackend* image, NetworkVolumeBackend* network) -> helm::oar::Status;
+                      LazyImageBackend* image, NetworkVolumeBackend* network,
+                      HydratingBackend* hydrating = nullptr) -> helm::oar::Status;
 
     RoleConfig _config;
     std::vector<Slot> _slots;

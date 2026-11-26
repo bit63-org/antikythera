@@ -120,27 +120,27 @@ auto InitiatorCore::set_route(const proto::ReplicaConfig& c, Clock::time_point n
 
 auto InitiatorCore::submit_read(std::uint64_t offset, std::span<std::byte> out,
                                 BackendCompletion done, Clock::time_point now) -> void {
-    const auto id = _next_op++;
-    auto& op = _ops[id];
-    op.kind = Kind::read;
-    op.offset = offset;
-    op.out = out;
-    op.done = std::move(done);
-    // Held without a deadline until the route arrives (Requirement 2.2).
-    op.deadline = _route ? now + _config.request_timeout : Clock::time_point::max();
-    if (_route) {
-        split(id, op);
-    }
-    pump(now);
-    run_completions();
+    submit(Kind::read, offset, out, {}, std::move(done), now);
 }
 
 auto InitiatorCore::submit_write(std::uint64_t offset, std::span<const std::byte> in,
                                  BackendCompletion done, Clock::time_point now) -> void {
+    submit(Kind::write, offset, {}, in, std::move(done), now);
+}
+
+auto InitiatorCore::submit_hydrate(std::uint64_t offset, std::span<const std::byte> in,
+                                   BackendCompletion done, Clock::time_point now) -> void {
+    submit(Kind::hydrate, offset, {}, in, std::move(done), now);
+}
+
+auto InitiatorCore::submit(Kind kind, std::uint64_t offset, std::span<std::byte> out,
+                           std::span<const std::byte> in, BackendCompletion done,
+                           Clock::time_point now) -> void {
     const auto id = _next_op++;
     auto& op = _ops[id];
-    op.kind = Kind::write;
+    op.kind = kind;
     op.offset = offset;
+    op.out = out;
     op.in = in;
     op.done = std::move(done);
     // Held without a deadline until the route arrives (Requirement 2.2).
@@ -172,7 +172,7 @@ auto InitiatorCore::split(std::uint64_t id, Op& op) -> void {
         complete(id, std::unexpected(BackendError::io));
         return;
     }
-    if (op.kind == Kind::write) {
+    if (op.kind != Kind::read) {
         op.crcs = proto::block_crcs(op.in, static_cast<std::uint32_t>(bs));
     }
     const std::uint64_t total = len / bs;
@@ -209,12 +209,14 @@ auto InitiatorCore::outstanding() const -> bool {
 }
 
 auto InitiatorCore::blocked(std::deque<Part>::const_iterator it) const -> bool {
-    if (it->kind != Kind::write) {
+    // Hydrate writes too: a resent one is idempotent only behind the
+    // writes it was ordered after.
+    if (it->kind == Kind::read) {
         return false;
     }
     const auto end = it->lba + it->blocks;
     return std::any_of(_parts.cbegin(), it, [&](const Part& p) {
-        return p.kind == Kind::write && p.op != it->op && p.lba < end && it->lba < p.lba + p.blocks;
+        return p.kind != Kind::read && p.op != it->op && p.lba < end && it->lba < p.lba + p.blocks;
     });
 }
 
@@ -249,11 +251,14 @@ auto InitiatorCore::pump(Clock::time_point now) -> void {
         }
         const Op& op = _ops.at(it->op);
         auto h = header(it->kind == Kind::read ? HoldOpcode::read : HoldOpcode::write);
+        if (it->kind == Kind::hydrate) {
+            h.flags = proto::hold_flags::hydrate;
+        }
         h.request_id = it->request_id;
         h.lba = it->lba;
         h.blocks = it->blocks;
         proto::HoldPayload payload;
-        if (it->kind == Kind::write) {
+        if (it->kind != Kind::read) {
             payload = proto::BlockData{
                 .block_size = bs,
                 .crcs = std::span{op.crcs}.subspan(
@@ -397,7 +402,7 @@ auto InitiatorCore::on_reply(std::deque<Part>::iterator it, const proto::HoldFra
     const std::uint32_t bs = _route->config.block_size;
     switch (f.header.status) {
         case HoldStatus::ok: {
-            if (it->kind == Kind::write) {
+            if (it->kind != Kind::read) {
                 part_done(it);
                 return;
             }
@@ -454,6 +459,10 @@ auto InitiatorCore::on_reply(std::deque<Part>::iterator it, const proto::HoldFra
             return;
         case HoldStatus::range:
             complete(it->op, std::unexpected(BackendError::out_of_range));
+            return;
+        case HoldStatus::not_hydrated:
+            complete(it->op, std::unexpected(it->kind == Kind::read ? BackendError::not_hydrated
+                                                                    : BackendError::io));
             return;
         default:
             complete(it->op, std::unexpected(BackendError::io));

@@ -45,6 +45,9 @@
 //   throttled, io_suspended     resent after retry_backoff (x4 suspended)
 //   checksum (write)            resent up to twice, then io
 //   fenced                      every request fails; the attachment is over
+//   not_hydrated (read)         not_hydrated: a range of a volume restored
+//                               from an image that oar-blk must hydrate
+//                               first (HydratingBackend)
 //   range                       out_of_range;  anything else  io
 // A routed request still not done at its deadline (request_timeout after
 // submit, or after the route arrived) fails with io, so the guest never
@@ -120,6 +123,12 @@ public:
     auto submit_write(std::uint64_t offset, std::span<const std::byte> in, BackendCompletion done,
                       Clock::time_point now) -> void;
     auto submit_flush(BackendCompletion done) -> void;
+    // A WRITE with the hydrate flag (block-volume task 23): the hold stores
+    // only the blocks still awaiting hydration. Ordered and resent like a
+    // write; allowed on a read-only attachment, since it only fills in
+    // what the volume already holds.
+    auto submit_hydrate(std::uint64_t offset, std::span<const std::byte> in, BackendCompletion done,
+                        Clock::time_point now) -> void;
 
     // The session the transport should have open, if any.
     [[nodiscard]] auto target(Clock::time_point now) const -> std::optional<HoldTarget>;
@@ -146,7 +155,8 @@ private:
     };
     enum class Kind : std::uint8_t {
         read,
-        write
+        write,
+        hydrate  // a write with the hydrate flag
     };
 
     struct Route {
@@ -177,6 +187,9 @@ private:
         Clock::time_point not_before{};
     };
 
+    auto submit(Kind kind, std::uint64_t offset, std::span<std::byte> out,
+                std::span<const std::byte> in, BackendCompletion done, Clock::time_point now)
+        -> void;
     auto split(std::uint64_t id, Op& op) -> void;
     auto pump(Clock::time_point now) -> void;
     auto send_hello() -> void;

@@ -273,6 +273,7 @@ target_link_libraries(ak_objstore
 # oar-blk image volumes: a read-only base image in object storage under an
 # ephemeral overlay (.kiro/specs/oar-blk-data-plane/ Requirement 8).
 add_library(ak_oar_blk_image
+  oar/blk/hydrating_backend.cpp
   oar/blk/image_pack.cpp
   oar/blk/lazy_image_backend.cpp
   oar/blk/overlay.cpp)

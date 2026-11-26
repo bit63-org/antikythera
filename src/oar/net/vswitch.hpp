@@ -102,19 +102,38 @@
 //
 // VPC gateway (Requirement 12, task 17): a VNI with a VpcConfig has a
 // virtual gateway at the config's MAC. oar-net answers, for the asking NIC
-// only, ARP for the gateway address and 169.254.169.254, neighbor
+// only, ARP for its subnet's gateway address and 169.254.169.254, neighbor
 // solicitations for the gateway's link-local address and fd00:ec2::254
-// (when the VNI has an IPv6 prefix), and DHCPv4 from the mapping: the
-// NIC's lowest guest IPv4 address inside the VPC prefix, the prefix's
-// mask, the gateway as router and server, the DNS servers, domain, lease
+// (when the NIC's subnet has an IPv6 prefix), and DHCPv4 from the mapping:
+// the NIC's lowest guest IPv4 address inside its subnet, the subnet's
+// mask, the subnet's gateway as router and server, the DNS servers, domain, lease
 // and the NIC's MTU (given at attach). Nothing about DHCP is stored: the
 // mapping is the lease database. Other IP packets for the gateway MAC are
 // routed (below) or dropped. Without a VpcConfig, DHCP is dropped and
-// counted, never flooded. With an IPv6 prefix the gateway also answers
+// counted, never flooded. With an IPv6 subnet prefix the gateway also answers
 // router solicitations and DHCPv6 (the NIC's in-prefix IPv6 addresses in
 // IA_NA), and poll() sends each attached NIC an unsolicited router
 // advertisement every ra_interval, so a guest's default route never
 // expires (task 18).
+//
+// Subnets (.kiro/specs/vpc-subnets-routing/ Requirements 2, 3 and 6, task
+// 4): a VpcConfig lists the VPC's subnets, and each NIC's mapping entry
+// names its subnet (MapUpdate v4). Once a VNI has a config the subnet is
+// the link: a NIC whose subnet the config does not know carries nothing
+// (tx_drop_no_subnet / rx_drop_no_subnet); the gateway answers ARP for the
+// NIC's own subnet's gateway only (another subnet's gateway address is
+// tx_drop_arp_other_subnet) and hands out DHCPv4, router advertisements
+// and DHCPv6 from the NIC's subnet; the ARP/ND proxy answers only for NICs
+// in the asker's subnet; the querier speaks from the subnet's gateway;
+// unicast to another subnet's NIC MAC is dropped on transmit and receive
+// (tx_drop_cross_subnet / rx_drop_cross_subnet; another subnet is reached
+// through the router, task 5); group frames reach only the sender's
+// subnet's local NICs and the VTEPs hosting one of its NICs, and the
+// flood-list cap is compared with that list. The subnet is looked up per
+// frame from the snapshot's binding and the config, so a mapping and a
+// config applied in either order give the same behaviour; NetRole filters
+// the neighbor table to each NIC's subnet the same way. A VNI with a
+// mapping but no config stays one L2 segment without a gateway.
 //
 // Routing (Requirements 11.10 and 12.7, task 22): a VpcConfig may carry routes, each
 // a prefix and a target NIC in the VNI. A unicast IP packet a guest sends
@@ -247,14 +266,28 @@ struct VpcRoute {
     friend auto operator==(const VpcRoute&, const VpcRoute&) -> bool = default;
 };
 
+// One subnet of a VPC (vpc-subnets-routing Requirement 2): a slice of one
+// of the VPC's IPv4 blocks, optionally a /64 of its IPv6 block, and the
+// route table its traffic uses. A NIC belongs to the subnet its mapping
+// entry names (MapUpdate version 4).
+struct VpcSubnet {
+    std::uint64_t id{0};                       // non-zero, the controller's subnet ID
+    Ipv4Prefix ipv4{};                         // inside one of the VPC's IPv4 blocks
+    neighbor::Ipv4Address gateway{};           // inside ipv4, not its network or broadcast address
+    std::optional<Ipv6Address> ipv6_prefix{};  // a /64 inside the VPC's IPv6 block
+    std::uint16_t table{0};                    // the route table it is associated with
+
+    friend auto operator==(const VpcSubnet&, const VpcSubnet&) -> bool = default;
+};
+
 // A VNI's gateway and guest configuration (Requirement 12.1). Written by the
 // controller, signed (proto::VpcConfigFrame), forwarded by helm and
 // applied by NetRole::vpc_config.
 struct VpcConfig {
     MacAddress gateway_mac{};  // locally administered unicast, from the controller's pool
-    Ipv4Prefix ipv4{};         // the VPC's IPv4 prefix, length 8..30, no host bits
-    neighbor::Ipv4Address ipv4_gateway{};       // inside ipv4, not its network or broadcast address
-    std::optional<Ipv6Address> ipv6_prefix{};   // a /64: low 64 bits zero
+    std::vector<Ipv4Prefix> ipv4_blocks{};      // 1..max_vpc_ipv4_blocks, the primary first
+    std::optional<Ipv6Address> ipv6_block{};    // a /56: low 72 bits zero
+    std::vector<VpcSubnet> subnets{};           // 1..max_vpc_subnets, ascending by id
     std::vector<neighbor::Ipv4Address> dns4{};  // at most max_dns_servers
     std::vector<Ipv6Address> dns6{};            // at most max_dns_servers
     std::string domain{};                       // DNS name, at most max_domain_size bytes
@@ -270,21 +303,37 @@ inline constexpr std::uint32_t min_lease_seconds = 60;
 inline constexpr std::uint32_t max_lease_seconds = 0x7FFF'FFFF;
 inline constexpr std::uint8_t min_ipv4_prefix = 8;
 inline constexpr std::uint8_t max_ipv4_prefix = 30;
-inline constexpr std::size_t max_vpc_routes = 100;  // proto::max_vpc_routes
+inline constexpr std::size_t max_vpc_routes = 100;     // proto::max_vpc_routes
+inline constexpr std::size_t max_vpc_ipv4_blocks = 5;  // proto::max_vpc_ipv4_blocks
+inline constexpr std::size_t max_vpc_subnets = 200;    // proto::max_vpc_subnets
+inline constexpr std::uint8_t ipv6_block_length = 56;
 
 enum class VpcConfigError : std::uint8_t {
     vni_out_of_range,  // 0, or wider than 24 bits
     bad_gateway_mac,   // zero, group, or not locally administered
-    bad_ipv4_prefix,   // length outside 8..30, or host bits set
-    bad_ipv4_gateway,  // outside the prefix, or its network or broadcast address
-    bad_ipv6_prefix,   // low 64 bits set, or multicast, link-local or unspecified
+    bad_ipv4_prefix,   // no block, too many, a length outside 8..30, host bits, or overlap
+    bad_ipv4_gateway,  // outside its subnet, or the subnet's network or broadcast address
+    bad_ipv6_prefix,   // a block or subnet prefix with host bits, multicast, link-local,
+                       // unspecified, or a subnet /64 outside the block (or without one)
     too_many_dns,      // more than max_dns_servers in a family
     bad_dns,           // a zero, multicast or broadcast server address
     bad_domain,        // too long, or not a DNS name
     bad_lease,         // outside min_lease_seconds .. max_lease_seconds
     too_many_routes,   // more than max_vpc_routes
     bad_route,         // host bits, a bad length, a bad target, or one prefix twice
+    bad_subnet,        // none, too many, id 0 or out of order, outside every block,
+                       // or overlapping another subnet
 };
+
+// The subnet `id` names in `config`, or null (id 0 and unknown IDs alike).
+[[nodiscard]] auto find_subnet(const VpcConfig& config, std::uint64_t id) noexcept
+    -> const VpcSubnet*;
+// Whether `address` lies inside `prefix`.
+[[nodiscard]] auto in_prefix(const Ipv4Prefix& prefix,
+                             const neighbor::Ipv4Address& address) noexcept -> bool;
+// Whether `address` lies inside the /64 `prefix`.
+[[nodiscard]] auto in_prefix64(const Ipv6Address& prefix, const Ipv6Address& address) noexcept
+    -> bool;
 
 [[nodiscard]] auto to_string(VpcConfigError e) noexcept -> const char*;
 
@@ -412,34 +461,37 @@ struct SwitchCounters {
     std::uint64_t tx_drop_spoofed{0};     // source MAC is not the NIC's mapped MAC
     std::uint64_t tx_drop_neighbor_spoofed{
         0};  // ARP/NS sender MAC, ARP sender IP or NA target not the NIC's
-    std::uint64_t tx_drop_ethertype{0};        // not IPv4, IPv6 or ARP (VLAN tags included)
-    std::uint64_t tx_drop_malformed{0};        // IPv4/IPv6 frame the packet parser refused
-    std::uint64_t tx_drop_ip_spoofed{0};       // IP source not one of the NIC's addresses
-    std::uint64_t tx_drop_local_only{0};       // 0.0.0.0, :: or link-local source nothing consumed
-    std::uint64_t tx_drop_router_msg{0};       // RA, redirect or DHCP server message from a guest
-    std::uint64_t tx_drop_ip_dst{0};           // IP destination not owned by the destination NIC
-    std::uint64_t tx_drop_unknown_unicast{0};  // no NIC holds the destination MAC
-    std::uint64_t tx_drop_hairpin{0};          // unicast to the sender's own MAC
-    std::uint64_t tx_drop_unattached{0};       // local destination with no function attached
-    std::uint64_t tx_drop_no_route{0};         // IP for the gateway MAC that no route matched
-    std::uint64_t tx_drop_route_target{0};     // the route's target NIC is not in the VNI here
-    std::uint64_t tx_drop_ttl{0};              // routed packet whose TTL or hop limit ran out
-    std::uint64_t tx_routed{0};                // routed to a target NIC (local or remote)
-    std::uint64_t snoop_reports{0};            // IGMP/MLD membership reports read
-    std::uint64_t snoop_joins{0};              // new joins recorded
-    std::uint64_t snoop_leaves{0};             // joins removed by a leave or done
-    std::uint64_t snoop_drop_cap{0};           // joins refused: the NIC or role is at its cap
-    std::uint64_t snoop_malformed{0};          // reports refused (igmp::SnoopError)
-    std::uint64_t snoop_ignored{0};            // reports from a VNI that has not opted in
-    std::uint64_t snoop_expired{0};            // joins that went unrefreshed
-    std::uint64_t queries_sent{0};             // general queries delivered to NICs
-    std::uint64_t tx_replicas_pruned{0};       // group frames sent by a VTEP list, not flooded
+    std::uint64_t tx_drop_ethertype{0};         // not IPv4, IPv6 or ARP (VLAN tags included)
+    std::uint64_t tx_drop_malformed{0};         // IPv4/IPv6 frame the packet parser refused
+    std::uint64_t tx_drop_ip_spoofed{0};        // IP source not one of the NIC's addresses
+    std::uint64_t tx_drop_local_only{0};        // 0.0.0.0, :: or link-local source nothing consumed
+    std::uint64_t tx_drop_router_msg{0};        // RA, redirect or DHCP server message from a guest
+    std::uint64_t tx_drop_ip_dst{0};            // IP destination not owned by the destination NIC
+    std::uint64_t tx_drop_unknown_unicast{0};   // no NIC holds the destination MAC
+    std::uint64_t tx_drop_hairpin{0};           // unicast to the sender's own MAC
+    std::uint64_t tx_drop_unattached{0};        // local destination with no function attached
+    std::uint64_t tx_drop_no_route{0};          // IP for the gateway MAC that no route matched
+    std::uint64_t tx_drop_route_target{0};      // the route's target NIC is not in the VNI here
+    std::uint64_t tx_drop_ttl{0};               // routed packet whose TTL or hop limit ran out
+    std::uint64_t tx_routed{0};                 // routed to a target NIC (local or remote)
+    std::uint64_t tx_drop_no_subnet{0};         // sender in a VPC with a config but no known subnet
+    std::uint64_t tx_drop_cross_subnet{0};      // unicast to a NIC's MAC in another subnet
+    std::uint64_t tx_drop_arp_other_subnet{0};  // ARP for another subnet's gateway address
+    std::uint64_t snoop_reports{0};             // IGMP/MLD membership reports read
+    std::uint64_t snoop_joins{0};               // new joins recorded
+    std::uint64_t snoop_leaves{0};              // joins removed by a leave or done
+    std::uint64_t snoop_drop_cap{0};            // joins refused: the NIC or role is at its cap
+    std::uint64_t snoop_malformed{0};           // reports refused (igmp::SnoopError)
+    std::uint64_t snoop_ignored{0};             // reports from a VNI that has not opted in
+    std::uint64_t snoop_expired{0};             // joins that went unrefreshed
+    std::uint64_t queries_sent{0};              // general queries delivered to NICs
+    std::uint64_t tx_replicas_pruned{0};        // group frames sent by a VTEP list, not flooded
     std::uint64_t arp_replies{0};
     std::uint64_t nd_replies{0};
     std::uint64_t dhcp4_replies{0};
     std::uint64_t dhcp4_ignored{0};     // release, decline, or a request for another server
     std::uint64_t dhcp4_no_config{0};   // the VNI has no VpcConfig
-    std::uint64_t dhcp4_no_address{0};  // the NIC has no IPv4 address inside the VPC prefix
+    std::uint64_t dhcp4_no_address{0};  // the NIC has no IPv4 address inside its subnet
     std::uint64_t dhcp4_bad{0};         // unparsable, or chaddr is not the NIC's MAC
     std::uint64_t ra_sent{0};           // solicited and periodic router advertisements
     std::uint64_t rs_dropped{0};        // no IPv6 gateway, or a hop limit other than 255
@@ -455,11 +507,13 @@ struct SwitchCounters {
     std::uint64_t rx_frames{0};                // packets handed to receive()
     std::uint64_t rx_delivered{0};             // copies delivered to local NICs
     std::uint64_t rx_drop_unattached{0};
-    std::uint64_t rx_drop_group{0};       // replicated frames this VTEP's policy does not admit
-    std::uint64_t rx_drop_ethertype{0};   // inner frame not IPv4, IPv6 or ARP
-    std::uint64_t rx_drop_malformed{0};   // inner IP frame the packet parser refused
-    std::uint64_t rx_drop_ip_spoofed{0};  // inner IP source not the source NIC's
-    std::uint64_t rx_drop_ip_dst{0};      // inner IP destination not the destination NIC's
+    std::uint64_t rx_drop_group{0};         // replicated frames this VTEP's policy does not admit
+    std::uint64_t rx_drop_ethertype{0};     // inner frame not IPv4, IPv6 or ARP
+    std::uint64_t rx_drop_malformed{0};     // inner IP frame the packet parser refused
+    std::uint64_t rx_drop_ip_spoofed{0};    // inner IP source not the source NIC's
+    std::uint64_t rx_drop_ip_dst{0};        // inner IP destination not the destination NIC's
+    std::uint64_t rx_drop_no_subnet{0};     // source NIC in no known subnet of the VPC here
+    std::uint64_t rx_drop_cross_subnet{0};  // switched frame between two subnets
     std::array<std::uint64_t, policy_error_count> rx_drop_policy{};  // by PolicyError
     std::uint64_t deliver_failed{0};  // a port refused a frame (it counts why)
 };
@@ -588,7 +642,7 @@ private:
     [[nodiscard]] auto joined(geneve::NicId nic, const igmp::Group& g) const -> bool;
     // Drops joins of NICs in `vni` beyond `cap` (a lowered or dropped policy).
     auto trim_memberships(std::uint32_t vni, std::size_t cap) -> void;
-    auto send_queries(geneve::NicId nic, NicGroupState& state, const VpcConfig& cfg) -> void;
+    auto send_queries(geneve::NicId nic, const VpcConfig& cfg, const VpcSubnet& subnet) -> void;
     // Group replication or unicast delivery once the frame passed every
     // check; `ip` is the parsed packet for IP frames, null for ARP.
     auto forward(const MappingSnapshot& snap, geneve::NicId src, const NicBinding& binding,
@@ -612,7 +666,7 @@ private:
     auto handle_rs(geneve::NicId src, const NicBinding& binding, const packet::ParsedPacket& p)
         -> void;
     auto send_ra(geneve::NicId nic, const NicBinding& binding, const VpcConfig& cfg,
-                 const Ipv6Address& dst) -> void;
+                 const Ipv6Address& prefix, const Ipv6Address& dst) -> void;
     auto handle_dhcp6(geneve::NicId src, const NicBinding& binding, const packet::ParsedPacket& p)
         -> void;
     auto handle_metadata(geneve::NicId src, const packet::ParsedPacket& p) -> void;
@@ -632,6 +686,12 @@ private:
     auto deliver_to(RxPort& port, std::span<const std::byte> frame) -> bool;
     [[nodiscard]] auto port(geneve::NicId nic) const -> RxPort*;
     [[nodiscard]] auto neighbors(std::uint32_t vni) const -> const VpcNeighbors*;
+    // The NIC's subnet in its VPC's config; null without a config, or when
+    // the mapping names no subnet the config knows.
+    [[nodiscard]] auto subnet_of(const NicBinding& binding) const -> const VpcSubnet*;
+    // Whether two NICs share a link: the same VNI and, once the VNI has a
+    // config, the same subnet.
+    [[nodiscard]] auto same_subnet(const NicBinding& a, const NicBinding& b) const -> bool;
 
     const MappingTable* _mappings;
     Underlay* _underlay;

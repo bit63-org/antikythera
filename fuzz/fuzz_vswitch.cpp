@@ -22,6 +22,10 @@
 //         gateway's address) may only reach the asking NIC. Its metadata
 //         endpoint must only hear from the NIC a packet came from, with
 //         that NIC's own source address. poll() runs between records.
+//         vpc_one has three subnets (vpc-subnets-routing Requirements 3
+//         and 6): a alone in A, b and remote c in B, remote e in C. No
+//         frame crosses from one subnet to another, on transmit or on
+//         receive.
 
 #include <array>
 #include <chrono>
@@ -46,11 +50,18 @@ namespace pk = ak::oar::net::packet;
 
 constexpr std::uint32_t vpc_one = 1;
 constexpr std::uint32_t vpc_two = 2;
-constexpr std::size_t nic_count = 5;  // a, b local + c remote in one; x local in two; dead
-constexpr std::array<std::uint64_t, nic_count> nic_ids{1, 2, 3, 4, 5};
-constexpr std::array<std::uint32_t, nic_count> nic_vnis{vpc_one, vpc_one, vpc_one, vpc_two, 0};
+// a, b local + c, e remote in one; x local in two; dead
+constexpr std::size_t nic_count = 6;
+constexpr std::array<std::uint64_t, nic_count> nic_ids{1, 2, 3, 4, 5, 6};
+constexpr std::array<std::uint32_t, nic_count> nic_vnis{vpc_one, vpc_one, vpc_one,
+                                                        vpc_two, 0,       vpc_one};
+// The subnet (third IPv4 octet, IPv6 byte 7) of each vpc_one NIC.
+constexpr std::array<std::uint8_t, nic_count> nic_subnets{0, 1, 1, 0, 0, 2};
+constexpr std::size_t subnet_count = 3;
+constexpr std::uint64_t subnet_id_base = 0x5B00;
 constexpr std::size_t remote_index = 2;
 constexpr std::size_t dead_index = 4;
+constexpr std::size_t e_index = 5;
 constexpr std::uint8_t self_tail = 1;
 constexpr std::uint8_t peer_tail = 2;
 constexpr std::size_t ipv6_last = 15;
@@ -97,15 +108,18 @@ public:
     std::vector<Sent> sent;
 };
 
-// Guest addresses: b (local) and c (remote) in vpc_one own one of each family.
+// Guest addresses: b (local), c and e (remote) in vpc_one own one of each
+// family, inside their subnet.
 auto ip4_of(std::size_t index) -> nb::Ipv4Address {
-    return {std::byte{10}, std::byte{0}, std::byte{0}, static_cast<std::byte>(index + 1)};
+    return {std::byte{10}, std::byte{0}, std::byte{nic_subnets.at(index)},
+            static_cast<std::byte>(index + 1)};
 }
 
 auto ip6_of(std::size_t index) -> net::Ipv6Address {
     net::Ipv6Address a{};
     a[0] = ula_prefix;
     a[1] = std::byte{1};
+    a[7] = std::byte{nic_subnets.at(index)};
     a[ipv6_last] = static_cast<std::byte>(index + 1);
     return a;
 }
@@ -113,7 +127,14 @@ auto ip6_of(std::size_t index) -> net::Ipv6Address {
 constexpr std::size_t b_index = 1;
 
 auto owns_addresses(std::size_t index) -> bool {
-    return index == b_index || index == remote_index;
+    return index == b_index || index == remote_index || index == e_index;
+}
+
+// Whether a frame from `sender` may reach `receiver`: the same subnet in
+// vpc_one (the VNI check is separate).
+auto same_subnet(std::size_t sender, std::size_t receiver) -> bool {
+    return sender >= nic_count || nic_vnis.at(sender) != vpc_one ||
+           nic_subnets.at(sender) == nic_subnets.at(receiver);
 }
 
 // Requirement 11: a forwarded frame is ARP, or IP from the true sender's
@@ -175,13 +196,15 @@ auto fuzz_parsers(std::span<const std::byte> in) -> void {
 auto fuzz_switch(std::span<const std::byte> in) -> void {
     net::MappingTable table{vtep(self_tail)};
     const auto entry = [](std::size_t i, std::uint8_t tail) {
-        return net::MapEntry{
-            .nic_id = geneve::NicId{nic_ids.at(i)}, .mac = mac(i), .owner_vtep = vtep(tail)};
+        return net::MapEntry{.nic_id = geneve::NicId{nic_ids.at(i)},
+                             .mac = mac(i),
+                             .owner_vtep = vtep(tail),
+                             .subnet_id = subnet_id_base + nic_subnets.at(i)};
     };
     if (!table.apply({.vni = vpc_one,
                       .version = 1,
                       .entries = {entry(0, self_tail), entry(1, self_tail),
-                                  entry(remote_index, peer_tail)}}) ||
+                                  entry(remote_index, peer_tail), entry(e_index, peer_tail)}}) ||
         !table.apply({.vni = vpc_two, .version = 1, .entries = {entry(3, self_tail)}})) {
         std::abort();
     }
@@ -201,34 +224,52 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
     }
     std::array<Port, nic_count> ports{};
     for (std::size_t i = 0; i < nic_count; ++i) {
-        if (i != remote_index && !sw.attach(geneve::NicId{nic_ids.at(i)}, ports.at(i),
-                                            static_cast<std::uint16_t>(1500))) {
+        if (i != remote_index && i != e_index &&
+            !sw.attach(geneve::NicId{nic_ids.at(i)}, ports.at(i),
+                       static_cast<std::uint16_t>(1500))) {
             std::abort();
         }
     }
     const geneve::NicId nic_b{nic_ids[b_index]};
     const geneve::NicId nic_c{nic_ids[remote_index]};
+    const geneve::NicId nic_e{nic_ids[e_index]};
     if (!sw.set_neighbors({.vni = vpc_one,
-                           .ipv4 = {{ip4_of(b_index), nic_b}, {ip4_of(remote_index), nic_c}},
-                           .ipv6 = {{ip6_of(b_index), nic_b}, {ip6_of(remote_index), nic_c}}})) {
+                           .ipv4 = {{ip4_of(b_index), nic_b},
+                                    {ip4_of(remote_index), nic_c},
+                                    {ip4_of(e_index), nic_e}},
+                           .ipv6 = {{ip6_of(b_index), nic_b},
+                                    {ip6_of(remote_index), nic_c},
+                                    {ip6_of(e_index), nic_e}}})) {
         std::abort();
     }
     // vpc_one has a gateway (DHCP, gateway ARP/ND); vpc_two has none. The
     // gateway's own address is nobody's, so a reply leaking to another NIC
     // or the underlay fails forwarded_ok().
-    net::Ipv6Address prefix6 = ip6_of(0);
-    prefix6[ipv6_last] = std::byte{0};
-    if (!sw.set_vpc_config(
-            vpc_one, {.gateway_mac = {locally_administered, std::byte{0xaa}, std::byte{0},
-                                      std::byte{0}, std::byte{0}, std::byte{1}},
-                      .ipv4 = {.address = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}},
-                               .length = 24},
-                      .ipv4_gateway = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{254}},
-                      .ipv6_prefix = prefix6,
-                      .dns4 = {},
-                      .dns6 = {},
-                      .domain = "fuzz.internal",
-                      .lease_seconds = 60})) {
+    net::Ipv6Address block6 = ip6_of(0);
+    block6[ipv6_last] = std::byte{0};
+    net::VpcConfig config{
+        .gateway_mac = {locally_administered, std::byte{0xaa}, std::byte{0}, std::byte{0},
+                        std::byte{0}, std::byte{1}},
+        .ipv4_blocks = {{.address = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}},
+                         .length = 16}},
+        .ipv6_block = block6,
+        .subnets = {},
+        .dns4 = {},
+        .dns6 = {},
+        .domain = "fuzz.internal",
+        .lease_seconds = 60};
+    for (std::uint8_t i = 0; i < subnet_count; ++i) {
+        net::Ipv6Address prefix6 = block6;
+        prefix6[7] = std::byte{i};
+        config.subnets.push_back(
+            {.id = subnet_id_base + i,
+             .ipv4 = {.address = {std::byte{10}, std::byte{0}, std::byte{i}, std::byte{0}},
+                      .length = 24},
+             .gateway = {std::byte{10}, std::byte{0}, std::byte{i}, std::byte{254}},
+             .ipv6_prefix = prefix6,
+             .table = 1});
+    }
+    if (!sw.set_vpc_config(vpc_one, config)) {
         std::abort();
     }
 
@@ -259,10 +300,18 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
                     !forwarded_ok(s.frame, src)) {
                     std::abort();
                 }
+                // Unicast reaches only the sender's subnet; replicas go only
+                // to the peer VTEP, which hosts a NIC of B and of C.
+                const std::size_t dst = index_of(s.nics.dst);
+                if (s.nics.dst == geneve::nic_broadcast
+                        ? vni == vpc_one && nic_subnets.at(src) == 0
+                        : dst >= nic_count || !same_subnet(src, dst)) {
+                    std::abort();
+                }
             }
             for (std::size_t i = 0; i < nic_count; ++i) {
                 if (i != src && ports.at(i).frames != before.at(i) &&
-                    !forwarded_ok(ports.at(i).last, src)) {
+                    (!forwarded_ok(ports.at(i).last, src) || !same_subnet(src, i))) {
                     std::abort();
                 }
             }
@@ -293,7 +342,7 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
                 const std::size_t sender = pkt->nics ? index_of(pkt->nics->src) : nic_count;
                 for (std::size_t i = 0; i < nic_count; ++i) {
                     if (ports.at(i).frames != before.at(i) &&
-                        !forwarded_ok(ports.at(i).last, sender)) {
+                        (!forwarded_ok(ports.at(i).last, sender) || !same_subnet(sender, i))) {
                         std::abort();
                     }
                 }

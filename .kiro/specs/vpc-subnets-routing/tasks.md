@@ -1,6 +1,6 @@
 # Implementation Plan — VPC subnets and the implicit router
 
-## Status: 3/12 tasks complete
+## Status: 4/12 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -40,7 +40,7 @@ end) for task 11.
 
 ### Phase B: the data plane
 
-- [ ] 4. `VpcState` in the network role and the subnet model in the
+- [x] 4. `VpcState` in the network role and the subnet model in the
   VSwitch: `nic_subnet` from the mapping, neighbor tables filtered to
   each NIC's subnet (`map_addr_outside_subnet`), NICs without a known
   subnet carry no IP; per-subnet gateway ARP/ND, ARP/ND proxy scoped to

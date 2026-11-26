@@ -18,6 +18,7 @@
 #include <openssl/rand.h>
 
 #include "common/wire.hpp"
+#include "proto/ec2_id.hpp"
 
 namespace ak::oar::net {
 
@@ -461,9 +462,13 @@ auto lookup(std::string_view rest, const MetadataView& view)
     }
     const auto leaf = key.substr(prefix.size());
     if (leaf.empty() || leaf == "/") {
-        return ok(
-            lines({"device-number", "interface-id", net.ipv6.empty() ? "" : "ipv6s", "local-ipv4s",
-                   "mac", net.subnet4 ? "subnet-ipv4-cidr-block" : "", "vpc-id"}));
+        return ok(lines({"device-number", "interface-id", net.ipv6.empty() ? "" : "ipv6s",
+                         "local-ipv4s", "mac", net.subnet_id ? "subnet-id" : "",
+                         net.subnet4 ? "subnet-ipv4-cidr-block" : "",
+                         net.subnet6 ? "subnet-ipv6-cidr-blocks" : "", "vpc-id",
+                         net.vpc4.empty() ? "" : "vpc-ipv4-cidr-block",
+                         net.vpc4.empty() ? "" : "vpc-ipv4-cidr-blocks",
+                         net.vpc6 ? "vpc-ipv6-cidr-blocks" : ""}));
     }
     if (leaf == "/device-number") {
         return ok(std::to_string(m.device_index));
@@ -483,8 +488,26 @@ auto lookup(std::string_view rest, const MetadataView& view)
     if (leaf == "/subnet-ipv4-cidr-block" && net.subnet4) {
         return ok(ipv4_text(*net.subnet4) + "/" + std::to_string(net.subnet4_length));
     }
+    if (leaf == "/subnet-id" && net.subnet_id) {
+        return ok(proto::ec2_id("subnet-", *net.subnet_id));
+    }
+    if (leaf == "/subnet-ipv6-cidr-blocks" && net.subnet6) {
+        return ok(ipv6_text(*net.subnet6) + "/64");
+    }
     if (leaf == "/vpc-id") {
         return ok(m.vpc_id);
+    }
+    const auto block_text = [](const NicNetwork::Ipv4Block& b) {
+        return ipv4_text(b.address) + "/" + std::to_string(b.length);
+    };
+    if (leaf == "/vpc-ipv4-cidr-block" && !net.vpc4.empty()) {
+        return ok(block_text(net.vpc4.front()));
+    }
+    if (leaf == "/vpc-ipv4-cidr-blocks" && !net.vpc4.empty()) {
+        return ok(lines_of(net.vpc4, block_text));
+    }
+    if (leaf == "/vpc-ipv6-cidr-blocks" && net.vpc6) {
+        return ok(ipv6_text(*net.vpc6) + "/56");
     }
     return std::nullopt;
 }

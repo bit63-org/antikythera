@@ -193,6 +193,17 @@ struct VpcState {                       // immutable, shared_ptr per VNI
 - `subnet_vteps` is the distinct remote VTEPs owning a NIC in each
   subnet, for group replication (Requirement 6.7).
 
+As built (task 4), the VSwitch does not precompute `nic_subnet`: each
+frame looks the NIC's subnet up from the snapshot's binding (the
+MapUpdate entry's subnet ID) and the VNI's config, a binary search over
+at most 200 subnets. That keeps the MappingTable, which other threads
+publish, and the config, which the data-plane thread owns, independent,
+and makes "applied in either order" hold by construction. `NetRole`
+filters the neighbor table whenever either input changes
+(`refresh_neighbors`), which is the one derived structure the design
+above keeps; the tries and `subnet_vteps` arrive with task 5 and task 12
+where they are needed.
+
 A VNI with a mapping but no config keeps today's behaviour (one L2
 segment, no gateway), which harbor's fabric tests and the unit tests
 rely on. A VNI with a config and a mapping whose entries all have subnet

@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -65,6 +66,7 @@ constexpr std::uint64_t server_two = 8;
 constexpr std::uint16_t key_id = 1;
 constexpr std::uint32_t vpc = 0x00AB'CD01;
 constexpr std::uint64_t vpc_subnet = 0x5B01;
+constexpr std::uint64_t other_subnet = 0x5B02;
 constexpr std::uint32_t underlay_mtu = 1500;
 constexpr std::size_t function_count = 2;
 constexpr oar::FunctionNumber fn0 = 0;
@@ -129,10 +131,13 @@ auto guest_ip(std::uint64_t nic) -> proto::Ipv4Address {
 }
 
 // Signs like the controller: encode with a blank signature, sign, set.
-// `addressed` NICs also get guest_ip(nic) in the frame (format v2).
+// `addressed` NICs also get guest_ip(nic) in the frame (format v2). Every
+// NIC is in vpc_subnet unless `subnets` names another (0 for none).
 auto signed_map(std::uint64_t server, std::uint64_t version,
                 const std::vector<std::pair<std::uint64_t, std::uint8_t>>& nics,
-                const std::vector<std::uint64_t>& addressed = {}) -> std::vector<std::byte> {
+                const std::vector<std::uint64_t>& addressed = {},
+                const std::map<std::uint64_t, std::uint64_t>& subnets = {})
+    -> std::vector<std::byte> {
     // Member by member, so the frame format can grow fields (v2's guest
     // addresses) without this needing every one spelled out.
     proto::MapUpdate m{};
@@ -141,7 +146,11 @@ auto signed_map(std::uint64_t server, std::uint64_t version,
     m.vni = vpc;
     m.map_version = version;
     for (const auto& [nic, tail] : nics) {
-        m.entries.push_back({.nic_id = nic, .mac = mac_of(nic), .owner_vtep = vtep(tail)});
+        const auto subnet = subnets.find(nic);
+        m.entries.push_back({.nic_id = nic,
+                             .mac = mac_of(nic),
+                             .owner_vtep = vtep(tail),
+                             .subnet_id = subnet == subnets.end() ? vpc_subnet : subnet->second});
     }
     for (const std::uint64_t nic : addressed) {  // ascending NIC IDs give ascending addresses
         m.ipv4.push_back({.nic_id = nic, .address = guest_ip(nic)});
@@ -155,9 +164,10 @@ auto signed_map(std::uint64_t server, std::uint64_t version,
 
 // A VpcConfig for `vpc`: block 10.0.0.0/16 and fd10::/56, one subnet
 // 10.0.0.0/24 (gateway .1) with fd10::/64, signed like the controller signs
-// it. `routes` adds a default route to nic_b to the main table.
+// it. `routes` adds a default route to nic_b to the main table;
+// `second_subnet` adds other_subnet, 10.0.1.0/24 without IPv6.
 auto signed_vpc(std::uint64_t server, std::uint64_t version, std::uint32_t lease = 3600,
-                bool routes = false) -> std::vector<std::byte> {
+                bool routes = false, bool second_subnet = false) -> std::vector<std::byte> {
     proto::VpcConfigFrame c{};
     c.server_id = server;
     c.key_id = key_id;
@@ -176,6 +186,14 @@ auto signed_vpc(std::uint64_t server, std::uint64_t version, std::uint32_t lease
                   .ipv4_prefix = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}},
                   .ipv4_length = 24,
                   .ipv6_prefix = ula}};
+    if (second_subnet) {
+        c.subnets.push_back(
+            {.subnet_id = other_subnet,
+             .table = 1,
+             .ipv4_prefix = {std::byte{10}, std::byte{0}, std::byte{1}, std::byte{0}},
+             .ipv4_length = 24,
+             .ipv6_prefix = std::nullopt});
+    }
     proto::VpcRouteTable main{.table = 1, .main = true, .routes = {}};
     if (routes) {
         main.routes.push_back({.kind = proto::RouteKind::nic,
@@ -677,6 +695,39 @@ BOOST_FIXTURE_TEST_CASE(map_updates_are_checked, One,
     BOOST_TEST(role->mappings().snapshot()->nic_count() == 0U);
 }
 
+// vpc-subnets-routing Requirement 2.6: a NIC's addresses count only inside
+// its subnet, and the mapping and config give the same table in either
+// order.
+BOOST_FIXTURE_TEST_CASE(guest_addresses_follow_the_nics_subnet, One,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // nic_b is placed in other_subnet (10.0.1.0/24) but its address is
+    // 10.0.0.x; nic_c names no subnet at all.
+    const auto map =
+        signed_map(server_one, 2, {{nic_a, self_tail}, {nic_b, self_tail}, {nic_c, peer_tail}},
+                   {nic_a, nic_b, nic_c}, {{nic_b, other_subnet}, {nic_c, 0}});
+    const auto config = signed_vpc(server_one, 2, 3600, false, true);
+    const auto count = [](net::NetRole& r, std::uint64_t nic) {
+        return r.vswitch().nic_addresses(vpc, net::geneve::NicId{nic}).first.size();
+    };
+
+    BOOST_REQUIRE((role->map_update(map) == Status::ok));
+    BOOST_TEST(count(*role, nic_b) == 1U);  // no config: one segment, every address counts
+    BOOST_REQUIRE((role->vpc_config(config) == Status::ok));
+    BOOST_TEST(count(*role, nic_a) == 1U);
+    BOOST_TEST(count(*role, nic_b) == 0U);
+    BOOST_TEST(count(*role, nic_c) == 0U);
+    BOOST_TEST(role->counters().map_addr_outside_subnet == 2U);
+
+    Board other{server_one, self_tail};
+    BOOST_REQUIRE((other.role->vpc_config(config) == Status::ok));
+    BOOST_REQUIRE((other.role->map_update(map) == Status::ok));
+    for (const std::uint64_t nic : {nic_a, nic_b, nic_c}) {
+        BOOST_TEST((other.role->vswitch().nic_addresses(vpc, net::geneve::NicId{nic}) ==
+                    role->vswitch().nic_addresses(vpc, net::geneve::NicId{nic})));
+    }
+    BOOST_TEST(other.role->counters().map_addr_outside_subnet == 2U);
+}
+
 // An ARP request from `nic` for `target`, as a guest sends it.
 BOOST_FIXTURE_TEST_CASE(vpc_configs_are_checked, One,
                         *boost::unit_test::timeout(unit_timeout_seconds)) {
@@ -699,10 +750,15 @@ BOOST_FIXTURE_TEST_CASE(vpc_configs_are_checked, One,
     const auto* applied = role->vswitch().vpc_config(vpc);
     BOOST_REQUIRE(applied != nullptr);
     BOOST_TEST(std::to_integer<int>(applied->gateway_mac[5]) == 0xFE);
-    BOOST_TEST(applied->ipv4.length == 24U);
-    BOOST_TEST(std::to_integer<int>(applied->ipv4_gateway[3]) == 1);
-    BOOST_REQUIRE(applied->ipv6_prefix.has_value());
-    BOOST_TEST(std::to_integer<int>((*applied->ipv6_prefix)[1]) == 0x10);
+    BOOST_REQUIRE(applied->subnets.size() == 1U);
+    const auto& subnet = applied->subnets.front();
+    BOOST_TEST(subnet.id == vpc_subnet);
+    BOOST_TEST(subnet.ipv4.length == 24U);
+    BOOST_TEST(std::to_integer<int>(subnet.gateway[3]) == 1);
+    BOOST_REQUIRE(subnet.ipv6_prefix.has_value());
+    BOOST_TEST(std::to_integer<int>((*subnet.ipv6_prefix)[1]) == 0x10);
+    BOOST_REQUIRE(applied->ipv4_blocks.size() == 1U);
+    BOOST_TEST(applied->ipv4_blocks.front().length == 16U);
     BOOST_REQUIRE(applied->dns4.size() == 1U);
     BOOST_TEST(applied->domain == "ec2.internal");
     BOOST_TEST(applied->lease_seconds == 3600U);
@@ -1293,6 +1349,11 @@ BOOST_FIXTURE_TEST_CASE(metadata_requests_go_through_the_tun_and_back, WithMetad
     BOOST_REQUIRE(view.network.ipv4.size() == 1U);
     BOOST_TEST((view.network.ipv4[0] == guest_ip(nic_a)));
     BOOST_TEST(view.network.subnet4_length == 24U);
+    BOOST_TEST(view.network.subnet_id.value_or(0) == vpc_subnet);
+    BOOST_TEST(view.network.subnet6.has_value());
+    BOOST_REQUIRE(view.network.vpc4.size() == 1U);
+    BOOST_TEST(view.network.vpc4[0].length == 16U);
+    BOOST_TEST(view.network.vpc6.has_value());
     BOOST_TEST(role->metadata_view(nic_b).record == nullptr);
 
     // Cleaning the NIC releases its aliases.

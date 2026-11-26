@@ -157,6 +157,7 @@ ak_add_test(khold_initiator_test  SOURCES khold_initiator_test.cpp  LIBS ak::oar
 ak_add_test(network_volume_test   SOURCES network_volume_test.cpp   LIBS ak::oar_blk_volume ak::hold_role OpenSSL::Crypto)
 ak_add_test(volume_copier_test    SOURCES volume_copier_test.cpp    LIBS ak::oar_blk)
 ak_add_test(hydrating_backend_test SOURCES hydrating_backend_test.cpp LIBS ak::oar_blk_image ak::oar_blk_volume ak::hold_server)
+ak_add_test(khold_volume_test     SOURCES khold_volume_test.cpp     LIBS ak::oar_blk_volume OpenSSL::Crypto)
 ak_add_test(role_identity_test    SOURCES role_identity_test.cpp    LIBS ak::tls OpenSSL::Crypto)
 ak_add_test(proto_hold_wire_test  SOURCES proto_hold_wire_test.cpp  LIBS ak::proto)
 ak_add_test(proto_hold_wire_v2_test SOURCES proto_hold_wire_v2_test.cpp LIBS ak::proto)

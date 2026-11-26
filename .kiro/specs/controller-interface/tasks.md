@@ -1,6 +1,6 @@
 # Implementation Plan — Controller interface and the kythira EC2 integration
 
-## Status: 11/14 tasks complete
+## Status: 14/16 tasks complete
 
 ## Tasks
 
@@ -84,9 +84,11 @@
   `ControllerSink::on_instance_metadata`, which drops it until helm keeps
   records (helm-control-plane task 14). `ak-test-controller` sends it with
   `instance-metadata NIC VNI VERSION INSTANCE_ID [KEY=VALUE ...]`.
-- [ ] 6. Draft the kythira `ec2-compatible-api` spec in the kythira
+- [x] 6. Draft the kythira `ec2-compatible-api` spec in the kythira
   repository, from Requirements 6 and 9 (network volumes ported from
-  `ak_hold_master`). _Requirements: 6, 9_
+  `ak_hold_master`). _Requirements: 6, 9_ — Done in kythira
+  (`.kiro/specs/ec2-compatible-api/`, 0a4efaf, 2026-11-24); its 21 tasks
+  are all open there.
 - [ ] 7. End-to-end: AWS CLI `run-instances` against kythira, landing in a
   harbor server. _Requirements: 6.1_
 - [ ] 12. Controller policy state, admission checks and usage metering

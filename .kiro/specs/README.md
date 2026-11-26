@@ -6,14 +6,14 @@ Steering that applies to all of them is in `../steering/`.
 
 | Spec | Piece | Status |
 |---|---|---|
-| [helm-control-plane](helm-control-plane/) | Control-plane role: mailbox, device pool, keys, sideband, power sequencing | 12/13 |
+| [helm-control-plane](helm-control-plane/) | Control-plane role: mailbox, device pool, keys, sideband, power sequencing | 13/14 |
 | [hull-host-agent](hull-host-agent/) | Minimal host image and agent: VFIO, jailed Cloud Hypervisor, lifecycle | 9/11 |
-| [oar-net-data-plane](oar-net-data-plane/) | virtio-net, VPC switching, Geneve VTEP with NIC IDs, WireGuard | 19/22 |
+| [oar-net-data-plane](oar-net-data-plane/) | virtio-net, VPC switching, Geneve VTEP with NIC IDs, WireGuard | 21/22 |
 | [oar-blk-data-plane](oar-blk-data-plane/) | virtio-blk with transparent per-VM AES-XTS, crypto-erase, lazy S3 image volumes | 13/16 |
-| [block-volume-service](block-volume-service/) | hold: replicated network volumes for VM guests (EBS-like), failover, rebuild, live moves, snapshots | 14/24 |
+| [block-volume-service](block-volume-service/) | hold: replicated network volumes for VM guests (EBS-like), failover, rebuild, live moves, snapshots | 17/24 |
 | [oar-gpu-data-plane](oar-gpu-data-plane/) | GPUs: designed now, built after network and storage | designed |
 | [harbor-virt-on-virt](harbor-virt-on-virt/) | Nested-KVM prototype of the whole system | 4/10 |
-| [controller-interface](controller-interface/) | Signed commands, mappings, inventory; kythira EC2 mapping | 10/13 |
+| [controller-interface](controller-interface/) | Signed commands, mappings, inventory; kythira EC2 mapping | 14/16 |
 | [backplane-hardware](backplane-hardware/) | Physical PCIe backplane requirements | deferred |
 | [build-and-ci](build-and-ci/) | Toolchain, vcpkg, caching and CI, following kythira | 9/11 |
 

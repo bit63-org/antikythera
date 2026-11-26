@@ -185,6 +185,13 @@ public:
     // mistaken for resends. Its old intents must already be in the copy.
     [[nodiscard]] auto rebase(std::uint64_t seq) -> std::expected<void, StoreError>;
     [[nodiscard]] auto unhydrated(std::uint64_t lba) -> std::expected<bool, StoreError>;
+    // Blocks still awaiting hydration (block-volume task 23.2): counted
+    // from the bitmap at open and kept as bits change, so replica_status
+    // reports fill progress without reading the bitmap. 0 without a
+    // source, and never more than the source's blocks.
+    [[nodiscard]] auto unhydrated_blocks() const noexcept -> std::uint64_t {
+        return _unhydrated_blocks;
+    }
     [[nodiscard]] auto chunk_state(std::uint64_t chunk) -> std::expected<ChunkState, StoreError>;
     // Chunks written since the last clear_changed (a snapshot freeze).
     [[nodiscard]] auto changed_chunks() -> std::expected<std::vector<std::uint64_t>, StoreError>;
@@ -224,6 +231,8 @@ private:
     [[nodiscard]] auto mark_written(std::uint64_t lba, std::uint64_t blocks)
         -> std::expected<void, StoreError>;
     [[nodiscard]] auto recover() -> std::expected<void, StoreError>;
+    // Counts the unhydrated bitmap's set bits into _unhydrated_blocks.
+    [[nodiscard]] auto count_unhydrated() -> std::expected<void, StoreError>;
     [[nodiscard]] auto sync_meta() -> std::expected<void, StoreError>;
 
     FileLayer* _files;
@@ -235,8 +244,9 @@ private:
     bool _reflink{false};
     std::uint64_t _last_seq{0};
     std::uint64_t _commit_seq{0};
-    std::uint64_t _meta_synced_seq{0};  // writes up to here have durable checksums
-    std::vector<Intent> _ring;          // by slot; seq 0 empty
+    std::uint64_t _meta_synced_seq{0};    // writes up to here have durable checksums
+    std::vector<Intent> _ring;            // by slot; seq 0 empty
+    std::uint64_t _unhydrated_blocks{0};  // set bits of the unhydrated bitmap
 };
 
 }  // namespace ak::hold::store

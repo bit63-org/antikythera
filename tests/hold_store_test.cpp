@@ -621,6 +621,7 @@ BOOST_AUTO_TEST_CASE(hydrates_restored_blocks, *utf::timeout(ak::test::unit_time
     BOOST_TEST(s->unhydrated(20).value());
     BOOST_TEST(s->unhydrated(21).error() == StoreError::bad_request);
     BOOST_TEST(read_blocks(*s, 0, 1).error() == StoreError::not_hydrated);
+    BOOST_TEST(s->unhydrated_blocks() == 21U);
 
     const auto src = content(100, 512, 21);
     const auto part = [&](std::uint64_t lba, std::uint64_t n) {
@@ -647,6 +648,7 @@ BOOST_AUTO_TEST_CASE(hydrates_restored_blocks, *utf::timeout(ak::test::unit_time
     BOOST_TEST(s->hydrate(16, part(16, 5), crcs_of(part(16, 5), 512)).value() == 3U);
     BOOST_TEST(s->chunk_state(2).value() == ChunkState::hydrated);
     BOOST_TEST(s->chunk_state(1).value() == ChunkState::unhydrated);
+    BOOST_TEST(s->unhydrated_blocks() == 8U);  // chunk 1 alone
     // Bad input changes nothing.
     auto crcs = crcs_of(part(8, 1), 512);
     crcs[0] ^= 1U;
@@ -654,6 +656,12 @@ BOOST_AUTO_TEST_CASE(hydrates_restored_blocks, *utf::timeout(ak::test::unit_time
     BOOST_TEST(s->hydrate(20, part(19, 2), crcs_of(part(19, 2), 512)).error() ==
                StoreError::bad_request);
     BOOST_TEST(s->unhydrated(8).value());
+    BOOST_TEST(s->unhydrated_blocks() == 8U);
+    // The count survives a reopen (counted from the bitmap).
+    BOOST_TEST_REQUIRE(s->flush().has_value());
+    s.reset();
+    s = reopen(files);
+    BOOST_TEST(s->unhydrated_blocks() == 8U);
     // Hydration is not a write: chunks stay unchanged.
     BOOST_TEST((s->changed_chunks().value() == std::vector<std::uint64_t>{0}));
     // A volume without a source has nothing to hydrate.
@@ -662,6 +670,7 @@ BOOST_AUTO_TEST_CASE(hydrates_restored_blocks, *utf::timeout(ak::test::unit_time
     BOOST_TEST(p->hydrate(0, part(0, 2), crcs_of(part(0, 2), 512)).value() == 0U);
     BOOST_TEST(p->chunk_state(0).value() == ChunkState::hydrated);
     BOOST_TEST(!p->unhydrated(0).value());
+    BOOST_TEST(p->unhydrated_blocks() == 0U);
 }
 
 BOOST_AUTO_TEST_CASE(hydrate_writes_fill_only_unwritten_blocks,
@@ -822,6 +831,7 @@ BOOST_AUTO_TEST_CASE(grows_a_restored_volume, *utf::timeout(ak::test::unit_timeo
     BOOST_TEST(s->unhydrated(8).value());
     BOOST_TEST(s->unhydrated(20).value());
     BOOST_TEST(!s->unhydrated(21).value());
+    BOOST_TEST(s->unhydrated_blocks() == 13U);                     // a grow adds nothing to fill
     BOOST_TEST(s->chunk_state(2).value() == ChunkState::partial);  // blocks 16-20 of 16-23
     BOOST_TEST(s->chunk_state(4).value() == ChunkState::hydrated);
     BOOST_TEST((read_blocks(*s, 0, 8)->data == src));
@@ -1161,6 +1171,15 @@ auto run(ReplicaStore& s, const std::vector<Op>& ops, Model& model) -> void {
     }
 }
 
+// The fill-progress count the store keeps agrees with its bitmap.
+auto check_unhydrated_count(ReplicaStore& s) -> void {
+    std::uint64_t n = 0;
+    for (std::uint64_t lba = 0; lba < s.meta().capacity_blocks; ++lba) {
+        n += s.unhydrated(lba).value() ? 1U : 0U;
+    }
+    BOOST_TEST(s.unhydrated_blocks() == n);
+}
+
 auto crash_and_check(MemFiles& files, const Model& model, std::uint64_t k, std::uint64_t seed)
     -> void {
     files.crash(seed);
@@ -1168,6 +1187,7 @@ auto crash_and_check(MemFiles& files, const Model& model, std::uint64_t k, std::
     BOOST_TEST_INFO("crash at op " << k << ", seed " << seed);
     BOOST_TEST_REQUIRE(s.has_value());
     model.check(**s, k, seed);
+    check_unhydrated_count(**s);
     // Still a working replica once the primary publishes its commit point.
     const auto next = (*s)->last_seq() + 1;
     (*s)->set_commit(next - 1);
@@ -1188,6 +1208,7 @@ auto sweep(const ReplicaMeta& m, std::uint64_t scenario_seed, std::size_t n_ops)
         run(*s, ops, model);
         BOOST_TEST_REQUIRE(model.last_seq() > 0U);
         total = files.ops() - before;
+        check_unhydrated_count(*s);
     }
     for (std::uint64_t k = 1; k <= total + 1; ++k) {
         for (std::uint64_t seed = 1; seed <= 3; ++seed) {

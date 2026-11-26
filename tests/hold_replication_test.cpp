@@ -789,6 +789,49 @@ auto status_of(const std::vector<proto::ReportBody>& reports)
     return std::nullopt;
 }
 
+BOOST_AUTO_TEST_CASE(reports_fill_progress, *utf::timeout(ak::test::unit_timeout_seconds)) {
+    // Block-volume task 23.2: every member reports how much of a restored
+    // volume no longer awaits hydration, counting guest writes and hydrate
+    // writes alike, so the controller sees a restore finish.
+    Net net;
+    auto c = config(1);
+    c.source = {.kind = proto::SourceKind::image,
+                .store_id = 3,
+                .hydrate_mib_per_s = 50,
+                .manifest_name = {}};
+    c.source.manifest_name[0] = std::byte{1};
+    net.apply(c);
+    net.step();
+    const auto total = std::uint64_t{256} * bs;
+    for (const std::uint64_t id : {std::uint64_t{1}, std::uint64_t{2}, std::uint64_t{3}}) {
+        BOOST_TEST_INFO(id);
+        const auto e = status_of(net.hold(id).take_reports(net.now));
+        BOOST_TEST_REQUIRE(e.has_value());
+        BOOST_TEST(e->total_bytes == total);
+        BOOST_TEST(e->hydrated_bytes == 0U);
+    }
+    const auto s = net.initiator();
+    BOOST_TEST((net.status(s, net.write(s, 11, blocks_of(1, 1))) == HoldStatus::ok));
+    BOOST_TEST((net.status(s, net.write(s, 10, blocks_of(2, 4), 1, 1,
+                                        proto::hold_flags::hydrate)) == HoldStatus::ok));
+    // Blocks 10-13: one written, three hydrated (the written one once).
+    for (const std::uint64_t id : {std::uint64_t{1}, std::uint64_t{2}, std::uint64_t{3}}) {
+        BOOST_TEST_INFO(id);
+        const auto e = status_of(net.hold(id).take_reports(net.now + 1h));
+        BOOST_TEST_REQUIRE(e.has_value());
+        BOOST_TEST(e->hydrated_bytes == 4U * bs);
+        BOOST_TEST(net.hold(id).replica(vol)->unhydrated_blocks() == 252U);
+    }
+    // Filling the rest completes it.
+    BOOST_TEST((net.status(s, net.write(s, 0, blocks_of(3, 10), 1, 1,
+                                        proto::hold_flags::hydrate)) == HoldStatus::ok));
+    BOOST_TEST((net.status(s, net.write(s, 14, blocks_of(4, 242), 1, 1,
+                                        proto::hold_flags::hydrate)) == HoldStatus::ok));
+    const auto done = status_of(net.hold(2).take_reports(net.now + 2h));
+    BOOST_TEST_REQUIRE(done.has_value());
+    BOOST_TEST(done->hydrated_bytes == total);
+}
+
 // Server 1 hangs: it runs no more, and nothing reaches it.
 auto hang(Net& net, std::uint64_t id) -> void {
     net.server(id).halted = true;
@@ -826,6 +869,9 @@ BOOST_AUTO_TEST_CASE(serves_reads_only_under_a_lease,
     BOOST_TEST(st->epoch == 1U);
     BOOST_TEST(st->last_seq == 1U);
     BOOST_TEST(st->lease_remaining_ms == 0U);
+    // Nothing to fill on a volume without a source.
+    BOOST_TEST(st->total_bytes == 256U * bs);
+    BOOST_TEST(st->hydrated_bytes == st->total_bytes);
     const auto member_st = status_of(net.hold(2).take_reports(net.now));
     BOOST_TEST_REQUIRE(member_st.has_value());
     BOOST_TEST((member_st->role == proto::ReplicaRole::secondary));

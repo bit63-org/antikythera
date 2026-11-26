@@ -196,7 +196,10 @@ repository. Prerequisites outside this spec: oar-blk task 14
     attachment resumes from the hold's bits alone); `BlkRole` puts it in
     front of the network backend when the config's source is an image.
   - [ ] 23.2 Local ↔ network conversion as a keyed copy, and
-    `hydrated_bytes` in `replica_status` (still 0).
+    `hydrated_bytes` in `replica_status`. As built so far: every replica
+    reports `total_bytes` and `hydrated_bytes` (the capacity less the
+    blocks still unhydrated, counted at open and kept as bits change);
+    conversion is still open.
 - [x] 24. Scrubbing: periodic full read and checksum verification per
   replica within 14 days, repair from peers, reporting.
   _Requirements: 5.5_ (cloud) As built: `scrub` VolumeOp run by

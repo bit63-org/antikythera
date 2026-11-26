@@ -908,10 +908,19 @@ As built (task 23.1):
   its next attach with no record but the hold's bits; failures are
   retried after a backoff. The role builds it when the config's source
   is an image, and `deliver_key` gives it the volume key and K_img.
+- **Fill progress** (task 23.2). Every replica reports `total_bytes`
+  (its capacity) and `hydrated_bytes` (what no longer awaits a fill:
+  the capacity less the blocks still marked unhydrated) in each
+  `replica_status`, so a restore is complete when the two are equal; a
+  volume with no source reports them equal from the start. The store
+  counts the unhydrated bitmap once at open and keeps the count as bits
+  change (guest writes, hydrate writes, `HYDRATE_FILL`, recovery
+  re-marking a block), so a status costs no bitmap read; capacity a grow
+  adds awaits nothing. The count is a property of the bitmap, not of
+  hold's wire, so khold's block store can report it the same way.
 - **Not yet:** blocks past the image but inside the original capacity
   are hydrated as encrypted zeros (a grown volume's new blocks are not:
-  they read as never written); `replica_status` still reports
-  `hydrated_bytes` 0; local ↔ network conversion (23.2).
+  they read as never written); local ↔ network conversion (23.2).
 
 **Clones** (Requirement 11.6, EBS `CopyVolumes`): a cut as for a snapshot,
 then each member `FICLONE`s its replica into a new replica directory for

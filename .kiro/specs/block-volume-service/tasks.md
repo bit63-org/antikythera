@@ -177,7 +177,7 @@ repository. Prerequisites outside this spec: oar-blk task 14
 - [ ] 22. Same-lineage restore and clones: hold-side on-demand and
   background hydration at a set rate, fast restore, `FICLONE` clones.
   _Requirements: 2.3, 11.4-11.6_ (cloud)
-- [ ] 23. Foreign-key restore: `HydratingBackend` in oar-blk for public
+- [x] 23. Foreign-key restore: `HydratingBackend` in oar-blk for public
   images and re-keyed restores, `not_hydrated` and the `HYDRATE` write
   flag; local ↔ network conversion as a keyed copy. _Requirements: 8.6,
   11.7, 12.5_ (cloud)
@@ -195,11 +195,19 @@ repository. Prerequisites outside this spec: oar-blk task 14
     `hydrate_mib_per_s`, skipping regions a read finds whole (a later
     attachment resumes from the hold's bits alone); `BlkRole` puts it in
     front of the network backend when the config's source is an image.
-  - [ ] 23.2 Local ↔ network conversion as a keyed copy, and
-    `hydrated_bytes` in `replica_status`. As built so far: every replica
+  - [x] 23.2 Local ↔ network conversion as a keyed copy, and
+    `hydrated_bytes` in `replica_status`. As built: every replica
     reports `total_bytes` and `hydrated_bytes` (the capacity less the
-    blocks still unhydrated, counted at open and kept as bits change);
-    conversion is still open.
+    blocks still unhydrated, counted at open and kept as bits change).
+    Conversion copies between two existing detached volumes on the local
+    volume's server: oar-blk's `VolumeCopier` (generic over
+    `BlockBackend`, so khold can reuse it) rewraps each written block
+    from the source's key to the target's and skips never-written ones,
+    behind the `copy_volume` sideband op; mailbox `CONVERT_VOLUME`
+    starts it once hull has checked the signature (helm unwraps the
+    local key and opens the utility attachment's key), and helm reports
+    `conversion_progress` until it ends. A restored network source is
+    converted only once fully hydrated.
 - [x] 24. Scrubbing: periodic full read and checksum verification per
   replica within 14 days, repair from peers, reporting.
   _Requirements: 5.5_ (cloud) As built: `scrub` VolumeOp run by

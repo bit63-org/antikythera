@@ -42,6 +42,9 @@ auto AgentHandler::handle(const mb::Message& /*msg*/, const mb::Body& body) -> C
             // helm withdraws a busy cooperative detach itself and never
             // relays the command: there is nothing here to withdraw.
             [](const mb::WithdrawDetach&) { return just(mb::Status::unsupported); },
+            // helm runs the copy on its storage role once hull has
+            // checked the signature: hull has nothing to do.
+            [](const mb::ConvertVolume&) { return just(mb::Status::ok); },
             [](const mb::CreateNetwork&) { return just(mb::Status::ok); },
             [](const mb::DeleteNetwork&) { return just(mb::Status::ok); },
             // Responses and events never reach a handler (the client only

@@ -263,6 +263,16 @@ auto policy(std::string_view s) -> std::expected<mb::DetachPolicy, std::string> 
     return std::unexpected("policy must be force, destroy-vm or wait");
 }
 
+auto convert_direction(std::string_view s) -> std::expected<mb::ConvertDirection, std::string> {
+    if (s == "to-network") {
+        return mb::ConvertDirection::to_network;
+    }
+    if (s == "to-local") {
+        return mb::ConvertDirection::to_local;
+    }
+    return std::unexpected("direction must be to-network or to-local");
+}
+
 auto mac(std::string_view s) -> std::expected<proto::Mac, std::string> {
     proto::Mac out{};
     for (std::size_t i = 0; i < out.size(); ++i) {
@@ -707,6 +717,7 @@ constexpr std::array kind_names{
     std::pair{"group_status", proto::ReportKind::group_status},
     std::pair{"capacity", proto::ReportKind::capacity},
     std::pair{"group_fault", proto::ReportKind::group_fault},
+    std::pair{"conversion_progress", proto::ReportKind::conversion_progress},
 };
 
 template<typename T, std::size_t N>
@@ -745,6 +756,7 @@ public:
     auto image() -> mb::ImageName { return take(image_name(next())); }
     [[nodiscard]] auto more() const noexcept -> bool { return _pos < _args.size(); }
     auto detach_policy() -> mb::DetachPolicy { return take(policy(next())); }
+    auto direction() -> mb::ConvertDirection { return take(convert_direction(next())); }
 
     [[nodiscard]] auto error() const -> const std::string& { return _error; }
 
@@ -875,6 +887,19 @@ constexpr std::array verbs{
              const auto from = p.num<std::uint64_t>("from VM id");
              const auto to = p.num<std::uint64_t>("to VM id");
              return mb::RewrapVolume{.volume_id = vol, .from_vm = from, .to_vm = to};
+         }},
+    Verb{"convert-volume", 5,
+         [](Args& p) -> mb::Body {
+             const auto local = p.num<std::uint64_t>("local volume id");
+             const auto owner = p.num<std::uint64_t>("owner VM id");
+             const auto network = p.num<std::uint64_t>("network volume id");
+             const auto dir = p.direction();
+             const auto pace = p.num<std::uint32_t>("MiB/s");
+             return mb::ConvertVolume{.local_volume_id = local,
+                                      .owner_vm = owner,
+                                      .network_volume_id = network,
+                                      .direction = dir,
+                                      .mib_per_s = pace};
          }},
     Verb{"create-network", 1,
          [](Args& p) -> mb::Body { return mb::CreateNetwork{.vni = p.num<std::uint32_t>("VNI")}; }},
@@ -1170,6 +1195,12 @@ auto to_string(const proto::Report& report) -> std::string {
             } else if constexpr (std::is_same_v<T, proto::GroupFault>) {
                 os << " volume=" << b.volume_id << " group=" << b.group_id
                    << " fault=" << static_cast<int>(b.kind) << " suspect=" << b.suspect;
+            } else if constexpr (std::is_same_v<T, proto::ConversionProgress>) {
+                os << " local=" << b.local_volume_id << " network=" << b.network_volume_id
+                   << " direction=" << static_cast<int>(b.direction)
+                   << " state=" << static_cast<int>(b.state)
+                   << " failure=" << static_cast<int>(b.failure) << " bytes=" << b.done_bytes << "/"
+                   << b.total_bytes;
             } else {
                 static_assert(std::is_same_v<T, proto::SnapshotProgress>);
                 os << " volume=" << b.volume_id << " cut=" << b.cut_id

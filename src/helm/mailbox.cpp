@@ -37,6 +37,7 @@ constexpr std::size_t attach_volume_body_len = 20;
 constexpr std::size_t detach_volume_body_len = 24;
 constexpr std::size_t rewrap_volume_body_len = 24;
 constexpr std::size_t withdraw_detach_body_len = 20;
+constexpr std::size_t convert_volume_body_len = 32;
 constexpr std::size_t network_body_len = 4;
 constexpr std::size_t vm_exited_body_len = 14;
 constexpr std::size_t device_released_body_len = 14;
@@ -58,6 +59,7 @@ constexpr auto known_type(std::uint16_t raw) noexcept -> bool {
         case Type::detach_volume:
         case Type::rewrap_volume:
         case Type::withdraw_detach:
+        case Type::convert_volume:
         case Type::create_network:
         case Type::delete_network:
         case Type::gpu_vf_config:
@@ -341,6 +343,30 @@ auto decode_rewrap_volume(const Message& msg) noexcept -> std::expected<RewrapVo
     if (out.volume_id == 0 || out.from_vm == 0 || out.to_vm == 0 || out.from_vm == out.to_vm) {
         return invalid();
     }
+    return out;
+}
+
+auto decode_convert_volume(const Message& msg) noexcept -> std::expected<ConvertVolume, BodyError> {
+    auto r = check_shape(msg, Type::convert_volume, convert_volume_body_len);
+    if (!r) {
+        return std::unexpected(r.error());
+    }
+    ConvertVolume out;
+    out.local_volume_id = *r->le64();
+    out.owner_vm = *r->le64();
+    out.network_volume_id = *r->le64();
+    const std::uint8_t direction = *r->u8();
+    const std::uint8_t rsvd8 = *r->u8();
+    const std::uint16_t rsvd16 = *r->le16();
+    out.mib_per_s = *r->le32();
+    if (out.local_volume_id == 0 || out.owner_vm == 0 || out.network_volume_id == 0 ||
+        out.local_volume_id == out.network_volume_id ||
+        (direction != std::to_underlying(ConvertDirection::to_network) &&
+         direction != std::to_underlying(ConvertDirection::to_local)) ||
+        rsvd8 != reserved_byte || rsvd16 != 0) {
+        return invalid();
+    }
+    out.direction = static_cast<ConvertDirection>(direction);
     return out;
 }
 
@@ -659,6 +685,8 @@ auto decode_body(const Message& msg) noexcept -> std::expected<Body, BodyError> 
             return to_body(decode_rewrap_volume(msg));
         case Type::withdraw_detach:
             return to_body(decode_withdraw_detach(msg));
+        case Type::convert_volume:
+            return to_body(decode_convert_volume(msg));
         case Type::create_network:
             return to_body(decode_network<CreateNetwork>(msg, Type::create_network));
         case Type::delete_network:
@@ -694,6 +722,7 @@ auto type_of(const Body& body) noexcept -> Type {
                           [](const DetachVolume&) { return Type::detach_volume; },
                           [](const RewrapVolume&) { return Type::rewrap_volume; },
                           [](const WithdrawDetach&) { return Type::withdraw_detach; },
+                          [](const ConvertVolume&) { return Type::convert_volume; },
                           [](const CreateNetwork&) { return Type::create_network; },
                           [](const DeleteNetwork&) { return Type::delete_network; },
                           [](const Response&) { return Type::response; },
@@ -770,6 +799,15 @@ auto encode_body(const Body& body) -> std::vector<std::byte> {
                        w.le64(b.volume_id);
                        w.le64(b.vm_id);
                        write_device(w, b.device);
+                   },
+                   [&](const ConvertVolume& b) {
+                       w.le64(b.local_volume_id);
+                       w.le64(b.owner_vm);
+                       w.le64(b.network_volume_id);
+                       w.u8(std::to_underlying(b.direction));
+                       w.u8(reserved_byte);
+                       w.le16(0);
+                       w.le32(b.mib_per_s);
                    },
                    [&](const CreateNetwork& b) { w.le32(b.vni); },
                    [&](const DeleteNetwork& b) { w.le32(b.vni); },

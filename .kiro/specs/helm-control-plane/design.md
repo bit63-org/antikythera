@@ -76,6 +76,13 @@ Built in `src/helm/command_router.*`. Decisions made in the implementation:
   (block-volume-service design "Detach blocked while mounted"). A forged
   one could at worst ask a guest to let go of a disk, or tell it the
   request is over; the volume stays attached and serving either way.
+- `CONVERT_VOLUME` (block-volume-service task 23.2) relays like any
+  command; on hull's ok helm unwraps the local volume's key, opens the
+  utility attachment's key and starts the copy on the storage role
+  (`copy_volume`), audited `conversion_started`. It then queries the copy
+  every `conversion_poll_interval` and reports `conversion_progress`
+  until it ends (audited `conversion_completed` or `conversion_failed`),
+  releases it on the role and forgets the attachment key.
 - A failed attach (role refused, hull answered with an error, mailbox
   write failed) moves the function
   `assigned → cleaning` (pool event `attach_failed`): hull never handed

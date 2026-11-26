@@ -42,6 +42,10 @@
 //   withdraw-detach VOLUME VM SLOT FN
 //                        clears a busy cooperative detach's request
 //   rewrap-volume VOLUME FROM_VM TO_VM
+//   convert-volume LOCAL OWNER_VM NETWORK to-network|to-local MIB_PER_S
+//                        copies a detached local volume into a network
+//                        volume or back (0 MiB/s: unpaced; block-volume
+//                        task 23.2)
 //   create-network VNI
 //   delete-network VNI
 //   map-update VNI VERSION [NIC,MAC,VTEP[,GUEST_IP ...][,nocheck] ...]

@@ -119,6 +119,16 @@
 //     suspect u64 (server ID; required except for no_space)
 //     kind u8 (GroupFaultKind) | slot u8 | drive u8 | rsvd [5]
 //
+// Local <-> network conversion (block-volume-service Requirement 8.6,
+// task 23.2), from helm, which runs the copy on a storage role (`slot`):
+//   conversion_progress  -- one CONVERT_VOLUME's copy, while it runs and
+//                           once when it ends
+//     local_volume_id u64 | network_volume_id u64
+//     total_bytes u64 | done_bytes u64 | written_bytes u64 (both <= total)
+//     direction u8 (ConversionDirection) | state u8 (ConversionState)
+//     failure u8 (ConversionFailure; non-zero exactly when failed) | slot u8
+//     rsvd u32
+//
 // Enrollment (block-volume-service task 12, design "Keys and crypto-erase"
 // and "hold wire protocol"):
 //   enrollment  -- helm's secure-element transport key, sent after the
@@ -253,6 +263,7 @@ inline constexpr std::size_t capacity_fixed_size = 8;
 inline constexpr std::size_t capacity_entry_size = 56;
 inline constexpr std::size_t max_capacity_drives = 64;
 inline constexpr std::size_t group_fault_size = 48;
+inline constexpr std::size_t conversion_progress_size = 48;
 
 inline constexpr std::size_t max_report_size =
     report_header_size + std::max({max_inventory_size, max_group_usage_size,
@@ -279,6 +290,30 @@ enum class ReportKind : std::uint16_t {
     group_status = 17,
     capacity = 18,
     group_fault = 19,
+    conversion_progress = 20,
+};
+
+// Which way a conversion copies (mailbox CONVERT_VOLUME's direction).
+enum class ConversionDirection : std::uint8_t {
+    to_network = 1,
+    to_local = 2,
+};
+
+enum class ConversionState : std::uint8_t {
+    copying = 1,
+    completed = 2,  // every block copied and the target flushed
+    failed = 3,
+};
+
+enum class ConversionFailure : std::uint8_t {
+    none = 0,
+    source_io = 1,
+    target_io = 2,
+    not_hydrated = 3,  // the network source still awaits hydration
+    out_of_range = 4,
+    crypto = 5,
+    start = 6,  // the copy could not start (keys, the storage role)
+    lost = 7,   // the storage role no longer knew the copy
 };
 
 // Which storage role a certificate is for.
@@ -634,6 +669,19 @@ struct SnapshotProgress {
     friend auto operator==(const SnapshotProgress&, const SnapshotProgress&) -> bool = default;
 };
 
+struct ConversionProgress {
+    std::uint64_t local_volume_id{0};
+    std::uint64_t network_volume_id{0};
+    std::uint64_t total_bytes{0};
+    std::uint64_t done_bytes{0};
+    std::uint64_t written_bytes{0};
+    ConversionDirection direction{ConversionDirection::to_network};
+    ConversionState state{ConversionState::copying};
+    ConversionFailure failure{ConversionFailure::none};
+    std::uint8_t slot{0};
+    friend auto operator==(const ConversionProgress&, const ConversionProgress&) -> bool = default;
+};
+
 struct GroupStatusEntry {
     std::uint64_t volume_id{0};
     std::uint64_t group_id{0};
@@ -707,7 +755,7 @@ using ReportBody =
     std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport, MapApplied,
                  HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault, AttachmentStatus,
                  DemotionConfirmed, OpOutcome, SnapshotProgress, Enrollment, CertRequest,
-                 GroupMembership, GroupStatus, Capacity, GroupFault>;
+                 GroupMembership, GroupStatus, Capacity, GroupFault, ConversionProgress>;
 
 struct Report {
     std::uint64_t server_id{0};
@@ -720,7 +768,8 @@ struct Report {
 [[nodiscard]] inline auto report_kind(const ReportBody& body) noexcept -> ReportKind {
     return static_cast<ReportKind>(body.index() + 1);
 }
-static_assert(std::variant_size_v<ReportBody> == static_cast<std::size_t>(ReportKind::group_fault));
+static_assert(std::variant_size_v<ReportBody> ==
+              static_cast<std::size_t>(ReportKind::conversion_progress));
 
 namespace detail {
 
@@ -771,6 +820,15 @@ namespace detail {
 }
 [[nodiscard]] constexpr auto known(GroupFaultKind k) noexcept -> bool {
     return k >= GroupFaultKind::lagging && k <= GroupFaultKind::checksum_unrepairable;
+}
+[[nodiscard]] constexpr auto known(ConversionDirection d) noexcept -> bool {
+    return d == ConversionDirection::to_network || d == ConversionDirection::to_local;
+}
+[[nodiscard]] constexpr auto known(ConversionState s) noexcept -> bool {
+    return s >= ConversionState::copying && s <= ConversionState::failed;
+}
+[[nodiscard]] constexpr auto known(ConversionFailure f) noexcept -> bool {
+    return f <= ConversionFailure::lost;
 }
 [[nodiscard]] constexpr auto known_member_kind(std::uint8_t k) noexcept -> bool {
     // volume_layout.hpp's MemberKind (data 1, witness 2, learner 3); the
@@ -1073,6 +1131,21 @@ namespace detail {
     }
     if (all_zero(p.manifest_name) == (p.state == SnapshotState::completed)) {
         return std::unexpected(DecodeError::bad_source);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const ConversionProgress& p) noexcept
+    -> std::expected<void, DecodeError> {
+    if (!known(p.direction) || !known(p.state) || !known(p.failure) ||
+        ((p.failure != ConversionFailure::none) != (p.state == ConversionState::failed))) {
+        return std::unexpected(DecodeError::unknown_value);
+    }
+    if (p.local_volume_id == 0 || p.network_volume_id == 0) {
+        return std::unexpected(DecodeError::bad_id);
+    }
+    if (p.done_bytes > p.total_bytes || p.written_bytes > p.total_bytes) {
+        return std::unexpected(DecodeError::bad_capacity);
     }
     return {};
 }
@@ -1587,6 +1660,8 @@ inline constexpr std::size_t volume_event_size<DemotionConfirmed> = demotion_con
 template<> inline constexpr std::size_t volume_event_size<OpOutcome> = op_outcome_size;
 template<>
 inline constexpr std::size_t volume_event_size<SnapshotProgress> = snapshot_progress_size;
+template<>
+inline constexpr std::size_t volume_event_size<ConversionProgress> = conversion_progress_size;
 
 // Decodes one of the fixed-size network volume event bodies.
 template<typename T>
@@ -1633,6 +1708,17 @@ template<typename T>
         out.status = static_cast<OpStatus>(in.u8());
         out.slot = in.u8();
         zero = in.zeros(5);
+    } else if constexpr (std::is_same_v<T, ConversionProgress>) {
+        out.local_volume_id = in.le64();
+        out.network_volume_id = in.le64();
+        out.total_bytes = in.le64();
+        out.done_bytes = in.le64();
+        out.written_bytes = in.le64();
+        out.direction = static_cast<ConversionDirection>(in.u8());
+        out.state = static_cast<ConversionState>(in.u8());
+        out.failure = static_cast<ConversionFailure>(in.u8());
+        out.slot = in.u8();
+        zero = in.zeros(4);
     } else {
         static_assert(std::is_same_v<T, SnapshotProgress>);
         out.volume_id = in.le64();
@@ -1704,6 +1790,19 @@ inline auto write_volume_event(wire::Writer& w, const SnapshotProgress& b) -> vo
     w.u8(b.slot);
     w.bytes(std::array<std::byte, 6>{});
     w.bytes(b.manifest_name);
+}
+
+inline auto write_volume_event(wire::Writer& w, const ConversionProgress& b) -> void {
+    w.le64(b.local_volume_id);
+    w.le64(b.network_volume_id);
+    w.le64(b.total_bytes);
+    w.le64(b.done_bytes);
+    w.le64(b.written_bytes);
+    w.u8(static_cast<std::uint8_t>(b.direction));
+    w.u8(static_cast<std::uint8_t>(b.state));
+    w.u8(static_cast<std::uint8_t>(b.failure));
+    w.u8(b.slot);
+    w.le32(0);
 }
 
 [[nodiscard]] inline auto decode_enrollment(std::span<const std::byte> body)
@@ -2140,6 +2239,8 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
             return wrap(detail::decode_capacity(body));
         case ReportKind::group_fault:
             return wrap(detail::decode_group_fault(body));
+        case ReportKind::conversion_progress:
+            return wrap(detail::decode_volume_event<ConversionProgress>(body));
     }
     return std::unexpected(DecodeError::unknown_value);
 }

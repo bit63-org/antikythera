@@ -417,6 +417,18 @@ auto khold_bodies() -> std::vector<proto::ReportBody> {
                               .drive = 0}};
 }
 
+auto sample_conversion() -> proto::ConversionProgress {
+    return {.local_volume_id = 0x100,
+            .network_volume_id = 0x200,
+            .total_bytes = 64ULL << 20U,
+            .done_bytes = 16ULL << 20U,
+            .written_bytes = 4ULL << 20U,
+            .direction = proto::ConversionDirection::to_network,
+            .state = proto::ConversionState::copying,
+            .failure = proto::ConversionFailure::none,
+            .slot = 3};
+}
+
 auto every_body() -> std::vector<proto::ReportBody> {
     auto all = all_bodies();
     std::ranges::move(volume_bodies(), std::back_inserter(all));
@@ -429,6 +441,16 @@ auto every_body() -> std::vector<proto::ReportBody> {
     all.emplace_back(
         proto::CertRequest{.slot = 4, .role = proto::StorageRole::khold, .csr = der_seq(0)});
     std::ranges::move(khold_bodies(), std::back_inserter(all));
+    all.emplace_back(sample_conversion());
+    all.emplace_back(proto::ConversionProgress{.local_volume_id = 1,
+                                               .network_volume_id = 2,
+                                               .total_bytes = 4096,
+                                               .done_bytes = 1024,
+                                               .written_bytes = 0,
+                                               .direction = proto::ConversionDirection::to_local,
+                                               .state = proto::ConversionState::failed,
+                                               .failure = proto::ConversionFailure::lost,
+                                               .slot = 0});
     return all;
 }
 
@@ -546,7 +568,7 @@ BOOST_AUTO_TEST_CASE(header_rules) {
     b = good;
     set_le16(b, off_kind, 0);
     BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
-    set_le16(b, off_kind, 20);
+    set_le16(b, off_kind, 21);
     BOOST_TEST((decode_error(b) == DecodeError::unknown_value));
     b = good;
     b[off_reserved + 3] = std::byte{1};
@@ -1152,6 +1174,76 @@ BOOST_AUTO_TEST_CASE(khold_kinds_are_numbered_by_the_spec) {
         BOOST_TEST(std::to_integer<int>(bytes[off_kind]) == kind);
     }
     BOOST_TEST(static_cast<int>(proto::StorageRole::khold) == 3);
+}
+
+BOOST_AUTO_TEST_CASE(conversion_progress_layout_and_rules) {
+    BOOST_TEST(static_cast<std::uint16_t>(proto::report_kind(sample_conversion())) == 20U);
+    auto b = encoded(make_report(sample_conversion()));
+    BOOST_TEST(std::to_integer<int>(b[off_kind]) == 20);
+    BOOST_TEST(b.size() == body + proto::conversion_progress_size);
+    BOOST_TEST(le64_at(b, body) == 0x100U);               // local_volume_id
+    BOOST_TEST(le64_at(b, body + 8) == 0x200U);           // network_volume_id
+    BOOST_TEST(le64_at(b, body + 16) == (64ULL << 20U));  // total_bytes
+    BOOST_TEST(le64_at(b, body + 24) == (16ULL << 20U));  // done_bytes
+    BOOST_TEST(le64_at(b, body + 32) == (4ULL << 20U));   // written_bytes
+    BOOST_TEST(std::to_integer<int>(b[body + 40]) == 1);  // to_network
+    BOOST_TEST(std::to_integer<int>(b[body + 41]) == 1);  // copying
+    BOOST_TEST(std::to_integer<int>(b[body + 42]) == 0);  // no failure
+    BOOST_TEST(std::to_integer<int>(b[body + 43]) == 3);  // slot
+
+    using C = proto::ConversionProgress;
+    struct Case {
+        void (*mutate)(C&);
+        DecodeError want;
+    };
+    const Case cases[] = {
+        {[](C& c) { c.local_volume_id = 0; }, DecodeError::bad_id},
+        {[](C& c) { c.network_volume_id = 0; }, DecodeError::bad_id},
+        {[](C& c) { c.done_bytes = c.total_bytes + 1; }, DecodeError::bad_capacity},
+        {[](C& c) { c.written_bytes = c.total_bytes + 1; }, DecodeError::bad_capacity},
+        {[](C& c) { c.direction = static_cast<proto::ConversionDirection>(0); },
+         DecodeError::unknown_value},
+        {[](C& c) { c.direction = static_cast<proto::ConversionDirection>(3); },
+         DecodeError::unknown_value},
+        {[](C& c) { c.state = static_cast<proto::ConversionState>(4); },
+         DecodeError::unknown_value},
+        {[](C& c) { c.failure = static_cast<proto::ConversionFailure>(8); },
+         DecodeError::unknown_value},
+        // A failure is named exactly when the copy failed.
+        {[](C& c) { c.failure = proto::ConversionFailure::source_io; }, DecodeError::unknown_value},
+        {[](C& c) { c.state = proto::ConversionState::failed; }, DecodeError::unknown_value},
+    };
+    for (const auto& [mutate, want] : cases) {
+        auto c = sample_conversion();
+        mutate(c);
+        BOOST_TEST((encode_error(make_report(c)) == want));
+    }
+    // The decoder refuses the same values.
+    const std::pair<std::size_t, DecodeError> patches[] = {
+        {0, DecodeError::bad_id},          // local_volume_id low byte
+        {40, DecodeError::unknown_value},  // direction
+        {41, DecodeError::unknown_value},  // state
+        {42, DecodeError::unknown_value},  // failure while copying
+    };
+    for (const auto& [off, want] : patches) {
+        auto bad = encoded(make_report(sample_conversion()));
+        if (off == 0) {
+            for (std::size_t i = 0; i < 8; ++i) {
+                bad[body + i] = std::byte{0};
+            }
+        } else {
+            bad[body + off] = std::byte{9};
+        }
+        BOOST_TEST((decode_error(bad) == want), "offset " << off);
+    }
+    auto over = encoded(make_report(sample_conversion()));
+    over[body + 31] = std::byte{0xFF};  // done_bytes > total_bytes
+    BOOST_TEST((decode_error(over) == DecodeError::bad_capacity));
+    for (std::size_t off = 44; off < proto::conversion_progress_size; ++off) {
+        auto r = encoded(make_report(sample_conversion()));
+        r[body + off] = std::byte{1};
+        BOOST_TEST((decode_error(r) == DecodeError::reserved_not_zero), "offset " << off);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(khold_report_vectors_reproduce) {

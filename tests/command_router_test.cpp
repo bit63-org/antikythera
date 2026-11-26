@@ -208,6 +208,50 @@ struct FakeOar final : helm::OarPort {
         }
         return r.op == oar::EjectOp::cancel ? oar::EjectState::none : eject_state;
     }
+    // copy_volume: every request (without its keys), the keys of each
+    // start, and the answers to give (the last one repeats).
+    struct Copy {
+        oar::CopyOp op{oar::CopyOp::query};
+        oar::CopyDirection direction{oar::CopyDirection::to_network};
+        std::uint32_t mib_per_s{0};
+        VolumeId local{0};
+        VolumeId network{0};
+        std::uint64_t attachment{0};
+        std::uint32_t generation{0};
+    };
+    std::vector<Copy> copies;
+    std::vector<std::pair<std::vector<std::byte>, std::vector<std::byte>>> copy_keys;
+    std::deque<std::expected<oar::CopyAnswer, LinkError>> copy_answers;
+    auto copy_volume(const oar::CopyVolume& r, std::optional<helm::ScopedKey> local_key,
+                     std::optional<helm::ScopedKey> network_key)
+        -> std::expected<oar::CopyAnswer, LinkError> override {
+        copies.push_back({.op = r.op,
+                          .direction = r.direction,
+                          .mib_per_s = r.mib_per_s,
+                          .local = r.local_volume_id,
+                          .network = r.network_volume_id,
+                          .attachment = r.attachment_id,
+                          .generation = r.generation});
+        if (local_key && network_key) {
+            copy_keys.emplace_back(helm::ScopedKeyTestAccess::bytes(*local_key),
+                                   helm::ScopedKeyTestAccess::bytes(*network_key));
+        }
+        if (r.op == oar::CopyOp::release) {
+            return oar::CopyAnswer{};
+        }
+        if (copy_answers.empty()) {
+            return oar::CopyAnswer{.state = oar::CopyVolumeState::copying,
+                                   .failure = oar::CopyVolumeFailure::none,
+                                   .total_bytes = 0,
+                                   .done_bytes = 0,
+                                   .written_bytes = 0};
+        }
+        auto a = copy_answers.front();
+        if (copy_answers.size() > 1) {
+            copy_answers.pop_front();
+        }
+        return a;
+    }
 };
 
 struct FakeReports final : helm::ReportSink {
@@ -1778,4 +1822,281 @@ BOOST_AUTO_TEST_CASE(a_forced_network_detach_needs_the_attachment_fenced,
     BOOST_TEST((h.state(blk_slot, fn_one) == FunctionState::releasing));
     BOOST_TEST(!h.keys.attachment_key(net_attachment).has_value());
     BOOST_TEST(h.router.network_configs().empty());
+}
+
+// ---- local <-> network conversion (block-volume-service task 23.2) ----------
+
+namespace {
+
+constexpr VolumeId vol_image = 203;
+constexpr std::uint64_t total_bytes = std::uint64_t{size_gib} << 30U;
+const auto conversion_poll = helm::RouterConfig{}.conversion_poll_interval;
+
+auto convert(mb::ConvertDirection direction = mb::ConvertDirection::to_network)
+    -> mb::ConvertVolume {
+    return {.local_volume_id = vol_one,
+            .owner_vm = vm_one,
+            .network_volume_id = vol_two,
+            .direction = direction,
+            .mib_per_s = 50};
+}
+
+auto copy_answer(oar::CopyVolumeState state, std::uint64_t done,
+                 oar::CopyVolumeFailure failure = oar::CopyVolumeFailure::none)
+    -> std::expected<oar::CopyAnswer, LinkError> {
+    return oar::CopyAnswer{.state = state,
+                           .failure = failure,
+                           .total_bytes = total_bytes,
+                           .done_bytes = done,
+                           .written_bytes = done / 2};
+}
+
+// A VM with a detached local volume (vol_one), and the network volume of
+// net_config() configured with a utility attachment here and its key.
+auto conversion_ready(Helm& h, std::span<const std::byte, 64> data_key) -> void {
+    h.run(mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib});
+    h.run(mb::CreateVolume{.volume_id = vol_one, .owner_vm = vm_one, .size_gib = size_gib});
+    BOOST_REQUIRE(h.router.on_replica_config(net_config(1)));
+    BOOST_REQUIRE(h.keys.put_attachment_key(net_key(h.se, data_key)).has_value());
+    h.reports.all.clear();
+}
+
+auto conversions(const FakeReports& r) -> std::vector<proto::ConversionProgress> {
+    std::vector<proto::ConversionProgress> out;
+    for (const auto& b : r.all) {
+        if (const auto* c = std::get_if<proto::ConversionProgress>(&b)) {
+            out.push_back(*c);
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(converts_a_local_volume_to_network_storage,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    std::array<std::byte, 64> data_key{};
+    data_key.fill(std::byte{0x4D});
+    conversion_ready(h, data_key);
+
+    const auto s = h.send(convert());
+    // Prepare hands the role the network volume's config; nothing is
+    // copied, and no key leaves the KeyStore, until hull checks the
+    // signature.
+    BOOST_REQUIRE(h.blk_role.configs.size() == 1U);
+    BOOST_TEST((h.blk_role.configs.at(0) == net_config(1)));
+    BOOST_TEST(h.blk_role.copies.empty());
+    BOOST_TEST(h.router.busy());
+
+    h.blk_role.copy_answers = {copy_answer(oar::CopyVolumeState::copying, 0)};
+    h.answer(s, convert());
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::ok));
+    BOOST_REQUIRE(h.blk_role.copies.size() == 1U);
+    const auto& start = h.blk_role.copies.at(0);
+    BOOST_TEST((start.op == oar::CopyOp::start));
+    BOOST_TEST((start.direction == oar::CopyDirection::to_network));
+    BOOST_TEST(start.mib_per_s == 50U);
+    BOOST_TEST(start.local == vol_one);
+    BOOST_TEST(start.network == vol_two);
+    BOOST_TEST(start.attachment == net_attachment);
+    BOOST_TEST(start.generation == 1U);
+    BOOST_REQUIRE(h.blk_role.copy_keys.size() == 1U);
+    auto local_key = h.keys.unwrap_volume_key(vol_one, vm_one);
+    BOOST_REQUIRE(local_key.has_value());
+    BOOST_TEST((h.blk_role.copy_keys.at(0).first == helm::ScopedKeyTestAccess::bytes(*local_key)));
+    BOOST_TEST((h.blk_role.copy_keys.at(0).second ==
+                std::vector<std::byte>(data_key.begin(), data_key.end())));
+    BOOST_TEST(h.router.converting() == 1U);
+    auto progress = conversions(h.reports);
+    BOOST_REQUIRE(progress.size() == 1U);
+    BOOST_TEST(progress.at(0).local_volume_id == vol_one);
+    BOOST_TEST(progress.at(0).network_volume_id == vol_two);
+    BOOST_TEST((progress.at(0).state == proto::ConversionState::copying));
+    BOOST_TEST((progress.at(0).direction == proto::ConversionDirection::to_network));
+    BOOST_TEST(progress.at(0).slot == blk_slot);
+    BOOST_TEST(h.audit_text().find("ev=conversion_started seq=" + std::to_string(s)) !=
+               std::string::npos);
+
+    // Neither volume can be deleted, attached, rewrapped or converted again
+    // while the copy runs.
+    const auto posted = h.host.posted.size();
+    for (const mb::Body& body :
+         {mb::Body{mb::DeleteVolume{.volume_id = vol_one}},
+          mb::Body{mb::AttachVolume{.volume_id = vol_one, .vm_id = vm_one, .device = blk(fn_zero)}},
+          mb::Body{mb::AttachVolume{.volume_id = vol_two, .vm_id = vm_one, .device = blk(fn_zero)}},
+          mb::Body{mb::RewrapVolume{.volume_id = vol_one, .from_vm = vm_one, .to_vm = vm_two}},
+          mb::Body{convert()}}) {
+        h.send(body);
+        BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::conflict));
+    }
+    BOOST_TEST(h.host.posted.size() == posted);
+    BOOST_TEST((h.state(blk_slot, fn_zero) == FunctionState::free));
+    // A config that moves the attachment away keeps the volume while it
+    // converts: the role must see it (the copy then fails there).
+    BOOST_TEST(h.router.on_replica_config(net_config(2, other_server)));
+    BOOST_TEST(h.router.network_configs().size() == 1U);
+    BOOST_TEST(h.router.on_replica_config(net_config(3)));
+
+    // Queried every interval, and reported.
+    h.reports.all.clear();
+    h.blk_role.copy_answers = {copy_answer(oar::CopyVolumeState::copying, total_bytes / 2)};
+    h.t += conversion_poll / 2;
+    h.router.poll();
+    BOOST_TEST(conversions(h.reports).empty());
+    h.t += conversion_poll;
+    h.router.poll();
+    progress = conversions(h.reports);
+    BOOST_REQUIRE(progress.size() == 1U);
+    BOOST_TEST(progress.at(0).total_bytes == total_bytes);
+    BOOST_TEST(progress.at(0).done_bytes == total_bytes / 2);
+    BOOST_TEST(progress.at(0).written_bytes == total_bytes / 4);
+    BOOST_TEST((h.blk_role.copies.back().op == oar::CopyOp::query));
+
+    // Completed: reported, released on the role, the key forgotten.
+    h.blk_role.copy_answers = {copy_answer(oar::CopyVolumeState::completed, total_bytes)};
+    h.t += conversion_poll;
+    h.router.poll();
+    progress = conversions(h.reports);
+    BOOST_REQUIRE(progress.size() == 2U);
+    BOOST_TEST((progress.at(1).state == proto::ConversionState::completed));
+    BOOST_TEST((progress.at(1).failure == proto::ConversionFailure::none));
+    BOOST_TEST(progress.at(1).done_bytes == total_bytes);
+    BOOST_TEST((h.blk_role.copies.back().op == oar::CopyOp::release));
+    BOOST_TEST(h.router.converting() == 0U);
+    BOOST_TEST(!h.keys.attachment_key(net_attachment).has_value());
+    BOOST_TEST(h.router.stats().conversions_completed == 1U);
+    BOOST_TEST(h.audit_text().find("ev=conversion_completed") != std::string::npos);
+    BOOST_TEST(helm::verify_audit_log(h.audit_text()).has_value());
+    // Nothing more is asked of the role, and the local volume is free again.
+    const auto asked = h.blk_role.copies.size();
+    h.t += conversion_poll * 3;
+    h.router.poll();
+    BOOST_TEST(h.blk_role.copies.size() == asked);
+    h.run(mb::DeleteVolume{.volume_id = vol_one});
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::ok));
+}
+
+BOOST_AUTO_TEST_CASE(converts_a_network_volume_back_to_local_storage,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    std::array<std::byte, 64> data_key{};
+    conversion_ready(h, data_key);
+    h.run(convert(mb::ConvertDirection::to_local));
+    BOOST_REQUIRE(!h.blk_role.copies.empty());
+    BOOST_TEST((h.blk_role.copies.at(0).direction == oar::CopyDirection::to_local));
+    const auto progress = conversions(h.reports);
+    BOOST_REQUIRE(!progress.empty());
+    BOOST_TEST((progress.at(0).direction == proto::ConversionDirection::to_local));
+}
+
+BOOST_AUTO_TEST_CASE(conversion_refuses_what_helm_cannot_copy,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    h.run(mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib});
+    h.run(mb::CreateVm{.vm_id = vm_two, .vcpus = vcpus, .memory_mib = memory_mib});
+    const auto refused = [&](const mb::ConvertVolume& c, mb::Status want) {
+        const auto posted = h.host.posted.size();
+        h.send(c);
+        BOOST_TEST((status_of(h.reports.last_outcome()) == want));
+        BOOST_TEST(h.host.posted.size() == posted);
+    };
+    refused(convert(), mb::Status::unknown_volume);  // no local volume
+    h.run(mb::CreateVolume{.volume_id = vol_one, .owner_vm = vm_one, .size_gib = size_gib});
+    refused(convert(), mb::Status::unknown_volume);  // no network volume
+    BOOST_REQUIRE(h.router.on_replica_config(net_config(1)));
+    refused(convert(), mb::Status::unknown_volume);  // no attachment key
+    std::array<std::byte, 64> data_key{};
+    BOOST_REQUIRE(h.keys.put_attachment_key(net_key(h.se, data_key)).has_value());
+
+    auto other_owner = convert();
+    other_owner.owner_vm = vm_two;
+    refused(other_owner, mb::Status::conflict);
+    h.run(image_volume(vol_image, vm_one));
+    auto image = convert();
+    image.local_volume_id = vol_image;
+    refused(image, mb::Status::unsupported);
+    // A key for another generation than the config's attachment.
+    BOOST_REQUIRE(h.keys.put_attachment_key(net_key(h.se, data_key, 2)).has_value());
+    refused(convert(), mb::Status::unknown_volume);
+    // An attached local volume is in use.
+    h.run(mb::AttachVolume{.volume_id = vol_one, .vm_id = vm_one, .device = blk(fn_zero)});
+    refused(convert(), mb::Status::conflict);
+    BOOST_TEST(h.blk_role.copies.empty());
+    BOOST_TEST(h.router.converting() == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(a_conversion_that_fails_or_is_lost_is_reported,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    std::array<std::byte, 64> data_key{};
+    conversion_ready(h, data_key);
+    const auto last = [&] {
+        const auto p = conversions(h.reports);
+        BOOST_REQUIRE(!p.empty());
+        return p.back();
+    };
+    const auto rearm = [&] {
+        BOOST_REQUIRE(h.keys.put_attachment_key(net_key(h.se, data_key)).has_value());
+        h.blk_role.copy_answers.clear();
+    };
+
+    // A copy that does not start: the command is still hull's ok.
+    h.blk_role.copy_answers.clear();
+    h.blk_role.copy_answers.emplace_back(
+        std::unexpected(LinkError{.code = LinkErrc::refused, .status = oar::Status::failed}));
+    h.run(convert());
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::ok));
+    BOOST_TEST((last().state == proto::ConversionState::failed));
+    BOOST_TEST((last().failure == proto::ConversionFailure::start));
+    BOOST_TEST(h.router.converting() == 0U);
+    BOOST_TEST(!h.keys.attachment_key(net_attachment).has_value());
+    BOOST_TEST(h.audit_text().find("ev=conversion_failed") != std::string::npos);
+
+    // The role fails it: its reason is reported.
+    rearm();
+    h.run(convert());
+    BOOST_TEST(h.router.converting() == 1U);
+    h.blk_role.copy_answers = {copy_answer(oar::CopyVolumeState::failed, total_bytes / 8,
+                                           oar::CopyVolumeFailure::target_io)};
+    h.t += conversion_poll;
+    h.router.poll();
+    BOOST_TEST((last().state == proto::ConversionState::failed));
+    BOOST_TEST((last().failure == proto::ConversionFailure::target_io));
+    BOOST_TEST(last().done_bytes == total_bytes / 8);
+    BOOST_TEST((h.blk_role.copies.back().op == oar::CopyOp::release));
+    BOOST_TEST(h.router.converting() == 0U);
+
+    // The role no longer knows the copy (it restarted): lost.
+    rearm();
+    h.run(convert());
+    h.blk_role.copy_answers = {copy_answer(oar::CopyVolumeState::none, 0)};
+    h.t += conversion_poll;
+    h.router.poll();
+    BOOST_TEST((last().failure == proto::ConversionFailure::lost));
+    BOOST_TEST(h.router.converting() == 0U);
+
+    // The role cannot be asked: lost after max_conversion_query_failures.
+    rearm();
+    h.run(convert());
+    h.reports.all.clear();
+    h.blk_role.copy_answers.clear();
+    h.blk_role.copy_answers.emplace_back(std::unexpected(LinkError{.code = LinkErrc::timed_out}));
+    const auto tries = helm::RouterConfig{}.max_conversion_query_failures;
+    for (unsigned i = 1; i < tries; ++i) {
+        h.t += conversion_poll;
+        h.router.poll();
+        BOOST_TEST(h.router.converting() == 1U);
+    }
+    BOOST_TEST(conversions(h.reports).empty());
+    h.t += conversion_poll;
+    h.router.poll();
+    BOOST_TEST((last().failure == proto::ConversionFailure::lost));
+    BOOST_TEST(h.router.converting() == 0U);
+    BOOST_TEST(h.router.stats().conversions_failed == 4U);
+    // Every report it sent is one the controller accepts.
+    for (const auto& b : h.reports.all) {
+        BOOST_TEST(
+            proto::encode_report({.server_id = server, .report_seq = 1, .body = b}).has_value());
+    }
 }

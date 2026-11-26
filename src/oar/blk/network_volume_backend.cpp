@@ -310,7 +310,7 @@ auto NetworkVolumeBackend::session_open() const noexcept -> bool {
     return _core.session_open();
 }
 
-auto NetworkVolumeBackend::take_faults() -> std::vector<InitiatorFault> {
+auto NetworkVolumeBackend::take_faults() -> std::vector<FaultEvent> {
     return _core.take_faults();
 }
 

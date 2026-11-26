@@ -216,16 +216,16 @@ struct DaemonStats {
     std::uint64_t replica_configs{0};  // received from the controller
     std::uint64_t volume_ops{0};
     std::uint64_t lease_grants{0};
-    std::uint64_t hold_refused{0};          // a hold role refused or missed a frame or grant
-    std::uint64_t hold_reports{0};          // relayed to the controller
-    std::uint64_t hold_reports_dropped{0};  // undecodable, or of a kind a hold role never sends
-    std::uint64_t volume_keys{0};           // opened and kept (KeyStore::put_attachment_key)
-    std::uint64_t volume_keys_refused{0};   // did not open, stale, or too many
-    std::uint64_t image_keys{0};            // opened and kept (KeyStore::put_image_key)
-    std::uint64_t image_keys_refused{0};    // did not open, or too many
-    std::uint64_t blk_configs_refused{0};   // a storage role refused a network volume's config
-    std::uint64_t cert_requests{0};         // storage role requests reported to the controller
-    std::uint64_t role_certificates{0};     // certificates a storage role took
+    std::uint64_t hold_refused{0};               // a hold role refused or missed a frame or grant
+    std::uint64_t hold_reports{0};               // relayed to the controller (hold and blk roles)
+    std::uint64_t hold_reports_dropped{0};       // undecodable, or of a kind that role never sends
+    std::uint64_t volume_keys{0};                // opened and kept (KeyStore::put_attachment_key)
+    std::uint64_t volume_keys_refused{0};        // did not open, stale, or too many
+    std::uint64_t image_keys{0};                 // opened and kept (KeyStore::put_image_key)
+    std::uint64_t image_keys_refused{0};         // did not open, or too many
+    std::uint64_t blk_configs_refused{0};        // a storage role refused a network volume's config
+    std::uint64_t cert_requests{0};              // storage role requests reported to the controller
+    std::uint64_t role_certificates{0};          // certificates a storage role took
     std::uint64_t role_certificates_refused{0};  // refused, or for a slot with no storage role
     // Tunnel keys.
     std::uint64_t tunnel_provisioned{0};          // network roles given their key (and peers)

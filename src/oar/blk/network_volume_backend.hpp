@@ -26,8 +26,8 @@
 // The process must ignore SIGPIPE, as the roles' mains do: a hold that
 // hangs up mid-write would otherwise end it.
 //
-// Faults the core reports (primary timeout, fenced, checksum) wait in
-// take_faults() for helm's report path.
+// Faults the core reports (primary timeout, fenced, checksum, media
+// error) wait in take_faults(); BlkRole turns them into reports for helm.
 //
 // A volume restored from an image under another key answers reads of
 // blocks not yet hydrated with BackendError::not_hydrated, and takes
@@ -82,7 +82,7 @@ public:
     auto set_tls(const tls::Config& config) -> void;
     [[nodiscard]] auto routed() const noexcept -> bool;
     [[nodiscard]] auto fenced() const noexcept -> bool;
-    [[nodiscard]] auto take_faults() -> std::vector<InitiatorFault>;
+    [[nodiscard]] auto take_faults() -> std::vector<FaultEvent>;
     [[nodiscard]] auto session_open() const noexcept -> bool;
 
     // BlockBackend. size_bytes() is 0 until the route arrives.

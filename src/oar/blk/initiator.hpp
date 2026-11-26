@@ -83,9 +83,22 @@ struct InitiatorConfig {
 };
 
 enum class InitiatorFault : std::uint8_t {
-    primary_timeout,  // the primary stopped answering (volume_fault to the controller)
+    primary_timeout,  // the primary (khold: a group leader) stopped answering
     fenced,           // the attachment's generation was retired
     checksum,         // a block read back did not match its CRC32C
+    media_error,      // the server answered io_error: a media error it could not repair
+};
+
+[[nodiscard]] auto to_string(InitiatorFault f) noexcept -> const char*;
+
+// One fault, for helm's report path (BlkRole turns it into a volume_fault
+// or attachment_status report): the server it is about (0 for fenced) and
+// the epoch the initiator held.
+struct FaultEvent {
+    InitiatorFault kind{InitiatorFault::primary_timeout};
+    std::uint64_t server{0};
+    std::uint64_t epoch{0};
+    friend auto operator==(const FaultEvent&, const FaultEvent&) -> bool = default;
 };
 
 enum class RouteError : std::uint8_t {
@@ -139,7 +152,7 @@ public:
 
     // Frames for the current session, in order.
     [[nodiscard]] auto take_output() -> std::vector<std::vector<std::byte>>;
-    [[nodiscard]] auto take_faults() -> std::vector<InitiatorFault>;
+    [[nodiscard]] auto take_faults() -> std::vector<FaultEvent>;
 
     auto tick(Clock::time_point now) -> void;
     [[nodiscard]] auto next_wake(Clock::time_point now) const -> std::optional<Clock::time_point>;
@@ -197,6 +210,7 @@ private:
     auto complete(std::uint64_t id, BackendResult r) -> void;
     auto fail_all(BackendError e) -> void;
     auto fence() -> void;
+    auto fault(InitiatorFault kind) -> void;
     auto part_done(std::deque<Part>::iterator it) -> void;
     auto on_reply(std::deque<Part>::iterator it, const proto::HoldFrame& f, Clock::time_point now)
         -> void;
@@ -225,7 +239,7 @@ private:
     std::uint64_t _next_op{1};
     std::uint64_t _next_request{1};
     std::vector<std::vector<std::byte>> _out;
-    std::vector<InitiatorFault> _faults;
+    std::vector<FaultEvent> _faults;
     std::vector<std::pair<BackendCompletion, BackendResult>> _ready;
     bool _running_completions{false};
 };

@@ -10,6 +10,7 @@
 
 #include "oar/blk/file_backend.hpp"
 #include "objstore/image_manifest.hpp"
+#include "proto/report.hpp"
 
 namespace ak::oar::blk {
 
@@ -168,6 +169,8 @@ auto BlkRole::close(Slot& s) -> bool {
     s.image = nullptr;
     s.network = nullptr;
     s.hydrating = nullptr;
+    s.attachment_id = 0;
+    s.generation = 0;
     s.active.reset();
     s.volume = 0;
     return true;
@@ -392,7 +395,12 @@ auto BlkRole::prepare_network(Slot& s, const oar::PrepareFunction& /*request*/,
     if (!f) {
         return oar::Status::failed;
     }
-    return serve_active(s, std::move(*f), cfg.volume_id, nullptr, network, hydrating);
+    const auto st = serve_active(s, std::move(*f), cfg.volume_id, nullptr, network, hydrating);
+    if (st == oar::Status::ok) {
+        s.attachment_id = cfg.attachment_id;
+        s.generation = cfg.generation;
+    }
+    return st;
 }
 
 auto BlkRole::cert_request() -> std::expected<oar::CertAnswer, oar::Status> {
@@ -585,11 +593,67 @@ auto BlkRole::poll() -> bool {
             // abandoned by a reset must run even while the driver is not live.
             more = s.active->poll() || more;
         }
+        if (s.network != nullptr) {
+            report_faults(s, s.network->take_faults());
+        }
     }
     for (auto& [local, copy] : _copies) {
         more = copy.copier->poll() || more;
     }
     return more;
+}
+
+auto BlkRole::queue_report(proto::ReportBody body) -> void {
+    const auto seq = _next_report;
+    _next_report = _next_report == std::numeric_limits<std::uint64_t>::max() ? 1 : _next_report + 1;
+    auto bytes = proto::encode_report(
+        {.server_id = _config.server_id, .report_seq = seq, .body = std::move(body)});
+    if (bytes) {
+        static_cast<void>(_reports.push(seq, std::move(*bytes)));
+    }
+}
+
+auto BlkRole::report_faults(const Slot& s, const std::vector<FaultEvent>& faults) -> void {
+    for (const auto& f : faults) {
+        // helm stamps the data-plane slot, which the role does not know.
+        if (f.kind == InitiatorFault::fenced) {
+            queue_report(proto::AttachmentStatus{.attachment_id = s.attachment_id,
+                                                 .volume_id = s.volume,
+                                                 .generation = s.generation,
+                                                 .state = proto::AttachmentState::fenced,
+                                                 .slot = 0,
+                                                 .in_flight = 0});
+            continue;
+        }
+        if (f.server == 0 || f.epoch == 0) {
+            continue;  // nothing to name: no route yet
+        }
+        proto::VolumeFaultKind kind = proto::VolumeFaultKind::primary_timeout;
+        switch (f.kind) {
+            case InitiatorFault::primary_timeout:
+                kind = proto::VolumeFaultKind::primary_timeout;
+                break;
+            case InitiatorFault::checksum:
+                kind = proto::VolumeFaultKind::checksum_mismatch;
+                break;
+            case InitiatorFault::media_error:
+                kind = proto::VolumeFaultKind::media_error;
+                break;
+            case InitiatorFault::fenced:
+                continue;
+        }
+        queue_report(proto::VolumeFault{.volume_id = s.volume,
+                                        .epoch = f.epoch,
+                                        .suspect = f.server,
+                                        .kind = kind,
+                                        .reporter = proto::FaultReporter::initiator,
+                                        .slot = 0});
+    }
+}
+
+auto BlkRole::hold_reports(const oar::ReportRequest& request)
+    -> std::expected<oar::ReportChunk, oar::Status> {
+    return _reports.serve(request);
 }
 
 auto BlkRole::wake_fds() const -> std::vector<int> {

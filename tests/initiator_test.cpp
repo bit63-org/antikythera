@@ -36,7 +36,7 @@ auto operator<<(std::ostream& os, RouteError e) -> std::ostream& {
     return os << to_string(e);
 }
 auto operator<<(std::ostream& os, InitiatorFault f) -> std::ostream& {
-    return os << static_cast<int>(f);
+    return os << to_string(f);
 }
 auto operator<<(std::ostream& os, BackendError e) -> std::ostream& {
     return os << static_cast<int>(e);
@@ -428,7 +428,9 @@ BOOST_AUTO_TEST_CASE(retries_a_read_that_fails_its_checksum,
     BOOST_TEST(rig.count(HoldOpcode::read) == 2U);
     auto faults = rig.core.take_faults();
     BOOST_TEST(faults.size() == 1U);
-    BOOST_TEST((faults.at(0) == InitiatorFault::checksum));
+    BOOST_TEST((faults.at(0).kind == InitiatorFault::checksum));
+    BOOST_TEST(faults.at(0).server == 1U);  // the primary that answered
+    BOOST_TEST(faults.at(0).epoch == 1U);
 
     // Corrupted every time: the guest gets an I/O error after one retry.
     corrupt = 100;
@@ -472,7 +474,8 @@ BOOST_AUTO_TEST_CASE(follows_a_new_primary, *utf::timeout(ak::test::unit_timeout
     rig.run_for(2s);
     auto faults = rig.core.take_faults();
     BOOST_TEST_REQUIRE(faults.size() == 1U);
-    BOOST_TEST((faults.at(0) == InitiatorFault::primary_timeout));
+    BOOST_TEST((faults.at(0).kind == InitiatorFault::primary_timeout));
+    BOOST_TEST(faults.at(0).server == 1U);
     rig.server(1).reachable = false;
     rig.run_for(1s);  // retries against server 1 fail
     BOOST_TEST(!w.result.has_value());
@@ -597,7 +600,8 @@ BOOST_AUTO_TEST_CASE(stops_when_fenced, *utf::timeout(ak::test::unit_timeout_sec
     BOOST_TEST(a.failed(BackendError::io));
     BOOST_TEST(b.failed(BackendError::io));
     auto faults = rig.core.take_faults();
-    BOOST_TEST((std::ranges::find(faults, InitiatorFault::fenced) != faults.end()));
+    BOOST_TEST((std::ranges::find(faults, InitiatorFault::fenced,
+                                  &ak::oar::blk::FaultEvent::kind) != faults.end()));
     BOOST_TEST(!rig.core.target(rig.now).has_value());
     // Everything after fails too.
     Done later;
@@ -798,7 +802,7 @@ BOOST_AUTO_TEST_CASE(pings_an_idle_primary, *utf::timeout(ak::test::unit_timeout
     rig.run_for(3s);
     auto faults = rig.core.take_faults();
     BOOST_TEST_REQUIRE(!faults.empty());
-    BOOST_TEST((faults.at(0) == InitiatorFault::primary_timeout));
+    BOOST_TEST((faults.at(0).kind == InitiatorFault::primary_timeout));
     BOOST_TEST(rig.connects >= 2U);
 }
 

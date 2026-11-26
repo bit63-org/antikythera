@@ -519,7 +519,8 @@ primary reports time throttled below the provisioned rate (Requirement
 | `StopInstances` / `StartInstances` | `DESTROY_VM {persist_volumes = true}` and retire the generations / place anywhere, new generations, `VolumeKey` per attachment, `ATTACH_VOLUME` each |
 
 The mailbox sees only `ATTACH_VOLUME`, `DETACH_VOLUME` (with
-`DetachPolicy` `wait = 3`), `WITHDRAW_DETACH` and the VM commands;
+`DetachPolicy` `wait = 3`), `WITHDRAW_DETACH`, `CONVERT_VOLUME` and the
+VM commands;
 everything else is ReplicaConfig, VolumeOp, VolumeKey and reports on the
 controller link. `WITHDRAW_DETACH` cancels a `busy` detach's request to
 the guest and returns the attachment to `attached`. EC2 has no action
@@ -527,6 +528,22 @@ for that (a `busy` attachment stays so until the guest lets go or a
 forced detach), so the EC2 mapping never sends it; it is there for
 controllers and tools that let a caller abandon a detach, and for
 reconciliation after a controller decides not to detach after all.
+
+`CONVERT_VOLUME` (type `0x0026`, 32 bytes: `local_volume_id u64 |
+owner_vm u64 | network_volume_id u64 | direction u8 (1 to_network, 2
+to_local) | rsvd u8 | rsvd u16 | mib_per_s u32`) moves a volume between
+local and network storage (block-volume-service Requirement 8.6). The
+controller creates the target first (`CREATE_VOLUME`, or a network
+volume with a utility attachment for the local volume's server and its
+`VolumeKey`), and for a restored network source waits until
+`hydrated_bytes` equals `total_bytes`. The command's outcome says only
+that the copy was accepted; its progress and end arrive as
+`conversion_progress` reports (kind 20: both volume IDs, `total_bytes`,
+`done_bytes`, `written_bytes`, direction, state `copying` / `completed` /
+`failed`, failure, slot). After `completed` the controller switches the
+instance's records to the new volume and deletes the old one; after
+`failed` it deletes the target. Either way it retires the utility
+attachment.
 
 ## Where the code lives
 

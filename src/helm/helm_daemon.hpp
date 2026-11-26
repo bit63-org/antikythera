@@ -402,6 +402,10 @@ private:
             -> std::expected<void, LinkError> override;
         auto group_membership(std::optional<std::uint32_t> since)
             -> std::expected<std::optional<OarLink::Memberships>, LinkError> override;
+        auto eject(const oar::Eject& request) -> std::expected<oar::EjectState, LinkError> override;
+        auto copy_volume(const oar::CopyVolume& request, std::optional<ScopedKey> local_key,
+                         std::optional<ScopedKey> network_key)
+            -> std::expected<oar::CopyAnswer, LinkError> override;
 
     private:
         SlotState* _slot;

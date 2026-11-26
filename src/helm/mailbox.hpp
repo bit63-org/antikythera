@@ -102,6 +102,7 @@ enum class Type : std::uint16_t {
     detach_volume = 0x0023,
     rewrap_volume = 0x0024,
     withdraw_detach = 0x0025,  // helm's: withdraws a busy cooperative detach
+    convert_volume = 0x0026,   // copies a local volume to network storage or back
     create_network = 0x0030,   // VPC
     delete_network = 0x0031,
     gpu_vf_config = 0x0040,  // reserved: GPU support is designed, not yet built
@@ -355,6 +356,35 @@ struct RewrapVolume {
     friend auto operator==(const RewrapVolume&, const RewrapVolume&) -> bool = default;
 };
 
+// CONVERT_VOLUME: local_volume_id u64 | owner_vm u64 | network_volume_id
+// u64 | direction u8 | rsvd u8 | rsvd u16 | mib_per_s u32  (32 bytes)
+// Local <-> network conversion (.kiro/specs/block-volume-service/
+// Requirement 8.6, design "Local <-> network conversion"): copies one
+// detached volume into another on the local volume's server, rewrapping
+// every block from the source's key to the target's. Both volumes exist
+// already: the local one is a disk volume (CREATE_VOLUME, not an image)
+// owned by owner_vm, and the network one is the controller's, configured
+// with a utility attachment for this server (read-write when it is the
+// target) whose key helm holds. direction says which is the source.
+// mib_per_s paces the copy (0: as fast as the media go). hull answers ok
+// once it has checked the signature; helm then starts the copy on the
+// storage role and reports its progress (conversion_progress) until it
+// ends. The two volume IDs differ; direction is known; reserved bytes are
+// zero.
+enum class ConvertDirection : std::uint8_t {
+    to_network = 1,  // the local volume is the source
+    to_local = 2,    // the network volume is the source
+};
+
+struct ConvertVolume {
+    std::uint64_t local_volume_id{0};
+    std::uint64_t owner_vm{0};
+    std::uint64_t network_volume_id{0};
+    ConvertDirection direction{ConvertDirection::to_network};
+    std::uint32_t mib_per_s{0};
+    friend auto operator==(const ConvertVolume&, const ConvertVolume&) -> bool = default;
+};
+
 // CREATE_NETWORK / DELETE_NETWORK: vni u32  (4 bytes), 1 <= vni <= 0xFFFFFF.
 struct CreateNetwork {
     std::uint32_t vni{0};
@@ -531,7 +561,7 @@ struct ScrubDone {
 using Body = std::variant<ListVms, VmStatus, CreateVm, DestroyVm, AttachDevice, DetachDevice,
                           CreateVolume, DeleteVolume, AttachVolume, DetachVolume, RewrapVolume,
                           WithdrawDetach, CreateNetwork, DeleteNetwork, Response, VmExited,
-                          DeviceReleased, HostFault, ScrubDone>;
+                          DeviceReleased, HostFault, ScrubDone, ConvertVolume>;
 
 // Decodes and validates the body of any message according to its type.
 [[nodiscard]] auto decode_body(const Message& msg) noexcept -> std::expected<Body, BodyError>;

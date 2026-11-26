@@ -556,7 +556,7 @@ the new network volume (its key from KMS via `VolumeKey`), and copies
 decrypt-then-encrypt in a utility mode with no VM attached. The new
 volume gets a new lineage.
 
-As built so far (task 23.2, the oar-blk half):
+As built (task 23.2):
 
 - **Both volumes exist first.** The copy runs between a local volume and
   a network volume that are both already there, both detached, on the
@@ -586,9 +586,26 @@ As built so far (task 23.2, the oar-blk half):
   its functions and re-routes the copy's network side on a new config. A
   copy stays queryable until it is released, so helm reads the outcome
   however late it polls.
-- **Still to come:** helm's half, a mailbox command that starts the copy
-  once hull has verified it (helm unwraps the local key and opens the
-  attachment key), and a report that carries progress to the controller.
+- **`CONVERT_VOLUME`** (mailbox `0x0026`: local volume, owner VM,
+  network volume, direction, MiB/s) starts it. helm checks before relay
+  that the local volume is a detached disk volume (not an image) of that
+  owner on this server, that the network volume's newest config lists one
+  attachment here whose key helm holds at that generation, and that
+  nothing attaches or converts either volume; it hands the role the
+  config. hull only checks the signature and answers ok. On that answer
+  helm unwraps the local key, opens the attachment key and calls
+  `copy_volume start`; a copy that does not start is reported failed
+  (`start`), not as the command's status.
+- **`conversion_progress`** (report kind 20) carries both volume IDs,
+  `total_bytes`, `done_bytes`, `written_bytes`, the direction, the state
+  (`copying`, `completed`, `failed`) and the failure (the role's reason,
+  `start`, or `lost` for a copy the role no longer knows or cannot be
+  asked about three times running). helm queries every second and
+  reports each answer; when the copy ends it releases it on the role and
+  forgets the attachment key, and the controller retires the utility
+  attachment. While a volume converts, delete, attach, rewrap and a
+  second conversion of either volume are conflicts. The controller
+  cancels a copy by publishing a config without the utility attachment.
 
 **Between VMs and servers** (Requirement 9) needs no data movement:
 detach, then attach anywhere. Changing the owning VM is a controller

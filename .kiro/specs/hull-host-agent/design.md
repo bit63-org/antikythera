@@ -100,7 +100,9 @@ guest that never releases with `busy` itself; the agent never sees that
 command. Nor does it see `WITHDRAW_DETACH`, with which the controller
 cancels a busy request: helm clears the request on the storage role and
 answers it. One that reaches the agent anyway is answered
-`unsupported`.
+`unsupported`. `CONVERT_VOLUME` (a local volume copied to network
+storage or back) needs nothing from the agent: it answers ok once the
+signature checks, and helm runs the copy on the storage role.
 
 As built (task 8):
 

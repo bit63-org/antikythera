@@ -69,6 +69,9 @@ enum class AuditEvent : std::uint8_t {
     eject_released,              // the guest released it (helm may now relay the detach)
     detach_busy,                 // the guest did not release it by the command's timeout
     detach_withdrawn,            // WITHDRAW_DETACH cleared a pending eject request
+    conversion_started,    // CONVERT_VOLUME: both keys went to the storage role (volume = local)
+    conversion_failed,     // the copy did not start, failed or was lost (status = the failure)
+    conversion_completed,  // the copy is durable on the target (count = bytes written)
 };
 
 [[nodiscard]] auto to_string(AuditEvent e) noexcept -> const char*;

@@ -150,6 +150,24 @@ auto HelmDaemon::SlotPort::group_membership(std::optional<std::uint32_t> since)
     return _slot->link->group_membership(since);
 }
 
+auto HelmDaemon::SlotPort::eject(const oar::Eject& request)
+    -> std::expected<oar::EjectState, LinkError> {
+    if (!_slot->link) {
+        return disconnected();
+    }
+    return _slot->link->eject(request);
+}
+
+auto HelmDaemon::SlotPort::copy_volume(const oar::CopyVolume& request,
+                                       std::optional<ScopedKey> local_key,
+                                       std::optional<ScopedKey> network_key)
+    -> std::expected<oar::CopyAnswer, LinkError> {
+    if (!_slot->link) {
+        return disconnected();  // the keys are wiped as they go out of scope
+    }
+    return _slot->link->copy_volume(request, std::move(local_key), std::move(network_key));
+}
+
 // ---- HelmDaemon ---------------------------------------------------------------
 
 HelmDaemon::HelmDaemon(DaemonConfig config, KeyStore& keys, AuditLog& audit, HostPort& host,

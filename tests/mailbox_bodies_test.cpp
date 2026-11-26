@@ -117,6 +117,14 @@ auto nic_attach() -> mb::AttachDevice {
     return {.vm_id = vm_a, .device = nic, .vni = vni, .nic_id = nic_id, .mac = guest_mac};
 }
 
+auto convert() -> mb::ConvertVolume {
+    return {.local_volume_id = volume,
+            .owner_vm = vm_a,
+            .network_volume_id = volume + 1,
+            .direction = mb::ConvertDirection::to_network,
+            .mib_per_s = 200};
+}
+
 auto image_volume() -> mb::CreateVolume {
     mb::ImageName name{};
     name.fill(std::byte{0x5A});
@@ -176,6 +184,12 @@ auto every_body() -> std::vector<mb::Body> {
                          .policy = mb::DetachPolicy::wait},
         mb::RewrapVolume{.volume_id = volume, .from_vm = vm_a, .to_vm = vm_b},
         mb::WithdrawDetach{.volume_id = volume, .vm_id = vm_a, .device = blk},
+        convert(),
+        mb::ConvertVolume{.local_volume_id = volume,
+                          .owner_vm = vm_a,
+                          .network_volume_id = volume + 1,
+                          .direction = mb::ConvertDirection::to_local,
+                          .mib_per_s = 0},
         mb::CreateNetwork{.vni = vni},
         mb::DeleteNetwork{.vni = mb::max_vni},
         ok_response(),
@@ -304,6 +318,9 @@ BOOST_AUTO_TEST_CASE(zero_identifiers_are_rejected,
         mb::RewrapVolume{.volume_id = volume, .from_vm = vm_a},
         mb::WithdrawDetach{.vm_id = vm_a, .device = blk},
         mb::WithdrawDetach{.volume_id = volume, .device = blk},
+        mb::ConvertVolume{.owner_vm = vm_a, .network_volume_id = volume + 1},
+        mb::ConvertVolume{.local_volume_id = volume, .network_volume_id = volume + 1},
+        mb::ConvertVolume{.local_volume_id = volume, .owner_vm = vm_a},
         mb::CreateNetwork{},
         mb::DeleteNetwork{},
         mb::VmExited{},
@@ -330,6 +347,28 @@ BOOST_AUTO_TEST_CASE(field_ranges_are_enforced, *boost::unit_test::timeout(unit_
                              .vm_id = vm_a,
                              .device = blk,
                              .timeout_s = mb::max_detach_timeout_s + 1});
+}
+
+// CONVERT_VOLUME (block-volume-service task 23.2): 32 bytes, two distinct
+// volumes, a known direction, reserved bytes zero.
+BOOST_AUTO_TEST_CASE(convert_volume_fields, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    constexpr std::size_t direction_offset = 24;
+    const auto bytes = mb::encode_body(convert());
+    BOOST_REQUIRE(bytes.size() == 32U);
+    BOOST_TEST((bytes[0] == std::byte{volume & 0xFFU}));
+    BOOST_TEST((bytes[direction_offset] == std::byte{1}));
+    BOOST_TEST((bytes[28] == std::byte{200}));  // mib_per_s, little-endian
+    BOOST_TEST(mb::is_command(mb::Type::convert_volume));
+
+    expect_invalid(convert(), direction_offset, zero);
+    expect_invalid(convert(), direction_offset, std::byte{3});
+    for (std::size_t off = direction_offset + 1; off < direction_offset + 4; ++off) {
+        expect_invalid(convert(), off, nonzero);
+    }
+    auto same = convert();
+    same.network_volume_id = same.local_volume_id;
+    BOOST_TEST((decode_error(mb::Type::convert_volume, mb::encode_body(same)) ==
+                BodyError::invalid_field));
 }
 
 // An image volume (oar-blk Requirement 8) is the 20-byte disk body plus

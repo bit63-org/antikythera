@@ -28,6 +28,19 @@ auto to_mailbox_slot(const proto::Slot& slot) noexcept -> mailbox::Slot {
     return out;
 }
 
+// A copy_volume query or release: it names the pair and carries no keys.
+auto copy_request(oar::CopyOp op, VolumeId local, VolumeId network) -> oar::CopyVolume {
+    return {.op = op,
+            .direction = oar::CopyDirection::to_network,
+            .mib_per_s = 0,
+            .local_volume_id = local,
+            .network_volume_id = network,
+            .attachment_id = 0,
+            .generation = 0,
+            .local_key = std::nullopt,
+            .network_key = std::nullopt};
+}
+
 auto link_status(const LinkError& e) noexcept -> mailbox::Status {
     switch (e.code) {
         case LinkErrc::timed_out:
@@ -97,6 +110,12 @@ auto OarLinkPort::replica_config(std::span<const std::byte> frame)
 
 auto OarLinkPort::eject(const oar::Eject& request) -> std::expected<oar::EjectState, LinkError> {
     return _link->eject(request);
+}
+
+auto OarLinkPort::copy_volume(const oar::CopyVolume& request, std::optional<ScopedKey> local_key,
+                              std::optional<ScopedKey> network_key)
+    -> std::expected<oar::CopyAnswer, LinkError> {
+    return _link->copy_volume(request, std::move(local_key), std::move(network_key));
 }
 
 auto OarLinkPort::group_policy(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
@@ -685,13 +704,16 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
         if (!volume_owner(d->volume_id)) {
             return std::unexpected(Status::unknown_volume);
         }
-        if (_attached.contains(d->volume_id)) {
+        if (_attached.contains(d->volume_id) || is_converting(d->volume_id)) {
             return std::unexpected(Status::conflict);
         }
         return {};
     }
 
     if (const auto* a = std::get_if<mailbox::AttachVolume>(&body)) {
+        if (is_converting(a->volume_id)) {
+            return std::unexpected(Status::conflict);
+        }
         const auto owner = volume_owner(a->volume_id);
         if (!owner && _network.contains(a->volume_id)) {
             return prepare_network_attach(*a, undo);
@@ -753,7 +775,8 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
         if (!owner) {
             return std::unexpected(Status::unknown_volume);
         }
-        if (*owner != r->from_vm || _attached.contains(r->volume_id)) {
+        if (*owner != r->from_vm || _attached.contains(r->volume_id) ||
+            is_converting(r->volume_id)) {
             return std::unexpected(Status::conflict);
         }
         if (!_keys->find_vm_key(r->to_vm)) {
@@ -762,9 +785,224 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
         return {};
     }
 
+    if (const auto* c = std::get_if<mailbox::ConvertVolume>(&body)) {
+        return prepare_convert(*c);
+    }
+
     // DESTROY_VM, LIST_VMS, VM_STATUS, CREATE_NETWORK, DELETE_NETWORK: hull
     // decides; helm commits on its answer.
     return {};
+}
+
+// ---- local <-> network conversion ---------------------------------------
+
+auto CommandRouter::is_converting(VolumeId volume) const -> bool {
+    return _converting.contains(volume) || std::ranges::any_of(_converting, [&](const auto& entry) {
+               return entry.second.network == volume;
+           });
+}
+
+auto CommandRouter::prepare_convert(const mailbox::ConvertVolume& convert)
+    -> std::expected<void, mailbox::Status> {
+    using mailbox::Status;
+    const auto local = convert.local_volume_id;
+    const auto network = convert.network_volume_id;
+    if (is_image_volume(local)) {
+        return std::unexpected(Status::unsupported);  // an image's overlay is not a volume to copy
+    }
+    const auto owner = _keys->owner(local);
+    const auto stored = _volumes.find(local);
+    if (!owner || stored == _volumes.end()) {
+        return std::unexpected(Status::unknown_volume);
+    }
+    if (*owner != convert.owner_vm || _attached.contains(local) || is_converting(local) ||
+        is_converting(network)) {
+        return std::unexpected(Status::conflict);
+    }
+    const auto net = _network.find(network);
+    if (net == _network.end()) {
+        return std::unexpected(Status::unknown_volume);
+    }
+    if (net->second.attached_by != 0 || _attached.contains(network)) {
+        return std::unexpected(Status::conflict);
+    }
+    const auto att = network_attachment(network);
+    if (!att) {
+        return std::unexpected(att.error());
+    }
+    // The key must be here before the copy: it goes to the role on commit.
+    const auto key = _keys->attachment_key(att->attachment_id);
+    if (!key || key->generation != att->generation || key->volume_id != network) {
+        return std::unexpected(Status::unknown_volume);
+    }
+    auto* port = port_for(stored->second.slot);
+    if (port == nullptr) {
+        return std::unexpected(Status::internal_error);
+    }
+    // The role opens the network volume from this config; one that cannot
+    // take it (not a storage role, a stale epoch) refuses here, before
+    // hull sees the command.
+    if (auto ok = port->replica_config(net->second.frame); !ok) {
+        return std::unexpected(link_status(ok.error()));
+    }
+    return {};
+}
+
+auto CommandRouter::start_conversion(std::uint64_t seq, const mailbox::ConvertVolume& convert)
+    -> void {
+    const auto local = convert.local_volume_id;
+    const auto stored = _volumes.find(local);
+    const auto att = network_attachment(convert.network_volume_id);
+    Conversion c{.network = convert.network_volume_id,
+                 .attachment = att ? att->attachment_id : 0,
+                 .direction = convert.direction,
+                 .slot = stored == _volumes.end() ? std::uint8_t{0} : stored->second.slot,
+                 .seq = seq,
+                 .next_query = now() + _config.conversion_poll_interval,
+                 .failures = 0};
+    auto* port = stored == _volumes.end() ? nullptr : port_for(c.slot);
+    bool started = false;
+    oar::CopyAnswer answer;
+    if (port != nullptr && att) {
+        auto local_key = _keys->unwrap_volume_key(local, convert.owner_vm);
+        auto network_key = _keys->open_attachment_key(att->attachment_id, att->generation);
+        if (local_key && network_key) {
+            auto r = port->copy_volume(
+                {.op = oar::CopyOp::start,
+                 .direction = convert.direction == mailbox::ConvertDirection::to_network
+                                  ? oar::CopyDirection::to_network
+                                  : oar::CopyDirection::to_local,
+                 .mib_per_s = convert.mib_per_s,
+                 .local_volume_id = local,
+                 .network_volume_id = convert.network_volume_id,
+                 .attachment_id = att->attachment_id,
+                 .generation = att->generation,
+                 .local_key = std::nullopt,
+                 .network_key = std::nullopt},
+                std::move(*local_key), std::move(*network_key));
+            if (r) {
+                started = true;
+                answer = *r;
+            }
+        }
+    }
+    if (!started) {
+        // The command itself succeeded (hull's ok); the copy did not.
+        report_conversion(local, c, {}, proto::ConversionFailure::start);
+        end_conversion(local, c, proto::ConversionFailure::start, 0);
+        return;
+    }
+    audit(AuditRecord::of(AuditEvent::conversion_started)
+              .with_seq(seq)
+              .with_vm(convert.owner_vm)
+              .with_volume(local));
+    const auto [it, inserted] = _converting.insert_or_assign(local, c);
+    (void)inserted;
+    // A copy that finishes inside its start (an empty volume) is reported
+    // and released at the first poll, like any other.
+    report_conversion(local, it->second, answer, proto::ConversionFailure::none);
+}
+
+auto CommandRouter::poll_conversions(Clock::time_point t) -> void {
+    for (auto it = _converting.begin(); it != _converting.end();) {
+        auto& [local, c] = *it;
+        if (t < c.next_query) {
+            ++it;
+            continue;
+        }
+        c.next_query = t + _config.conversion_poll_interval;
+        auto* port = port_for(c.slot);
+        auto answer = port == nullptr
+                          ? std::expected<oar::CopyAnswer, LinkError>{std::unexpected(LinkError{
+                                .code = LinkErrc::disconnected, .status = oar::Status::ok})}
+                          : port->copy_volume(copy_request(oar::CopyOp::query, local, c.network),
+                                              std::nullopt, std::nullopt);
+        if (!answer) {
+            if (++c.failures < _config.max_conversion_query_failures) {
+                ++it;
+                continue;
+            }
+        } else {
+            c.failures = 0;
+        }
+        proto::ConversionFailure failure = proto::ConversionFailure::none;
+        bool ended = true;
+        if (!answer || answer->state == oar::CopyVolumeState::none) {
+            failure = proto::ConversionFailure::lost;
+        } else if (answer->state == oar::CopyVolumeState::failed) {
+            failure = static_cast<proto::ConversionFailure>(std::to_underlying(answer->failure));
+            if (failure == proto::ConversionFailure::none) {
+                failure = proto::ConversionFailure::lost;  // a failure the role did not name
+            }
+        } else if (answer->state == oar::CopyVolumeState::copying) {
+            ended = false;
+        }
+        const auto progress = answer.value_or(oar::CopyAnswer{});
+        report_conversion(local, c, progress, failure);
+        if (!ended) {
+            ++it;
+            continue;
+        }
+        const auto done = *it;
+        it = _converting.erase(it);
+        end_conversion(done.first, done.second, failure, progress.written_bytes);
+    }
+}
+
+auto CommandRouter::report_conversion(VolumeId local, const Conversion& c,
+                                      const oar::CopyAnswer& answer,
+                                      proto::ConversionFailure failure) -> void {
+    proto::ConversionState state = proto::ConversionState::copying;
+    if (failure != proto::ConversionFailure::none) {
+        state = proto::ConversionState::failed;
+    } else if (answer.state == oar::CopyVolumeState::completed) {
+        state = proto::ConversionState::completed;
+    }
+    // The role's figures, kept within what the report allows.
+    const auto total = answer.total_bytes;
+    _reports->report(
+        proto::ConversionProgress{.local_volume_id = local,
+                                  .network_volume_id = c.network,
+                                  .total_bytes = total,
+                                  .done_bytes = std::min(answer.done_bytes, total),
+                                  .written_bytes = std::min(answer.written_bytes, total),
+                                  .direction = c.direction == mailbox::ConvertDirection::to_network
+                                                   ? proto::ConversionDirection::to_network
+                                                   : proto::ConversionDirection::to_local,
+                                  .state = state,
+                                  .failure = failure,
+                                  .slot = c.slot});
+}
+
+auto CommandRouter::end_conversion(VolumeId local, const Conversion& c,
+                                   proto::ConversionFailure failure, std::uint64_t written)
+    -> void {
+    if (failure == proto::ConversionFailure::none) {
+        ++_stats.conversions_completed;
+        audit(AuditRecord::of(AuditEvent::conversion_completed)
+                  .with_seq(c.seq)
+                  .with_volume(local)
+                  .with_count(written));
+    } else {
+        ++_stats.conversions_failed;
+        audit(AuditRecord::of(AuditEvent::conversion_failed)
+                  .with_seq(c.seq)
+                  .with_volume(local)
+                  .with_status(std::to_underlying(failure)));
+    }
+    // Released even after a start that failed: a start that timed out may
+    // have begun on the role. Releasing a copy the role does not have is a
+    // no-op, and one that fails leaves only a copier the next delete or
+    // restart drops.
+    if (auto* port = port_for(c.slot); port != nullptr) {
+        (void)port->copy_volume(copy_request(oar::CopyOp::release, local, c.network), std::nullopt,
+                                std::nullopt);
+    }
+    // The utility attachment served this copy only: the controller retires it.
+    if (c.attachment != 0) {
+        _keys->drop_attachment_key(c.attachment);
+    }
+    drop_unattached(c.network);
 }
 
 auto CommandRouter::check_attached(VolumeId volume, VmId vm, const mailbox::DeviceRef& device) const
@@ -927,6 +1165,8 @@ auto CommandRouter::commit(std::uint64_t seq, const mailbox::Body& body, const U
         } else {
             ++_stats.inconsistencies;
         }
+    } else if (const auto* cv2 = std::get_if<mailbox::ConvertVolume>(&body)) {
+        start_conversion(seq, *cv2);
     } else if (const auto* cn = std::get_if<mailbox::CreateNetwork>(&body)) {
         _networks.try_emplace(cn->vni, 0);
     } else if (const auto* dn = std::get_if<mailbox::DeleteNetwork>(&body)) {
@@ -1005,7 +1245,7 @@ auto CommandRouter::on_replica_config(std::span<const std::byte> frame) -> bool 
     it->second.frame.assign(frame.begin(), frame.end());
     // A volume no longer attached here is forgotten once it is detached;
     // until then the role must see the config that fences it.
-    if (!ours && it->second.attached_by == 0) {
+    if (!ours && it->second.attached_by == 0 && !is_converting(c->volume_id)) {
         _network.erase(it);
     }
     return true;
@@ -1083,7 +1323,7 @@ auto CommandRouter::prepare_network_attach(const mailbox::AttachVolume& attach, 
 
 auto CommandRouter::drop_unattached(VolumeId volume) -> void {
     const auto it = _network.find(volume);
-    if (it != _network.end() && it->second.attached_by == 0 &&
+    if (it != _network.end() && it->second.attached_by == 0 && !is_converting(volume) &&
         network_attachment(volume).error_or(mailbox::Status::ok) ==
             mailbox::Status::unknown_volume) {
         _network.erase(it);
@@ -1247,6 +1487,7 @@ auto CommandRouter::poll() -> void {
         pump();
     }
     poll_ejects(t);
+    poll_conversions(t);
     for (auto it = _deadlines.begin(); it != _deadlines.end();) {
         if (t < it->second) {
             ++it;

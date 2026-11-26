@@ -120,7 +120,8 @@ BOOST_AUTO_TEST_CASE(every_command_verifies_under_hull) {
           "attach-device 7 1 nic 0 0x55 0x10 02:00:00:00:00:10", "attach-device 7 3 gpu 1",
           "detach-device 7 1 nic 0 30 force", "create-volume 9 7 20", "delete-volume 9",
           "attach-volume 9 7 2 0", "detach-volume 9 7 2 0 30 destroy-vm", "rewrap-volume 9 7 8",
-          "withdraw-detach 9 7 2 0", "create-network 0x55", "delete-network 0x55"}) {
+          "withdraw-detach 9 7 2 0", "convert-volume 9 7 10 to-network 100", "create-network 0x55",
+          "delete-network 0x55"}) {
         auto env = s.envelope(7, 2, seq++, body_of(line));
         BOOST_REQUIRE_MESSAGE(env.has_value(), line);
         auto decoded = proto::decode_envelope(*env);
@@ -189,6 +190,14 @@ BOOST_AUTO_TEST_CASE(commands_parse_to_their_bodies) {
                     .device = {.slot = 2, .type = mb::DeviceType::blk_fn, .function = 1},
                     .timeout_s = 30,
                     .policy = mb::DetachPolicy::wait}}));
+    BOOST_TEST((body_of("convert-volume 9 7 10 to-local 0") ==
+                mb::Body{mb::ConvertVolume{.local_volume_id = 9,
+                                           .owner_vm = 7,
+                                           .network_volume_id = 10,
+                                           .direction = mb::ConvertDirection::to_local,
+                                           .mib_per_s = 0}}));
+    BOOST_TEST(parse_error("convert-volume 9 7 10 sideways 0").find("direction") !=
+               std::string::npos);
     BOOST_TEST((body_of("withdraw-detach 9 7 2 1") ==
                 mb::Body{mb::WithdrawDetach{
                     .volume_id = 9,

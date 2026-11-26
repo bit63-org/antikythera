@@ -469,6 +469,12 @@ BOOST_AUTO_TEST_CASE(handler_dispatches_every_command,
     // helm answers WITHDRAW_DETACH itself and never relays it.
     BOOST_TEST((status(mb::WithdrawDetach{.volume_id = 3, .vm_id = 1, .device = Harness::blk}) ==
                 mb::Status::unsupported));
+    // helm runs a conversion's copy once hull has checked the signature.
+    BOOST_TEST((status(mb::ConvertVolume{.local_volume_id = 1,
+                                         .owner_vm = 1,
+                                         .network_volume_id = 2,
+                                         .direction = mb::ConvertDirection::to_network,
+                                         .mib_per_s = 0}) == mb::Status::ok));
     BOOST_TEST((status(mb::DestroyVm{.vm_id = 1}) == mb::Status::ok));
     BOOST_TEST(!h.supervisor.contains(1));
     BOOST_TEST((status(mb::VmExited{.vm_id = 1}) == mb::Status::malformed));

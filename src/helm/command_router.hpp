@@ -105,6 +105,41 @@
 //   DELETE_VOLUME, REWRAP_VOLUME are the controller's (no mailbox command):
 //                  unknown_volume, as for any volume helm does not hold.
 //
+// Local <-> network conversion (.kiro/specs/block-volume-service/
+// Requirement 8.6, task 23.2). CONVERT_VOLUME copies a detached local
+// disk volume into a network volume or back, on the storage role that
+// holds the local volume (oar-blk's VolumeCopier rewraps every block from
+// the source's key to the target's). The controller creates the target
+// first (CREATE_VOLUME, or a network volume with a utility attachment for
+// this server and its VolumeKey) and waits for a restored network source
+// to be filled in (replica_status hydrated_bytes == total_bytes).
+//
+//   prepare  the local volume is a disk volume (an image: unsupported)
+//            owned by owner_vm, stored here and not attached; the network
+//            volume's newest config lists exactly one attachment for this
+//            server, whose key helm holds at that generation, and nothing
+//            attaches it; neither volume is converting already (conflict);
+//            the config goes to the local volume's slot (replica_config).
+//   commit   unwrap the local volume's key for owner_vm, open the
+//            attachment's key, and start the copy (copy_volume) with both.
+//            hull answers ok after checking the signature, so the command's
+//            outcome is ok; a copy that does not start is reported failed
+//            (`start`) in a conversion_progress.
+//   poll     every conversion_poll_interval, query the copy and report its
+//            progress (conversion_progress, `copying`). When it ends,
+//            report `completed` or `failed`, release it on the role and
+//            forget the attachment's key (the controller retires the
+//            utility attachment either way). A role that no longer knows
+//            the copy (it restarted), or that cannot be asked
+//            max_conversion_query_failures times running, is `lost`.
+//
+// While a volume converts, DELETE_VOLUME, ATTACH_VOLUME and REWRAP_VOLUME
+// of either volume are conflicts. The controller cancels a copy by
+// publishing a config without the utility attachment: the role's copy
+// then fails on the network side, and helm reports that. DESTROY_VM
+// without persist_volumes deletes the local volume on the role, which
+// drops the copy; helm reports it `lost` at its next query.
+//
 // Cooperative detach (.kiro/specs/block-volume-service/ Requirements
 // 3.3-3.6, design "Detach blocked while mounted"). DETACH_VOLUME under the
 // `wait` policy, for every volume kind:
@@ -283,6 +318,15 @@ public:
         return std::unexpected(
             LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported});
     }
+    // Local <-> network conversion, to the storage role
+    // (OarLink::copy_volume): the keys go with a start only.
+    virtual auto copy_volume(const oar::CopyVolume& /*request*/,
+                             std::optional<ScopedKey> /*local_key*/,
+                             std::optional<ScopedKey> /*network_key*/)
+        -> std::expected<oar::CopyAnswer, LinkError> {
+        return std::unexpected(
+            LinkError{.code = LinkErrc::refused, .status = oar::Status::unsupported});
+    }
 };
 
 class OarLinkPort final : public OarPort {
@@ -307,6 +351,9 @@ public:
     auto replica_config(std::span<const std::byte> frame)
         -> std::expected<void, LinkError> override;
     auto eject(const oar::Eject& request) -> std::expected<oar::EjectState, LinkError> override;
+    auto copy_volume(const oar::CopyVolume& request, std::optional<ScopedKey> local_key,
+                     std::optional<ScopedKey> network_key)
+        -> std::expected<oar::CopyAnswer, LinkError> override;
 
 private:
     OarLink* _link;
@@ -339,6 +386,10 @@ struct RouterConfig {
     // guest released the function. The role needs 2 s of quiet to call a
     // function released, so finer polling buys little.
     std::chrono::milliseconds eject_poll_interval{std::chrono::milliseconds{500}};
+    // How often a conversion's copy is queried and its progress reported.
+    std::chrono::milliseconds conversion_poll_interval{std::chrono::seconds{1}};
+    // Queries in a row that may fail before a conversion is reported lost.
+    unsigned max_conversion_query_failures{3};
     // This server (the ControllerSession's): network volume attachments
     // naming it are the ones it serves.
     std::uint64_t server_id{0};
@@ -363,6 +414,8 @@ struct RouterStats {
     std::uint64_t detaches_released{0};      // cooperative detaches the guest released
     std::uint64_t detaches_busy{0};          // cooperative detaches answered busy
     std::uint64_t detaches_withdrawn{0};     // eject requests cleared by WITHDRAW_DETACH
+    std::uint64_t conversions_completed{0};
+    std::uint64_t conversions_failed{0};  // did not start, failed, or lost
 };
 
 class CommandRouter {
@@ -414,6 +467,8 @@ public:
     // still attached (waiting, busy or released but not yet detached).
     [[nodiscard]] auto ejecting() const noexcept -> std::size_t { return _ejecting.size(); }
     [[nodiscard]] auto queued() const noexcept -> std::size_t { return _queue.size(); }
+    // Conversions whose copy runs on a storage role.
+    [[nodiscard]] auto converting() const noexcept -> std::size_t { return _converting.size(); }
 
 private:
     // What a command did before relay, so it can be undone.
@@ -451,6 +506,17 @@ private:
         bool busy{false};      // a detach timed out on it
         bool released{false};  // the role said so (reported once)
         Clock::time_point next_query;
+    };
+
+    // A CONVERT_VOLUME's copy, by local volume.
+    struct Conversion {
+        VolumeId network{0};
+        AttachmentId attachment{0};
+        mailbox::ConvertDirection direction{mailbox::ConvertDirection::to_network};
+        std::uint8_t slot{0};
+        std::uint64_t seq{0};
+        Clock::time_point next_query;
+        unsigned failures{0};  // queries in a row the role did not answer
     };
 
     struct Vm {
@@ -507,6 +573,21 @@ private:
     [[nodiscard]] auto fenced(const NetworkVolume& net) const -> bool;
     auto prepare(std::uint64_t seq, const mailbox::Body& body, Undo& undo)
         -> std::expected<void, mailbox::Status>;
+    // CONVERT_VOLUME's checks, and its config to the local volume's slot.
+    auto prepare_convert(const mailbox::ConvertVolume& convert)
+        -> std::expected<void, mailbox::Status>;
+    // CONVERT_VOLUME's commit: both keys to the role, and the copy starts.
+    auto start_conversion(std::uint64_t seq, const mailbox::ConvertVolume& convert) -> void;
+    auto poll_conversions(Clock::time_point t) -> void;
+    // Reports a conversion_progress for `local`'s copy.
+    auto report_conversion(VolumeId local, const Conversion& c, const oar::CopyAnswer& answer,
+                           proto::ConversionFailure failure) -> void;
+    // The copy ended (or never started): audits, releases it on the role
+    // and forgets the attachment's key.
+    auto end_conversion(VolumeId local, const Conversion& c, proto::ConversionFailure failure,
+                        std::uint64_t written) -> void;
+    // Either volume of a running conversion.
+    [[nodiscard]] auto is_converting(VolumeId volume) const -> bool;
     auto reserve(VmId vm, const mailbox::DeviceRef& device, Undo& undo)
         -> std::expected<FunctionId, mailbox::Status>;
     auto compensate(std::uint64_t seq, Undo& undo) -> void;
@@ -568,6 +649,7 @@ private:
     std::map<VolumeId, Volume> _volumes;
     std::map<VolumeId, FunctionId> _attached;  // volume -> blk function serving it
     std::map<VolumeId, NetworkVolume> _network;
+    std::map<VolumeId, Conversion> _converting;        // by local volume
     std::map<std::uint32_t, std::uint64_t> _networks;  // vni -> applied map version
 
     RouterStats _stats;

@@ -46,6 +46,7 @@ struct MapEntry {
     MacAddress mac{};
     Ipv6Address owner_vtep{};
     bool source_dest_check{true};  // false: may send and receive for others (Requirement 11.10)
+    std::uint64_t subnet_id{0};    // MapUpdate v4; 0 = none (vpc-subnets-routing Requirement 2.6)
     friend auto operator==(const MapEntry&, const MapEntry&) -> bool = default;
 };
 

@@ -31,21 +31,6 @@ constexpr std::uint64_t placeholder_nic_base = 0xFFFF'FFFE'0000'0000;
 // Metadata packets read from the TUN per poll().
 constexpr std::size_t metadata_budget = 64;
 
-auto ipv4_value(const neighbor::Ipv4Address& a) -> std::uint32_t {
-    std::uint32_t v = 0;
-    for (const auto b : a) {
-        v = (v << 8U) | std::to_integer<std::uint32_t>(b);
-    }
-    return v;
-}
-
-auto in_ipv4_prefix(const Ipv4Prefix& p, const neighbor::Ipv4Address& a) -> bool {
-    if (p.length == 0) {
-        return true;
-    }
-    const std::uint32_t mask = ~std::uint32_t{0} << (32U - p.length);
-    return (ipv4_value(a) & mask) == (ipv4_value(p.address) & mask);
-}
 constexpr std::byte placeholder_mac_head{0x02};  // locally administered unicast
 constexpr std::byte placeholder_mac_fill{0xFF};
 constexpr unsigned byte_bits = 8;
@@ -53,29 +38,37 @@ constexpr std::size_t mac_fn_high = 4;
 constexpr std::size_t mac_fn_low = 5;
 
 // The VSwitch's config from a decoded VpcConfig version 2 frame, or
-// nothing for a frame using what the VSwitch cannot apply yet. Until the
-// subnet model and the router land (vpc-subnets-routing tasks 4 and 5) the
-// VSwitch holds one L2 segment per VNI, so only a VPC with one subnet and
-// one (main) table holding nothing but its local routes maps onto it: the
-// subnet's prefix and its base + 1 gateway become the segment's, its /64
-// the segment's IPv6 prefix. decode_vpc_config already checked every value;
-// the VSwitch checks the result again.
+// nothing for a frame using what the VSwitch cannot apply yet: until the
+// router lands (vpc-subnets-routing task 5) a table may hold only its
+// `local` routes. decode_vpc_config already checked every value; the
+// VSwitch checks the result again.
 auto to_vpc_config(const proto::VpcConfigFrame& f) -> std::optional<VpcConfig> {
-    if (f.subnets.size() != 1 || f.tables.size() != 1 ||
-        std::ranges::any_of(f.tables.front().routes, [](const proto::VpcRoute& r) {
-            return r.kind != proto::RouteKind::local;
+    if (std::ranges::any_of(f.tables, [](const proto::VpcRouteTable& t) {
+            return std::ranges::any_of(t.routes, [](const proto::VpcRoute& r) {
+                return r.kind != proto::RouteKind::local;
+            });
         })) {
         return std::nullopt;
     }
-    const auto& subnet = f.subnets.front();
     VpcConfig c{.gateway_mac = f.gateway_mac,
-                .ipv4 = {.address = subnet.ipv4_prefix, .length = subnet.ipv4_length},
-                .ipv4_gateway = proto::vpc_subnet_gateway(subnet),
-                .ipv6_prefix = subnet.ipv6_prefix,
+                .ipv4_blocks = {},
+                .ipv6_block = f.ipv6_block,
+                .subnets = {},
                 .dns4 = f.dns4,
                 .dns6 = f.dns6,
                 .domain = f.domain,
-                .lease_seconds = f.lease_seconds};
+                .lease_seconds = f.lease_seconds,
+                .routes = {}};
+    for (const auto& b : f.ipv4_blocks) {
+        c.ipv4_blocks.push_back({.address = b.prefix, .length = b.length});
+    }
+    for (const auto& s : f.subnets) {
+        c.subnets.push_back({.id = s.subnet_id,
+                             .ipv4 = {.address = s.ipv4_prefix, .length = s.ipv4_length},
+                             .gateway = proto::vpc_subnet_gateway(s),
+                             .ipv6_prefix = s.ipv6_prefix,
+                             .table = s.table});
+    }
     return c;
 }
 
@@ -86,7 +79,8 @@ auto to_map_update(const proto::MapUpdate& u) -> MapUpdate {
         out.entries.push_back({.nic_id = geneve::NicId{e.nic_id},
                                .mac = e.mac,
                                .owner_vtep = e.owner_vtep,
-                               .source_dest_check = e.source_dest_check});
+                               .source_dest_check = e.source_dest_check,
+                               .subnet_id = e.subnet_id});
     }
     return out;
 }
@@ -343,13 +337,22 @@ auto NetRole::metadata_view(std::uint64_t nic_id) const -> MetadataView {
     view.network.mac = binding->mac;
     auto [ipv4, ipv6] = _vswitch->nic_addresses(binding->vni, nic);
     if (const VpcConfig* cfg = _vswitch->vpc_config(binding->vni); cfg != nullptr) {
-        view.network.subnet4 = cfg->ipv4.address;
-        view.network.subnet4_length = cfg->ipv4.length;
-        // local-ipv4 is the address DHCP hands out: the lowest in the prefix.
-        const auto inside = std::ranges::find_if(
-            ipv4, [&](const neighbor::Ipv4Address& a) { return in_ipv4_prefix(cfg->ipv4, a); });
-        if (inside != ipv4.end()) {
-            std::rotate(ipv4.begin(), inside, inside + 1);
+        for (const auto& b : cfg->ipv4_blocks) {
+            view.network.vpc4.push_back({.address = b.address, .length = b.length});
+        }
+        view.network.vpc6 = cfg->ipv6_block;
+        if (const VpcSubnet* subnet = find_subnet(*cfg, binding->subnet_id); subnet != nullptr) {
+            view.network.subnet_id = subnet->id;
+            view.network.subnet4 = subnet->ipv4.address;
+            view.network.subnet4_length = subnet->ipv4.length;
+            view.network.subnet6 = subnet->ipv6_prefix;
+            // local-ipv4 is the address DHCP hands out: the lowest in the
+            // subnet (the table holds only addresses inside it).
+            const auto inside = std::ranges::find_if(
+                ipv4, [&](const neighbor::Ipv4Address& a) { return in_prefix(subnet->ipv4, a); });
+            if (inside != ipv4.end()) {
+                std::rotate(ipv4.begin(), inside, inside + 1);
+            }
         }
     }
     view.network.ipv4 = std::move(ipv4);
@@ -435,6 +438,10 @@ auto NetRole::vpc_config(std::span<const std::byte> frame) -> oar::Status {
     }
     _vpc_versions.insert_or_assign(config->vni, config->config_version);
     ++_counters.vpc_applied;
+    // The subnets decide which guest addresses count (Requirement 2.6).
+    if (!refresh_neighbors(config->vni)) {
+        ++_counters.map_neighbors_rejected;
+    }
     return oar::Status::ok;
 }
 
@@ -464,16 +471,56 @@ auto NetRole::map_update(std::span<const std::byte> frame) -> oar::Status {
     }
     // The proxy follows the mapping. Its answers resolve each address
     // through the current snapshot, so the moment between the two calls
-    // cannot answer for a NIC the new mapping dropped. If the addresses are
-    // refused (decode makes that unreachable), fail closed: no proxy answers
-    // for the VNI rather than stale ones.
-    if (!_vswitch->set_neighbors(to_neighbors(*update))) {
-        static_cast<void>(_vswitch->set_neighbors({.vni = update->vni, .ipv4 = {}, .ipv6 = {}}));
+    // cannot answer for a NIC the new mapping dropped.
+    _guest_addresses.insert_or_assign(update->vni, to_neighbors(*update));
+    if (!refresh_neighbors(update->vni)) {
         ++_counters.map_neighbors_rejected;
         return oar::Status::failed;
     }
     ++_counters.map_applied;
     return oar::Status::ok;
+}
+
+auto NetRole::refresh_neighbors(std::uint32_t vni) -> bool {
+    const auto it = _guest_addresses.find(vni);
+    if (it == _guest_addresses.end()) {
+        return true;  // no map_update yet: nothing to filter
+    }
+    const NeighborUpdate& all = it->second;
+    const VpcConfig* const cfg = _vswitch->vpc_config(vni);
+    NeighborUpdate next{.vni = vni, .ipv4 = {}, .ipv6 = {}};
+    if (cfg == nullptr) {
+        next = all;  // one L2 segment: every address counts
+    } else {
+        const auto snap = _mappings.snapshot();
+        const auto subnet_of = [&](geneve::NicId nic) -> const VpcSubnet* {
+            const auto binding = snap->lookup(nic);
+            return binding ? find_subnet(*cfg, binding->subnet_id) : nullptr;
+        };
+        for (const auto& n : all.ipv4) {
+            const VpcSubnet* const s = subnet_of(n.nic);
+            if (s != nullptr && in_prefix(s->ipv4, n.ip)) {
+                next.ipv4.push_back(n);
+            } else {
+                ++_counters.map_addr_outside_subnet;
+            }
+        }
+        for (const auto& n : all.ipv6) {
+            const VpcSubnet* const s = subnet_of(n.nic);
+            if (s != nullptr && s->ipv6_prefix && in_prefix64(*s->ipv6_prefix, n.ip)) {
+                next.ipv6.push_back(n);
+            } else {
+                ++_counters.map_addr_outside_subnet;
+            }
+        }
+    }
+    // Fail closed if refused (decode makes that unreachable): no proxy
+    // answers or source matches for the VNI rather than stale ones.
+    if (!_vswitch->set_neighbors(next)) {
+        static_cast<void>(_vswitch->set_neighbors({.vni = vni, .ipv4 = {}, .ipv6 = {}}));
+        return false;
+    }
+    return true;
 }
 
 auto NetRole::group_policy(std::span<const std::byte> frame) -> oar::Status {

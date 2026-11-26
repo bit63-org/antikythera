@@ -270,11 +270,18 @@ routed hop to reach an address the controller never gave it.
 `VSwitch::set_vpc_config(vni, VpcConfig)`:
 
 ```
+struct VpcSubnet {
+    std::uint64_t id;                    // non-zero, ascending in the list
+    Ipv4Prefix ipv4;                     // inside a block, no overlap
+    Ipv4Address gateway;                 // inside ipv4 (base + 1), not network/broadcast
+    std::optional<Ipv6Prefix> ipv6;      // a /64 inside the VPC's /56
+    std::uint16_t table;                 // route table (vpc-subnets-routing task 5)
+};
 struct VpcConfig {
-    MacAddress gateway_mac;              // locally administered unicast
-    Ipv4Prefix ipv4;                     // e.g. 10.0.0.0/16, length 8..30
-    Ipv4Address ipv4_gateway;            // inside ipv4, not network/broadcast
-    std::optional<Ipv6Prefix> ipv6;      // a /64
+    MacAddress gateway_mac;              // locally administered unicast, one per VPC
+    std::vector<Ipv4Prefix> ipv4_blocks; // 1..5, length 8..30, no overlap
+    std::optional<Ipv6Prefix> ipv6_block;  // a /56
+    std::vector<VpcSubnet> subnets;      // 1..200
     std::vector<Ipv4Address> dns4;       // ≤ 4
     std::vector<Ipv6Address> dns6;       // ≤ 4
     std::string domain;                  // ≤ 253 bytes, DNS name syntax
@@ -282,7 +289,11 @@ struct VpcConfig {
 };
 ```
 
-Validated whole (`VpcConfigError`); an empty optional clears the VNI. The
+Validated whole (`VpcConfigError`); `clear_vpc_config()` clears the VNI.
+Each answer below comes from the asking NIC's subnet, the one its mapping
+entry names (MapUpdate v4); a NIC in no known subnet of a VNI with a
+config carries nothing (vpc-subnets-routing design "Transmit" and
+"Receive"). The
 interface MTU comes from the NIC, not the config: `attach()` takes the
 MTU its function advertises (set by the MTU plan), so DHCP option 26 and
 the RA MTU option always match `VIRTIO_NET_F_MTU`.
@@ -290,11 +301,11 @@ the RA MTU option always match `VIRTIO_NET_F_MTU`.
 DHCPv4 (`src/oar/net/dhcp4.*`): parse BOOTP + options (RFC 2131/2132,
 option overload ignored, at most 1500 bytes of options), build replies.
 Stateless: the reply is a pure function of the message, the mapping and
-the config. Server identifier = gateway address; replies go to the NIC's
+the config. Server identifier = the subnet's gateway address; replies go to the NIC's
 MAC with IP destination `255.255.255.255` when the broadcast flag is set
 or `ciaddr` is zero, else `ciaddr`; source is the gateway address and
 MAC. T1 = lease/2, T2 = lease × 7/8. Address: the NIC's lowest IPv4 guest
-address inside the prefix; a NIC with none gets no answer
+address inside its subnet; a NIC with none gets no answer
 (`dhcp4_no_address`). A future MapUpdate flag marking the primary
 address replaces "lowest".
 
@@ -304,7 +315,7 @@ DUID-LL (type 3, hardware type 1) of the gateway MAC. RAs: hop limit 64,
 M and O set, router lifetime 1800 s, prefix information (L=1, A=0,
 lifetimes infinite), MTU, source link-layer address. `VSwitch::poll(now)`,
 called by the Vtep runtime's loop, sends an unsolicited RA to each
-attached NIC in a VNI with an IPv6 prefix every 200 s (and right after
+attached NIC whose subnet has an IPv6 prefix every 200 s (and right after
 attach). DHCPv6 lifetimes: preferred = valid = lease, T1/T2 as DHCPv4.
 
 ### Metadata intercept

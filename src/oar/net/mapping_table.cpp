@@ -178,8 +178,8 @@ auto MappingTable::apply(const MapUpdate& update) -> std::expected<std::uint64_t
     vpc.version = update.version;
     vpc.entries = update.entries;
     for (const MapEntry& e : update.entries) {
-        next->_nics.emplace(e.nic_id,
-                            NicBinding{update.vni, e.mac, e.owner_vtep, e.source_dest_check});
+        next->_nics.emplace(e.nic_id, NicBinding{update.vni, e.mac, e.owner_vtep,
+                                                 e.source_dest_check, e.subnet_id});
     }
 
     _current.store(std::move(next), std::memory_order_release);

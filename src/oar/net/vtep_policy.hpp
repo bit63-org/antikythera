@@ -36,6 +36,9 @@ struct NicBinding {
     // False when the mapping turns the NIC's source/destination check off
     // (MapUpdate v3 flag, oar-net Requirement 11.10).
     bool source_dest_check{true};
+    // The NIC's subnet (MapUpdate v4); 0 when the mapping names none
+    // (vpc-subnets-routing Requirement 2.6).
+    std::uint64_t subnet_id{0};
 };
 
 // Read-only view of the controller-pushed mapping table.

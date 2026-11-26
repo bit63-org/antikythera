@@ -226,10 +226,9 @@ struct RoleCounters {
     std::uint64_t vpc_bad_signature{0};
     std::uint64_t vpc_stale{0};     // older than the version applied for the VNI
     std::uint64_t vpc_rejected{0};  // the VSwitch refused it
-    // A version 2 frame with more than one subnet, more than one table, or
-    // a route other than `local`: refused whole until the VSwitch applies
-    // subnets and route tables (vpc-subnets-routing tasks 4 and 5), so
-    // nothing half-applies.
+    // A version 2 frame with a route other than `local`: refused whole
+    // until the VSwitch applies route tables (vpc-subnets-routing task 5),
+    // so nothing half-applies.
     std::uint64_t vpc_unsupported{0};
     std::uint64_t map_applied{0};       // frames that changed the table
     std::uint64_t map_redelivered{0};   // the version already applied: ok, unchanged
@@ -238,7 +237,11 @@ struct RoleCounters {
     std::uint64_t map_bad_signature{0};
     std::uint64_t map_rejected{0};  // MappingTable refused it (stale version, bad entries)
     std::uint64_t map_neighbors_rejected{0};  // the VSwitch refused its proxy addresses
-    std::uint64_t tunnel_keys_refused{0};     // set_tunnel_key / set_tunnel_peer the Tunnel refused
+    // Guest addresses left out of a VNI's neighbor table because they lie
+    // outside the owning NIC's subnet, or the NIC has no known subnet
+    // (vpc-subnets-routing Requirement 2.6); counted once per rebuild.
+    std::uint64_t map_addr_outside_subnet{0};
+    std::uint64_t tunnel_keys_refused{0};  // set_tunnel_key / set_tunnel_peer the Tunnel refused
     // GroupPolicy frames (task 13), counted like map_updates.
     std::uint64_t group_applied{0};
     std::uint64_t group_redelivered{0};
@@ -359,6 +362,11 @@ private:
     auto start_metadata() -> std::expected<void, std::string>;
     // Notes which up peers still lack mtu_ok, and since when.
     auto track_mtu(VtepClock::time_point now) -> void;
+    // Hands the VSwitch the VNI's guest addresses from its last map_update,
+    // filtered to each NIC's subnet once the VNI has a config, so the
+    // mapping and the config give the same table in either order. False if
+    // the VSwitch refused them (it then holds none for the VNI).
+    auto refresh_neighbors(std::uint32_t vni) -> bool;
     // The VSwitch's meters as group_usage entries (UsagePager's snapshot).
     auto usage_snapshot() -> helm::oar::UsagePager::Snapshot;
 
@@ -369,7 +377,8 @@ private:
     std::unique_ptr<TunnelPeerSet> _peer_set;
     std::unique_ptr<Vtep> _vtep;
     std::unique_ptr<VSwitch> _vswitch;
-    std::map<std::uint32_t, std::uint64_t> _vpc_versions;  // applied config version, by VNI
+    std::map<std::uint32_t, std::uint64_t> _vpc_versions;      // applied config version, by VNI
+    std::map<std::uint32_t, NeighborUpdate> _guest_addresses;  // last map_update's, by VNI
     std::vector<Slot> _slots;
     NetRoleConfig::Clock::time_point _started;
     // Up peers without mtu_ok, with when tick() first saw them so, and the

@@ -93,6 +93,13 @@ auto network() -> net::NicNetwork {
     n.ipv6 = {v6};
     n.subnet4 = net::neighbor::Ipv4Address{std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}};
     n.subnet4_length = 24;
+    n.subnet_id = 0x5B01;
+    net::Ipv6Address prefix{};
+    prefix[0] = std::byte{0xfd};
+    n.subnet6 = prefix;
+    n.vpc4 = {{.address = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}}, .length = 16},
+              {.address = {std::byte{10}, std::byte{1}, std::byte{0}, std::byte{0}}, .length = 16}};
+    n.vpc6 = prefix;
     return n;
 }
 
@@ -359,14 +366,21 @@ BOOST_AUTO_TEST_CASE(the_path_table) {
     BOOST_TEST(a.body("/latest/meta-data/network/interfaces/macs/") == "02:00:00:0a:bc:de/");
     const std::string mac = "/latest/meta-data/network/interfaces/macs/02:00:00:0a:bc:de/";
     BOOST_TEST(a.body(mac) ==
-               "device-number\ninterface-id\nipv6s\nlocal-ipv4s\nmac\n"
-               "subnet-ipv4-cidr-block\nvpc-id");
+               "device-number\ninterface-id\nipv6s\nlocal-ipv4s\nmac\nsubnet-id\n"
+               "subnet-ipv4-cidr-block\nsubnet-ipv6-cidr-blocks\nvpc-id\nvpc-ipv4-cidr-block\n"
+               "vpc-ipv4-cidr-blocks\nvpc-ipv6-cidr-blocks");
     BOOST_TEST(a.body(mac + "device-number") == "0");
     BOOST_TEST(a.body(mac + "interface-id") == "eni-0123456789abcdef0");
     BOOST_TEST(a.body(mac + "ipv6s") == "fd00::5");
     BOOST_TEST(a.body(mac + "local-ipv4s") == "10.0.0.5\n10.0.0.6");
     BOOST_TEST(a.body(mac + "subnet-ipv4-cidr-block") == "10.0.0.0/24");
     BOOST_TEST(a.body(mac + "vpc-id") == "vpc-0123456789abcdef0");
+    // vpc-subnets-routing design "Metadata": the subnet and the VPC's blocks.
+    BOOST_TEST(a.body(mac + "subnet-id") == "subnet-00000000000005b01");
+    BOOST_TEST(a.body(mac + "subnet-ipv6-cidr-blocks") == "fd00::/64");
+    BOOST_TEST(a.body(mac + "vpc-ipv4-cidr-block") == "10.0.0.0/16");
+    BOOST_TEST(a.body(mac + "vpc-ipv4-cidr-blocks") == "10.0.0.0/16\n10.1.0.0/16");
+    BOOST_TEST(a.body(mac + "vpc-ipv6-cidr-blocks") == "fd00::/56");
     BOOST_TEST(a.status("/latest/meta-data/network/interfaces/macs/02:00:00:00:00:01/mac") == 404U);
     BOOST_TEST(a.status("/latest/meta-data/iam/") == 404U);
     BOOST_TEST(a.status("/latest/meta-data/nothing") == 404U);

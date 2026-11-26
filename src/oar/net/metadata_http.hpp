@@ -171,8 +171,18 @@ struct NicNetwork {
     MacAddress mac{};
     std::vector<neighbor::Ipv4Address> ipv4;  // the first is local-ipv4
     std::vector<Ipv6Address> ipv6;
-    std::optional<neighbor::Ipv4Address> subnet4;  // the VPC's IPv4 prefix
+    // From the VPC's config, when the VNI has one and the NIC is in one of
+    // its subnets (vpc-subnets-routing design "Metadata").
+    std::optional<std::uint64_t> subnet_id;        // rendered as subnet-...
+    std::optional<neighbor::Ipv4Address> subnet4;  // the NIC's subnet's IPv4 prefix
     std::uint8_t subnet4_length{0};
+    std::optional<Ipv6Address> subnet6;  // the subnet's /64
+    struct Ipv4Block {
+        neighbor::Ipv4Address address{};
+        std::uint8_t length{0};
+    };
+    std::vector<Ipv4Block> vpc4;      // the VPC's IPv4 blocks, the primary first
+    std::optional<Ipv6Address> vpc6;  // the VPC's /56
 };
 
 struct MetadataView {

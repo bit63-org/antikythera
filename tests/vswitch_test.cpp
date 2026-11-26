@@ -113,8 +113,14 @@ auto multicast_policy() -> net::GroupPolicy {
             .max_remote_vteps = test_max_remote_vteps};
 }
 
-auto entry(NicId id, std::uint8_t vtep_tail) -> MapEntry {
-    return {.nic_id = id, .mac = mac_of(id), .owner_vtep = vtep(vtep_tail)};
+// Every NIC is in subnet_a unless a test moves it; the subnet matters only
+// once the VNI has a VpcConfig.
+constexpr std::uint64_t subnet_a = 0x5B01;
+constexpr std::uint64_t subnet_b = 0x5B02;
+constexpr std::uint64_t subnet_c = 0x5B03;
+
+auto entry(NicId id, std::uint8_t vtep_tail, std::uint64_t subnet = subnet_a) -> MapEntry {
+    return {.nic_id = id, .mac = mac_of(id), .owner_vtep = vtep(vtep_tail), .subnet_id = subnet};
 }
 
 auto ip4(std::uint8_t last) -> nb::Ipv4Address {
@@ -1211,19 +1217,27 @@ auto gw_ip() -> nb::Ipv4Address {
     return {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{1}};
 }
 
+// One VPC block 10.0.0.0/8 with fd10::/56; subnet_a is 10.0.0.0/16 with
+// fd10::/64, where every Fixture NIC and address lives.
 auto config() -> net::VpcConfig {
     net::Ipv6Address prefix{};
     prefix[0] = ula_prefix;
     prefix[1] = std::byte{0x10};
-    return {.gateway_mac = gw_mac(),
-            .ipv4 = {.address = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}},
-                     .length = 16},
-            .ipv4_gateway = gw_ip(),
-            .ipv6_prefix = prefix,
-            .dns4 = {{std::byte{10}, std::byte{0}, std::byte{0}, std::byte{2}}},
-            .dns6 = {},
-            .domain = "ec2.internal",
-            .lease_seconds = lease};
+    return {
+        .gateway_mac = gw_mac(),
+        .ipv4_blocks = {{.address = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}},
+                         .length = 8}},
+        .ipv6_block = prefix,
+        .subnets = {{.id = subnet_a,
+                     .ipv4 = {.address = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}},
+                              .length = 16},
+                     .gateway = gw_ip(),
+                     .ipv6_prefix = prefix,
+                     .table = 1}},
+        .dns4 = {{std::byte{10}, std::byte{0}, std::byte{0}, std::byte{2}}},
+        .dns6 = {},
+        .domain = "ec2.internal",
+        .lease_seconds = lease};
 }
 
 auto bcast_ip() -> nb::Ipv4Address {
@@ -1271,21 +1285,65 @@ BOOST_AUTO_TEST_CASE(config_validation, *boost::unit_test::timeout(unit_timeout_
     c.gateway_mac[0] = std::byte{0x03};  // group
     BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_gateway_mac));
     c = config();
-    c.ipv4.length = 31;
+    c.ipv4_blocks[0].length = 31;
     BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv4_prefix));
     c = config();
-    c.ipv4.address[3] = std::byte{1};  // host bits
+    c.ipv4_blocks[0].address[3] = std::byte{1};  // host bits
     BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv4_prefix));
     c = config();
-    c.ipv4_gateway = {std::byte{10}, std::byte{1}, std::byte{0}, std::byte{0}};
-    c.ipv4.length = 24;  // 10.1.0.0 is outside 10.0.0.0/24
+    c.ipv4_blocks.clear();
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv4_prefix));
+    c = config();
+    c.ipv4_blocks.push_back({.address = {std::byte{10}, std::byte{9}, std::byte{0}, std::byte{0}},
+                             .length = 16});  // inside the first block
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv4_prefix));
+    c = config();
+    c.ipv4_blocks.resize(net::max_vpc_ipv4_blocks + 1, c.ipv4_blocks[0]);
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv4_prefix));
+    c = config();
+    c.subnets[0].gateway = {std::byte{10}, std::byte{1}, std::byte{0}, std::byte{0}};
+    c.subnets[0].ipv4.length = 24;  // 10.1.0.0 is outside 10.0.0.0/24
     BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv4_gateway));
     c = config();
-    c.ipv4_gateway = {std::byte{10}, std::byte{0}, std::byte{255}, std::byte{255}};  // broadcast
+    c.subnets[0].gateway = {std::byte{10}, std::byte{0}, std::byte{255},
+                            std::byte{255}};  // broadcast
     BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv4_gateway));
     c = config();
-    (*c.ipv6_prefix)[ipv6_last] = std::byte{1};  // not a /64
+    (*c.subnets[0].ipv6_prefix)[ipv6_last] = std::byte{1};  // not a /64
     BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv6_prefix));
+    c = config();
+    (*c.subnets[0].ipv6_prefix)[1] = std::byte{0x11};  // outside fd10::/56
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv6_prefix));
+    c = config();
+    c.ipv6_block.reset();  // a subnet /64 needs the VPC's block
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv6_prefix));
+    c = config();
+    (*c.ipv6_block)[7] = std::byte{1};  // not a /56
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_ipv6_prefix));
+    c = config();
+    c.subnets.clear();
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_subnet));
+    c = config();
+    c.subnets[0].id = 0;
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_subnet));
+    c = config();
+    c.subnets[0].ipv4 = {.address = {std::byte{11}, std::byte{0}, std::byte{0}, std::byte{0}},
+                         .length = 16};  // outside every block
+    c.subnets[0].gateway = {std::byte{11}, std::byte{0}, std::byte{0}, std::byte{1}};
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_subnet));
+    c = config();
+    c.subnets.push_back(c.subnets[0]);  // the same ID twice, overlapping
+    c.subnets[1].ipv6_prefix.reset();
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_subnet));
+    c.subnets[1].id = subnet_b;  // ascending, but still overlapping
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_subnet));
+    c = config();
+    c.subnets.insert(c.subnets.begin(), c.subnets[0]);  // descending IDs
+    c.subnets[0].id = subnet_b;
+    c.subnets[0].ipv4.address[1] = std::byte{1};
+    c.subnets[0].gateway[1] = std::byte{1};
+    c.subnets[0].ipv6_prefix.reset();
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_subnet));
     c = config();
     c.dns4.resize(net::max_dns_servers + 1, gw_ip());
     BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::too_many_dns));
@@ -1418,9 +1476,10 @@ BOOST_AUTO_TEST_CASE(dhcp_checks, *boost::unit_test::timeout(unit_timeout_second
     BOOST_TEST(
         std::ranges::equal(pk::parse(port_a.frames[0])->payload.subspan(yiaddr_offset, 4), ip4(3)));
     auto c = config();
-    c.ipv4 = {.address = {std::byte{192}, std::byte{168}, std::byte{0}, std::byte{0}},
-              .length = 16};
-    c.ipv4_gateway = {std::byte{192}, std::byte{168}, std::byte{0}, std::byte{1}};
+    c.ipv4_blocks.push_back(
+        {.address = {std::byte{192}, std::byte{168}, std::byte{0}, std::byte{0}}, .length = 16});
+    c.subnets[0].ipv4 = c.ipv4_blocks[1];
+    c.subnets[0].gateway = {std::byte{192}, std::byte{168}, std::byte{0}, std::byte{1}};
     BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
     send(nic_a, discover(nic_a));
     BOOST_TEST(port_a.frames.size() == 1);
@@ -1452,7 +1511,7 @@ BOOST_AUTO_TEST_CASE(answers_nd_for_gateway, *boost::unit_test::timeout(unit_tim
     BOOST_TEST(std::to_integer<int>(gw_ll[11]) == 0xff);
     BOOST_TEST(std::to_integer<int>(gw_ll[12]) == 0xfe);
     auto c = config();
-    c.ipv6_prefix.reset();
+    c.subnets[0].ipv6_prefix.reset();
     BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
     send(nic_a, neighbor_solicitation(nic_a, link_local(nic_a), gw_ll));
     BOOST_TEST(nothing_delivered());  // no IPv6 prefix: no IPv6 gateway
@@ -2273,6 +2332,202 @@ BOOST_AUTO_TEST_CASE(gateway_queries_and_joins_expire,
     const std::vector<net::Membership> want{{.nic = nic_b, .vni = vpc, .group = group_of(g4(1))}};
     BOOST_TEST((sw.memberships() == want));
     BOOST_TEST(sw.counters().snoop_expired == 1);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// vpc-subnets-routing task 4: subnets inside one VNI. subnet_a is
+// 10.0.0.0/27 (gateway .1) with fd10::/64, subnet_b 10.0.0.32/27 (gateway
+// .33) with fd10:0:0:1::/64, subnet_c 10.0.0.64/27 with no NIC. a (here)
+// and d (third VTEP) are in A; b (here), c and e (peer VTEP) in B.
+BOOST_FIXTURE_TEST_SUITE(subnets, Fixture)
+
+namespace {
+
+namespace ig = ak::oar::net::igmp;
+
+auto v4(std::uint8_t last) -> nb::Ipv4Address {
+    return {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{last}};
+}
+
+auto subnet(std::uint64_t id, std::uint8_t base, std::optional<std::uint8_t> ipv6)
+    -> net::VpcSubnet {
+    std::optional<net::Ipv6Address> prefix;
+    if (ipv6) {
+        prefix = net::Ipv6Address{};
+        (*prefix)[0] = ula_prefix;
+        (*prefix)[1] = std::byte{0x10};
+        (*prefix)[7] = std::byte{*ipv6};
+    }
+    return {.id = id,
+            .ipv4 = {.address = v4(base), .length = 27},
+            .gateway = v4(static_cast<std::uint8_t>(base + 1)),
+            .ipv6_prefix = prefix,
+            .table = 1};
+}
+
+auto three_subnets() -> net::VpcConfig {
+    auto c = gateway::config();
+    c.subnets = {subnet(subnet_a, 0, 0), subnet(subnet_b, 32, 1), subnet(subnet_c, 64, {})};
+    return c;
+}
+
+struct SubnetFixture : Fixture {
+    SubnetFixture() {
+        BOOST_REQUIRE(table.apply(
+            {.vni = vpc,
+             .version = 2,
+             .entries = {entry(nic_a, self_tail, subnet_a), entry(nic_b, self_tail, subnet_b),
+                         entry(nic_c, peer_tail, subnet_b), entry(nic_d, third_tail, subnet_a),
+                         entry(nic_e, peer_tail, subnet_b)}}));
+    }
+
+    auto configure() -> void { BOOST_REQUIRE(sw.set_vpc_config(vpc, three_subnets())); }
+};
+
+}  // namespace
+
+BOOST_FIXTURE_TEST_CASE(unicast_stays_inside_a_subnet, SubnetFixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // Without a config the VNI is still one segment.
+    send(nic_a, frame(mac_of(nic_b), mac_of(nic_a)));
+    BOOST_TEST(port_b.frames.size() == 1U);
+    configure();
+    send(nic_a, frame(mac_of(nic_b), mac_of(nic_a)));  // local, other subnet
+    send(nic_a, frame(mac_of(nic_c), mac_of(nic_a)));  // remote, other subnet
+    BOOST_TEST(sw.counters().tx_drop_cross_subnet == 2);
+    BOOST_TEST(port_b.frames.size() == 1U);
+    BOOST_TEST(underlay.sent.empty());
+    send(nic_a, frame(mac_of(nic_d), mac_of(nic_a)));  // same subnet, third VTEP
+    send(nic_b, frame(mac_of(nic_c), mac_of(nic_b)));  // same subnet, peer VTEP
+    BOOST_REQUIRE(underlay.sent.size() == 2U);
+    BOOST_TEST((underlay.sent[0].nics.dst == nic_d));
+    BOOST_TEST((underlay.sent[1].nics.dst == nic_c));
+}
+
+BOOST_FIXTURE_TEST_CASE(received_unicast_stays_inside_a_subnet, SubnetFixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    configure();
+    const Inbound to_b{nic_c, nic_b, vpc, frame(mac_of(nic_b), mac_of(nic_c))};
+    const Inbound to_a{nic_c, nic_a, vpc, frame(mac_of(nic_a), mac_of(nic_c))};
+    BOOST_TEST(sw.receive(to_b.packet, vtep(peer_tail)).has_value());
+    BOOST_TEST(sw.receive(to_a.packet, vtep(peer_tail)).has_value());
+    BOOST_TEST(port_b.frames.size() == 1U);
+    BOOST_TEST(port_a.frames.empty());
+    BOOST_TEST(sw.counters().rx_drop_cross_subnet == 1);
+}
+
+BOOST_FIXTURE_TEST_CASE(nics_without_a_known_subnet_carry_nothing, SubnetFixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    configure();
+    BOOST_REQUIRE(table.apply(
+        {.vni = vpc,
+         .version = 3,
+         .entries = {entry(nic_a, self_tail, 0), entry(nic_b, self_tail, subnet_b),
+                     entry(nic_c, peer_tail, 0x9999), entry(nic_d, third_tail, subnet_a)}}));
+    send(nic_a, frame(mac_of(nic_d), mac_of(nic_a)));
+    send(nic_a, arp_request(nic_a, ip4(11), v4(1)));
+    BOOST_TEST(sw.counters().tx_drop_no_subnet == 2);
+    const Inbound from_c{nic_c, nic_b, vpc, frame(mac_of(nic_b), mac_of(nic_c))};
+    BOOST_TEST(sw.receive(from_c.packet, vtep(peer_tail)).has_value());
+    BOOST_TEST(sw.counters().rx_drop_no_subnet == 1);
+    BOOST_TEST(nothing_delivered());
+}
+
+BOOST_FIXTURE_TEST_CASE(gateway_and_proxy_answer_only_on_the_link, SubnetFixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    configure();
+    send(nic_a, arp_request(nic_a, ip4(11), v4(33)));  // subnet_b's gateway
+    BOOST_TEST(sw.counters().tx_drop_arp_other_subnet == 1);
+    BOOST_TEST(nothing_delivered());
+    send(nic_b, arp_request(nic_b, ip4(22), v4(33)));  // its own gateway
+    send(nic_a, arp_request(nic_a, ip4(11), v4(1)));
+    BOOST_REQUIRE(port_a.frames.size() == 1U);
+    BOOST_REQUIRE(port_b.frames.size() == 1U);
+    BOOST_TEST((nb::parse_arp(port_b.frames[0])->sender_ip == v4(33)));
+    BOOST_TEST((nb::parse_arp(port_a.frames[0])->sender_ip == v4(1)));
+    // The proxy answers for d (subnet_a) but not for b or c (subnet_b).
+    send(nic_a, arp_request(nic_a, ip4(11), ip4(44)));
+    BOOST_REQUIRE(port_a.frames.size() == 2U);
+    BOOST_TEST((nb::parse_arp(port_a.frames[1])->sender_mac == mac_of(nic_d)));
+    const auto replies = sw.counters().arp_replies;
+    send(nic_a, arp_request(nic_a, ip4(11), ip4(22)));
+    send(nic_a, arp_request(nic_a, ip4(11), ip4(33)));
+    send(nic_a, neighbor_solicitation(nic_a, ip6(11), ip6(33)));
+    BOOST_TEST(sw.counters().arp_replies == replies);
+    BOOST_TEST(port_a.frames.size() == 2U);
+    BOOST_TEST(underlay.sent.empty());
+}
+
+BOOST_FIXTURE_TEST_CASE(dhcp_and_ra_come_from_the_nics_subnet, SubnetFixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    configure();
+    net::NeighborUpdate u = Fixture::addresses(vpc, {nic_a, nic_c, nic_d, nic_e});
+    u.ipv4.push_back({v4(40), nic_b});
+    BOOST_REQUIRE(sw.set_neighbors(u));
+    send(nic_b, gateway::discover(nic_b));
+    BOOST_REQUIRE(port_b.frames.size() == 1U);
+    const auto& offer = port_b.frames[0];
+    BOOST_TEST(
+        std::ranges::equal(pk::parse(offer)->payload.subspan(gateway::yiaddr_offset, 4), v4(40)));
+    BOOST_TEST(std::ranges::equal(gateway::option(offer, 3), v4(33)));  // router
+    const nb::Ipv4Address mask27{std::byte{255}, std::byte{255}, std::byte{255}, std::byte{224}};
+    BOOST_TEST(std::ranges::equal(gateway::option(offer, 1), mask27));
+    BOOST_TEST(std::ranges::equal(pk::parse(offer)->src4, v4(33)));
+    // Router advertisements carry each NIC's own /64.
+    sw.poll();
+    BOOST_REQUIRE(port_a.frames.size() == 1U);
+    BOOST_REQUIRE(port_b.frames.size() == 2U);
+    const auto carries = [](const std::vector<std::byte>& ra, std::uint8_t subnet) {
+        const std::array<std::byte, 8> prefix{ula_prefix,   std::byte{0x10},  std::byte{0},
+                                              std::byte{0}, std::byte{0},     std::byte{0},
+                                              std::byte{0}, std::byte{subnet}};
+        return !std::ranges::search(ra, prefix).empty();
+    };
+    BOOST_TEST(carries(port_a.frames[0], 0));
+    BOOST_TEST(!carries(port_a.frames[0], 1));
+    BOOST_TEST(carries(port_b.frames[1], 1));
+    BOOST_TEST(!carries(port_b.frames[1], 0));
+}
+
+BOOST_FIXTURE_TEST_CASE(group_frames_stay_inside_a_subnet, SubnetFixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in();
+    configure();
+    send(nic_a, frame(mdns_mac(), mac_of(nic_a)));
+    // b is in another subnet; only d's VTEP hosts subnet_a.
+    BOOST_TEST(port_b.frames.empty());
+    BOOST_REQUIRE(underlay.sent.size() == 1U);
+    BOOST_TEST((underlay.sent[0].vtep == vtep(third_tail)));
+    underlay.sent.clear();
+    send(nic_b, frame(mdns_mac(), mac_of(nic_b)));
+    BOOST_TEST(port_a.frames.empty());
+    BOOST_REQUIRE(underlay.sent.size() == 1U);
+    BOOST_TEST((underlay.sent[0].vtep == vtep(peer_tail)));
+    // A replica from c (subnet_b) reaches b only.
+    const Inbound replica{nic_c, geneve::nic_broadcast, vpc, frame(mdns_mac(), mac_of(nic_c))};
+    BOOST_TEST(sw.receive(replica.packet, vtep(peer_tail)).has_value());
+    BOOST_TEST(port_b.frames.size() == 1U);
+    BOOST_TEST(port_a.frames.empty());
+}
+
+BOOST_FIXTURE_TEST_CASE(the_querier_speaks_from_each_subnets_gateway, SubnetFixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    opt_in();
+    configure();
+    sw.poll();
+    const auto query_source = [](const FakePort& p) {
+        for (const auto& f : p.frames) {
+            const auto parsed = pk::parse(f);
+            if (parsed && parsed->family == pk::IpFamily::ipv4 &&
+                ig::classify(*parsed) == ig::Kind::query) {
+                return parsed->src4;
+            }
+        }
+        return nb::Ipv4Address{};
+    };
+    BOOST_TEST((query_source(port_a) == v4(1)));
+    BOOST_TEST((query_source(port_b) == v4(33)));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

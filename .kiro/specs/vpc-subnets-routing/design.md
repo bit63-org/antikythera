@@ -267,6 +267,55 @@ intersected with the subnet's VTEPs. The flood-list cap is compared with
 the subnet's list, so a tenant spreading one subnet wide still hits it,
 and a VPC with many small subnets is not penalised for its total spread.
 
+## GroupPolicy version 2
+
+Task 12. Requirement 7's multicast setting is per subnet on EC2, so the
+frame gains a version that carries one policy per opted-in subnet
+(`src/proto/group_policy.hpp`):
+
+```
+GroupPolicy v2 {              // controller -> helm -> oar-net, signed, LE
+  0x00 magic 'AKGP' u32, 0x04 version u16 (2), 0x06 key_id u16,
+  0x08 server_id u64, 0x10 vni u32,
+  0x14 entry_count u16 (<= 200), 0x16 reserved u16,
+  0x18 policy_version u64,    // one sequence per VNI across both versions
+  0x20 entries, strictly ascending subnet_id, 0x28 bytes each:
+       subnet_id u64 (non-zero) | rate_frames u32 | burst_frames u32 |
+       rate_bytes u64 | burst_bytes u64 | max_remote_vteps u32 |
+       max_groups_per_nic u16 | reserved u16
+  then signature [64]         // Ed25519 over every byte before it
+}```
+
+- **Meaning.** An entry opts its subnet in with a multicast policy's
+  limits, held to the same bounds as version 1's `multicast`. A subnet
+  without an entry is in `drop`, and no entries at all is the whole
+  VPC's `drop`. The frame is still a full per-VNI snapshot, so a later
+  frame of either version replaces it whole.
+- **Version 1 stays.** A version 1 frame is a VNI-wide policy, as
+  before; the controller sends version 1 to a VPC whose subnets all
+  share a setting and version 2 otherwise, under the same
+  `policy_version` sequence, so a server applies whichever is newer.
+- **Size and transfer.** 0x60 bytes with no entries, 8096 with 200, so
+  the sideband `group_policy` op is now chunked like `map_update`
+  (`OarLink::group_policy` checks the size first: 0x80 for version 1,
+  otherwise within the version 2 bounds). The link record bound
+  (`max_record_payload`) counts `max_group_policy_size`.
+- **VSwitch.** `set_subnet_group_policies(vni, entries)` replaces the
+  VNI's policy with per-subnet ones (`GroupPolicyError::bad_subnet` for
+  a zero, repeated or unordered subnet); `set_group_policy` replaces it
+  with a VNI-wide one. Every multicast decision takes the policy of the
+  NIC it is about: the sender's subnet when it polls, snoops or
+  replicates, the source NIC's subnet when a replicated frame arrives,
+  and each NIC's own subnet when memberships are trimmed after a change
+  (so lowering one subnet's group cap leaves its neighbours' joins
+  alone). Rate buckets stay per NIC.
+- **Billing.** Usage reports stay per NIC (`GroupUsage`), and the
+  controller, which knows each NIC's subnet and when it sent each
+  policy version, bills enablement per subnet-hour from its own record.
+- **Test controller.** `group-policy VNI VERSION subnets
+  [ID,RATE_FRAMES,BURST_FRAMES,RATE_BYTES,BURST_BYTES,MAX_REMOTE_VTEPS[,MAX_GROUPS_PER_NIC] ...]`
+  sends version 2.
+
 ## Receive
 
 After `check_ingress` and the inner EtherType and parse steps:

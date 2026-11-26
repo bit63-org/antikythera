@@ -2240,7 +2240,7 @@ BOOST_AUTO_TEST_CASE(guests_never_query_and_drop_vnis_ignore_reports,
 BOOST_AUTO_TEST_CASE(joins_are_capped, *boost::unit_test::timeout(unit_timeout_seconds)) {
     opt_in(snoop_policy(2));
     for (std::uint8_t g = 1; g <= 3; ++g) {
-        send(nic_a, join(nic_a, g4(g)));
+        send(nic_a, snooping::join(nic_a, snooping::g4(g)));
     }
     BOOST_TEST(sw.memberships().size() == 2U);
     BOOST_TEST(sw.counters().snoop_drop_cap == 1);
@@ -2663,6 +2663,77 @@ BOOST_FIXTURE_TEST_CASE(routed_frames_are_checked_on_receive, SubnetFixture,
     BOOST_TEST(sw.counters().rx_drop_route_mismatch == 4);
     BOOST_TEST(port_a.frames.size() == 1U);
     BOOST_TEST(port_b.frames.empty());
+}
+
+// vpc-subnets-routing task 12: GroupPolicy version 2 opts subnets in one
+// by one.
+BOOST_FIXTURE_TEST_CASE(multicast_opts_in_per_subnet, SubnetFixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    using SGP = net::SubnetGroupPolicy;
+    using E = net::GroupPolicyError;
+    configure();
+    auto policy = multicast_policy();
+    policy.max_groups_per_nic = 2;
+    const auto refused = [&](std::uint32_t vni, std::span<const SGP> list) {
+        auto r = sw.set_subnet_group_policies(vni, list);
+        return r ? std::optional<E>{} : std::optional<E>{r.error()};
+    };
+    const std::array out_of_order{SGP{subnet_b, policy}, SGP{subnet_a, policy}};
+    const std::array twice{SGP{subnet_a, policy}, SGP{subnet_a, policy}};
+    const std::array no_subnet{SGP{0, policy}};
+    const std::array dropped{SGP{subnet_a, net::GroupPolicy{}}};
+    auto no_rate = policy;
+    no_rate.rate_frames = 0;
+    const std::array missing{SGP{subnet_a, no_rate}};
+    const std::array only_a{SGP{subnet_a, policy}};
+    BOOST_TEST((refused(vpc, out_of_order) == E::bad_subnet));
+    BOOST_TEST((refused(vpc, twice) == E::bad_subnet));
+    BOOST_TEST((refused(vpc, no_subnet) == E::bad_subnet));
+    BOOST_TEST((refused(vpc, dropped) == E::bad_subnet));
+    BOOST_TEST((refused(vpc, missing) == E::missing_limit));
+    BOOST_TEST((refused(0, only_a) == E::vni_out_of_range));
+    BOOST_TEST(std::string_view{net::to_string(E::bad_subnet)} == "bad_subnet");
+
+    // Subnet A opts in; B does not.
+    BOOST_REQUIRE(sw.set_subnet_group_policies(vpc, only_a));
+    BOOST_TEST((sw.group_policy(vpc).mode == net::GroupMode::drop));
+    BOOST_TEST((sw.group_policy(vpc, subnet_a).mode == net::GroupMode::multicast));
+    BOOST_TEST((sw.group_policy(vpc, subnet_b).mode == net::GroupMode::drop));
+    send(nic_a, frame(mdns_mac(), mac_of(nic_a)));
+    BOOST_REQUIRE(underlay.sent.size() == 1U);
+    BOOST_TEST((underlay.sent[0].vtep == vtep(third_tail)));
+    underlay.sent.clear();
+    send(nic_b, frame(mdns_mac(), mac_of(nic_b)));
+    BOOST_TEST(underlay.sent.empty());
+    BOOST_TEST(sw.counters().tx_drop_group == 1U);
+
+    // On receive the source's subnet decides: c (B) is refused, d (A) is not.
+    const Inbound from_c{nic_c, geneve::nic_broadcast, vpc, frame(mdns_mac(), mac_of(nic_c))};
+    const Inbound from_d{nic_d, geneve::nic_broadcast, vpc, frame(mdns_mac(), mac_of(nic_d))};
+    BOOST_TEST(sw.receive(from_c.packet, vtep(peer_tail)).has_value());
+    BOOST_TEST(sw.receive(from_d.packet, vtep(third_tail)).has_value());
+    BOOST_TEST(port_b.frames.empty());
+    BOOST_TEST(sw.counters().rx_drop_group == 1U);
+    BOOST_TEST(port_a.frames.size() == 1U);
+
+    // a joins up to its subnet's cap; a lower cap trims it.
+    for (std::uint8_t g = 1; g <= 3; ++g) {
+        send(nic_a, snooping::join(nic_a, snooping::g4(g)));
+    }
+    BOOST_TEST(sw.counters().snoop_joins == 2U);
+    BOOST_TEST(sw.counters().snoop_drop_cap == 1U);
+    policy.max_groups_per_nic = 1;
+    const std::array lower{SGP{subnet_a, policy}};
+    BOOST_REQUIRE(sw.set_subnet_group_policies(vpc, lower));
+    BOOST_TEST(sw.memberships().size() == 1U);
+
+    // A VNI-wide policy covers B again; an empty list is drop for all.
+    BOOST_REQUIRE(sw.set_group_policy(vpc, multicast_policy()));
+    send(nic_b, frame(mdns_mac(), mac_of(nic_b)));
+    BOOST_TEST(underlay.sent.size() == 1U);
+    BOOST_REQUIRE(sw.set_subnet_group_policies(vpc, {}));
+    BOOST_TEST((sw.group_policy(vpc, subnet_a).mode == net::GroupMode::drop));
+    BOOST_TEST(sw.memberships().empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

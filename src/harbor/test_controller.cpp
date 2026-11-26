@@ -694,6 +694,63 @@ auto group_members(std::span<const std::string_view> args)
     return out;
 }
 
+// group-policy ... subnets: ID,RATE_FRAMES,BURST_FRAMES,RATE_BYTES,
+// BURST_BYTES,MAX_REMOTE_VTEPS[,MAX_GROUPS_PER_NIC] per opted-in subnet,
+// sorted by subnet and checked as the encoder would.
+auto subnet_group_limits(std::span<const std::string_view> args)
+    -> std::expected<std::vector<proto::GroupSubnetLimits>, std::string> {
+    constexpr std::size_t fields_without_cap = 6;
+    std::vector<proto::GroupSubnetLimits> out;
+    for (const auto arg : args) {
+        const auto f = split(arg, ',');
+        if (f.size() != fields_without_cap && f.size() != fields_without_cap + 1) {
+            return std::unexpected(
+                "group-policy: a subnet wants ID,RATE_FRAMES,BURST_FRAMES,RATE_BYTES,"
+                "BURST_BYTES,MAX_REMOTE_VTEPS[,MAX_GROUPS_PER_NIC]");
+        }
+        auto id = number<std::uint64_t>(f[0], "subnet id");
+        auto rate_frames = number<std::uint32_t>(f[1], "frame rate");
+        auto burst_frames = number<std::uint32_t>(f[2], "frame burst");
+        auto rate_bytes = number<std::uint64_t>(f[3], "byte rate");
+        auto burst_bytes = number<std::uint64_t>(f[4], "byte burst");
+        auto vteps = number<std::uint32_t>(f[5], "flood-list cap");
+        auto groups = f.size() > fields_without_cap
+                          ? number<std::uint16_t>(f[fields_without_cap], "group cap")
+                          : std::expected<std::uint16_t, std::string>{0};
+        for (const auto* r : {&id, &rate_bytes, &burst_bytes}) {
+            if (!*r) {
+                return std::unexpected(r->error());
+            }
+        }
+        for (const auto* r : {&rate_frames, &burst_frames, &vteps}) {
+            if (!*r) {
+                return std::unexpected(r->error());
+            }
+        }
+        if (!groups) {
+            return std::unexpected(groups.error());
+        }
+        out.push_back({.subnet_id = *id,
+                       .rate_frames = *rate_frames,
+                       .burst_frames = *burst_frames,
+                       .rate_bytes = *rate_bytes,
+                       .burst_bytes = *burst_bytes,
+                       .max_remote_vteps = *vteps,
+                       .max_groups_per_nic = *groups});
+    }
+    std::ranges::sort(out, {}, &proto::GroupSubnetLimits::subnet_id);
+    const proto::GroupPolicy check{.server_id = 1,
+                                   .key_id = 1,
+                                   .vni = 1,
+                                   .policy_version = 1,
+                                   .format = proto::group_policy_version_subnets,
+                                   .subnets = out};
+    if (auto ok = proto::encode_group_policy(check); !ok) {
+        return std::unexpected(std::string{"group-policy: "} + proto::to_string(ok.error()));
+    }
+    return out;
+}
+
 // instance-metadata NIC VNI VERSION INSTANCE_ID then KEY=VALUE overrides
 // of a sample record.
 auto instance_metadata(std::span<const std::string_view> args)
@@ -1145,7 +1202,7 @@ auto parse_line(std::string_view line) -> std::expected<std::optional<Action>, s
     if (verb == "group-policy") {
         constexpr std::size_t multicast_args = 8;
         if (args.size() < 3) {
-            return std::unexpected("group-policy: want VNI VERSION drop|multicast ...");
+            return std::unexpected("group-policy: want VNI VERSION drop|multicast|subnets ...");
         }
         auto vni = number<std::uint32_t>(args[0], "VNI");
         auto version = number<std::uint64_t>(args[1], "policy version");
@@ -1158,6 +1215,15 @@ auto parse_line(std::string_view line) -> std::expected<std::optional<Action>, s
         SendGroupPolicy g{.vni = *vni, .policy_version = *version};
         if (args[2] == "drop" && args.size() == 3) {
             return std::optional<Action>{g};
+        }
+        if (args[2] == "subnets") {
+            auto subnets = subnet_group_limits(args.subspan(3));
+            if (!subnets) {
+                return std::unexpected(subnets.error());
+            }
+            g.per_subnet = true;
+            g.subnets = std::move(*subnets);
+            return std::optional<Action>{std::move(g)};
         }
         if (args[2] != "multicast" ||
             (args.size() != multicast_args && args.size() != multicast_args + 1)) {
@@ -1562,7 +1628,11 @@ auto TestController::run(const Action& action) -> std::expected<void, std::strin
                                            .burst_bytes = a.burst_bytes,
                                            .max_remote_vteps = a.max_remote_vteps,
                                            .max_groups_per_nic = a.max_groups_per_nic,
-                                           .signature = {}};
+                                           .signature = {},
+                                           .format = a.per_subnet
+                                                         ? proto::group_policy_version_subnets
+                                                         : proto::group_policy_version,
+                                           .subnets = a.subnets};
                 auto frame = _signer.group_policy(g);
                 if (!frame) {
                     return std::unexpected("could not encode or sign the group policy");

@@ -1141,6 +1141,61 @@ BOOST_FIXTURE_TEST_CASE(group_policies_are_checked, One,
     BOOST_TEST(role->counters().group_applied == 2U);
 }
 
+// vpc-subnets-routing task 12: a version 2 policy opts subnets in one by
+// one, on the same version sequence as version 1.
+BOOST_FIXTURE_TEST_CASE(group_policies_opt_in_per_subnet, One,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto v2 = [](std::uint64_t version, std::vector<std::uint64_t> subnets) {
+        proto::GroupPolicy p{.server_id = server_one,
+                             .key_id = key_id,
+                             .vni = vpc,
+                             .mode = proto::GroupMode::drop,
+                             .policy_version = version,
+                             .signature = {},
+                             .format = proto::group_policy_version_subnets,
+                             .subnets = {}};
+        for (const std::uint64_t s : subnets) {
+            p.subnets.push_back({.subnet_id = s,
+                                 .rate_frames = 100,
+                                 .burst_frames = 10,
+                                 .rate_bytes = 1'000'000,
+                                 .burst_bytes = 100'000,
+                                 .max_remote_vteps = 4,
+                                 .max_groups_per_nic = 3});
+        }
+        auto bytes = proto::encode_group_policy(p);
+        BOOST_REQUIRE(bytes.has_value());
+        proto::set_group_policy_signature(*bytes,
+                                          signer().sign(proto::group_policy_signed_bytes(*bytes)));
+        return *bytes;
+    };
+    BOOST_REQUIRE(role->group_policy(signed_policy(server_one, 1, true)) == Status::ok);
+    const auto only_other = v2(2, {other_subnet});
+    auto tampered = only_other;
+    tampered[0x20 + 0x08] ^= std::byte{0x01};  // the entry's rate_frames
+    BOOST_TEST((role->group_policy(tampered) == Status::failed));
+    BOOST_TEST(role->counters().group_bad_signature == 1U);
+
+    BOOST_TEST((role->group_policy(only_other) == Status::ok));
+    auto& sw = role->vswitch();
+    BOOST_TEST((sw.group_policy(vpc).mode == net::GroupMode::drop));
+    BOOST_TEST((sw.group_policy(vpc, vpc_subnet).mode == net::GroupMode::drop));
+    const auto other = sw.group_policy(vpc, other_subnet);
+    BOOST_TEST((other.mode == net::GroupMode::multicast));
+    BOOST_TEST(other.max_groups_per_nic == 3U);
+    BOOST_TEST(other.rate_bytes == 1'000'000U);
+
+    // Versions run across both formats: an older version 1 is stale, a
+    // newer one takes the whole VNI back.
+    BOOST_TEST((role->group_policy(signed_policy(server_one, 1, true)) == Status::failed));
+    BOOST_TEST(role->counters().group_stale == 1U);
+    BOOST_TEST((role->group_policy(v2(3, {})) == Status::ok));
+    BOOST_TEST((sw.group_policy(vpc, other_subnet).mode == net::GroupMode::drop));
+    BOOST_TEST((role->group_policy(signed_policy(server_one, 4, true)) == Status::ok));
+    BOOST_TEST((sw.group_policy(vpc, vpc_subnet).mode == net::GroupMode::multicast));
+    BOOST_TEST(role->counters().group_applied == 4U);
+}
+
 BOOST_FIXTURE_TEST_CASE(group_usage_reads_every_attachment, One,
                         *boost::unit_test::timeout(unit_timeout_seconds)) {
     BOOST_REQUIRE(role->map_update(signed_map(

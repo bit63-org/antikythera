@@ -200,8 +200,9 @@ consecutive chunks (`total`, `offset`, bytes); offset 0 restarts a
 transfer, any gap or changed total aborts it, and the last chunk's answer
 is the result of applying the frame.
 
-`group_policy` forwards the controller's GroupPolicy frame the same way
-(it fits one message). `group_usage` asks a network role for its per-NIC
+`group_policy` forwards the controller's GroupPolicy frame the same way,
+in chunks since GroupPolicy version 2 (up to 8096 bytes,
+vpc-subnets-routing task 12). `group_usage` asks a network role for its per-NIC
 group meters; the answer is the `group_usage` report body, which helm
 wraps in a report header and sends (Requirement 11). The role keeps a
 detached NIC's final meter until it has answered one `group_usage`; helm

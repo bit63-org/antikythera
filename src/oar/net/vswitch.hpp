@@ -50,6 +50,10 @@
 //     Broadcast and every other group address stay dropped. Replication is
 //     limited per source NIC by a frame and byte token bucket and refused
 //     when the VNI spans more remote VTEPs than the policy allows.
+//     A per-subnet policy (set_subnet_group_policies, GroupPolicy version 2,
+//     vpc-subnets-routing task 12) opts subnets in one by one: a NIC sends,
+//     receives and joins groups under its own subnet's policy, and a NIC
+//     whose subnet has none is in `drop`.
 //
 // Receive (VSwitch::receive, a decoded Geneve packet from the Vtep): the
 // ingress policy (vtep_policy.hpp) runs against the same snapshot used to
@@ -443,6 +447,20 @@ enum class GroupPolicyError : std::uint8_t {
     missing_limit,    // a multicast policy with a zero rate, burst or flood-list cap
     limit_too_large,  // above the group_*_max bounds
     nonzero_limits,   // a drop policy that carries limits
+    bad_subnet,       // per-subnet: subnet 0, out of order, too many, or not multicast
+};
+
+// One subnet's policy in a per-subnet group policy (GroupPolicy version 2).
+struct SubnetGroupPolicy {
+    std::uint64_t subnet{0};
+    GroupPolicy policy{};
+};
+
+// A VNI's group policy as the VSwitch holds it: VNI-wide (version 1), or
+// per subnet (version 2, ascending by subnet).
+struct VniGroupPolicy {
+    std::optional<GroupPolicy> vni_wide;
+    std::vector<SubnetGroupPolicy> subnets;
 };
 
 [[nodiscard]] auto to_string(GroupPolicyError e) noexcept -> const char*;
@@ -585,7 +603,16 @@ public:
     // their tokens, clamped to the new burst.
     auto set_group_policy(std::uint32_t vni, const GroupPolicy& policy)
         -> std::expected<void, GroupPolicyError>;
+    // Replaces one VNI's policy with per-subnet ones: each listed subnet
+    // (non-zero, strictly ascending, at most max_vpc_subnets) gets its
+    // multicast policy, and every other subnet is in drop. An empty list is
+    // the VNI's drop policy. Validated as a whole like set_group_policy.
+    auto set_subnet_group_policies(std::uint32_t vni, std::span<const SubnetGroupPolicy> subnets)
+        -> std::expected<void, GroupPolicyError>;
+    // The VNI-wide policy (drop while the VNI has per-subnet ones), and the
+    // one a NIC in `subnet` follows.
     [[nodiscard]] auto group_policy(std::uint32_t vni) const -> GroupPolicy;
+    [[nodiscard]] auto group_policy(std::uint32_t vni, std::uint64_t subnet) const -> GroupPolicy;
 
     // Replaces one VNI's per-group VTEP lists, validated as a whole; an
     // empty map makes every group unknown again.
@@ -688,7 +715,11 @@ private:
         -> const std::vector<Ipv6Address>*;
     [[nodiscard]] auto joined(geneve::NicId nic, const igmp::Group& g) const -> bool;
     // Drops joins of NICs in `vni` beyond `cap` (a lowered or dropped policy).
-    auto trim_memberships(std::uint32_t vni, std::size_t cap) -> void;
+    // Cuts every NIC of the VNI back to its subnet's max_groups_per_nic.
+    auto trim_memberships(std::uint32_t vni) -> void;
+    // The multicast policy a NIC in (vni, subnet) follows; nullptr: drop.
+    [[nodiscard]] auto policy_for(std::uint32_t vni, std::uint64_t subnet) const
+        -> const GroupPolicy*;
     auto send_queries(geneve::NicId nic, const VpcConfig& cfg, const VpcSubnet& subnet) -> void;
     // Group replication or unicast delivery once the frame passed every
     // check; `ip` is the parsed packet for IP frames, null for ARP.
@@ -763,7 +794,7 @@ private:
     std::unordered_map<geneve::NicId, Bucket, NicIdHash> _metadata_buckets;
     MetadataEndpoint* _metadata{nullptr};
     std::unordered_map<std::uint32_t, VpcNeighbors> _neighbors;
-    std::unordered_map<std::uint32_t, GroupPolicy> _group_policies;  // only non-drop VNIs
+    std::unordered_map<std::uint32_t, VniGroupPolicy> _group_policies;  // only non-drop VNIs
     std::unordered_map<geneve::NicId, NicGroupState, NicIdHash> _group;
     std::unordered_map<std::uint32_t, GroupMembers> _group_members;  // only non-empty lists
     std::size_t _membership_count{0};

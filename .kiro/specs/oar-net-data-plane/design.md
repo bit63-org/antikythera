@@ -109,6 +109,10 @@ default, or `multicast`), per-source-NIC `rate_frames`/`burst_frames` and
 `multicast` policy must set every limit; a `drop` policy carries none.
 `max_groups_per_nic` (0 to 256) caps snooped joins per NIC; 0 refuses
 every join, so every group stays unknown (see "Multicast snooping").
+Since vpc-subnets-routing task 12 a VNI may instead hold one policy per
+subnet (`GroupPolicy` version 2, `VSwitch::set_subnet_group_policies`):
+each NIC follows its own subnet's policy, and a subnet without one is in
+`drop`.
 
 Transmit, after the ARP/ND proxy has had the frame:
 

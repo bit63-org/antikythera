@@ -373,6 +373,43 @@ BOOST_AUTO_TEST_CASE(group_members_parse_and_sort) {
                    .find("group-members") != std::string::npos);
 }
 
+BOOST_AUTO_TEST_CASE(group_policies_parse_in_both_versions) {
+    auto d = std::get<harbor::SendGroupPolicy>(action("group-policy 100 1 drop"));
+    BOOST_TEST((d.mode == proto::GroupMode::drop));
+    BOOST_TEST(!d.per_subnet);
+    auto m = std::get<harbor::SendGroupPolicy>(
+        action("group-policy 100 2 multicast 100 200 65536 131072 4 8"));
+    BOOST_TEST((m.mode == proto::GroupMode::multicast));
+    BOOST_TEST(m.max_groups_per_nic == 8U);
+    // Version 2: entries sorted by subnet; the group cap defaults to 0.
+    auto s = std::get<harbor::SendGroupPolicy>(
+        action("group-policy 100 3 subnets 9,10,20,4096,8192,2,5 7,100,200,65536,131072,4"));
+    BOOST_TEST(s.per_subnet);
+    BOOST_TEST((s.mode == proto::GroupMode::drop));
+    BOOST_REQUIRE(s.subnets.size() == 2U);
+    BOOST_TEST(s.subnets[0].subnet_id == 7U);
+    BOOST_TEST(s.subnets[0].max_groups_per_nic == 0U);
+    BOOST_TEST(s.subnets[1].subnet_id == 9U);
+    BOOST_TEST(s.subnets[1].max_groups_per_nic == 5U);
+    // No entries: every subnet in drop.
+    BOOST_TEST(
+        std::get<harbor::SendGroupPolicy>(action("group-policy 100 4 subnets")).subnets.empty());
+
+    BOOST_TEST(parse_error("group-policy 100 1").find("drop|multicast|subnets") !=
+               std::string::npos);
+    BOOST_TEST(parse_error("group-policy 100 1 subnets 7,1,1,1").find("a subnet wants") !=
+               std::string::npos);
+    BOOST_TEST(parse_error("group-policy 100 1 subnets x,1,1,1,1,1").find("subnet id") !=
+               std::string::npos);
+    BOOST_TEST(parse_error("group-policy 100 1 subnets 0,1,1,1,1,1").find("group-policy") !=
+               std::string::npos);
+    BOOST_TEST(
+        parse_error("group-policy 100 1 subnets 7,1,1,1,1,1 7,1,1,1,1,1").find("group-policy") !=
+        std::string::npos);
+    BOOST_TEST(parse_error("group-policy 100 1 subnets 7,0,1,1,1,1").find("group-policy") !=
+               std::string::npos);
+}
+
 BOOST_AUTO_TEST_CASE(instance_metadata_parses_with_sample_defaults) {
     auto a = action(
         "instance-metadata 17 100 3 i-0123456789abcdef0 tokens=required hop=2 "

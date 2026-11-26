@@ -43,6 +43,8 @@ constexpr auto frame_limit(mctp::VendorType type) noexcept -> std::size_t {
             return oar::max_volume_layout_frame;
         case mctp::VendorType::vpc_config:
             return oar::max_vpc_config_frame;
+        case mctp::VendorType::group_policy:
+            return oar::max_group_policy_frame;
         default:
             return oar::max_cert_chain;
     }
@@ -407,11 +409,12 @@ auto OarLink::send_chunked(mctp::VendorType type, std::span<const std::byte> fra
 }
 
 auto OarLink::group_policy(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
-    auto body = oar::encode_group_policy_frame(frame);
-    if (!body) {
+    if (frame.size() != oar::group_policy_frame_size &&
+        (frame.size() < oar::min_group_policy_v2_frame ||
+         frame.size() > oar::max_group_policy_frame)) {
         return std::unexpected(bad_request());
     }
-    return expect_empty(transact(mctp::VendorType::group_policy, *body));
+    return send_chunked(mctp::VendorType::group_policy, frame);
 }
 
 auto OarLink::group_usage() -> std::expected<std::vector<oar::UsageEntry>, LinkError> {
@@ -761,6 +764,7 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
         case mctp::VendorType::instance_metadata:
         case mctp::VendorType::volume_layout:
         case mctp::VendorType::vpc_config:
+        case mctp::VendorType::group_policy:
         case mctp::VendorType::role_certificate:
             return status_only(frame_chunk(handler, type, body));
         case mctp::VendorType::group_membership: {
@@ -812,10 +816,6 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
                                                                      : answer.error());
             }
             return with_body(oar::encode_copy_answer(*answer));
-        }
-        case mctp::VendorType::group_policy: {
-            auto frame = oar::decode_group_policy_frame(body);
-            return status_only(frame ? handler.group_policy(*frame) : oar::Status::bad_request);
         }
         case mctp::VendorType::group_usage: {
             auto cursor = oar::decode_usage_request(body);
@@ -912,6 +912,9 @@ auto OarEndpoint::frame_chunk(OarHandler& handler, mctp::VendorType type,
             break;
         case mctp::VendorType::vpc_config:
             status = handler.vpc_config(_frame);
+            break;
+        case mctp::VendorType::group_policy:
+            status = handler.group_policy(_frame);
             break;
         default:
             status = handler.role_certificate(_frame);

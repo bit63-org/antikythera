@@ -31,7 +31,10 @@
 //   drop_key            0  fn u16 | 2  reserved u16 | 4  reserved u32 | 8  volume_id u64
 //   map_update          0  total u32 | 4  offset u32 | 8  chunk (1..max_map_chunk bytes)
 //   health              (empty)
-//   group_policy        0  frame [group_policy_frame_size] (proto::GroupPolicy, signed)
+//   group_policy        0  total u32 | 4  offset u32 | 8  chunk (as map_update): one
+//                          controller proto::GroupPolicy (signed; version 1 is
+//                          group_policy_frame_size bytes, version 2
+//                          min_group_policy_v2_frame to max_group_policy_frame)
 //   group_usage         0  cursor u16 | 2  reserved u16
 //   create_volume       0  volume_id u64 | 8  owner_vm u64 | 16 capacity_sectors u64
 //                       24 block_size u32 | 28 key_len u16 | 30 image_store u16
@@ -103,12 +106,12 @@
 // acknowledged; the last acknowledgement carries the result of applying it.
 //
 // group_policy forwards one controller GroupPolicy frame
-// (src/proto/group_policy.hpp) unmodified, like map_update; it fits one
-// message. group_usage reads the role's per-NIC group meters (oar-net
-// Requirement 10.6) a page at a time: cursor 0 takes a new snapshot,
-// later cursors page through it. A snapshot's final readings of detached
-// NICs are carried into the next snapshot until a read reaches its last
-// page, so an interrupted read loses nothing (UsagePager).
+// (src/proto/group_policy.hpp) unmodified, in map_update's chunks: a
+// version 2 frame, one entry per opted-in subnet, is up to 8,096 bytes
+// (.kiro/specs/vpc-subnets-routing/ task 12). group_usage reads the role's per-NIC group meters
+// (oar-net Requirement 10.6) a page at a time: cursor 0 takes a new snapshot, later cursors page
+// through it. A snapshot's final readings of detached NICs are carried into the next snapshot until
+// a read reaches its last page, so an interrupted read loses nothing (UsagePager).
 //
 // vpc_config forwards one controller VpcConfig frame
 // (src/proto/vpc_config.hpp: a VPC's blocks, subnets, route tables, gateway
@@ -296,8 +299,12 @@ inline constexpr std::size_t inventory_entry_size = 4;
 // Bounded so an inventory response fits one message with room to spare.
 inline constexpr std::size_t max_inventory_entries = 1000;
 inline constexpr std::size_t health_body_size = 8;
-// proto::group_policy_size, mirrored; tests/oar_protocol_test.cpp pins it.
+// proto::group_policy_size (version 1) and the version 2 bounds (no
+// entries; 200 of 0x28 bytes), mirrored; tests/oar_protocol_test.cpp pins
+// them.
 inline constexpr std::size_t group_policy_frame_size = 0x80;
+inline constexpr std::size_t min_group_policy_v2_frame = 0x20 + 64;
+inline constexpr std::size_t max_group_policy_frame = 0x20 + (200 * 0x28) + 64;
 inline constexpr std::size_t usage_request_size = 4;
 inline constexpr std::size_t usage_head_size = 8;
 inline constexpr std::size_t usage_entry_size = 96;
@@ -701,12 +708,6 @@ struct MapChunk {
     -> std::expected<std::vector<std::byte>, BodyError>;
 [[nodiscard]] auto decode_remove_tunnel_peer(std::span<const std::byte> body) noexcept
     -> std::expected<RemoveTunnelPeer, BodyError>;
-
-[[nodiscard]] auto encode_group_policy_frame(std::span<const std::byte> frame)
-    -> std::expected<std::vector<std::byte>, BodyError>;
-// The frame, a view into the body: exactly group_policy_frame_size bytes.
-[[nodiscard]] auto decode_group_policy_frame(std::span<const std::byte> body) noexcept
-    -> std::expected<std::span<const std::byte>, BodyError>;
 
 // replica_config and volume_op bodies: the frame itself, a view into the
 // body. Only its size is checked here; the role decodes and verifies it.

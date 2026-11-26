@@ -44,6 +44,22 @@ auto ip_multicast(const MacAddress& dst) noexcept -> bool {
            dst[2] != ipv6_solicited_node_mac_2;
 }
 
+// A multicast policy's limits: all set, none above the bounds.
+auto check_multicast(const GroupPolicy& policy) noexcept -> std::expected<void, GroupPolicyError> {
+    if (policy.rate_frames == 0 || policy.burst_frames == 0 || policy.rate_bytes == 0 ||
+        policy.burst_bytes == 0 || policy.max_remote_vteps == 0) {
+        return std::unexpected(GroupPolicyError::missing_limit);
+    }
+    if (policy.rate_frames > group_rate_frames_max ||
+        policy.burst_frames > group_burst_frames_max || policy.rate_bytes > group_rate_bytes_max ||
+        policy.burst_bytes > group_burst_bytes_max ||
+        policy.max_remote_vteps > group_max_remote_vteps_max ||
+        policy.max_groups_per_nic > group_max_groups_per_nic_max) {
+        return std::unexpected(GroupPolicyError::limit_too_large);
+    }
+    return {};
+}
+
 auto admits(const GroupPolicy& policy, const MacAddress& dst) noexcept -> bool {
     return policy.mode == GroupMode::multicast && ip_multicast(dst);
 }
@@ -505,6 +521,8 @@ auto to_string(GroupPolicyError e) noexcept -> const char* {
             return "missing_limit";
         case GroupPolicyError::limit_too_large:
             return "limit_too_large";
+        case GroupPolicyError::bad_subnet:
+            return "bad_subnet";
         case GroupPolicyError::nonzero_limits:
             return "nonzero_limits";
     }
@@ -815,7 +833,8 @@ auto VSwitch::poll() -> void {
             ++_membership_changes;
         }
         const auto binding = snap->lookup(nic);
-        if (!binding || !snap->is_local(nic) || !_group_policies.contains(binding->vni)) {
+        if (!binding || !snap->is_local(nic) ||
+            policy_for(binding->vni, binding->subnet_id) == nullptr) {
             continue;
         }
         const VpcConfig* const cfg = vpc_config(binding->vni);
@@ -1019,8 +1038,8 @@ auto VSwitch::snoop(geneve::NicId src, const NicBinding& binding, const packet::
         ++_counters.snoop_malformed;
         return;
     }
-    const auto policy = _group_policies.find(binding.vni);
-    if (policy == _group_policies.end()) {
+    const GroupPolicy* const policy = policy_for(binding.vni, binding.subnet_id);
+    if (policy == nullptr) {
         ++_counters.snoop_ignored;
         return;
     }
@@ -1037,7 +1056,7 @@ auto VSwitch::snoop(geneve::NicId src, const NicBinding& binding, const packet::
             }
         } else if (it != state.groups.end()) {
             it->second = expiry;
-        } else if (state.groups.size() >= policy->second.max_groups_per_nic ||
+        } else if (state.groups.size() >= policy->max_groups_per_nic ||
                    _membership_count >= max_role_memberships) {
             ++_counters.snoop_drop_cap;
         } else {
@@ -1049,11 +1068,16 @@ auto VSwitch::snoop(geneve::NicId src, const NicBinding& binding, const packet::
     }
 }
 
-auto VSwitch::trim_memberships(std::uint32_t vni, std::size_t cap) -> void {
+auto VSwitch::trim_memberships(std::uint32_t vni) -> void {
     const auto snap = _mappings->snapshot();
     for (auto& [nic, state] : _group) {
         const auto binding = snap->lookup(nic);
-        if (!binding || binding->vni != vni || state.groups.size() <= cap) {
+        if (!binding || binding->vni != vni) {
+            continue;
+        }
+        const GroupPolicy* const policy = policy_for(vni, binding->subnet_id);
+        const std::size_t cap = policy == nullptr ? 0 : policy->max_groups_per_nic;
+        if (state.groups.size() <= cap) {
             continue;
         }
         const std::size_t extra = state.groups.size() - cap;
@@ -1192,32 +1216,73 @@ auto VSwitch::set_group_policy(std::uint32_t vni, const GroupPolicy& policy)
                 return std::unexpected(GroupPolicyError::nonzero_limits);
             }
             _group_policies.erase(vni);
-            trim_memberships(vni, 0);
+            trim_memberships(vni);
             return {};
         case GroupMode::multicast:
             break;
         default:
             return std::unexpected(GroupPolicyError::unknown_mode);
     }
-    if (policy.rate_frames == 0 || policy.burst_frames == 0 || policy.rate_bytes == 0 ||
-        policy.burst_bytes == 0 || policy.max_remote_vteps == 0) {
-        return std::unexpected(GroupPolicyError::missing_limit);
+    if (auto ok = check_multicast(policy); !ok) {
+        return std::unexpected(ok.error());
     }
-    if (policy.rate_frames > group_rate_frames_max ||
-        policy.burst_frames > group_burst_frames_max || policy.rate_bytes > group_rate_bytes_max ||
-        policy.burst_bytes > group_burst_bytes_max ||
-        policy.max_remote_vteps > group_max_remote_vteps_max ||
-        policy.max_groups_per_nic > group_max_groups_per_nic_max) {
-        return std::unexpected(GroupPolicyError::limit_too_large);
-    }
-    _group_policies.insert_or_assign(vni, policy);
-    trim_memberships(vni, policy.max_groups_per_nic);
+    _group_policies.insert_or_assign(vni, VniGroupPolicy{.vni_wide = policy, .subnets = {}});
+    trim_memberships(vni);
     return {};
+}
+
+auto VSwitch::set_subnet_group_policies(std::uint32_t vni,
+                                        std::span<const SubnetGroupPolicy> subnets)
+    -> std::expected<void, GroupPolicyError> {
+    if (vni == 0 || vni > geneve::vni_max) {
+        return std::unexpected(GroupPolicyError::vni_out_of_range);
+    }
+    if (subnets.size() > max_vpc_subnets) {
+        return std::unexpected(GroupPolicyError::bad_subnet);
+    }
+    for (std::size_t i = 0; i < subnets.size(); ++i) {
+        const SubnetGroupPolicy& s = subnets[i];
+        if (s.subnet == 0 || (i > 0 && subnets[i - 1].subnet >= s.subnet) ||
+            s.policy.mode != GroupMode::multicast) {
+            return std::unexpected(GroupPolicyError::bad_subnet);
+        }
+        if (auto ok = check_multicast(s.policy); !ok) {
+            return std::unexpected(ok.error());
+        }
+    }
+    if (subnets.empty()) {
+        _group_policies.erase(vni);
+    } else {
+        _group_policies.insert_or_assign(
+            vni,
+            VniGroupPolicy{.vni_wide = std::nullopt, .subnets = {subnets.begin(), subnets.end()}});
+    }
+    trim_memberships(vni);
+    return {};
+}
+
+auto VSwitch::policy_for(std::uint32_t vni, std::uint64_t subnet) const -> const GroupPolicy* {
+    const auto it = _group_policies.find(vni);
+    if (it == _group_policies.end()) {
+        return nullptr;
+    }
+    const VniGroupPolicy& p = it->second;
+    if (p.vni_wide) {
+        return &*p.vni_wide;
+    }
+    const auto s = std::ranges::lower_bound(p.subnets, subnet, {}, &SubnetGroupPolicy::subnet);
+    return s != p.subnets.end() && s->subnet == subnet ? &s->policy : nullptr;
 }
 
 auto VSwitch::group_policy(std::uint32_t vni) const -> GroupPolicy {
     const auto it = _group_policies.find(vni);
-    return it == _group_policies.end() ? GroupPolicy{} : it->second;
+    return it == _group_policies.end() || !it->second.vni_wide ? GroupPolicy{}
+                                                               : *it->second.vni_wide;
+}
+
+auto VSwitch::group_policy(std::uint32_t vni, std::uint64_t subnet) const -> GroupPolicy {
+    const GroupPolicy* const p = policy_for(vni, subnet);
+    return p == nullptr ? GroupPolicy{} : *p;
 }
 
 auto VSwitch::group_meter(geneve::NicId nic) const -> std::optional<GroupMeter> {
@@ -1700,9 +1765,8 @@ auto VSwitch::replicate(const MappingSnapshot& snap, geneve::NicId src, std::uin
     const bool ip_ok = ip == nullptr || ip_multicast_destination(*ip);
     NicGroupState& state = _group[src];  // attached senders always have one
     GroupMeter& meter = state.meter;
-    const auto policy_it = _group_policies.find(vni);
-    if (policy_it == _group_policies.end() ||
-        !admits(policy_it->second, mac_at(frame, dst_mac_offset))) {
+    const GroupPolicy* const policy_ptr = policy_for(vni, snap.lookup(src)->subnet_id);
+    if (policy_ptr == nullptr || !admits(*policy_ptr, mac_at(frame, dst_mac_offset))) {
         ++meter.drop_policy;
         ++_counters.tx_drop_group;
         return;
@@ -1712,7 +1776,7 @@ auto VSwitch::replicate(const MappingSnapshot& snap, geneve::NicId src, std::uin
         ++_counters.tx_drop_ip_dst;
         return;
     }
-    const GroupPolicy& policy = policy_it->second;
+    const GroupPolicy& policy = *policy_ptr;
 
     // A listed group goes to its VTEPs and the local NICs that joined it;
     // any other group to the whole VNI.
@@ -1817,9 +1881,14 @@ auto VSwitch::receive(const geneve::Packet& packet, const Ipv6Address& outer_src
         return dst;
     }
     if (*dst == geneve::nic_broadcast) {
-        const auto policy_it = _group_policies.find(packet.vni);
-        if (policy_it == _group_policies.end() ||
-            !admits(policy_it->second, mac_at(packet.inner, dst_mac_offset))) {
+        // The source NIC's subnet's policy: a subnet that has not opted in
+        // takes no group traffic from its own members elsewhere either.
+        // (check_ingress found the source NIC; src_binding is only looked
+        // up for a VNI with a config.)
+        const auto source = src_binding ? src_binding : snap->lookup(packet.nics->src);
+        const GroupPolicy* const policy =
+            policy_for(packet.vni, source ? source->subnet_id : std::uint64_t{0});
+        if (policy == nullptr || !admits(*policy, mac_at(packet.inner, dst_mac_offset))) {
             ++_counters.rx_drop_group;
             return dst;
         }

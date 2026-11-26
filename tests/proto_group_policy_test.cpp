@@ -207,7 +207,7 @@ BOOST_AUTO_TEST_CASE(strict_framing) {
     b[0] = std::byte{0};
     BOOST_TEST((decode_error(b) == DecodeError::bad_magic));
     b = good;
-    b[4] = std::byte{2};
+    b[4] = std::byte{3};  // version 2 is the per-subnet layout
     BOOST_TEST((decode_error(b) == DecodeError::bad_version));
     for (const std::size_t off :
          {off_reserved1, off_reserved1 + 2, off_reserved2, off_reserved2 + 1}) {
@@ -248,6 +248,155 @@ BOOST_AUTO_TEST_CASE(errors_have_names) {
     for (auto e : {DecodeError::bad_policy_version, DecodeError::bad_group_limits}) {
         BOOST_TEST(std::string_view{proto::to_string(e)} != "unknown");
     }
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// .kiro/specs/vpc-subnets-routing/ task 12: version 2, one entry per
+// opted-in subnet.
+namespace {
+
+constexpr std::size_t v2_entries = 0x20;
+constexpr std::size_t v2_count = 0x14;
+
+auto limits(std::uint64_t subnet) -> proto::GroupSubnetLimits {
+    return {.subnet_id = subnet,
+            .rate_frames = 1000,
+            .burst_frames = 100,
+            .rate_bytes = 1'250'000,
+            .burst_bytes = 150'000,
+            .max_remote_vteps = 16,
+            .max_groups_per_nic = 8};
+}
+
+auto per_subnet(std::vector<proto::GroupSubnetLimits> subnets) -> proto::GroupPolicy {
+    return {.server_id = sample_server,
+            .key_id = sample_key,
+            .vni = sample_vni,
+            .mode = proto::GroupMode::drop,
+            .policy_version = 9,
+            .signature = {},
+            .format = proto::group_policy_version_subnets,
+            .subnets = std::move(subnets)};
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_SUITE(group_policy_v2, *boost::unit_test::timeout(unit_timeout_seconds))
+
+BOOST_AUTO_TEST_CASE(round_trips_from_none_to_every_subnet) {
+    std::vector<proto::GroupSubnetLimits> all;
+    for (std::uint64_t s = 1; s <= proto::max_group_policy_subnets; ++s) {
+        all.push_back(limits(s));
+    }
+    for (auto p : {per_subnet({}), per_subnet({limits(0x5A01), limits(0x5A03)}), per_subnet(all)}) {
+        p.signature.fill(std::byte{0x5A});
+        const auto b = encoded(p);
+        BOOST_TEST(b.size() == proto::min_group_policy_v2_size +
+                                   (p.subnets.size() * proto::group_policy_entry_size));
+        BOOST_TEST(b.size() <= proto::max_group_policy_size);
+        auto back = proto::decode_group_policy(b);
+        BOOST_REQUIRE(back.has_value());
+        BOOST_TEST((*back == p));
+        BOOST_TEST(proto::group_policy_signed_bytes(b).size() == b.size() - 64);
+    }
+    BOOST_TEST(proto::max_group_policy_size == 8096U);
+}
+
+BOOST_AUTO_TEST_CASE(layout_is_little_endian) {
+    const auto b = encoded(per_subnet({limits(0x5A01), limits(0x5A03)}));
+    BOOST_TEST(std::to_integer<int>(b[4]) == 2);
+    BOOST_TEST(std::to_integer<int>(b[v2_count]) == 2);
+    BOOST_TEST(le64_at(b, off_version_field) == 9U);
+    BOOST_TEST(le64_at(b, v2_entries) == 0x5A01U);
+    BOOST_TEST(le64_at(b, v2_entries + 0x10) == 1'250'000U);
+    BOOST_TEST(le64_at(b, v2_entries + proto::group_policy_entry_size) == 0x5A03U);
+    BOOST_TEST(std::to_integer<int>(b[v2_entries + 0x24]) == 8);
+}
+
+BOOST_AUTO_TEST_CASE(rules_hold_both_ways) {
+    // Each broken policy is refused by the encoder, and the same bytes
+    // (patched from a good frame) by the decoder.
+    BOOST_TEST((encode_error(per_subnet({limits(0)})) == DecodeError::bad_id));
+    BOOST_TEST((encode_error(per_subnet({limits(2), limits(1)})) == DecodeError::not_ascending));
+    BOOST_TEST((encode_error(per_subnet({limits(2), limits(2)})) == DecodeError::not_ascending));
+    auto zero_rate = limits(1);
+    zero_rate.rate_frames = 0;
+    BOOST_TEST((encode_error(per_subnet({zero_rate})) == DecodeError::bad_group_limits));
+    auto too_many_groups = limits(1);
+    too_many_groups.max_groups_per_nic = proto::max_group_groups_per_nic + 1;
+    BOOST_TEST((encode_error(per_subnet({too_many_groups})) == DecodeError::bad_group_limits));
+    auto vpc_wide = per_subnet({});
+    vpc_wide.mode = proto::GroupMode::multicast;
+    BOOST_TEST((encode_error(vpc_wide) == DecodeError::bad_group_limits));
+    auto v1_with_subnets = multicast();
+    v1_with_subnets.subnets = {limits(1)};
+    BOOST_TEST((encode_error(v1_with_subnets) == DecodeError::bad_group_limits));
+    auto format3 = per_subnet({});
+    format3.format = 3;
+    BOOST_TEST((encode_error(format3) == DecodeError::bad_version));
+    std::vector<proto::GroupSubnetLimits> over;
+    for (std::uint64_t s = 1; s <= proto::max_group_policy_subnets + 1; ++s) {
+        over.push_back(limits(s));
+    }
+    BOOST_TEST((encode_error(per_subnet(over)) == DecodeError::too_many_entries));
+
+    const auto good = encoded(per_subnet({limits(1), limits(2)}));
+    auto b = good;
+    b[v2_entries] = std::byte{0};  // subnet 1 becomes 0
+    BOOST_TEST((decode_error(b) == DecodeError::bad_id));
+    b = good;
+    b[v2_entries + proto::group_policy_entry_size] = std::byte{1};  // 2 becomes 1
+    BOOST_TEST((decode_error(b) == DecodeError::not_ascending));
+    b = good;
+    b[v2_entries + 0x08] = std::byte{0};  // rate_frames 1000 becomes 0
+    b[v2_entries + 0x09] = std::byte{0};
+    BOOST_TEST((decode_error(b) == DecodeError::bad_group_limits));
+    b = good;
+    b[v2_count] = std::byte{201};
+    BOOST_TEST((decode_error(b) == DecodeError::too_many_entries));
+    for (const std::size_t off : {std::size_t{0x16}, v2_entries + 0x26, v2_entries + 0x27}) {
+        b = good;
+        b[off] = std::byte{1};
+        BOOST_TEST((decode_error(b) == DecodeError::reserved_not_zero));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(strict_framing) {
+    const auto good = encoded(per_subnet({limits(1), limits(2)}));
+    for (std::size_t n = 6; n < good.size(); ++n) {
+        BOOST_TEST((decode_error(std::span{good}.first(n)) == DecodeError::truncated));
+    }
+    auto longer = good;
+    longer.push_back(std::byte{0});
+    BOOST_TEST((decode_error(longer) == DecodeError::trailing_bytes));
+    // One entry fewer than the count claims is short by an entry.
+    auto b = good;
+    b[v2_count] = std::byte{3};
+    BOOST_TEST((decode_error(b) == DecodeError::truncated));
+}
+
+BOOST_AUTO_TEST_CASE(signature_covers_every_entry) {
+    const ak::test::TestSigner signer{ak::test::rfc_test1_secret};
+    const std::array keys{ak::test::controller_key(sample_key, ak::test::rfc_test1_public)};
+    auto verifier = ak::hull::SignatureVerifier::create(keys);
+    BOOST_REQUIRE(verifier.has_value());
+    auto frame = encoded(per_subnet({limits(1), limits(2)}));
+    proto::set_group_policy_signature(frame, signer.sign(proto::group_policy_signed_bytes(frame)));
+    const auto decoded = proto::decode_group_policy(frame);
+    BOOST_REQUIRE(decoded.has_value());
+    BOOST_TEST(
+        verifier
+            ->verify(proto::group_policy_signed_bytes(frame), decoded->signature, decoded->key_id)
+            .has_value());
+    // The last entry's byte rate, raised after signing.
+    frame[v2_entries + proto::group_policy_entry_size + 0x11] ^= std::byte{0x01};
+    const auto tampered = proto::decode_group_policy(frame);
+    BOOST_REQUIRE(tampered.has_value());
+    BOOST_TEST(!verifier
+                    ->verify(proto::group_policy_signed_bytes(frame), tampered->signature,
+                             tampered->key_id)
+                    .has_value());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

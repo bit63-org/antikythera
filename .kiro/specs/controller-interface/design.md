@@ -150,8 +150,10 @@ key IDs inside the signed bytes, so applying it is idempotent and a server
 that missed versions catches up from the newest. A `drop` policy has
 every limit zero; a `multicast` policy has every limit non-zero
 (`max_groups_per_nic` may be zero, refusing every join) and within the
-oar-net bounds. Per-subnet policies come with subnets: a later version
-carries one entry per subnet.
+oar-net bounds. Per-subnet policies are version 2 (vpc-subnets-routing
+design "GroupPolicy version 2"): one entry per opted-in subnet, each
+with a `multicast` policy's limits, every other subnet in `drop`, under
+the same `policy_version` sequence; the sideband op is chunked for it.
 
 Snooping (Requirement 7.9) closes the loop. helm sends a
 `group_membership` report with one network role's whole join list

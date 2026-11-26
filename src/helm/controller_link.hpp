@@ -146,6 +146,13 @@ public:
     virtual auto on_lease_grant(const proto::LeaseGrant& /*grant*/) -> void {}
     // A storage role's certificate, for the role in `certificate.slot`.
     virtual auto on_role_certificate(const proto::RoleCertificate& /*certificate*/) -> void {}
+    // khold (kythira khold-block-service task 17). A khold volume's layout
+    // at one epoch for this server; `frame` is its exact encoding, which
+    // the khold or blk role verifies.
+    virtual auto on_volume_layout(const proto::VolumeLayout& /*layout*/,
+                                  std::span<const std::byte> /*frame*/) -> void {}
+    // Run the storage self-test on one khold role or all of them.
+    virtual auto on_self_test(const proto::SelfTest& /*request*/) -> void {}
 };
 
 enum class SessionError : std::uint8_t {

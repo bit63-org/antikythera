@@ -267,6 +267,28 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
             _sink->on_role_certificate(*cert);
             return {};
         }
+        case proto::RecordType::volume_layout: {
+            auto layout = proto::decode_volume_layout(rec.payload);
+            if (!layout) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (layout->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_volume_layout(*layout, rec.payload);
+            return {};
+        }
+        case proto::RecordType::self_test: {
+            auto request = proto::decode_self_test(rec.payload);
+            if (!request) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (request->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_self_test(*request);
+            return {};
+        }
         case proto::RecordType::report_ack: {
             auto ack = proto::decode_report_ack(rec.payload);
             if (!ack) {

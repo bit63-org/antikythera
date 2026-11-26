@@ -40,6 +40,15 @@
 //   instance_metadata controller -> helm an InstanceMetadata
 //                                      (instance_metadata.hpp), for the
 //                                      NIC's network role
+//   volume_layout controller -> helm   a VolumeLayout (volume_layout.hpp),
+//                                      for this server's khold role (a
+//                                      member or gateway) or blk role (an
+//                                      attachment)
+//   self_test     controller -> helm   server_id u64 | slot u8 | scope u8
+//                                      (SelfTestScope) | rsvd [6]: run the
+//                                      storage self-test on the khold role
+//                                      in that slot (scope slot) or on
+//                                      every khold role (scope all, slot 0)
 //
 // The block volume records (.kiro/specs/block-volume-service/ task 12):
 // helm forwards replica_config, volume_op and lease_grant to its storage
@@ -53,6 +62,13 @@
 // CREATE_VOLUME is about to create (.kiro/specs/oar-blk-data-plane/ task
 // 15). helm opens it in its secure element to refuse a bad one, and keeps
 // it until that command re-wraps it under the owner's VM key.
+//
+// The khold records (kythira .kiro/specs/khold-block-service/ task 17):
+// helm forwards volume_layout unmodified, keeping the newest epoch of each
+// volume to replay to a role whose sideband reopens; the role verifies
+// the signature. self_test is unsigned like lease_grant: it only asks a
+// khold role to measure its drives and link again (Requirement 12.1), and
+// the answer is the role's next capacity report.
 //
 // role_certificate's chain is DER certificates back to back, leaf first,
 // at most max_cert_chain_certs of them and max_cert_chain_size bytes in
@@ -95,6 +111,7 @@
 #include "proto/report.hpp"
 #include "proto/tunnel_peers.hpp"
 #include "proto/volume_key.hpp"
+#include "proto/volume_layout.hpp"
 #include "proto/volume_op.hpp"
 #include "proto/vpc_config.hpp"
 
@@ -107,11 +124,13 @@ inline constexpr std::size_t lease_grant_size = 24;
 inline constexpr std::size_t role_certificate_fixed_size = 16;
 inline constexpr std::size_t max_cert_chain_size = 16384;
 inline constexpr std::size_t max_cert_chain_certs = 4;
-inline constexpr std::size_t max_record_payload = std::max(
-    {envelope_size, max_map_update_size, max_report_size, report_ack_size, hello_size,
-     group_policy_size, max_tunnel_peers_size, max_replica_config_size, volume_op_size,
-     volume_key_size, lease_grant_size, role_certificate_fixed_size + max_cert_chain_size,
-     image_key_size, max_vpc_config_size, max_group_members_size, max_instance_metadata_size});
+inline constexpr std::size_t self_test_size = 16;
+inline constexpr std::size_t max_record_payload =
+    std::max({envelope_size, max_map_update_size, max_report_size, report_ack_size, hello_size,
+              group_policy_size, max_tunnel_peers_size, max_replica_config_size, volume_op_size,
+              volume_key_size, lease_grant_size, role_certificate_fixed_size + max_cert_chain_size,
+              image_key_size, max_vpc_config_size, max_group_members_size,
+              max_instance_metadata_size, max_volume_layout_size, self_test_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class RecordType : std::uint16_t {
@@ -131,6 +150,14 @@ enum class RecordType : std::uint16_t {
     vpc_config = 14,
     group_members = 15,
     instance_metadata = 16,
+    volume_layout = 17,
+    self_test = 18,
+};
+
+// Which khold roles a self_test record asks.
+enum class SelfTestScope : std::uint8_t {
+    slot = 1,  // the khold role in `slot`
+    all = 2,   // every khold role on the server; `slot` is 0
 };
 
 struct Record {
@@ -158,6 +185,13 @@ struct LeaseGrant {
     friend auto operator==(const LeaseGrant&, const LeaseGrant&) -> bool = default;
 };
 
+struct SelfTest {
+    std::uint64_t server_id{0};
+    std::uint8_t slot{0};
+    SelfTestScope scope{SelfTestScope::all};
+    friend auto operator==(const SelfTest&, const SelfTest&) -> bool = default;
+};
+
 struct RoleCertificate {
     std::uint64_t server_id{0};
     std::uint8_t slot{0};
@@ -168,7 +202,7 @@ struct RoleCertificate {
 namespace detail {
 
 [[nodiscard]] constexpr auto known(RecordType t) noexcept -> bool {
-    return t >= RecordType::envelope && t <= RecordType::instance_metadata;
+    return t >= RecordType::envelope && t <= RecordType::self_test;
 }
 
 }  // namespace detail
@@ -307,6 +341,61 @@ namespace detail {
         return std::unexpected(ok.error());
     }
     return g;
+}
+
+[[nodiscard]] inline auto check_self_test(const SelfTest& t) noexcept
+    -> std::expected<void, DecodeError> {
+    if (t.server_id == 0) {
+        return std::unexpected(DecodeError::bad_server_id);
+    }
+    if (t.scope != SelfTestScope::slot && t.scope != SelfTestScope::all) {
+        return std::unexpected(DecodeError::unknown_value);
+    }
+    if (t.scope == SelfTestScope::all && t.slot != 0) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto encode_self_test(const SelfTest& t)
+    -> std::expected<std::vector<std::byte>, DecodeError> {
+    if (auto ok = check_self_test(t); !ok) {
+        return std::unexpected(ok.error());
+    }
+    std::vector<std::byte> out;
+    out.reserve(self_test_size);
+    wire::Writer w{out};
+    w.le64(t.server_id);
+    w.u8(t.slot);
+    w.u8(static_cast<std::uint8_t>(t.scope));
+    w.le16(0);
+    w.le32(0);
+    return out;
+}
+
+[[nodiscard]] inline auto decode_self_test(std::span<const std::byte> bytes) noexcept
+    -> std::expected<SelfTest, DecodeError> {
+    wire::Reader r{bytes};
+    auto server_id = r.le64();
+    auto slot = r.u8();
+    auto scope = r.u8();
+    auto reserved1 = r.le16();
+    auto reserved2 = r.le32();
+    if (!server_id || !slot || !scope || !reserved1 || !reserved2) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (r.remaining() != 0) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    if (*reserved1 != 0 || *reserved2 != 0) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    const SelfTest t{
+        .server_id = *server_id, .slot = *slot, .scope = static_cast<SelfTestScope>(*scope)};
+    if (auto ok = check_self_test(t); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return t;
 }
 
 [[nodiscard]] inline auto check_role_certificate(const RoleCertificate& c) noexcept

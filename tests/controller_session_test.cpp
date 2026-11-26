@@ -91,6 +91,13 @@ struct RecordingSink final : helm::ControllerSink {
         -> void override {
         metadata.emplace_back(m, std::vector<std::byte>{frame.begin(), frame.end()});
     }
+    std::vector<std::pair<proto::VolumeLayout, std::vector<std::byte>>> layouts;
+    auto on_volume_layout(const proto::VolumeLayout& l, std::span<const std::byte> frame)
+        -> void override {
+        layouts.emplace_back(l, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
+    std::vector<proto::SelfTest> self_tests;
+    auto on_self_test(const proto::SelfTest& t) -> void override { self_tests.push_back(t); }
     std::vector<proto::RoleCertificate> certificates;
     auto on_role_certificate(const proto::RoleCertificate& c) -> void override {
         certificates.push_back(c);
@@ -300,6 +307,32 @@ auto instance_metadata_record(std::uint64_t to) -> std::vector<std::byte> {
     return framed(RecordType::instance_metadata, *b);
 }
 
+auto volume_layout_record(std::uint64_t to) -> std::vector<std::byte> {
+    proto::VolumeLayout l;
+    l.key_id = key;
+    l.server_id = to;
+    l.volume_id = 0x200;
+    l.epoch = 3;
+    l.lineage_id = 0x2EE;
+    l.capacity_blocks = 1024;
+    l.qos = {.iops = 100, .mib_per_s = 10, .burst_iops = 100, .burst_mib = 10};
+    l.timings = {.member_deadline_ms = 1000, .election_min_ms = 1000, .resync_window_s = 900};
+    proto::LayoutMember m{.server_id = to, .endpoint = {}, .port = 7400};
+    m.endpoint[0] = std::byte{0xFD};
+    m.endpoint[15] = std::byte{1};
+    l.groups = {{.group_id = 0x5001, .members = {m}}};
+    auto b = proto::encode_volume_layout(l);
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::volume_layout, *b);
+}
+
+auto self_test_record(std::uint64_t to) -> std::vector<std::byte> {
+    auto b =
+        proto::encode_self_test({.server_id = to, .slot = 4, .scope = proto::SelfTestScope::slot});
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::self_test, *b);
+}
+
 auto tunnel_peers_record(std::uint64_t to) -> std::vector<std::byte> {
     proto::TunnelPeers t{
         .server_id = to,
@@ -481,6 +514,39 @@ BOOST_FIXTURE_TEST_CASE(block_volume_records_for_another_server_end_the_connecti
     BOOST_REQUIRE(!res.has_value());
     BOOST_TEST((res.error() == SessionError::bad_record));
     BOOST_TEST(sink.grants.empty());
+}
+
+// kythira khold-block-service task 17.
+BOOST_FIXTURE_TEST_CASE(khold_records_reach_the_sink_unmodified, Fixture) {
+    session.on_connected();
+    const auto layout = volume_layout_record(server);
+    const auto test = self_test_record(server);
+    BOOST_REQUIRE(session.on_bytes(layout).has_value());
+    BOOST_REQUIRE(session.on_bytes(test).has_value());
+    BOOST_REQUIRE(sink.layouts.size() == 1U);
+    BOOST_TEST(sink.layouts[0].first.epoch == 3U);
+    BOOST_TEST(std::ranges::equal(sink.layouts[0].second,
+                                  std::span{layout}.subspan(proto::record_header_size)));
+    BOOST_REQUIRE(sink.self_tests.size() == 1U);
+    BOOST_TEST(
+        (sink.self_tests[0] ==
+         proto::SelfTest{.server_id = server, .slot = 4, .scope = proto::SelfTestScope::slot}));
+    for (const auto& r : {volume_layout_record(other_server), self_test_record(other_server)}) {
+        session.on_disconnected();
+        session.on_connected();
+        auto res = session.on_bytes(r);
+        BOOST_REQUIRE(!res.has_value());
+        BOOST_TEST((res.error() == SessionError::wrong_server));
+    }
+    auto bad = volume_layout_record(server);
+    bad.back() = std::byte{0};
+    bad[proto::record_header_size + 0x46] = std::byte{1};  // a reserved byte
+    session.on_disconnected();
+    session.on_connected();
+    auto res = session.on_bytes(bad);
+    BOOST_REQUIRE(!res.has_value());
+    BOOST_TEST((res.error() == SessionError::bad_record));
+    BOOST_TEST(sink.layouts.size() == 1U);
 }
 
 BOOST_AUTO_TEST_CASE(block_volume_records_default_to_dropped) {

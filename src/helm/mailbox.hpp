@@ -101,7 +101,8 @@ enum class Type : std::uint16_t {
     attach_volume = 0x0022,
     detach_volume = 0x0023,
     rewrap_volume = 0x0024,
-    create_network = 0x0030,  // VPC
+    withdraw_detach = 0x0025,  // helm's: withdraws a busy cooperative detach
+    create_network = 0x0030,   // VPC
     delete_network = 0x0031,
     gpu_vf_config = 0x0040,  // reserved: GPU support is designed, not yet built
 
@@ -330,6 +331,20 @@ struct DetachVolume {
     friend auto operator==(const DetachVolume&, const DetachVolume&) -> bool = default;
 };
 
+// WITHDRAW_DETACH: volume_id u64 | vm_id u64 | device (4)  (20 bytes)
+// device.type must be blk_fn. Withdraws a cooperative detach the guest
+// has not acted on (.kiro/specs/block-volume-service/ Requirement 3.3,
+// design "Detach blocked while mounted"): helm clears the function's
+// eject request and the attachment carries on as if no detach had been
+// asked. helm answers it itself and never relays it, like the `busy`
+// answer it replaces; hull answers one that reaches it `unsupported`.
+struct WithdrawDetach {
+    std::uint64_t volume_id{0};
+    std::uint64_t vm_id{0};
+    DeviceRef device;
+    friend auto operator==(const WithdrawDetach&, const WithdrawDetach&) -> bool = default;
+};
+
 // REWRAP_VOLUME: volume_id u64 | from_vm u64 | to_vm u64  (24 bytes)
 // Names the current owner as well as the new one, so a stale or reordered
 // command cannot move a volume it no longer describes. from_vm != to_vm.
@@ -513,10 +528,10 @@ struct ScrubDone {
 
 // ---- Any body -------------------------------------------------------------
 
-using Body =
-    std::variant<ListVms, VmStatus, CreateVm, DestroyVm, AttachDevice, DetachDevice, CreateVolume,
-                 DeleteVolume, AttachVolume, DetachVolume, RewrapVolume, CreateNetwork,
-                 DeleteNetwork, Response, VmExited, DeviceReleased, HostFault, ScrubDone>;
+using Body = std::variant<ListVms, VmStatus, CreateVm, DestroyVm, AttachDevice, DetachDevice,
+                          CreateVolume, DeleteVolume, AttachVolume, DetachVolume, RewrapVolume,
+                          WithdrawDetach, CreateNetwork, DeleteNetwork, Response, VmExited,
+                          DeviceReleased, HostFault, ScrubDone>;
 
 // Decodes and validates the body of any message according to its type.
 [[nodiscard]] auto decode_body(const Message& msg) noexcept -> std::expected<Body, BodyError>;

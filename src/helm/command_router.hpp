@@ -94,6 +94,8 @@
 //                  prepare_function with the attachment, which opens the
 //                  role's session to the primary; commit: open the key in
 //                  the secure element and deliver it.
+//   WITHDRAW_DETACH only by the VM that attached; answered by helm (see
+//                  cooperative detach below).
 //   DETACH_VOLUME  only by the VM that attached; under force or
 //                  destroy_vm only once the newest config no longer lists
 //                  the attachment's generation (the controller fenced it,
@@ -122,7 +124,16 @@
 //      guest that lets go later still can; helm keeps querying and reports
 //      the release (an attachment_status for a network volume). The
 //      controller then sends DETACH_VOLUME again, which finds the release
-//      and relays at once, or a forced detach.
+//      and relays at once, or a forced detach, or withdraws the request.
+//   5. WITHDRAW_DETACH (only by the VM that attached; never relayed):
+//      eject(cancel) on the role, which clears eject_requested, and helm
+//      stops watching the function. A network volume reports its
+//      attachment `attached` again. The role's cancel is idempotent, so
+//      a withdraw with nothing pending (a retry, or a request helm lost
+//      across a restart) still clears the role and answers ok. It also
+//      withdraws a request the guest already acted on (`released`): the
+//      function stays attached, and the guest may take it back by
+//      rescanning its bus.
 //
 // Network volumes report attachment_status eject_requested, released and
 // busy as they happen. Local and image volumes have no attachment to name
@@ -351,6 +362,7 @@ struct RouterStats {
     std::uint64_t storage_failures{0};       // a committed delete or rewrap failed on the media
     std::uint64_t detaches_released{0};      // cooperative detaches the guest released
     std::uint64_t detaches_busy{0};          // cooperative detaches answered busy
+    std::uint64_t detaches_withdrawn{0};     // eject requests cleared by WITHDRAW_DETACH
 };
 
 class CommandRouter {
@@ -475,6 +487,13 @@ private:
     // Cooperative detach: asks the guest to release, then relays or waits.
     auto start_wait(std::uint64_t seq, const mailbox::Slot& slot,
                     const mailbox::DetachVolume& detach) -> void;
+    // WITHDRAW_DETACH: clears the eject request on the role and forgets it.
+    auto withdraw(std::uint64_t seq, const mailbox::WithdrawDetach& withdraw) -> void;
+    // The volume is attached here, to `vm`, on `device` (DETACH_VOLUME and
+    // WITHDRAW_DETACH): unknown_volume or conflict otherwise.
+    [[nodiscard]] auto check_attached(VolumeId volume, VmId vm,
+                                      const mailbox::DeviceRef& device) const
+        -> std::expected<void, mailbox::Status>;
     // Asks the role where a function stands; records and reports a release.
     // nullopt if the role could not be asked.
     auto query_eject(FunctionId id) -> std::optional<oar::EjectState>;

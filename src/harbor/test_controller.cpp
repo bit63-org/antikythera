@@ -862,6 +862,13 @@ constexpr std::array verbs{
              return mb::DetachVolume{
                  .volume_id = vol, .vm_id = vm, .device = dev, .timeout_s = timeout, .policy = pol};
          }},
+    Verb{"withdraw-detach", 4,
+         [](Args& p) -> mb::Body {
+             const auto vol = p.num<std::uint64_t>("volume id");
+             const auto vm = p.num<std::uint64_t>("VM id");
+             const auto dev = device_ref(p, mb::DeviceType::blk_fn);
+             return mb::WithdrawDetach{.volume_id = vol, .vm_id = vm, .device = dev};
+         }},
     Verb{"rewrap-volume", 3,
          [](Args& p) -> mb::Body {
              const auto vol = p.num<std::uint64_t>("volume id");

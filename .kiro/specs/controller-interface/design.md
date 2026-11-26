@@ -518,10 +518,15 @@ primary reports time throttled below the provisioned rate (Requirement
 | `TerminateInstances` | `DESTROY_VM`; retire every attachment's generation; `DeleteVolume` for those with `DeleteOnTermination` |
 | `StopInstances` / `StartInstances` | `DESTROY_VM {persist_volumes = true}` and retire the generations / place anywhere, new generations, `VolumeKey` per attachment, `ATTACH_VOLUME` each |
 
-None of this needs a new mailbox command: the mailbox sees only
-`ATTACH_VOLUME`, `DETACH_VOLUME` (with `DetachPolicy` `wait = 3`) and
-the VM commands; everything else is ReplicaConfig, VolumeOp, VolumeKey
-and reports on the controller link.
+The mailbox sees only `ATTACH_VOLUME`, `DETACH_VOLUME` (with
+`DetachPolicy` `wait = 3`), `WITHDRAW_DETACH` and the VM commands;
+everything else is ReplicaConfig, VolumeOp, VolumeKey and reports on the
+controller link. `WITHDRAW_DETACH` cancels a `busy` detach's request to
+the guest and returns the attachment to `attached`. EC2 has no action
+for that (a `busy` attachment stays so until the guest lets go or a
+forced detach), so the EC2 mapping never sends it; it is there for
+controllers and tools that let a caller abandon a detach, and for
+reconciliation after a controller decides not to detach after all.
 
 ## Where the code lives
 

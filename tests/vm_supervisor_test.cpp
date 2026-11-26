@@ -466,6 +466,9 @@ BOOST_AUTO_TEST_CASE(handler_dispatches_every_command,
     BOOST_TEST(
         (status(mb::CreateVolume{.volume_id = 1, .owner_vm = 1, .size_gib = 1}) == mb::Status::ok));
     BOOST_TEST((status(mb::CreateNetwork{.vni = 7}) == mb::Status::ok));
+    // helm answers WITHDRAW_DETACH itself and never relays it.
+    BOOST_TEST((status(mb::WithdrawDetach{.volume_id = 3, .vm_id = 1, .device = Harness::blk}) ==
+                mb::Status::unsupported));
     BOOST_TEST((status(mb::DestroyVm{.vm_id = 1}) == mb::Status::ok));
     BOOST_TEST(!h.supervisor.contains(1));
     BOOST_TEST((status(mb::VmExited{.vm_id = 1}) == mb::Status::malformed));

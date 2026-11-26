@@ -68,6 +68,7 @@ enum class AuditEvent : std::uint8_t {
     eject_requested,             // cooperative detach: the guest was asked to release the function
     eject_released,              // the guest released it (helm may now relay the detach)
     detach_busy,                 // the guest did not release it by the command's timeout
+    detach_withdrawn,            // WITHDRAW_DETACH cleared a pending eject request
 };
 
 [[nodiscard]] auto to_string(AuditEvent e) noexcept -> const char*;

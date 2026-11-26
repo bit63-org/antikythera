@@ -10,7 +10,8 @@
 //   [0]   geometry: bit 0 = 4 KiB blocks, bit 1 = read-only, bits 2-7 = seg_max - 1
 //   [1]   capacity in logical blocks (0-255)
 //   [2]   readable segment count (low 3 bits); the stream is cut evenly
-//   [3]   writable segment count (low 3 bits)
+//   [3]   writable segment count (low 3 bits); bit 3 offers trim
+//         (DISCARD and WRITE_ZEROES, max_trim_sectors 64)
 //   [4-5] writable bytes per segment, little-endian, capped at 9 KiB
 
 #include <algorithm>
@@ -32,6 +33,8 @@ constexpr std::uint8_t flag_4k = 0x01;
 constexpr std::uint8_t flag_ro = 0x02;
 constexpr unsigned seg_max_shift = 2;
 constexpr std::uint8_t count_mask = 0x07;
+constexpr std::uint8_t flag_trim = 0x08;
+constexpr std::uint32_t max_trim = 64;
 constexpr unsigned byte_bits = 8;
 constexpr std::size_t max_writable_segment = 9 * 1024;
 constexpr std::uint32_t block_4k = 4096;
@@ -67,6 +70,8 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         .read_only = (g & flag_ro) != 0,
         .seg_max = static_cast<std::uint32_t>(g >> seg_max_shift) + 1,
         .max_transfer_bytes = max_transfer,
+        .trim = (data[3] & flag_trim) != 0,
+        .max_trim_sectors = max_trim,
     };
     auto parser = blk::RequestParser::create(geometry);
     check(parser.has_value());
@@ -141,6 +146,18 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
             break;
         case blk::RequestType::get_id:
             check(req->data_bytes != 0 && req->out_data.empty());
+            break;
+        case blk::RequestType::discard:
+        case blk::RequestType::write_zeroes:
+            // Only offered with trim; a whole-block range inside the volume.
+            check(geometry.trim && !geometry.read_only);
+            check(req->data_bytes == 0 && req->out_data.empty() && req->in_data.empty());
+            check(req->sector_count != 0 && req->sector_count <= max_trim);
+            check(req->sector % (lbs / blk::sector_size) == 0 &&
+                  req->sector_count % (lbs / blk::sector_size) == 0);
+            check(req->sector_count <= geometry.capacity_sectors &&
+                  req->sector <= geometry.capacity_sectors - req->sector_count);
+            check(!req->unmap || req->type == blk::RequestType::write_zeroes);
             break;
         default:
             std::abort();  // parse accepted a type it does not implement

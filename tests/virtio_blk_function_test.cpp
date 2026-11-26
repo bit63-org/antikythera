@@ -134,9 +134,34 @@ public:
         }
         return {};
     }
+    // Trim, when enabled, frees by zeroing (what khold's reads then return).
+    [[nodiscard]] auto supports_trim() const noexcept -> bool override { return trim; }
+    auto submit_discard(std::uint64_t offset, std::uint64_t length, blk::BackendCompletion done)
+        -> void override {
+        ++discards;
+        done(zero(offset, length));
+    }
+    auto submit_write_zeroes(std::uint64_t offset, std::uint64_t length,
+                             blk::BackendCompletion done) -> void override {
+        ++write_zeroes;
+        done(zero(offset, length));
+    }
+    auto zero(std::uint64_t offset, std::uint64_t length) -> blk::BackendResult {
+        if (fail) {
+            return std::unexpected(blk::BackendError::io);
+        }
+        if (offset > data.size() || length > data.size() - offset) {
+            return std::unexpected(blk::BackendError::out_of_range);
+        }
+        std::fill_n(data.begin() + static_cast<std::ptrdiff_t>(offset), length, std::byte{0});
+        return {};
+    }
 
     std::vector<std::byte> data;
     bool fail{false};
+    bool trim{false};
+    unsigned discards{0};
+    unsigned write_zeroes{0};
     unsigned reads{0};
     unsigned writes{0};
     unsigned flushes{0};
@@ -168,6 +193,7 @@ class Rig {
 public:
     explicit Rig(const BlkParams& p = params(), bool bring_up = true) {
         auto backend = std::make_unique<MemoryBackend>(volume_sectors * blk::sector_size);
+        backend->trim = p.geometry.trim;
         _backend = backend.get();
         auto fn = blk::VirtioBlkFunction::create(p, _ram.memory(), _irq, std::move(backend));
         BOOST_REQUIRE(fn);
@@ -315,6 +341,26 @@ auto encrypt(std::uint64_t unit, std::size_t data_unit, std::span<const std::byt
     std::vector<std::byte> out(plain.size());
     BOOST_REQUIRE(cipher->encrypt(unit, plain, out));
     return out;
+}
+
+// A virtio_blk_discard_write_zeroes range.
+auto trim_range(std::uint64_t sector, std::uint32_t sectors, std::uint32_t flags = 0)
+    -> std::vector<std::byte> {
+    std::vector<std::byte> out;
+    ak::wire::Writer w{out};
+    w.le64(sector);
+    w.le32(sectors);
+    w.le32(flags);
+    return out;
+}
+
+constexpr std::uint32_t test_max_trim = 64;  // sectors
+
+auto trim_params(std::uint32_t block_size = blk::sector_size) -> BlkParams {
+    auto p = params(block_size);
+    p.geometry.trim = true;
+    p.geometry.max_trim_sectors = test_max_trim;
+    return p;
 }
 
 auto backend_bytes(MemoryBackend& b, std::uint64_t sector, std::size_t len)
@@ -854,6 +900,140 @@ BOOST_AUTO_TEST_CASE(unrelated_unmap_keeps_io_flowing,
     // Unmapping the rings themselves still resets, as it must.
     rig.fn().pci().memory_changing(VirtioDriver::desc_gpa(queue0), 1);
     BOOST_TEST((rig.status() & vio::status_device_needs_reset) != 0);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// kythira .kiro/specs/khold-block-service/ Requirement 4.2: DISCARD and
+// WRITE_ZEROES for backends that free space.
+BOOST_AUTO_TEST_SUITE(trim)
+
+BOOST_AUTO_TEST_CASE(offered_only_with_trim, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig plain{params(), false};
+    const std::uint64_t f = plain.offered();
+    BOOST_TEST((f & vio::feature_bit(blk::feature_blk_discard)) == 0);
+    BOOST_TEST((f & vio::feature_bit(blk::feature_blk_write_zeroes)) == 0);
+
+    Rig rig{trim_params(block_4k), false};
+    const std::uint64_t g = rig.offered();
+    BOOST_TEST((g & vio::feature_bit(blk::feature_blk_discard)) != 0);
+    BOOST_TEST((g & vio::feature_bit(blk::feature_blk_write_zeroes)) != 0);
+    auto& fn = rig.fn();
+    BOOST_TEST(*fn.read_config(blk::blk_cfg::max_discard_sectors, 4) == test_max_trim);
+    BOOST_TEST(*fn.read_config(blk::blk_cfg::max_discard_seg, 4) == 1U);
+    BOOST_TEST(*fn.read_config(blk::blk_cfg::discard_sector_alignment, 4) == sectors_per_4k);
+    BOOST_TEST(*fn.read_config(blk::blk_cfg::max_write_zeroes_sectors, 4) == test_max_trim);
+    BOOST_TEST(*fn.read_config(blk::blk_cfg::max_write_zeroes_seg, 4) == 1U);
+    BOOST_TEST(*fn.read_config(blk::blk_cfg::write_zeroes_may_unmap, 1) == 1U);
+    BOOST_TEST(*fn.read_config(blk::blk_cfg::num_queues, 2) == 1U);
+    BOOST_TEST(fn.read_config(blk::blk_cfg::trim_size, 1).error() == vio::AccessError::bad_offset);
+}
+
+BOOST_AUTO_TEST_CASE(refused_without_a_trim_backend,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    GuestRam ram;
+    RecordingInterrupts irq;
+    auto make = [&](const BlkParams& p, bool backend_trims) {
+        auto backend = std::make_unique<MemoryBackend>(volume_sectors * blk::sector_size);
+        backend->trim = backend_trims;
+        return blk::VirtioBlkFunction::create(p, ram.memory(), irq, std::move(backend));
+    };
+    BOOST_TEST(make(trim_params(), false).error() == BlkConfigError::trim_unsupported);
+    auto p = trim_params(block_4k);
+    p.geometry.max_trim_sectors = 0;
+    BOOST_TEST(make(p, true).error() == BlkConfigError::bad_geometry);
+    p.geometry.max_trim_sectors = sectors_per_4k + 1;  // not whole blocks
+    BOOST_TEST(make(p, true).error() == BlkConfigError::bad_geometry);
+    BOOST_TEST(make(trim_params(block_4k), true).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(freed_blocks_read_as_zeros, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{trim_params()};
+    rig.deliver_key();
+    constexpr std::uint64_t first = 8;
+    constexpr std::size_t sectors = 6;
+    const auto plain = pattern(first, sectors * blk::sector_size);
+    BOOST_TEST(rig.write(first, plain).status == ok());
+
+    // Zero sectors 9-10 and discard 12: the backend frees them.
+    const auto wz = trim_range(first + 1, 2, blk::trim_flag_unmap);
+    BOOST_TEST(rig.request(static_cast<std::uint32_t>(RequestType::write_zeroes), 0, wz).status ==
+               ok());
+    const auto d = trim_range(first + 4, 1);
+    BOOST_TEST(rig.request(static_cast<std::uint32_t>(RequestType::discard), 0, d).status == ok());
+    BOOST_TEST(rig.backend().write_zeroes == 1U);
+    BOOST_TEST(rig.backend().discards == 1U);
+    BOOST_TEST(rig.fn().counters().trims == 2U);
+
+    // One read across written, freed, written, freed, written blocks: the
+    // written ones decrypt, the freed ones are zeros.
+    auto want = plain;
+    const auto zero_sector = [&](std::size_t i) {
+        std::fill_n(want.begin() + static_cast<std::ptrdiff_t>(i * blk::sector_size),
+                    blk::sector_size, std::byte{0});
+    };
+    zero_sector(1);
+    zero_sector(2);
+    zero_sector(4);
+    const auto r = rig.read(first, static_cast<std::uint32_t>(sectors * blk::sector_size));
+    BOOST_TEST(r.status == ok());
+    BOOST_TEST(r.data == want, boost::test_tools::per_element());
+    BOOST_TEST(rig.fn().counters().zero_blocks == 3U);
+
+    // Never written: zeros too.
+    const auto blank = rig.read(100, blk::sector_size);
+    BOOST_TEST((blank.data == std::vector<std::byte>(blk::sector_size, std::byte{0})));
+}
+
+BOOST_AUTO_TEST_CASE(without_trim_zeros_still_decrypt,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // Hold and file volumes keep decrypting every block, as before.
+    Rig rig;
+    rig.deliver_key();
+    const auto r = rig.read(0, blk::sector_size);
+    BOOST_TEST(r.status == ok());
+    BOOST_TEST((r.data != std::vector<std::byte>(blk::sector_size, std::byte{0})));
+    BOOST_TEST(rig.fn().counters().zero_blocks == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(bad_ranges_fail_without_io, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig rig{trim_params(block_4k)};
+    const auto discard = static_cast<std::uint32_t>(RequestType::discard);
+    const auto wz = static_cast<std::uint32_t>(RequestType::write_zeroes);
+    const auto status = [&](std::uint32_t type, std::span<const std::byte> range) {
+        return rig.request(type, 0, range).status;
+    };
+    // unmap on DISCARD, and reserved flag bits: UNSUPP.
+    BOOST_TEST(status(discard, trim_range(0, sectors_per_4k, blk::trim_flag_unmap)) == unsupp());
+    BOOST_TEST(status(wz, trim_range(0, sectors_per_4k, 0x2)) == unsupp());
+    // Misaligned, empty, too long, past the end, wrapping: IOERR.
+    BOOST_TEST(status(discard, trim_range(1, sectors_per_4k)) == ioerr());
+    BOOST_TEST(status(discard, trim_range(0, 1)) == ioerr());
+    BOOST_TEST(status(discard, trim_range(0, 0)) == ioerr());
+    BOOST_TEST(status(wz, trim_range(0, test_max_trim + sectors_per_4k)) == ioerr());
+    BOOST_TEST(status(wz, trim_range(volume_sectors, sectors_per_4k)) == ioerr());
+    BOOST_TEST(status(wz, trim_range(~std::uint64_t{0} - 7, sectors_per_4k)) == ioerr());
+    // Two ranges (one is the limit), and a short range.
+    auto two = trim_range(0, sectors_per_4k);
+    const auto second = trim_range(sectors_per_4k, sectors_per_4k);
+    two.insert(two.end(), second.begin(), second.end());
+    BOOST_TEST(status(discard, two) == ioerr());
+    BOOST_TEST(status(discard, std::span{two}.first(8)) == ioerr());
+    BOOST_TEST(rig.backend().discards == 0U);
+    BOOST_TEST(rig.backend().write_zeroes == 0U);
+    // No key is needed: no data moves.
+    BOOST_TEST(status(discard, trim_range(0, sectors_per_4k)) == ok());
+    BOOST_TEST(rig.backend().discards == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(read_only_refuses_trim, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto p = trim_params();
+    p.geometry.read_only = true;
+    Rig rig{p};
+    BOOST_TEST(
+        rig.request(static_cast<std::uint32_t>(RequestType::discard), 0, trim_range(0, 1)).status ==
+        ioerr());
+    BOOST_TEST(rig.backend().discards == 0U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

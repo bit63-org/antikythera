@@ -79,6 +79,8 @@ auto to_string(GeometryError e) noexcept -> const char* {
             return "bad_seg_max";
         case GeometryError::bad_max_transfer:
             return "bad_max_transfer";
+        case GeometryError::bad_max_trim:
+            return "bad_max_trim";
     }
     return "unknown";
 }
@@ -107,12 +109,15 @@ auto to_string(ParseError e) noexcept -> const char* {
             return "too_many_segments";
         case ParseError::too_large:
             return "too_large";
+        case ParseError::bad_flags:
+            return "bad_flags";
     }
     return "unknown";
 }
 
 auto status_for(ParseError e) noexcept -> Status {
-    return e == ParseError::unsupported_type ? Status::unsupp : Status::ioerr;
+    return e == ParseError::unsupported_type || e == ParseError::bad_flags ? Status::unsupp
+                                                                           : Status::ioerr;
 }
 
 auto complete(std::span<std::byte> status, Status s) noexcept -> void {
@@ -136,6 +141,10 @@ auto RequestParser::create(const VolumeGeometry& geometry)
     }
     if (geometry.max_transfer_bytes == 0 || geometry.max_transfer_bytes % lbs != 0) {
         return std::unexpected(GeometryError::bad_max_transfer);
+    }
+    if (geometry.trim &&
+        (geometry.max_trim_sectors == 0 || geometry.max_trim_sectors % sectors_per_block != 0)) {
+        return std::unexpected(GeometryError::bad_max_trim);
     }
     return RequestParser{geometry};
 }
@@ -224,9 +233,14 @@ auto RequestParser::parse(std::span<const std::span<const std::byte>> readable,
             req.type = RequestType::get_id;
             req.data_bytes = writable_data;
             return req;
-        case RequestType::get_lifetime:
         case RequestType::discard:
         case RequestType::write_zeroes:
+            if (!_geometry.trim) {
+                return reject(ParseError::unsupported_type);
+            }
+            return parse_trim(static_cast<RequestType>(*type), std::move(req), readable_data,
+                              writable_data);
+        case RequestType::get_lifetime:
         case RequestType::secure_erase:
         default:
             return reject(ParseError::unsupported_type);
@@ -257,6 +271,63 @@ auto RequestParser::parse(std::span<const std::span<const std::byte>> readable,
     }
     req.sector = *sector;
     req.sector_count = count;
+    return req;
+}
+
+auto RequestParser::parse_trim(RequestType type, Request req, std::uint64_t readable_data,
+                               std::uint64_t writable_data) const
+    -> std::expected<Request, Rejection> {
+    auto reject = [&req](ParseError e) {
+        return std::unexpected(Rejection{.error = e, .status = req.status});
+    };
+    if (_geometry.read_only) {
+        return reject(ParseError::read_only);
+    }
+    if (writable_data != 0) {
+        return reject(ParseError::unexpected_data);
+    }
+    if (readable_data != trim_range_size) {
+        // One range per request: more is too many segments, less no range.
+        return reject(readable_data > trim_range_size && readable_data % trim_range_size == 0
+                          ? ParseError::too_many_segments
+                          : ParseError::bad_length);
+    }
+    // Copy the range out of guest memory once, then decode the copy.
+    std::array<std::byte, trim_range_size> range{};
+    std::size_t at = 0;
+    for (auto seg : req.out_data) {
+        std::ranges::copy(seg, range.begin() + static_cast<std::ptrdiff_t>(at));
+        at += seg.size();
+    }
+    wire::Reader r{range};
+    const std::uint64_t sector = r.le64().value_or(0);
+    const std::uint32_t count = r.le32().value_or(0);
+    const std::uint32_t flags = r.le32().value_or(0);
+    const std::uint32_t allowed = type == RequestType::write_zeroes ? trim_flag_unmap : 0;
+    if ((flags & ~allowed) != 0) {
+        return reject(ParseError::bad_flags);
+    }
+    if (count == 0) {
+        return reject(ParseError::bad_length);
+    }
+    if (count > _geometry.max_trim_sectors) {
+        return reject(ParseError::too_large);
+    }
+    const std::uint64_t sectors_per_block = _geometry.logical_block_size / sector_size;
+    if (sector % sectors_per_block != 0 || count % sectors_per_block != 0) {
+        return reject(ParseError::misaligned_sector);
+    }
+    const std::uint64_t capacity = _geometry.capacity_sectors;
+    if (count > capacity || sector > capacity - count) {
+        return reject(ParseError::out_of_range);
+    }
+    req.type = type;
+    req.out_data.clear();
+    req.in_data.clear();
+    req.sector = sector;
+    req.sector_count = count;
+    req.data_bytes = 0;
+    req.unmap = (flags & trim_flag_unmap) != 0;
     return req;
 }
 

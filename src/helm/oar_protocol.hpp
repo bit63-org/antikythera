@@ -277,12 +277,12 @@ inline constexpr std::uint32_t sector_size = 512;
 // with room for the role's metadata.
 inline constexpr std::uint64_t max_capacity_sectors = std::uint64_t{1} << 53U;
 inline constexpr std::size_t max_map_chunk = max_body_size - map_chunk_head_size;
-// Largest MapUpdate frame (proto::max_map_update_size, format v2: 40-byte
-// header, 4096 entries of 32 bytes, 8192 guest IPv4 addresses of 16 bytes
+// Largest MapUpdate frame (proto::max_map_update_size, format v4: 40-byte
+// header, 4096 entries of 40 bytes, 8192 guest IPv4 addresses of 16 bytes
 // and 8192 IPv6 of 24, 64-byte signature). Mirrored so this header does not
 // depend on ak::proto; tests/oar_protocol_test.cpp pins the two.
 inline constexpr std::size_t max_map_frame =
-    0x28 + (4096 * 0x20) + (8192 * 0x10) + (8192 * 0x18) + 64;
+    0x28 + (4096 * 0x28) + (8192 * 0x10) + (8192 * 0x18) + 64;
 // Largest TunnelPeers frame (proto::max_tunnel_peers_size: 48-byte header,
 // 2048 peers of 56 bytes, 64-byte signature), pinned the same way.
 inline constexpr std::size_t max_tunnel_peers_frame = 0x30 + (2048 * 0x38) + 64;

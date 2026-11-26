@@ -1,6 +1,6 @@
 # Implementation Plan — VPC subnets and the implicit router
 
-## Status: 0/12 tasks complete
+## Status: 1/12 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -18,7 +18,7 @@ end) for task 11.
 
 ### Phase A: frames
 
-- [ ] 1. MapUpdate version 4: 40-byte entries with `subnet_id`, flags
+- [x] 1. MapUpdate version 4: 40-byte entries with `subnet_id`, flags
   bit 1 (security groups enforced) defined and decoded, version 3
   refused; signing vectors regenerated; `fuzz_map_update` and
   `proto_map_update_test` updated; `ak-test-controller map-update` takes

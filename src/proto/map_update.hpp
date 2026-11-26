@@ -15,7 +15,7 @@
 //
 // Layout (little-endian):
 //   0x00  magic        u32  'AKMU'
-//   0x04  version      u16  frame format version (3)
+//   0x04  version      u16  frame format version (4)
 //   0x06  key_id       u16  controller key that signed it; non-zero
 //   0x08  server_id    u64  target server; non-zero
 //   0x10  vni          u32  VPC's 24-bit Geneve VNI; non-zero
@@ -24,10 +24,12 @@
 //   0x18  map_version  u64  per-VPC, starts at 1, increases on every change
 //   0x20  ipv6_count   u16  at most max_guest_addresses
 //   0x22  reserved     6 bytes, zero
-//   0x28  entries      entry_count x 32 bytes, NIC IDs strictly ascending:
+//   0x28  entries      entry_count x 40 bytes, NIC IDs strictly ascending:
 //           +0x00 nic_id u64 (non-zero) | +0x08 mac [6] | +0x0E flags u8
-//           (bit 0: source/destination check off) | +0x0F reserved u8
+//           (bit 0: source/destination check off, bit 1: security groups
+//           enforced) | +0x0F reserved u8
 //           +0x10 owner_vtep [16] (IPv6 underlay address, network order)
+//           +0x20 subnet_id u64 (0: no subnet)
 //   then  ipv4         ipv4_count x 16 bytes, addresses strictly ascending:
 //           +0x00 nic_id u64 | +0x08 address [4] (network order) | +0x0C reserved [4]
 //   then  ipv6         ipv6_count x 24 bytes, addresses strictly ascending:
@@ -48,8 +50,19 @@
 // receive traffic addressed to others, so it can be a route target
 // (proto::VpcConfigFrame routes). The flag is in the signed mapping, not a
 // separate frame, so every VTEP judges the NIC's traffic by the same
-// record. Nothing spoke versions 1 or 2 outside this repository, so decode
-// accepts version 3 only.
+// record.
+//
+// Version 4 (.kiro/specs/vpc-subnets-routing/ design "MapUpdate version 4")
+// grew each entry by the NIC's subnet ID: the subnet decides which route
+// table the NIC's traffic follows, so it is explicit rather than derived
+// from the NIC's addresses, which a NIC may lack in a family. Subnet 0
+// means none (a VNI used without a VpcConfig). The ID is not checked
+// against anything here: the network role matches it against its
+// VpcConfig, which arrives independently (vpc-subnets-routing Requirement
+// 2.6). Flags bit 1 marks the NIC's security groups as enforced
+// (vpc-security-groups Requirement 6); it only travels here until that
+// spec's role code reads it. Nothing spoke versions 1 to 3 outside this
+// repository, so decode accepts version 4 only.
 //
 // Unlike the envelope, key_id and server_id are inside the signed bytes:
 // nothing else carries them, so a mapping cannot be replayed to another
@@ -74,15 +87,18 @@
 namespace ak::proto {
 
 inline constexpr std::uint32_t map_update_magic = 0x554D'4B41;  // "AKMU" as little-endian bytes
-inline constexpr std::uint16_t map_update_version = 3;
+inline constexpr std::uint16_t map_update_version = 4;
 inline constexpr std::uint8_t map_entry_no_source_dest_check = 0x01;
+inline constexpr std::uint8_t map_entry_security_groups_enforced = 0x02;
+inline constexpr std::uint8_t map_entry_known_flags =
+    map_entry_no_source_dest_check | map_entry_security_groups_enforced;
 inline constexpr std::size_t map_update_header_size = 0x28;
 inline constexpr std::size_t map_update_reserved_offset = 0x22;
-inline constexpr std::size_t map_entry_size = 0x20;
+inline constexpr std::size_t map_entry_size = 0x28;
 inline constexpr std::size_t map_ipv4_size = 0x10;
 inline constexpr std::size_t map_ipv6_size = 0x18;
 inline constexpr std::uint32_t max_vni = 0x00FF'FFFF;
-// Bound one frame to about 450 KiB. A VPC with more NICs or addresses than
+// Bound one frame to about 480 KiB. A VPC with more NICs or addresses than
 // this needs a new frame version (deltas or paging).
 inline constexpr std::size_t max_map_entries = 4096;
 inline constexpr std::size_t max_guest_addresses = 8192;  // per address family
@@ -106,7 +122,9 @@ struct MapEntry {
     std::uint64_t nic_id{0};
     Mac mac{};
     VtepAddress owner_vtep{};
-    bool source_dest_check{true};  // false: the NIC may send and receive for others
+    bool source_dest_check{true};          // false: the NIC may send and receive for others
+    bool security_groups_enforced{false};  // vpc-security-groups Requirement 6
+    std::uint64_t subnet_id{0};            // 0: no subnet
 
     friend auto operator==(const MapEntry&, const MapEntry&) -> bool = default;
 };
@@ -314,10 +332,12 @@ template<typename Guest>
         const auto pad = r.u8().value_or(0);
         std::ranges::copy(r.bytes(vtep_address_size).value_or(std::span<const std::byte>{}),
                           e.owner_vtep.begin());
-        if (pad != 0 || (flags & ~map_entry_no_source_dest_check) != 0) {
+        e.subnet_id = r.le64().value_or(0);
+        if (pad != 0 || (flags & ~map_entry_known_flags) != 0) {
             return std::unexpected(DecodeError::reserved_not_zero);
         }
         e.source_dest_check = (flags & map_entry_no_source_dest_check) == 0;
+        e.security_groups_enforced = (flags & map_entry_security_groups_enforced) != 0;
         if (auto ok = detail::check_map_entry(e, prev); !ok) {
             return std::unexpected(ok.error());
         }
@@ -393,9 +413,17 @@ template<typename Guest>
     for (const auto& e : m.entries) {
         w.le64(e.nic_id);
         w.bytes(e.mac);
-        w.u8(e.source_dest_check ? std::uint8_t{0} : map_entry_no_source_dest_check);
+        std::uint8_t flags = 0;
+        if (!e.source_dest_check) {
+            flags |= map_entry_no_source_dest_check;
+        }
+        if (e.security_groups_enforced) {
+            flags |= map_entry_security_groups_enforced;
+        }
+        w.u8(flags);
         w.u8(0);
         w.bytes(e.owner_vtep);
+        w.le64(e.subnet_id);
     }
     for (const auto& g : m.ipv4) {
         w.le64(g.nic_id);

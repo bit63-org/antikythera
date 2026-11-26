@@ -263,6 +263,7 @@ enum class VendorType : std::uint8_t {
     group_members = 0x19,
     group_membership = 0x1A,
     instance_metadata = 0x1B,
+    copy_volume = 0x1C,
 };
 
 struct VendorHeader {

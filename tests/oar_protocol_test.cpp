@@ -843,6 +843,150 @@ BOOST_AUTO_TEST_CASE(eject_answer_round_trip_and_rules) {
                 oar::BodyError::trailing_bytes));
 }
 
+BOOST_AUTO_TEST_CASE(copy_volume_round_trip_and_rules) {
+    std::array<std::byte, ak::helm::volume_key_size> lk{};
+    std::array<std::byte, ak::helm::volume_key_size> nk{};
+    lk.fill(std::byte{0x11});
+    nk.fill(std::byte{0x22});
+    const oar::CopyVolume query{.op = oar::CopyOp::query,
+                                .direction = oar::CopyDirection::to_local,
+                                .mib_per_s = 0x01020304,
+                                .local_volume_id = 0x0A,
+                                .network_volume_id = 0x0B,
+                                .attachment_id = 0x0C,
+                                .generation = 0x0D,
+                                .local_key = std::nullopt,
+                                .network_key = std::nullopt};
+    auto b = oar::encode_copy_volume(query);
+    BOOST_REQUIRE(b.has_value());
+    BOOST_TEST(b->size() == oar::copy_volume_head_size);
+    BOOST_TEST((std::vector<std::byte>(b->begin(), b->begin() + 8) ==
+                bytes_of(2, 2, 0, 0, 0x04, 0x03, 0x02, 0x01)));
+    const auto q = oar::decode_copy_volume(*b);
+    BOOST_REQUIRE(q.has_value());
+    BOOST_TEST((q->op == oar::CopyOp::query));
+    BOOST_TEST((q->direction == oar::CopyDirection::to_local));
+    BOOST_TEST(q->mib_per_s == 0x01020304U);
+    BOOST_TEST(q->local_volume_id == 0x0AU);
+    BOOST_TEST(q->network_volume_id == 0x0BU);
+    BOOST_TEST(q->attachment_id == 0x0CU);
+    BOOST_TEST(q->generation == 0x0DU);
+    BOOST_TEST(!q->local_key.has_value());
+
+    // A start carries both keys, local first.
+    auto start = query;
+    start.op = oar::CopyOp::start;
+    start.direction = oar::CopyDirection::to_network;
+    start.local_key = std::span<const std::byte, ak::helm::volume_key_size>{lk};
+    start.network_key = std::span<const std::byte, ak::helm::volume_key_size>{nk};
+    auto sb = oar::encode_copy_volume(start);
+    BOOST_REQUIRE(sb.has_value());
+    BOOST_TEST(sb->size() == oar::copy_volume_start_size);
+    const auto st = oar::decode_copy_volume(*sb);
+    BOOST_REQUIRE(st.has_value());
+    BOOST_TEST(std::ranges::equal(*st->local_key, lk));
+    BOOST_TEST(std::ranges::equal(*st->network_key, nk));
+
+    // Keys exactly on a start; ids, attachment and generation non-zero.
+    auto keyless = start;
+    keyless.network_key.reset();
+    BOOST_TEST((oar::encode_copy_volume(keyless).error() == BodyError::bad_key_length));
+    auto keyed = query;
+    keyed.local_key = start.local_key;
+    keyed.network_key = start.network_key;
+    BOOST_TEST((oar::encode_copy_volume(keyed).error() == BodyError::bad_key_length));
+    for (int field = 0; field < 4; ++field) {
+        auto z = query;
+        switch (field) {
+            case 0:
+                z.local_volume_id = 0;
+                break;
+            case 1:
+                z.network_volume_id = 0;
+                break;
+            case 2:
+                z.attachment_id = 0;
+                break;
+            default:
+                z.generation = 0;
+                break;
+        }
+        BOOST_TEST((oar::encode_copy_volume(z).error() == BodyError::zero_id));
+    }
+    auto bad_op = query;
+    bad_op.op = static_cast<oar::CopyOp>(4);
+    BOOST_TEST((oar::encode_copy_volume(bad_op).error() == BodyError::unknown_enum));
+
+    // The decoder holds the wire to the same rules.
+    BOOST_TEST((oar::decode_copy_volume(std::span{*b}.first(39)).error() == BodyError::truncated));
+    auto longer = *b;
+    longer.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_copy_volume(longer).error() == BodyError::trailing_bytes));
+    for (const std::size_t at : {std::size_t{2}, std::size_t{3}, std::size_t{36}}) {
+        auto bad = *b;
+        bad[at] = std::byte{1};
+        BOOST_TEST((oar::decode_copy_volume(bad).error() == BodyError::reserved_not_zero));
+    }
+    for (const auto& [at, v] :
+         {std::pair{0, 0}, std::pair{0, 4}, std::pair{1, 0}, std::pair{1, 3}}) {
+        auto bad = *b;
+        bad[static_cast<std::size_t>(at)] = static_cast<std::byte>(v);
+        BOOST_TEST((oar::decode_copy_volume(bad).error() == BodyError::unknown_enum));
+    }
+    auto zero = *b;
+    std::fill_n(zero.begin() + 8, 8, std::byte{0});
+    BOOST_TEST((oar::decode_copy_volume(zero).error() == BodyError::zero_id));
+    auto start_without_op = *sb;
+    start_without_op[0] = std::byte{2};  // a query with keys
+    BOOST_TEST((oar::decode_copy_volume(start_without_op).error() == BodyError::bad_key_length));
+    auto bare_start = *b;
+    bare_start[0] = std::byte{1};  // a start without keys
+    BOOST_TEST((oar::decode_copy_volume(bare_start).error() == BodyError::bad_key_length));
+}
+
+BOOST_AUTO_TEST_CASE(copy_answer_round_trip_and_rules) {
+    const oar::CopyAnswer a{.state = oar::CopyVolumeState::copying,
+                            .failure = oar::CopyVolumeFailure::none,
+                            .total_bytes = 100,
+                            .done_bytes = 40,
+                            .written_bytes = 30};
+    auto b = oar::encode_copy_answer(a);
+    BOOST_REQUIRE(b.has_value());
+    BOOST_TEST(b->size() == oar::copy_volume_answer_size);
+    BOOST_TEST((oar::decode_copy_answer(*b).value() == a));
+    const oar::CopyAnswer f{.state = oar::CopyVolumeState::failed,
+                            .failure = oar::CopyVolumeFailure::not_hydrated,
+                            .total_bytes = 100,
+                            .done_bytes = 0,
+                            .written_bytes = 0};
+    BOOST_TEST((oar::decode_copy_answer(oar::encode_copy_answer(f).value()).value() == f));
+    BOOST_TEST((oar::decode_copy_answer(oar::encode_copy_answer({}).value()).value() ==
+                oar::CopyAnswer{}));
+    // A failure exactly when failed; progress within the total.
+    auto bad = a;
+    bad.failure = oar::CopyVolumeFailure::source_io;
+    BOOST_TEST((oar::encode_copy_answer(bad).error() == BodyError::unknown_enum));
+    bad = f;
+    bad.failure = oar::CopyVolumeFailure::none;
+    BOOST_TEST((oar::encode_copy_answer(bad).error() == BodyError::unknown_enum));
+    bad = a;
+    bad.done_bytes = 101;
+    BOOST_TEST((oar::encode_copy_answer(bad).error() == BodyError::bad_geometry));
+    auto wire = *b;
+    wire[1] = std::byte{1};  // a failure on a running copy
+    BOOST_TEST((oar::decode_copy_answer(wire).error() == BodyError::unknown_enum));
+    wire = *b;
+    wire[0] = std::byte{4};
+    BOOST_TEST((oar::decode_copy_answer(wire).error() == BodyError::unknown_enum));
+    wire = *b;
+    wire[5] = std::byte{1};
+    BOOST_TEST((oar::decode_copy_answer(wire).error() == BodyError::reserved_not_zero));
+    wire = *b;
+    wire[24] = std::byte{0xFF};  // written past the total
+    BOOST_TEST((oar::decode_copy_answer(wire).error() == BodyError::bad_geometry));
+    BOOST_TEST((oar::decode_copy_answer(std::span{*b}.first(31)).error() == BodyError::truncated));
+}
+
 BOOST_AUTO_TEST_CASE(report_queue_serves_and_acknowledges) {
     oar::ReportQueue q{2};
     BOOST_TEST(oar::encode_report_chunk(q.serve({}).value()).has_value());

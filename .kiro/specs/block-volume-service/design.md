@@ -556,6 +556,40 @@ the new network volume (its key from KMS via `VolumeKey`), and copies
 decrypt-then-encrypt in a utility mode with no VM attached. The new
 volume gets a new lineage.
 
+As built so far (task 23.2, the oar-blk half):
+
+- **Both volumes exist first.** The copy runs between a local volume and
+  a network volume that are both already there, both detached, on the
+  local volume's server. To convert local to network, the controller
+  creates the network volume as usual, with a utility attachment for this
+  server (read-write, no VM) and a `VolumeKey` for it. To convert network
+  to local, it creates a new local volume (`CREATE_VOLUME`) and lists a
+  utility attachment of the network volume. Either way the target is new,
+  and nothing about creating volumes changes.
+- **`VolumeCopier`** (`src/oar/blk/volume_copier.hpp`) copies region by
+  region (1 MiB) between two `BlockBackend`s, so it knows nothing of either
+  side: a `FileBackend` for the local volume, a `NetworkVolumeBackend` for
+  the attachment, and later whatever backend khold's initiator provides.
+  Each block is decrypted with the source's key and encrypted with the
+  target's, at the block's own number. A block whose ciphertext is all
+  zeros was never written, so it is skipped and the target stays thin.
+  The copier paces at an optional rate, keeps two regions in flight,
+  retries `io` failures three times, fails at once on `not_hydrated` (the
+  controller converts a restored volume only once `hydrated_bytes` equals
+  `total_bytes`), and reports `completed` only after it has flushed the
+  target.
+- **`copy_volume`** (OarLink, `blk` role) is `start` (with both keys),
+  `query` and `release`. The role checks that the attachment is in the
+  newest config for this server (read-write when it is the target), that
+  the block sizes match, that neither volume is attached or already in a
+  copy, and that a network target has no source. It runs the copy beside
+  its functions and re-routes the copy's network side on a new config. A
+  copy stays queryable until it is released, so helm reads the outcome
+  however late it polls.
+- **Still to come:** helm's half, a mailbox command that starts the copy
+  once hull has verified it (helm unwraps the local key and opens the
+  attachment key), and a report that carries progress to the controller.
+
 **Between VMs and servers** (Requirement 9) needs no data movement:
 detach, then attach anywhere. Changing the owning VM is a controller
 record change (the network-volume `REWRAP_VOLUME`). A future VM live

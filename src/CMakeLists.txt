@@ -238,6 +238,7 @@ add_library(ak_oar_blk
   oar/blk/key_slot.cpp
   oar/blk/request_parser.cpp
   oar/blk/virtio_blk_function.cpp
+  oar/blk/volume_copier.cpp
   oar/blk/xts_cipher.cpp)
 add_library(ak::oar_blk ALIAS ak_oar_blk)
 target_link_libraries(ak_oar_blk

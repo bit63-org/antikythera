@@ -1136,6 +1136,17 @@ BOOST_AUTO_TEST_CASE(roles_without_replicas_answer_unsupported) {
     BOOST_TEST((link.role_certificate(pattern(10)).error().status == oar::Status::unsupported));
     BOOST_TEST((link.eject({.fn = 0, .op = oar::EjectOp::query}).error().status ==
                 oar::Status::unsupported));
+    BOOST_TEST((link.copy_volume({.op = oar::CopyOp::query,
+                                  .direction = oar::CopyDirection::to_network,
+                                  .mib_per_s = 0,
+                                  .local_volume_id = 1,
+                                  .network_volume_id = 2,
+                                  .attachment_id = 3,
+                                  .generation = 1,
+                                  .local_key = std::nullopt,
+                                  .network_key = std::nullopt})
+                    .error()
+                    .status == oar::Status::unsupported));
 }
 
 namespace {
@@ -1198,6 +1209,97 @@ BOOST_AUTO_TEST_CASE(eject_requests_and_answers_cross) {
                     LinkErrc::bad_request));  // never sent
     }
     BOOST_TEST(role.seen.size() == 4U);
+}
+
+namespace {
+
+// A storage role's half of a conversion: remembers the keys of a start
+// (copied, as the message is wiped after the call) and answers progress.
+class CopyingRole final : public ak::helm::OarHandler {
+public:
+    auto function_inventory() -> std::expected<oar::Inventory, oar::Status> override {
+        return oar::Inventory{.role = oar::Role::blk, .vtep = {}, .functions = {}};
+    }
+    auto prepare_function(const oar::PrepareFunction& /*r*/) -> oar::Status override {
+        return oar::Status::ok;
+    }
+    auto clean_function(const oar::CleanFunction& /*r*/) -> oar::Status override {
+        return oar::Status::ok;
+    }
+    auto deliver_key(const oar::DeliverKey& /*r*/) -> oar::Status override {
+        return oar::Status::ok;
+    }
+    auto drop_key(const oar::DropKey& /*r*/) -> oar::Status override { return oar::Status::ok; }
+    auto map_update(std::span<const std::byte> /*f*/) -> oar::Status override {
+        return oar::Status::unsupported;
+    }
+    auto health() -> std::expected<oar::Health, oar::Status> override { return oar::Health{}; }
+    auto copy_volume(const oar::CopyVolume& r)
+        -> std::expected<oar::CopyAnswer, oar::Status> override {
+        ops.push_back(r.op);
+        if (r.local_volume_id == 99) {
+            return std::unexpected(oar::Status::busy);
+        }
+        if (r.op == oar::CopyOp::start) {
+            local_key.assign(r.local_key->begin(), r.local_key->end());
+            network_key.assign(r.network_key->begin(), r.network_key->end());
+        }
+        return oar::CopyAnswer{.state = oar::CopyVolumeState::copying,
+                               .failure = oar::CopyVolumeFailure::none,
+                               .total_bytes = 8,
+                               .done_bytes = 4,
+                               .written_bytes = 2};
+    }
+    std::vector<oar::CopyOp> ops;
+    std::vector<std::byte> local_key;
+    std::vector<std::byte> network_key;
+};
+
+auto test_scoped_key(std::byte fill) -> ak::helm::ScopedKey {
+    std::array<std::byte, ak::helm::volume_key_size> raw{};
+    raw.fill(fill);
+    return ScopedKeyTestAccess::make(raw);
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(copy_volume_requests_and_answers_cross) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    CopyingRole role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const oar::CopyVolume head{.op = oar::CopyOp::start,
+                               .direction = oar::CopyDirection::to_network,
+                               .mib_per_s = 0,
+                               .local_volume_id = 1,
+                               .network_volume_id = 2,
+                               .attachment_id = 3,
+                               .generation = 1,
+                               .local_key = std::nullopt,
+                               .network_key = std::nullopt};
+    {
+        const Server server{endpoint, role};
+        const auto started =
+            link.copy_volume(head, test_scoped_key(std::byte{1}), test_scoped_key(std::byte{2}));
+        BOOST_REQUIRE(started.has_value());
+        BOOST_TEST(started->done_bytes == 4U);
+        BOOST_TEST((role.local_key == std::vector<std::byte>(64, std::byte{1})));
+        BOOST_TEST((role.network_key == std::vector<std::byte>(64, std::byte{2})));
+        auto q = head;
+        q.op = oar::CopyOp::query;
+        BOOST_TEST((link.copy_volume(q).value().state == oar::CopyVolumeState::copying));
+        q.op = oar::CopyOp::release;
+        BOOST_TEST(link.copy_volume(q).has_value());
+        // A refusal carries its status; bad arguments never reach the wire.
+        q.local_volume_id = 99;
+        BOOST_TEST((link.copy_volume(q).error().status == oar::Status::busy));
+        BOOST_TEST((link.copy_volume(head).error().code == LinkErrc::bad_request));  // no keys
+        BOOST_TEST(
+            (link.copy_volume(q, test_scoped_key(std::byte{1}), test_scoped_key(std::byte{2}))
+                 .error()
+                 .code == LinkErrc::bad_request));  // keys on a release
+    }
+    BOOST_TEST(role.ops.size() == 4U);
 }
 
 BOOST_AUTO_TEST_CASE(names) {

@@ -3,6 +3,7 @@
 
 #include "oar/blk/blk_role.hpp"
 
+#include <algorithm>
 #include <format>
 #include <limits>
 #include <utility>
@@ -258,7 +259,7 @@ auto BlkRole::prepare_function(const oar::PrepareFunction& request) -> oar::Stat
     if (request.type != helm::FunctionType::blk_fn || cfg == nullptr) {
         return oar::Status::wrong_type;
     }
-    if (s->active || slot_of_volume(cfg->volume_id) != nullptr) {
+    if (s->active || slot_of_volume(cfg->volume_id) != nullptr || copying(cfg->volume_id)) {
         return oar::Status::busy;
     }
     if (cfg->network()) {
@@ -440,6 +441,9 @@ auto BlkRole::set_storage_tls(const tls::Config& config) -> void {
             s.network->set_tls(config);
         }
     }
+    for (auto& [local, copy] : _copies) {
+        copy.network->set_tls(config);
+    }
 }
 
 auto BlkRole::replica_config(std::span<const std::byte> frame) -> oar::Status {
@@ -473,6 +477,12 @@ auto BlkRole::replica_config(std::span<const std::byte> frame) -> oar::Status {
         const std::uint64_t sectors = s->network->size_bytes() / oar::sector_size;
         if (s->active && !s->network->fenced() &&
             sectors > s->active->geometry().capacity_sectors && !s->active->grow(sectors)) {
+            return oar::Status::failed;
+        }
+    }
+    // A copy's network side follows it the same way.
+    for (auto& [local, copy] : _copies) {
+        if (copy.network_volume == c->volume_id && !copy.network->set_route(*c)) {
             return oar::Status::failed;
         }
     }
@@ -576,6 +586,9 @@ auto BlkRole::poll() -> bool {
             more = s.active->poll() || more;
         }
     }
+    for (auto& [local, copy] : _copies) {
+        more = copy.copier->poll() || more;
+    }
     return more;
 }
 
@@ -586,7 +599,170 @@ auto BlkRole::wake_fds() const -> std::vector<int> {
             fds.push_back(s.active->wake_fd());
         }
     }
+    for (const auto& [local, copy] : _copies) {
+        fds.push_back(copy.copier->wake_fd());
+    }
     return fds;
+}
+
+// ---- local <-> network conversion (block-volume task 23.2) ------------------
+
+namespace {
+
+auto copy_answer(const VolumeCopier* c) -> oar::CopyAnswer {
+    if (c == nullptr) {
+        return {};
+    }
+    oar::CopyAnswer a{.state = oar::CopyVolumeState::copying,
+                      .failure = oar::CopyVolumeFailure::none,
+                      .total_bytes = c->progress().total_bytes,
+                      .done_bytes = c->progress().done_bytes,
+                      .written_bytes = c->progress().written_bytes};
+    switch (c->state()) {
+        case CopyState::waiting_for_keys:
+        case CopyState::copying:
+        case CopyState::flushing:
+            break;
+        case CopyState::completed:
+            a.state = oar::CopyVolumeState::completed;
+            break;
+        case CopyState::failed:
+            a.state = oar::CopyVolumeState::failed;
+            switch (c->failure()) {
+                case CopyFailure::none:
+                case CopyFailure::crypto:
+                    a.failure = oar::CopyVolumeFailure::crypto;
+                    break;
+                case CopyFailure::source_io:
+                    a.failure = oar::CopyVolumeFailure::source_io;
+                    break;
+                case CopyFailure::target_io:
+                    a.failure = oar::CopyVolumeFailure::target_io;
+                    break;
+                case CopyFailure::not_hydrated:
+                    a.failure = oar::CopyVolumeFailure::not_hydrated;
+                    break;
+                case CopyFailure::out_of_range:
+                    a.failure = oar::CopyVolumeFailure::out_of_range;
+                    break;
+            }
+            break;
+    }
+    return a;
+}
+
+}  // namespace
+
+auto BlkRole::copying(std::uint64_t volume) const -> bool {
+    return std::ranges::any_of(_copies, [volume](const auto& c) {
+        return c.first == volume || c.second.network_volume == volume;
+    });
+}
+
+auto BlkRole::copier(std::uint64_t local_volume) -> VolumeCopier* {
+    const auto it = _copies.find(local_volume);
+    return it == _copies.end() ? nullptr : it->second.copier.get();
+}
+
+auto BlkRole::copy_volume(const oar::CopyVolume& request)
+    -> std::expected<oar::CopyAnswer, oar::Status> {
+    const auto it = _copies.find(request.local_volume_id);
+    const bool ours = it != _copies.end() && it->second.network_volume == request.network_volume_id;
+    switch (request.op) {
+        case oar::CopyOp::query:
+            return copy_answer(ours ? it->second.copier.get() : nullptr);
+        case oar::CopyOp::release: {
+            if (!ours) {
+                return oar::CopyAnswer{};
+            }
+            auto a = copy_answer(it->second.copier.get());
+            _copies.erase(it);  // stops it if it still runs
+            return a;
+        }
+        case oar::CopyOp::start:
+            break;
+    }
+    if (const auto st = start_copy(request); st != oar::Status::ok) {
+        return std::unexpected(st);
+    }
+    return copy_answer(_copies.at(request.local_volume_id).copier.get());
+}
+
+auto BlkRole::start_copy(const oar::CopyVolume& request) -> oar::Status {
+    if (!_config.verify_config) {
+        return oar::Status::unsupported;
+    }
+    if (!request.local_key || !request.network_key) {
+        return oar::Status::bad_request;
+    }
+    const std::uint64_t local = request.local_volume_id;
+    const std::uint64_t network = request.network_volume_id;
+    if (copying(local) || copying(network) || slot_of_volume(local) != nullptr ||
+        slot_of_volume(network) != nullptr) {
+        return oar::Status::busy;
+    }
+    if (!_config.storage_tls) {
+        return oar::Status::failed;  // not enrolled yet
+    }
+    const bool to_network = request.direction == oar::CopyDirection::to_network;
+    // The network side: the attachment the request names, for this server.
+    const auto c = _configs.find(network);
+    if (c == _configs.end()) {
+        return oar::Status::failed;
+    }
+    const auto& rc = c->second;
+    const auto att = std::ranges::find_if(rc.attachments, [&](const proto::VolumeAttachment& a) {
+        return a.attachment_id == request.attachment_id;
+    });
+    if (att == rc.attachments.end() || att->generation != request.generation ||
+        att->server_id != _config.server_id ||
+        (to_network &&
+         (att->mode != proto::AttachMode::rw || rc.source.kind != proto::SourceKind::none))) {
+        return oar::Status::failed;
+    }
+    // The local side: a disk volume file of the same block size.
+    auto file = FileBackend::open(volume_path(local));
+    if (!file || (*file)->metadata().volume_id != local ||
+        (*file)->metadata().logical_block_size != rc.block_size) {
+        return oar::Status::failed;
+    }
+    auto initiator = _config.initiator;
+    initiator.attachment_id = request.attachment_id;
+    auto net =
+        NetworkVolumeBackend::create({.initiator = initiator,
+                                      .tls = *_config.storage_tls,
+                                      .connect_timeout = NetworkVolumeConfig{}.connect_timeout,
+                                      .write_timeout = NetworkVolumeConfig{}.write_timeout});
+    if (!net || !(*net)->set_route(rc)) {
+        return oar::Status::failed;
+    }
+    NetworkVolumeBackend* network_side = net->get();
+    std::unique_ptr<BlockBackend> local_side = std::move(*file);
+    std::unique_ptr<BlockBackend> remote = std::move(*net);
+    auto copier =
+        VolumeCopier::create({.source = to_network ? std::move(local_side) : std::move(remote),
+                              .target = to_network ? std::move(remote) : std::move(local_side),
+                              .logical_block_size = rc.block_size,
+                              .region_bytes = CopyParams{}.region_bytes,
+                              .max_in_flight = _config.copy_max_in_flight,
+                              .mib_per_s = request.mib_per_s,
+                              .max_tries = CopyParams{}.max_tries,
+                              .retry_backoff = CopyParams{}.retry_backoff,
+                              .clock = _config.clock});
+    if (!copier) {
+        return oar::Status::failed;
+    }
+    // The spans view helm's message, which OarEndpoint wipes after this
+    // returns; the ciphers copy what they need now.
+    const XtsKey local_key = *request.local_key;
+    const XtsKey network_key = *request.network_key;
+    if (!(*copier)->load_keys(to_network ? local_key : network_key,
+                              to_network ? network_key : local_key)) {
+        return oar::Status::failed;
+    }
+    _copies[local] =
+        Copy{.network_volume = network, .network = network_side, .copier = std::move(*copier)};
+    return oar::Status::ok;
 }
 
 // ---- volumes ---------------------------------------------------------------
@@ -620,6 +796,10 @@ auto BlkRole::delete_volume(const oar::DeleteVolume& request) -> oar::Status {
     if (Slot* s = slot_of_volume(request.volume_id); s != nullptr && !close(*s)) {
         return oar::Status::failed;
     }
+    // A copy from or into it is over (the controller gave up on it).
+    std::erase_if(_copies, [&](const auto& c) {
+        return c.first == request.volume_id || c.second.network_volume == request.volume_id;
+    });
     auto erased = FileBackend::erase(volume_path(request.volume_id));
     if (!erased && erased.error().error != FileError::not_found) {
         return oar::Status::failed;
@@ -629,7 +809,7 @@ auto BlkRole::delete_volume(const oar::DeleteVolume& request) -> oar::Status {
 }
 
 auto BlkRole::rewrap_volume(const oar::RewrapVolume& request) -> oar::Status {
-    if (slot_of_volume(request.volume_id) != nullptr) {
+    if (slot_of_volume(request.volume_id) != nullptr || copying(request.volume_id)) {
         return oar::Status::busy;
     }
     // An encrypted image volume's key is K_img (task 15); a plain image

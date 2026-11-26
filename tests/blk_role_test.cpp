@@ -1446,6 +1446,182 @@ BOOST_AUTO_TEST_CASE(network_volume_refuses_a_missing_source_image) {
     BOOST_TEST(!rig.role->attached(fn0).has_value());
 }
 
+// ---- local <-> network conversion (block-volume task 23.2) ----------------
+
+auto other_key(std::uint8_t base) -> std::array<std::byte, blk::xts_key_size> {
+    std::array<std::byte, blk::xts_key_size> k{};
+    for (std::size_t i = 0; i < k.size(); ++i) {
+        k[i] = static_cast<std::byte>(base + (i * 3) + (i < half_key ? 0 : 0x40));
+    }
+    return k;
+}
+
+auto copy_request(oar::CopyOp op, oar::CopyDirection d, std::uint64_t local) -> oar::CopyVolume {
+    return {.op = op,
+            .direction = d,
+            .mib_per_s = 0,
+            .local_volume_id = local,
+            .network_volume_id = vol_one,
+            .attachment_id = net_attachment,
+            .generation = 1,
+            .local_key = std::nullopt,
+            .network_key = std::nullopt};
+}
+
+// Polls the role until the copy of `local` ends; its last answer.
+auto run_copy(Rig& rig, std::uint64_t local, oar::CopyDirection d) -> oar::CopyAnswer {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (std::chrono::steady_clock::now() < deadline) {
+        static_cast<void>(rig.role->poll());
+        const auto a = rig.role->copy_volume(copy_request(oar::CopyOp::query, d, local));
+        BOOST_REQUIRE(a.has_value());
+        if (a->state != oar::CopyVolumeState::copying) {
+            return *a;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    BOOST_FAIL("the copy did not finish");
+    return {};
+}
+
+auto start_copy(Rig& rig, oar::CopyDirection d, std::uint64_t local,
+                const std::array<std::byte, blk::xts_key_size>& local_key,
+                const std::array<std::byte, blk::xts_key_size>& network_key)
+    -> std::expected<oar::CopyAnswer, oar::Status> {
+    auto r = copy_request(oar::CopyOp::start, d, local);
+    r.local_key = std::span<const std::byte, blk::xts_key_size>{local_key};
+    r.network_key = std::span<const std::byte, blk::xts_key_size>{network_key};
+    return rig.role->copy_volume(r);
+}
+
+BOOST_AUTO_TEST_CASE(converts_a_local_volume_to_network_and_back) {
+    ak::test::TestCa ca{"storage CA"};
+    Hold hold{ca};
+    Rig rig{false, compute_tls(ca)};
+    const auto local_key = test_key();
+    const auto network_key = other_key(0x21);
+    const auto back_key = other_key(0x57);
+
+    // A local volume with a guest's write in it.
+    BOOST_REQUIRE(rig.create(vol_two, vm_one) == oar::Status::ok);
+    BOOST_REQUIRE(rig.prepare(fn0, vm_one, vol_two) == oar::Status::ok);
+    rig.t0.flr();
+    BOOST_REQUIRE(rig.deliver(fn0, vol_two) == oar::Status::ok);
+    const auto plain = marker();
+    {
+        Guest g{rig.ram0, *rig.t0.served(), rig.role.get()};
+        BOOST_REQUIRE(g.up());
+        BOOST_REQUIRE(g.write(marker_sector, plain) == Status::ok);
+    }
+    BOOST_REQUIRE(rig.clean(fn0) == oar::Status::ok);
+
+    // Into a new network volume, through a utility attachment.
+    BOOST_REQUIRE((rig.role->replica_config(frame_of(net_config(compute_id, hold.port()))) ==
+                   oar::Status::ok));
+    const auto started =
+        start_copy(rig, oar::CopyDirection::to_network, vol_two, local_key, network_key);
+    BOOST_REQUIRE(started.has_value());
+    BOOST_TEST((started->state == oar::CopyVolumeState::copying));
+    BOOST_TEST(started->total_bytes == volume_sectors * blk::sector_size);
+    // Both volumes are taken while it runs.
+    BOOST_TEST((rig.prepare(fn1, vm_one, vol_two) == oar::Status::busy));
+    BOOST_TEST((attach_network(rig, fn1) == oar::Status::busy));
+    BOOST_TEST(
+        (start_copy(rig, oar::CopyDirection::to_network, vol_two, local_key, network_key).error() ==
+         oar::Status::busy));
+    const auto done = run_copy(rig, vol_two, oar::CopyDirection::to_network);
+    BOOST_TEST_REQUIRE((done.state == oar::CopyVolumeState::completed));
+    BOOST_TEST(done.done_bytes == done.total_bytes);
+    BOOST_TEST(done.written_bytes == blk::sector_size);  // the one sector written
+    // It stays queryable until released, then is gone.
+    BOOST_TEST((rig.role
+                    ->copy_volume(
+                        copy_request(oar::CopyOp::release, oar::CopyDirection::to_network, vol_two))
+                    .value()
+                    .state == oar::CopyVolumeState::completed));
+    BOOST_TEST((
+        rig.role
+            ->copy_volume(copy_request(oar::CopyOp::query, oar::CopyDirection::to_network, vol_two))
+            .value() == oar::CopyAnswer{}));
+
+    // The network volume holds the guest's data under its own key.
+    BOOST_REQUIRE(attach_network(rig, fn1) == oar::Status::ok);
+    rig.t1.flr();
+    BOOST_REQUIRE(
+        (rig.role->deliver_key(
+             {.fn = fn1, .volume_id = vol_one, .key = network_key, .image_key = std::nullopt}) ==
+         oar::Status::ok));
+    {
+        Guest g{rig.ram1, *rig.t1.served(), rig.role.get()};
+        BOOST_REQUIRE(g.up());
+        BOOST_TEST(g.read(marker_sector) == plain, boost::test_tools::per_element());
+        BOOST_TEST((g.read(marker_sector + 1) != plain));  // never written
+    }
+    BOOST_REQUIRE(rig.clean(fn1) == oar::Status::ok);
+
+    // And back into a new local volume under yet another key.
+    constexpr std::uint64_t vol_three = 0x203;
+    BOOST_REQUIRE(rig.create(vol_three, vm_two) == oar::Status::ok);
+    BOOST_REQUIRE(start_copy(rig, oar::CopyDirection::to_local, vol_three, back_key, network_key)
+                      .has_value());
+    const auto back = run_copy(rig, vol_three, oar::CopyDirection::to_local);
+    BOOST_TEST_REQUIRE((back.state == oar::CopyVolumeState::completed));
+    BOOST_TEST(back.written_bytes == blk::sector_size);
+    BOOST_REQUIRE(rig.role
+                      ->copy_volume(copy_request(oar::CopyOp::release, oar::CopyDirection::to_local,
+                                                 vol_three))
+                      .has_value());
+    BOOST_REQUIRE(rig.prepare(fn0, vm_two, vol_three) == oar::Status::ok);
+    rig.t0.flr();
+    BOOST_REQUIRE(
+        (rig.role->deliver_key(
+             {.fn = fn0, .volume_id = vol_three, .key = back_key, .image_key = std::nullopt}) ==
+         oar::Status::ok));
+    Guest g{rig.ram0, *rig.t0.served(), rig.role.get()};
+    BOOST_REQUIRE(g.up());
+    BOOST_TEST(g.read(marker_sector) == plain, boost::test_tools::per_element());
+    BOOST_REQUIRE(rig.clean(fn0) == oar::Status::ok);
+}
+
+BOOST_AUTO_TEST_CASE(conversion_refuses_what_it_cannot_copy) {
+    ak::test::TestCa ca{"storage CA"};
+    Hold hold{ca};
+    Rig rig{false, compute_tls(ca)};
+    const auto k = test_key();
+    const auto to_net = oar::CopyDirection::to_network;
+    BOOST_REQUIRE(rig.create(vol_two, vm_one) == oar::Status::ok);
+    // No config for the network volume yet.
+    BOOST_TEST((start_copy(rig, to_net, vol_two, k, k).error() == oar::Status::failed));
+    // A read-only attachment cannot take the copy.
+    BOOST_REQUIRE(
+        (rig.role->replica_config(frame_of(net_config(
+             compute_id, hold.port(), 1, ak::proto::AttachMode::ro))) == oar::Status::ok));
+    BOOST_TEST((start_copy(rig, to_net, vol_two, k, k).error() == oar::Status::failed));
+    BOOST_REQUIRE((rig.role->replica_config(frame_of(net_config(compute_id, hold.port(), 2))) ==
+                   oar::Status::ok));
+    // A wrong attachment generation, or a missing local volume.
+    auto r = copy_request(oar::CopyOp::start, to_net, vol_two);
+    r.generation = 2;
+    r.local_key = std::span<const std::byte, blk::xts_key_size>{k};
+    r.network_key = std::span<const std::byte, blk::xts_key_size>{k};
+    BOOST_TEST((rig.role->copy_volume(r).error() == oar::Status::failed));
+    BOOST_TEST((start_copy(rig, to_net, 0x2FF, k, k).error() == oar::Status::failed));
+    // An attached local volume is busy.
+    BOOST_REQUIRE(rig.prepare(fn0, vm_one, vol_two) == oar::Status::ok);
+    BOOST_TEST((start_copy(rig, to_net, vol_two, k, k).error() == oar::Status::busy));
+    BOOST_REQUIRE(rig.clean(fn0) == oar::Status::ok);
+    // Deleting a volume mid-copy ends the copy.
+    BOOST_REQUIRE(start_copy(rig, to_net, vol_two, k, other_key(9)).has_value());
+    BOOST_REQUIRE(rig.role->delete_volume({.volume_id = vol_two}) == oar::Status::ok);
+    BOOST_TEST(rig.role->copier(vol_two) == nullptr);
+    // Without a storage certificate there is no network side.
+    Rig bare{false};
+    BOOST_REQUIRE(bare.create(vol_two, vm_one) == oar::Status::ok);
+    BOOST_REQUIRE((bare.role->replica_config(frame_of(net_config(compute_id, hold.port()))) ==
+                   oar::Status::ok));
+    BOOST_TEST((start_copy(bare, to_net, vol_two, k, k).error() == oar::Status::failed));
+}
+
 BOOST_AUTO_TEST_CASE(network_volume_configs_must_be_signed_for_this_server) {
     ak::test::TestCa ca{"storage CA"};
     {

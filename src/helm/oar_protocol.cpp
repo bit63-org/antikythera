@@ -1025,6 +1025,158 @@ auto decode_eject_answer(std::span<const std::byte> body) noexcept
     return static_cast<EjectState>(state);
 }
 
+// ---- copy_volume ---------------------------------------------------------------
+
+namespace {
+
+constexpr auto valid_copy_op(std::uint8_t raw) noexcept -> bool {
+    return raw >= std::to_underlying(CopyOp::start) && raw <= std::to_underlying(CopyOp::release);
+}
+
+constexpr auto valid_copy_direction(std::uint8_t raw) noexcept -> bool {
+    return raw == std::to_underlying(CopyDirection::to_network) ||
+           raw == std::to_underlying(CopyDirection::to_local);
+}
+
+constexpr auto valid_copy_state(std::uint8_t raw) noexcept -> bool {
+    return raw <= std::to_underlying(CopyVolumeState::failed);
+}
+
+constexpr auto valid_copy_failure(std::uint8_t raw) noexcept -> bool {
+    return raw <= std::to_underlying(CopyVolumeFailure::crypto);
+}
+
+// The rules both ends hold a copy_volume request to.
+auto check_copy_volume(const CopyVolume& c) noexcept -> std::expected<void, BodyError> {
+    if (!valid_copy_op(std::to_underlying(c.op)) ||
+        !valid_copy_direction(std::to_underlying(c.direction))) {
+        return std::unexpected(BodyError::unknown_enum);
+    }
+    if (c.local_volume_id == 0 || c.network_volume_id == 0 || c.attachment_id == 0 ||
+        c.generation == 0) {
+        return std::unexpected(BodyError::zero_id);
+    }
+    const bool start = c.op == CopyOp::start;
+    if (c.local_key.has_value() != start || c.network_key.has_value() != start) {
+        return std::unexpected(BodyError::bad_key_length);
+    }
+    return {};
+}
+
+}  // namespace
+
+auto encode_copy_volume(const CopyVolume& c) -> std::expected<std::vector<std::byte>, BodyError> {
+    if (auto ok = check_copy_volume(c); !ok) {
+        return std::unexpected(ok.error());
+    }
+    // Reserved to the exact size so the buffer never reallocates and leaves
+    // a stray copy of a key behind.
+    std::vector<std::byte> out;
+    out.reserve(c.local_key ? copy_volume_start_size : copy_volume_head_size);
+    wire::Writer w{out};
+    w.u8(std::to_underlying(c.op));
+    w.u8(std::to_underlying(c.direction));
+    w.le16(zero16);
+    w.le32(c.mib_per_s);
+    w.le64(c.local_volume_id);
+    w.le64(c.network_volume_id);
+    w.le64(c.attachment_id);
+    w.le32(c.generation);
+    w.le32(zero32);
+    if (c.local_key) {
+        w.bytes(*c.local_key);
+        w.bytes(*c.network_key);
+    }
+    return out;
+}
+
+auto decode_copy_volume(std::span<const std::byte> body) noexcept
+    -> std::expected<CopyVolume, BodyError> {
+    if (body.size() != copy_volume_start_size) {
+        if (auto ok = check_size(body, copy_volume_head_size); !ok) {
+            return std::unexpected(ok.error());
+        }
+    }
+    wire::Reader r{body};
+    const auto op = r.u8().value_or(0);
+    const auto direction = r.u8().value_or(0);
+    if (r.le16().value_or(1) != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    if (!valid_copy_op(op) || !valid_copy_direction(direction)) {
+        return std::unexpected(BodyError::unknown_enum);
+    }
+    CopyVolume c{.op = static_cast<CopyOp>(op),
+                 .direction = static_cast<CopyDirection>(direction),
+                 .mib_per_s = r.le32().value_or(0),
+                 .local_volume_id = r.le64().value_or(0),
+                 .network_volume_id = r.le64().value_or(0),
+                 .attachment_id = r.le64().value_or(0),
+                 .generation = r.le32().value_or(0),
+                 .local_key = std::nullopt,
+                 .network_key = std::nullopt};
+    if (r.le32().value_or(1) != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    if (body.size() == copy_volume_start_size) {
+        const auto keys = r.rest();
+        c.local_key = keys.first<volume_key_size>();
+        c.network_key = keys.subspan<volume_key_size, volume_key_size>();
+    }
+    if (auto ok = check_copy_volume(c); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return c;
+}
+
+auto encode_copy_answer(const CopyAnswer& a) -> std::expected<std::vector<std::byte>, BodyError> {
+    if (!valid_copy_state(std::to_underlying(a.state)) ||
+        !valid_copy_failure(std::to_underlying(a.failure)) ||
+        ((a.failure != CopyVolumeFailure::none) != (a.state == CopyVolumeState::failed))) {
+        return std::unexpected(BodyError::unknown_enum);
+    }
+    if (a.done_bytes > a.total_bytes || a.written_bytes > a.total_bytes) {
+        return std::unexpected(BodyError::bad_geometry);
+    }
+    std::vector<std::byte> out;
+    out.reserve(copy_volume_answer_size);
+    wire::Writer w{out};
+    w.u8(std::to_underlying(a.state));
+    w.u8(std::to_underlying(a.failure));
+    w.le16(zero16);
+    w.le32(zero32);
+    w.le64(a.total_bytes);
+    w.le64(a.done_bytes);
+    w.le64(a.written_bytes);
+    return out;
+}
+
+auto decode_copy_answer(std::span<const std::byte> body) noexcept
+    -> std::expected<CopyAnswer, BodyError> {
+    if (auto ok = check_size(body, copy_volume_answer_size); !ok) {
+        return std::unexpected(ok.error());
+    }
+    wire::Reader r{body};
+    const auto state = r.u8().value_or(0xFF);
+    const auto failure = r.u8().value_or(0xFF);
+    if (r.le16().value_or(1) != 0 || r.le32().value_or(1) != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    if (!valid_copy_state(state) || !valid_copy_failure(failure) ||
+        ((failure != 0) != (state == std::to_underlying(CopyVolumeState::failed)))) {
+        return std::unexpected(BodyError::unknown_enum);
+    }
+    CopyAnswer a{.state = static_cast<CopyVolumeState>(state),
+                 .failure = static_cast<CopyVolumeFailure>(failure),
+                 .total_bytes = r.le64().value_or(0),
+                 .done_bytes = r.le64().value_or(0),
+                 .written_bytes = r.le64().value_or(0)};
+    if (a.done_bytes > a.total_bytes || a.written_bytes > a.total_bytes) {
+        return std::unexpected(BodyError::bad_geometry);
+    }
+    return a;
+}
+
 auto encode_cert_answer(const CertAnswer& a) -> std::expected<std::vector<std::byte>, BodyError> {
     if (a.role != Role::blk && a.role != Role::hold) {
         return std::unexpected(BodyError::unknown_enum);

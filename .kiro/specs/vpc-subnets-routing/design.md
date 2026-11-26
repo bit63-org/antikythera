@@ -380,4 +380,15 @@ scenarios (task 9) are scripts for it, run by harbor's phase-5 driver
   The TAP mode is a test seam: `ak-oar-net --tap NAME=NIC_ID,MAC`
   (repeatable) gives the role TAP-backed ports instead of virtio
   functions.
+  *As built (task 7):* the seam is a test program,
+  `tests/vpc_netns_role`, rather than a flag on `ak-oar-net`. CI's
+  kernel-interop job builds without libvfio-user, so `ak-oar-net` does
+  not exist there, and the program also plays helm and the controller
+  for its role (its tunnel key, then signed TunnelPeers, MapUpdate v4 and
+  VpcConfig v2 frames for a fixed VPC), which removes a fake helm from
+  the script. The frames still cross the role's signature checks, and
+  the role, Vtep, WireGuard tunnel and UdpEndpoint are the production
+  ones; only the virtio function is replaced by a TAP port on the
+  VSwitch. Guests use `dhclient` (run from a copy, outside its AppArmor
+  profile) and busybox `traceroute` and `arping`.
 - harbor: as above (tikhov), then the AWS CLI run (task 11).

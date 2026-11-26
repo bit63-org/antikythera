@@ -90,3 +90,11 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends wireguard-tools
           sudo modprobe wireguard
           sudo tests/wireguard_interop.sh build/tests/wireguard_interop_peer
+
+      # tests/vpc_netns.sh needs root too: two network roles with TAP
+      # NICs in network namespaces, and real guest stacks (dhclient,
+      # ping, TCP, busybox traceroute and arping) routed between subnets.
+      - name: VPC subnets in network namespaces
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends isc-dhcp-client busybox
+          sudo tests/vpc_netns.sh build/tests/vpc_netns_role

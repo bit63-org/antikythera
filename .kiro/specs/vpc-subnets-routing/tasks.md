@@ -1,6 +1,6 @@
 # Implementation Plan — VPC subnets and the implicit router
 
-## Status: 6/12 tasks complete
+## Status: 7/12 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -72,7 +72,7 @@ end) for task 11.
   before mapping; a hostile sending role forging routed frames to a
   NIC the table does not lead to, and cross-subnet frames with the
   sender's own MAC. _Requirements: 4.5, 5.6, 6, 8.2_ (cloud)
-- [ ] 7. Network-namespace test `tests/vpc_netns.sh`: the
+- [x] 7. Network-namespace test `tests/vpc_netns.sh`: the
   `ak-oar-net --tap NAME=NIC_ID,MAC` test seam, two roles in two
   namespaces over an IPv6 veth underlay with the tunnel, guest
   namespaces on their TAPs in two subnets; real DHCPv4 and RA/DHCPv6

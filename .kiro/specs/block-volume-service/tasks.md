@@ -83,10 +83,10 @@ repository. Prerequisites outside this spec: oar-blk task 14
   forced detach after fencing; hull Requirement 7.2 amendment; the
   `guest/ak-guest-eject` helper with a udev rule and shellcheck.
   _Requirements: 3.3-3.6_ (cloud)
-  Not yet: a mailbox command to withdraw a pending request (a busy
-  request stays set until the guest releases, a forced detach, or the
-  VM goes); hull's own `vm.remove-device` path (hull task 9) and the
-  harbor run with a real guest (task 15).
+  Done since: `WITHDRAW_DETACH` withdraws a busy request (design
+  "Detach blocked while mounted"); hull's `vm.remove-device` path landed
+  with hull task 9.
+  Not yet: the harbor run with a real guest (task 15).
 - [x] 14. controller-interface and backplane spec updates: a
   management-fabric port on storage-capable data-plane slots, the storage
   VLAN and traffic classes (backplane), and EC2 mapping of

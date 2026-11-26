@@ -120,7 +120,7 @@ BOOST_AUTO_TEST_CASE(every_command_verifies_under_hull) {
           "attach-device 7 1 nic 0 0x55 0x10 02:00:00:00:00:10", "attach-device 7 3 gpu 1",
           "detach-device 7 1 nic 0 30 force", "create-volume 9 7 20", "delete-volume 9",
           "attach-volume 9 7 2 0", "detach-volume 9 7 2 0 30 destroy-vm", "rewrap-volume 9 7 8",
-          "create-network 0x55", "delete-network 0x55"}) {
+          "withdraw-detach 9 7 2 0", "create-network 0x55", "delete-network 0x55"}) {
         auto env = s.envelope(7, 2, seq++, body_of(line));
         BOOST_REQUIRE_MESSAGE(env.has_value(), line);
         auto decoded = proto::decode_envelope(*env);
@@ -189,6 +189,11 @@ BOOST_AUTO_TEST_CASE(commands_parse_to_their_bodies) {
                     .device = {.slot = 2, .type = mb::DeviceType::blk_fn, .function = 1},
                     .timeout_s = 30,
                     .policy = mb::DetachPolicy::wait}}));
+    BOOST_TEST((body_of("withdraw-detach 9 7 2 1") ==
+                mb::Body{mb::WithdrawDetach{
+                    .volume_id = 9,
+                    .vm_id = 7,
+                    .device = {.slot = 2, .type = mb::DeviceType::blk_fn, .function = 1}}}));
     BOOST_TEST((body_of("destroy-vm 7 persist") ==
                 mb::Body{mb::DestroyVm{.vm_id = 7, .persist_volumes = true}}));
     {

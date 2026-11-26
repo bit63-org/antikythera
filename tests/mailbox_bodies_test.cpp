@@ -175,6 +175,7 @@ auto every_body() -> std::vector<mb::Body> {
                          .timeout_s = timeout_s,
                          .policy = mb::DetachPolicy::wait},
         mb::RewrapVolume{.volume_id = volume, .from_vm = vm_a, .to_vm = vm_b},
+        mb::WithdrawDetach{.volume_id = volume, .vm_id = vm_a, .device = blk},
         mb::CreateNetwork{.vni = vni},
         mb::DeleteNetwork{.vni = mb::max_vni},
         ok_response(),
@@ -301,6 +302,8 @@ BOOST_AUTO_TEST_CASE(zero_identifiers_are_rejected,
         mb::RewrapVolume{.from_vm = vm_a, .to_vm = vm_b},
         mb::RewrapVolume{.volume_id = volume, .to_vm = vm_b},
         mb::RewrapVolume{.volume_id = volume, .from_vm = vm_a},
+        mb::WithdrawDetach{.vm_id = vm_a, .device = blk},
+        mb::WithdrawDetach{.volume_id = volume, .device = blk},
         mb::CreateNetwork{},
         mb::DeleteNetwork{},
         mb::VmExited{},
@@ -372,6 +375,7 @@ BOOST_AUTO_TEST_CASE(device_types_match_the_command,
     rejects(mb::DetachDevice{.vm_id = vm_a, .device = blk, .timeout_s = timeout_s});
     rejects(mb::AttachVolume{.volume_id = volume, .vm_id = vm_a, .device = nic});
     rejects(mb::DetachVolume{.volume_id = volume, .vm_id = vm_a, .device = gpu, .timeout_s = 1});
+    rejects(mb::WithdrawDetach{.volume_id = volume, .vm_id = vm_a, .device = nic});
     rejects(mb::ScrubDone{.device = nic});
 
     expect_invalid(nic_attach(), after_vm_id + device_type_in_ref, zero);

@@ -672,9 +672,23 @@ As built (task 13, helm and guest side):
   and a later release is audited and, for a network volume, reported as
   `attachment_status released`; the controller then sends
   `DETACH_VOLUME` again, which relays at once because the role already
-  answers `released`. A forced detach replaces a busy one. There is no
-  mailbox command to withdraw a pending request yet; it ends with the
-  release, the forced detach or the VM.
+  answers `released`. A forced detach replaces a busy one.
+- **Withdrawing a request.** `WITHDRAW_DETACH = 0x0025` (`volume_id u64
+  | vm_id u64 | device`, 20 bytes, `blk_fn` only) is how the controller
+  cancels a pending request (step 5 above). helm checks it as it checks
+  `DETACH_VOLUME` (the VM that attached, the volume's function; no
+  fencing check, since nothing is removed), sends `eject(cancel)`, stops
+  polling the function and answers `ok`; a network volume reports
+  `attachment_status attached` again. Like the `busy` answer it never
+  reaches hull, and hull answers one that did `unsupported`. The role's
+  cancel is idempotent, so helm always sends it, even with nothing
+  pending in its own state: a retry, or a request helm forgot across a
+  restart, still ends with the flag clear. A withdraw that arrives while
+  the detach still holds the mailbox waits behind it like any command,
+  so it only ever meets a request that has gone `busy` (or that the
+  guest released, which it also withdraws: the function stays attached
+  and the guest can take it back by rescanning its bus). The guest helper
+  needs nothing new: it acts only while the flag is set.
 - **Reports.** Network volumes report `attachment_status`
   `eject_requested`, `busy` and `released` with their attachment and
   generation. Local and image volumes have no attachment ID for that

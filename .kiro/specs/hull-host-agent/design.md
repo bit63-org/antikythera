@@ -97,7 +97,10 @@ the oar-blk vendor capability (block-volume-service design "Detach
 blocked while mounted"), so `vm.remove-device` completes without a guest
 eject wait and the timeout and policy are not applied. helm answers a
 guest that never releases with `busy` itself; the agent never sees that
-command.
+command. Nor does it see `WITHDRAW_DETACH`, with which the controller
+cancels a busy request: helm clears the request on the storage role and
+answers it. One that reaches the agent anyway is answered
+`unsupported`.
 
 As built (task 8):
 

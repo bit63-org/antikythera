@@ -35,9 +35,9 @@ struct Claimed {
 auto known_command(std::uint16_t raw) -> std::optional<mb::Type> {
     using enum mb::Type;
     static constexpr std::array commands{
-        create_vm,     destroy_vm,     list_vms,       vm_status,     attach_device,
-        detach_device, create_volume,  delete_volume,  attach_volume, detach_volume,
-        rewrap_volume, create_network, delete_network, gpu_vf_config};
+        create_vm,     destroy_vm,      list_vms,       vm_status,      attach_device,
+        detach_device, create_volume,   delete_volume,  attach_volume,  detach_volume,
+        rewrap_volume, withdraw_detach, create_network, delete_network, gpu_vf_config};
     const auto* const it = std::ranges::find(commands, static_cast<mb::Type>(raw));
     if (it == commands.end()) {
         return std::nullopt;

@@ -39,6 +39,8 @@
 //   detach-volume VOLUME VM SLOT FN TIMEOUT_S force|destroy-vm|wait
 //                        wait: cooperative detach; `busy` if the guest
 //                        holds the disk past TIMEOUT_S
+//   withdraw-detach VOLUME VM SLOT FN
+//                        clears a busy cooperative detach's request
 //   rewrap-volume VOLUME FROM_VM TO_VM
 //   create-network VNI
 //   delete-network VNI

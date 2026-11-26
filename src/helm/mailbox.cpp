@@ -36,6 +36,7 @@ constexpr std::size_t delete_volume_body_len = 8;
 constexpr std::size_t attach_volume_body_len = 20;
 constexpr std::size_t detach_volume_body_len = 24;
 constexpr std::size_t rewrap_volume_body_len = 24;
+constexpr std::size_t withdraw_detach_body_len = 20;
 constexpr std::size_t network_body_len = 4;
 constexpr std::size_t vm_exited_body_len = 14;
 constexpr std::size_t device_released_body_len = 14;
@@ -56,6 +57,7 @@ constexpr auto known_type(std::uint16_t raw) noexcept -> bool {
         case Type::attach_volume:
         case Type::detach_volume:
         case Type::rewrap_volume:
+        case Type::withdraw_detach:
         case Type::create_network:
         case Type::delete_network:
         case Type::gpu_vf_config:
@@ -307,6 +309,23 @@ auto decode_detach_volume(const Message& msg) noexcept -> std::expected<DetachVo
     }
     out.device = *dev;
     out.policy = static_cast<DetachPolicy>(policy);
+    return out;
+}
+
+auto decode_withdraw_detach(const Message& msg) noexcept
+    -> std::expected<WithdrawDetach, BodyError> {
+    auto r = check_shape(msg, Type::withdraw_detach, withdraw_detach_body_len);
+    if (!r) {
+        return std::unexpected(r.error());
+    }
+    WithdrawDetach out;
+    out.volume_id = *r->le64();
+    out.vm_id = *r->le64();
+    const auto dev = read_device(*r);
+    if (out.volume_id == 0 || out.vm_id == 0 || !dev || dev->type != DeviceType::blk_fn) {
+        return invalid();
+    }
+    out.device = *dev;
     return out;
 }
 
@@ -638,6 +657,8 @@ auto decode_body(const Message& msg) noexcept -> std::expected<Body, BodyError> 
             return to_body(decode_detach_volume(msg));
         case Type::rewrap_volume:
             return to_body(decode_rewrap_volume(msg));
+        case Type::withdraw_detach:
+            return to_body(decode_withdraw_detach(msg));
         case Type::create_network:
             return to_body(decode_network<CreateNetwork>(msg, Type::create_network));
         case Type::delete_network:
@@ -672,6 +693,7 @@ auto type_of(const Body& body) noexcept -> Type {
                           [](const AttachVolume&) { return Type::attach_volume; },
                           [](const DetachVolume&) { return Type::detach_volume; },
                           [](const RewrapVolume&) { return Type::rewrap_volume; },
+                          [](const WithdrawDetach&) { return Type::withdraw_detach; },
                           [](const CreateNetwork&) { return Type::create_network; },
                           [](const DeleteNetwork&) { return Type::delete_network; },
                           [](const Response&) { return Type::response; },
@@ -743,6 +765,11 @@ auto encode_body(const Body& body) -> std::vector<std::byte> {
                        w.le64(b.volume_id);
                        w.le64(b.from_vm);
                        w.le64(b.to_vm);
+                   },
+                   [&](const WithdrawDetach& b) {
+                       w.le64(b.volume_id);
+                       w.le64(b.vm_id);
+                       write_device(w, b.device);
                    },
                    [&](const CreateNetwork& b) { w.le32(b.vni); },
                    [&](const DeleteNetwork& b) { w.le32(b.vni); },

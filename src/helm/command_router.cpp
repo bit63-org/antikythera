@@ -300,6 +300,10 @@ auto CommandRouter::dispatch(const proto::Envelope& envelope) -> void {
         start_wait(seq, slot, *d);  // prepare reserved nothing: no undo
         return;
     }
+    if (const auto* w = std::get_if<mailbox::WithdrawDetach>(&*body)) {
+        withdraw(seq, *w);  // helm's alone: never relayed
+        return;
+    }
     relay(seq, slot, *body, undo);
 }
 
@@ -365,6 +369,37 @@ auto CommandRouter::start_wait(std::uint64_t seq, const mailbox::Slot& slot,
                        .slot = slot,
                        .body = detach,
                        .deadline = t + std::chrono::seconds{detach.timeout_s}};
+}
+
+auto CommandRouter::withdraw(std::uint64_t seq, const mailbox::WithdrawDetach& withdraw) -> void {
+    const auto id = function_id(withdraw.device);
+    auto* port = port_for(withdraw.device.slot);
+    if (port == nullptr) {
+        refuse(seq, mailbox::Type::withdraw_detach, mailbox::Status::unknown_device);
+        return;
+    }
+    // Always ask the role, even with nothing pending here: cancel is
+    // idempotent there, and a request helm forgot (a restart) is cleared.
+    const auto state = port->eject({.fn = withdraw.device.function, .op = oar::EjectOp::cancel});
+    if (!state) {
+        refuse(seq, mailbox::Type::withdraw_detach, link_status(state.error()));
+        return;
+    }
+    if (_ejecting.erase(id) != 0) {
+        ++_stats.detaches_withdrawn;
+        audit(AuditRecord::of(AuditEvent::detach_withdrawn)
+                  .with_seq(seq)
+                  .with_vm(withdraw.vm_id)
+                  .with_volume(withdraw.volume_id)
+                  .with_function(id));
+        report_attachment(withdraw.volume_id, withdraw.device.slot,
+                          proto::AttachmentState::attached);
+    }
+    audit(AuditRecord::of(AuditEvent::command_outcome)
+              .with_seq(seq)
+              .with_command(command_code(mailbox::Type::withdraw_detach))
+              .with_status(status_code(mailbox::Status::ok)));
+    finish(seq, mailbox::Type::withdraw_detach, mailbox::Status::ok);
 }
 
 auto CommandRouter::query_eject(FunctionId id) -> std::optional<oar::EjectState> {
@@ -690,30 +725,24 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
     }
 
     if (const auto* d = std::get_if<mailbox::DetachVolume>(&body)) {
-        const auto net = _network.find(d->volume_id);
-        const bool network = net != _network.end() && net->second.attached_by != 0;
-        if (!network && !volume_owner(d->volume_id)) {
-            return std::unexpected(Status::unknown_volume);
-        }
-        if (network && net->second.attached_by != d->vm_id) {
-            return std::unexpected(Status::conflict);
+        if (auto ok = check_attached(d->volume_id, d->vm_id, d->device); !ok) {
+            return ok;
         }
         // Removing a network volume the guest may still be using needs the
         // attachment fenced first, so no request of its can reach the
         // volume afterwards (Requirements 3.5, 3.6): the controller
         // publishes a config without its generation before it forces.
         // Under wait, the guest's release is what makes it safe.
+        const auto net = _network.find(d->volume_id);
+        const bool network = net != _network.end() && net->second.attached_by != 0;
         if (network && d->policy != mailbox::DetachPolicy::wait && !fenced(net->second)) {
             return std::unexpected(Status::conflict);
         }
-        const auto id = function_id(d->device);
-        const auto it = _attached.find(d->volume_id);
-        const auto info = _pool->find(id);
-        if (it == _attached.end() || it->second != id || !info ||
-            info->state != FunctionState::assigned || info->owner != d->vm_id) {
-            return std::unexpected(Status::conflict);
-        }
         return {};
+    }
+
+    if (const auto* w = std::get_if<mailbox::WithdrawDetach>(&body)) {
+        return check_attached(w->volume_id, w->vm_id, w->device);
     }
 
     if (const auto* r = std::get_if<mailbox::RewrapVolume>(&body)) {
@@ -735,6 +764,27 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
 
     // DESTROY_VM, LIST_VMS, VM_STATUS, CREATE_NETWORK, DELETE_NETWORK: hull
     // decides; helm commits on its answer.
+    return {};
+}
+
+auto CommandRouter::check_attached(VolumeId volume, VmId vm, const mailbox::DeviceRef& device) const
+    -> std::expected<void, mailbox::Status> {
+    using mailbox::Status;
+    const auto net = _network.find(volume);
+    const bool network = net != _network.end() && net->second.attached_by != 0;
+    if (!network && !volume_owner(volume)) {
+        return std::unexpected(Status::unknown_volume);
+    }
+    if (network && net->second.attached_by != vm) {
+        return std::unexpected(Status::conflict);
+    }
+    const auto id = function_id(device);
+    const auto it = _attached.find(volume);
+    const auto info = _pool->find(id);
+    if (it == _attached.end() || it->second != id || !info ||
+        info->state != FunctionState::assigned || info->owner != vm) {
+        return std::unexpected(Status::conflict);
+    }
     return {};
 }
 

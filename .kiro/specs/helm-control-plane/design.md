@@ -69,6 +69,13 @@ Built in `src/helm/command_router.*`. Decisions made in the implementation:
   attachment, function type and state, `REWRAP_VOLUME`'s `from_vm`) and
   answers a violation itself. Malformed slots are refused as `malformed`,
   `GPU_VF_CONFIG` as `unsupported`.
+- Two answers come from helm alone, without hull having verified the
+  signature, because neither removes or erases anything: `busy` for a
+  `DETACH_VOLUME` (`wait`) whose guest kept the disk, and the whole of
+  `WITHDRAW_DETACH`, which clears that detach's eject request
+  (block-volume-service design "Detach blocked while mounted"). A forged
+  one could at worst ask a guest to let go of a disk, or tell it the
+  request is over; the volume stays attached and serving either way.
 - A failed attach (role refused, hull answered with an error, mailbox
   write failed) moves the function
   `assigned → cleaning` (pool event `attach_failed`): hull never handed

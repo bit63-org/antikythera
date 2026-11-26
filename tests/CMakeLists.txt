@@ -214,6 +214,15 @@ add_test(NAME wireguard_interop
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/wireguard_interop.sh $<TARGET_FILE:wireguard_interop_peer>)
 set_tests_properties(wireguard_interop PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 
+# vpc-subnets-routing task 8: frames per second through the VSwitch,
+# switched versus routed, at the VpcConfig limits. ctest runs a few
+# thousand frames per case for its delivery checks; the baseline in the
+# spec comes from a Release build with the default count.
+add_executable(vswitch_bench vswitch_bench.cpp)
+target_link_libraries(vswitch_bench PRIVATE ak::oar_net ak::warnings)
+add_test(NAME vswitch_bench COMMAND vswitch_bench --frames 20000)
+set_tests_properties(vswitch_bench PROPERTIES TIMEOUT 120)
+
 # vpc-subnets-routing task 7: two network roles with TAP-backed NICs in
 # network namespaces, real guest stacks routed between subnets. Root
 # only, so an ordinary ctest run skips it; CI runs tests/vpc_netns.sh

@@ -392,3 +392,35 @@ scenarios (task 9) are scripts for it, run by harbor's phase-5 driver
   VSwitch. Guests use `dhclient` (run from a copy, outside its AppArmor
   profile) and busybox `traceroute` and `arping`.
 - harbor: as above (tikhov), then the AWS CLI run (task 11).
+
+## Router benchmark
+
+`tests/vswitch_bench` (task 8) sends one 60-byte UDP frame (64 on the
+wire) from a local NIC through one VSwitch, 2,000,000 times per case, in
+a VPC at the VpcConfig limits: 200 subnets, 16 route tables with 4,096
+routes in all (two local routes and 254 IPv4 NIC routes of mixed lengths
+each), 204 NICs. Every case checks that each frame arrived where it
+should. ctest runs it with 20,000 frames for those checks only.
+
+Baseline, the median of three runs: Release build (GCC 14, `-O3`), one
+core of a 2.3 GHz Xeon cloud sandbox, 2026-11-26. Ports and the
+underlay only count frames, so this is the switch's own cost, not
+virtio's or the tunnel's.
+
+| Case | Path | Frames/s | ns/frame |
+|---|---|---:|---:|
+| `switched` | same subnet, local port | 3.70 M | 270 |
+| `switched-vtep` | same subnet, NIC on another VTEP | 3.74 M | 267 |
+| `routed` | another subnet, local route, local port | 5.05 M | 198 |
+| `routed-vtep` | another subnet, local route, other VTEP | 7.06 M | 142 |
+| `routed-nic` | NIC route (/24 among 254) to a local appliance | 6.13 M | 163 |
+| `routed6` | another subnet, IPv6 | 3.01 M | 332 |
+
+Routing costs no more than switching here: the trie lookup and the
+neighbor table's address lookup are cheaper than switching's
+`MappingSnapshot::find_by_mac`, a linear scan of the VNI's entries
+(204 here). An index by MAC would speed switching up in large VNIs; it
+is left for when security groups (which will compare against this
+table) change the transmit path anyway. IPv6 is slower than IPv4 on the
+same path: its local route sits 56 levels down the binary trie, against
+IPv4's 8, and its neighbor keys are 16 bytes.

@@ -288,6 +288,7 @@ target_link_libraries(ak_oar_blk_image
 # the volume's primary hold.
 add_library(ak_oar_blk_volume
   oar/blk/initiator.cpp
+  oar/blk/khold_initiator.cpp
   oar/blk/network_volume_backend.cpp)
 add_library(ak::oar_blk_volume ALIAS ak_oar_blk_volume)
 target_link_libraries(ak_oar_blk_volume

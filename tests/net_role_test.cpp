@@ -9,7 +9,9 @@
 // helm, peers from the controller's signed TunnelPeers frame). health
 // reports a peer that never proves a full-size path (mtu_ok). Task 13:
 // signed GroupPolicy frames applied to the VSwitch and its group meters
-// read back with group_usage.
+// read back with group_usage. vpc-subnets-routing task 6: three roles
+// route between subnets over the WireGuard tunnel, through a middlebox
+// appliance and around it, and refuse forged routed and cross-subnet frames.
 
 #define BOOST_TEST_MODULE net_role_test
 #include <boost/test/unit_test.hpp>
@@ -1422,4 +1424,435 @@ BOOST_FIXTURE_TEST_CASE(helm_drives_the_role_over_the_sideband, One,
     BOOST_TEST((role->attached(fn0) == NicId{2}));
     BOOST_TEST(role->counters().map_wrong_server == 1U);
     BOOST_TEST((role->vswitch().group_policy(vpc).mode == net::GroupMode::multicast));
+}
+
+// vpc-subnets-routing task 6: routing between subnets with three roles
+// over the WireGuard tunnel. Subnets A (10.0.0.0/27, fd10:0:0:0::/64),
+// B (10.0.0.32/27, fd10:0:0:1::/64) and M (10.0.0.64/27, fd10:0:0:2::/64);
+// a and b on role one, c on role two, the appliance m (its
+// source/destination check off) on role three. guest_ip(nic) lands each
+// NIC in its subnet: a .17, b .34, c .51, m .68.
+namespace {
+
+constexpr std::uint64_t server_three = 9;
+constexpr std::uint8_t third_tail = 3;
+constexpr std::uint64_t nic_m = 0x44;
+constexpr std::uint64_t subnet_a = 0x5A01;
+constexpr std::uint16_t main_table = 1;
+constexpr std::uint16_t middlebox_table = 2;
+constexpr std::uint8_t subnet_length = 27;
+constexpr std::size_t eth_size = 14;
+constexpr std::size_t ttl_at = eth_size + 8;
+constexpr std::size_t hop_limit_at = eth_size + 7;
+constexpr std::size_t subnet_byte = 7;  // of an IPv6 address in fd10::/56
+
+auto gateway_mac() -> net::MacAddress {
+    return {std::byte{0x02}, std::byte{0}, std::byte{0},
+            std::byte{0},    std::byte{0}, std::byte{0xFE}};
+}
+
+// 0 for A, 1 for B, 2 for M.
+auto subnet_index(std::uint64_t nic) -> std::uint8_t {
+    return static_cast<std::uint8_t>(guest_ip(nic)[3] >> 5U);
+}
+
+auto subnet_of(std::uint64_t nic) -> std::uint64_t {
+    return subnet_a + subnet_index(nic);
+}
+
+auto ula(std::uint8_t subnet) -> proto::Ipv6Address {
+    proto::Ipv6Address a{};
+    a[0] = std::byte{0xFD};
+    a[1] = std::byte{0x10};
+    a[subnet_byte] = std::byte{subnet};
+    return a;
+}
+
+auto guest_ip6(std::uint64_t nic) -> net::Ipv6Address {
+    auto a = ula(subnet_index(nic));
+    a[ipv6_last] = static_cast<std::byte>(nic);
+    return a;
+}
+
+struct Member {
+    std::uint64_t nic{0};
+    std::uint8_t tail{0};
+};
+
+// Every NIC of the VPC, both families addressed, m with its check off.
+auto subnet_map(std::uint64_t server, std::uint64_t version, const std::vector<Member>& members)
+    -> std::vector<std::byte> {
+    proto::MapUpdate m{};
+    m.server_id = server;
+    m.key_id = key_id;
+    m.vni = vpc;
+    m.map_version = version;
+    for (const auto& [nic, tail] : members) {  // ascending NIC IDs, so ascending addresses
+        m.entries.push_back({.nic_id = nic,
+                             .mac = mac_of(nic),
+                             .owner_vtep = vtep(tail),
+                             .source_dest_check = nic != nic_m,
+                             .subnet_id = subnet_of(nic)});
+        m.ipv4.push_back({.nic_id = nic, .address = guest_ip(nic)});
+        m.ipv6.push_back({.nic_id = nic, .address = guest_ip6(nic)});
+    }
+    auto bytes = proto::encode_map_update(m);
+    BOOST_REQUIRE(bytes.has_value());
+    proto::set_map_update_signature(*bytes, signer().sign(proto::map_update_signed_bytes(*bytes)));
+    return *bytes;
+}
+
+auto all_members() -> std::vector<Member> {
+    return {{nic_a, self_tail}, {nic_b, self_tail}, {nic_c, peer_tail}, {nic_m, third_tail}};
+}
+
+// The VPC's subnets and tables. Table 1 (main) holds the local routes;
+// table 2 adds subnet B's prefixes in both families to m. With
+// `middlebox` A and B use table 2, so A's traffic to B goes through m.
+auto subnet_vpc(std::uint64_t server, std::uint64_t version, bool middlebox)
+    -> std::vector<std::byte> {
+    proto::VpcConfigFrame c{};
+    c.server_id = server;
+    c.key_id = key_id;
+    c.vni = vpc;
+    c.config_version = version;
+    c.gateway_mac = gateway_mac();
+    c.ipv4_blocks = {
+        {.prefix = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}}, .length = 16}};
+    c.ipv6_block = ula(0);
+    const std::uint16_t ab = middlebox ? middlebox_table : main_table;
+    for (const std::uint64_t nic : {nic_a, nic_b, nic_m}) {
+        auto prefix = guest_ip(nic);
+        prefix[3] = static_cast<std::byte>(subnet_index(nic) << 5U);
+        c.subnets.push_back({.subnet_id = subnet_of(nic),
+                             .table = nic == nic_m ? main_table : ab,
+                             .ipv4_prefix = prefix,
+                             .ipv4_length = subnet_length,
+                             .ipv6_prefix = ula(subnet_index(nic))});
+    }
+    proto::VpcRoute local4{.kind = proto::RouteKind::local,
+                           .family = proto::RouteFamily::ipv4,
+                           .length = 16,
+                           .prefix = {},
+                           .target_nic = 0};
+    local4.prefix[0] = std::byte{10};
+    const proto::VpcRoute local6{.kind = proto::RouteKind::local,
+                                 .family = proto::RouteFamily::ipv6,
+                                 .length = 56,
+                                 .prefix = ula(0),
+                                 .target_nic = 0};
+    proto::VpcRouteTable main{.table = main_table, .main = true, .routes = {local4, local6}};
+    proto::VpcRouteTable steer{.table = middlebox_table, .main = false, .routes = {local4, local6}};
+    proto::VpcRoute to_m4{.kind = proto::RouteKind::nic,
+                          .family = proto::RouteFamily::ipv4,
+                          .length = subnet_length,
+                          .prefix = {},
+                          .target_nic = nic_m};
+    to_m4.prefix[0] = std::byte{10};
+    to_m4.prefix[3] = std::byte{0x20};
+    steer.routes.push_back(to_m4);
+    steer.routes.push_back({.kind = proto::RouteKind::nic,
+                            .family = proto::RouteFamily::ipv6,
+                            .length = 64,
+                            .prefix = ula(1),
+                            .target_nic = nic_m});
+    std::ranges::sort(steer.routes, proto::detail::vpc_route_key_less);
+    std::ranges::sort(main.routes, proto::detail::vpc_route_key_less);
+    c.tables = {main, steer};
+    c.lease_seconds = 3600;
+    auto bytes = proto::encode_vpc_config(c);
+    BOOST_REQUIRE(bytes.has_value());
+    proto::set_vpc_config_signature(*bytes, signer().sign(proto::vpc_config_signed_bytes(*bytes)));
+    return *bytes;
+}
+
+// The controller's TunnelPeers frame naming every other VTEP.
+auto signed_peer_set(std::uint64_t server, std::uint8_t tail,
+                     const std::vector<std::pair<std::uint8_t, net::wg::Key>>& peers)
+    -> std::vector<std::byte> {
+    proto::TunnelPeers t{};
+    t.server_id = server;
+    t.key_id = key_id;
+    t.vtep = vtep(tail);
+    t.peers_version = 1;
+    for (const auto& [peer, key] : peers) {  // ascending tails
+        if (peer != tail) {
+            t.peers.push_back(
+                {.vtep = vtep(peer), .mode = proto::TunnelMode::wireguard, .spi = 0, .key = key});
+        }
+    }
+    auto bytes = proto::encode_tunnel_peers(t);
+    BOOST_REQUIRE(bytes.has_value());
+    proto::set_tunnel_peers_signature(*bytes,
+                                      signer().sign(proto::tunnel_peers_signed_bytes(*bytes)));
+    return *bytes;
+}
+
+// UDP between two guests' addresses, sent to `dst_mac` from `src_mac`.
+auto udp4(const net::MacAddress& dst_mac, const net::MacAddress& src_mac, std::uint64_t from,
+          std::uint64_t to) -> std::vector<std::byte> {
+    const std::vector<std::byte> payload(payload_size, std::byte{payload_fill});
+    return ak::test::frames::ipv4(dst_mac, src_mac, guest_ip(from), guest_ip(to), ipproto_udp,
+                                  ak::test::frames::udp(udp_port, udp_port, payload));
+}
+
+auto udp6(const net::MacAddress& dst_mac, const net::MacAddress& src_mac, std::uint64_t from,
+          std::uint64_t to) -> std::vector<std::byte> {
+    const std::vector<std::byte> payload(payload_size, std::byte{payload_fill});
+    return ak::test::frames::ipv6(dst_mac, src_mac, guest_ip6(from), guest_ip6(to), ipproto_udp,
+                                  ak::test::frames::udp(udp_port, udp_port, payload));
+}
+
+// `got` is `sent` after `hops` routers: the target's MAC from the
+// gateway's, the TTL or hop limit `hops` lower, the IPv4 header checksum
+// still valid, and every other byte unchanged.
+auto routed_copy(const std::vector<std::byte>& got, const std::vector<std::byte>& sent,
+                 std::uint64_t dst, int hops, bool v6) -> bool {
+    if (got.size() != sent.size()) {
+        return false;
+    }
+    const net::MacAddress gw = gateway_mac();
+    const net::MacAddress to = mac_of(dst);
+    bool ok = std::equal(to.begin(), to.end(), got.begin()) &&
+              std::equal(gw.begin(), gw.end(), got.begin() + mac_last + 1);
+    const std::size_t hop_at = v6 ? hop_limit_at : ttl_at;
+    ok = ok && std::to_integer<int>(got[hop_at]) == ak::test::frames::default_ttl - hops;
+    for (std::size_t i = 2 * (mac_last + 1); i < got.size(); ++i) {
+        const bool rewritten = i == hop_at || (!v6 && (i == eth_size + 10 || i == eth_size + 11));
+        ok = ok && (rewritten || got[i] == sent[i]);
+    }
+    if (!v6) {
+        std::uint32_t sum = 0;
+        for (std::size_t i = eth_size; i < eth_size + 20; i += 2) {
+            sum += (std::to_integer<std::uint32_t>(got[i]) << 8U) |
+                   std::to_integer<std::uint32_t>(got[i + 1]);
+        }
+        sum = (sum & 0xFFFFU) + (sum >> 16U);
+        sum = (sum & 0xFFFFU) + (sum >> 16U);
+        ok = ok && sum == 0xFFFFU;
+    }
+    return ok;
+}
+
+// Three WireGuard-keyed roles and the underlay between them.
+struct Fabric {
+    Fabric() {
+        boards[0] = std::make_unique<Board>(server_one, self_tail, Encryption::wireguard);
+        boards[1] = std::make_unique<Board>(server_two, peer_tail, Encryption::wireguard);
+        boards[2] = std::make_unique<Board>(server_three, third_tail, Encryption::wireguard);
+        std::vector<std::pair<std::uint8_t, net::wg::Key>> publics;
+        for (std::size_t i = 0; i < boards.size(); ++i) {
+            const auto k = net::wg::generate_private_key();
+            BOOST_REQUIRE(k.has_value());
+            const auto p = net::wg::public_key(k->span());
+            BOOST_REQUIRE(p.has_value());
+            BOOST_REQUIRE(boards[i]->role->set_tunnel_key({.private_key = k->span()}) ==
+                          Status::ok);
+            publics.emplace_back(tails[i], *p);
+        }
+        for (std::size_t i = 0; i < boards.size(); ++i) {
+            BOOST_REQUIRE(boards[i]->role->tunnel_peers(
+                              signed_peer_set(servers[i], tails[i], publics)) == Status::ok);
+        }
+    }
+
+    // Ticks every role at `now` and carries datagrams to the VTEP they
+    // name until the underlay is quiet.
+    auto pump(net::VtepClock::time_point now) -> void {
+        for (auto& b : boards) {
+            static_cast<void>(b->role->tick(now));
+        }
+        for (int round = 0; round < 8; ++round) {
+            bool quiet = true;
+            for (std::size_t i = 0; i < boards.size(); ++i) {
+                auto sent = std::move(boards[i]->wire.sent);
+                boards[i]->wire.sent.clear();
+                for (const auto& d : sent) {
+                    quiet = false;
+                    for (std::size_t j = 0; j < boards.size(); ++j) {
+                        if (d.dst == vtep(tails[j])) {
+                            static_cast<void>(
+                                boards[j]->role->receive(d.payload, vtep(tails[i]), now));
+                        }
+                    }
+                }
+            }
+            if (quiet) {
+                return;
+            }
+        }
+    }
+
+    auto pump() -> void { pump(clock); }
+
+    // Brings the tunnels up: keepalives start the handshakes.
+    auto connect() -> void {
+        pump(clock);
+        clock += keepalive;
+        pump(clock);
+    }
+
+    // Posts a receive buffer on `fn` of board `b`.
+    auto post(std::size_t b, oar::FunctionNumber fn) -> void {
+        gpas[b][fn].push_back(boards[b]->post_rx(fn));
+    }
+
+    // The next frame `fn` of board `b` received, if any.
+    auto take(std::size_t b, oar::FunctionNumber fn) -> std::optional<std::vector<std::byte>> {
+        auto& driver = *boards[b]->drivers[fn];
+        auto& seen = taken[b][fn];
+        if (driver.used_idx(rx) == seen) {
+            return std::nullopt;
+        }
+        const auto slot = static_cast<std::uint16_t>(seen % ak::test::test_queue_size);
+        const auto len = driver.used_len(rx, slot);
+        const vio::Gpa gpa = gpas[b][fn].at(seen);
+        ++seen;
+        return boards[b]->transports[fn].ram.bytes(gpa + hdr, len - hdr);
+    }
+
+    auto board(std::size_t b) -> Board& { return *boards[b]; }
+    auto vswitch(std::size_t b) -> const net::SwitchCounters& {
+        return boards[b]->role->vswitch().counters();
+    }
+
+    static constexpr std::array<std::uint64_t, 3> servers{server_one, server_two, server_three};
+    static constexpr std::array<std::uint8_t, 3> tails{self_tail, peer_tail, third_tail};
+    std::array<std::unique_ptr<Board>, 3> boards;
+    std::array<std::array<std::vector<vio::Gpa>, function_count>, 3> gpas;
+    std::array<std::array<std::uint16_t, function_count>, 3> taken{};
+    net::VtepClock::time_point clock{net::VtepClock::now()};
+};
+
+constexpr std::size_t one = 0;
+constexpr std::size_t two = 1;
+constexpr std::size_t three = 2;
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(roles_route_between_subnets_through_a_middlebox,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Fabric f;
+    // Mapping before config on roles one and two, config before mapping
+    // on role three: either order ends in the same state.
+    for (const std::size_t b : {one, two}) {
+        BOOST_REQUIRE(f.board(b).role->map_update(
+                          subnet_map(Fabric::servers[b], 1, all_members())) == Status::ok);
+        BOOST_REQUIRE(f.board(b).role->vpc_config(subnet_vpc(Fabric::servers[b], 1, false)) ==
+                      Status::ok);
+    }
+    BOOST_REQUIRE(f.board(three).role->vpc_config(subnet_vpc(server_three, 1, false)) ==
+                  Status::ok);
+    BOOST_REQUIRE(f.board(three).role->map_update(subnet_map(server_three, 1, all_members())) ==
+                  Status::ok);
+    BOOST_REQUIRE(f.board(one).prepare(fn0, nic_a) == Status::ok);
+    BOOST_REQUIRE(f.board(one).prepare(fn1, nic_b) == Status::ok);
+    BOOST_REQUIRE(f.board(two).prepare(fn1, nic_c) == Status::ok);
+    BOOST_REQUIRE(f.board(three).prepare(fn0, nic_m) == Status::ok);
+    f.board(one).driver(fn0);
+    f.board(one).driver(fn1);
+    f.board(two).driver(fn1);
+    f.board(three).driver(fn0);
+    f.connect();
+    BOOST_TEST(f.board(one).role->vtep().peers().size() == 2U);
+    BOOST_TEST(f.board(three).role->tunnel()->counters().sessions_established >= 1U);
+
+    const auto gw = gateway_mac();
+    // a to b on one role, and a to c across roles, in both families: one
+    // hop, the gateway's MAC as the source.
+    for (const bool v6 : {false, true}) {
+        const auto make = v6 ? udp6 : udp4;
+        f.post(one, fn1);
+        const auto to_b = make(gw, mac_of(nic_a), nic_a, nic_b);
+        f.board(one).send(fn0, to_b);
+        auto got = f.take(one, fn1);
+        BOOST_REQUIRE(got.has_value());
+        BOOST_TEST(routed_copy(*got, to_b, nic_b, 1, v6));
+
+        f.post(two, fn1);
+        const auto to_c = make(gw, mac_of(nic_a), nic_a, nic_c);
+        f.board(one).send(fn0, to_c);
+        f.pump();
+        got = f.take(two, fn1);
+        BOOST_REQUIRE(got.has_value());
+        BOOST_TEST(routed_copy(*got, to_c, nic_c, 1, v6));
+    }
+    BOOST_TEST(f.vswitch(one).tx_routed == 4U);
+
+    // The middlebox config: A's traffic to B now goes to m on role three,
+    // which forwards it back through the gateway to b.
+    for (const std::size_t b : {one, two, three}) {
+        BOOST_REQUIRE(f.board(b).role->vpc_config(subnet_vpc(Fabric::servers[b], 2, true)) ==
+                      Status::ok);
+    }
+    for (const bool v6 : {false, true}) {
+        const auto make = v6 ? udp6 : udp4;
+        f.post(three, fn0);
+        f.post(one, fn1);
+        const auto to_b = make(gw, mac_of(nic_a), nic_a, nic_b);
+        f.board(one).send(fn0, to_b);
+        BOOST_TEST(!f.take(one, fn1).has_value());  // not switched straight to b
+        f.pump();
+        const auto at_m = f.take(three, fn0);
+        BOOST_REQUIRE(at_m.has_value());
+        BOOST_TEST(routed_copy(*at_m, to_b, nic_m, 1, v6));
+        // The appliance sends it on unchanged but for its own MAC, as a
+        // router would; its check is off, so a's address is allowed.
+        const auto forwarded = make(gw, mac_of(nic_m), nic_a, nic_b);
+        f.board(three).send(fn0, forwarded);
+        f.pump();
+        const auto at_b = f.take(one, fn1);
+        BOOST_REQUIRE(at_b.has_value());
+        BOOST_TEST(routed_copy(*at_b, forwarded, nic_b, 1, v6));
+    }
+
+    // Same-subnet traffic is switched, never routed: b to c bypasses m.
+    const auto routed_before = f.vswitch(one).tx_routed;
+    f.post(two, fn1);
+    const auto b_to_c = udp4(mac_of(nic_c), mac_of(nic_b), nic_b, nic_c);
+    f.board(one).send(fn1, b_to_c);
+    f.pump();
+    auto got = f.take(two, fn1);
+    BOOST_REQUIRE(got.has_value());
+    BOOST_TEST((*got == b_to_c));
+    BOOST_TEST(f.vswitch(one).tx_routed == routed_before);
+    BOOST_TEST(!f.take(three, fn0).has_value());
+
+    // The appliance's NIC leaves role one's mapping: its route is a
+    // blackhole, and comes back with the NIC.
+    BOOST_REQUIRE(f.board(one).role->map_update(subnet_map(
+                      server_one, 2,
+                      {{nic_a, self_tail}, {nic_b, self_tail}, {nic_c, peer_tail}})) == Status::ok);
+    f.board(one).send(fn0, udp4(gw, mac_of(nic_a), nic_a, nic_b));
+    f.pump();
+    BOOST_TEST(f.vswitch(one).tx_drop_route_target == 1U);
+    BOOST_TEST(!f.take(three, fn0).has_value());
+    BOOST_REQUIRE(f.board(one).role->map_update(subnet_map(server_one, 3, all_members())) ==
+                  Status::ok);
+    f.post(three, fn0);
+    const auto again = udp4(gw, mac_of(nic_a), nic_a, nic_b);
+    f.board(one).send(fn0, again);
+    f.pump();
+    got = f.take(three, fn0);
+    BOOST_REQUIRE(got.has_value());
+    BOOST_TEST(routed_copy(*got, again, nic_m, 1, false));
+
+    // A hostile role two forges frames to a. A "routed" frame from c whose
+    // destination address B's table leads to m, not a, and a switched
+    // frame from c, in subnet B, with c's own MAC.
+    f.post(one, fn0);
+    const auto forged_route = udp4(mac_of(nic_a), gw, nic_c, nic_b);
+    f.board(two).role->vtep().send({.vtep = vtep(self_tail),
+                                    .vni = vpc,
+                                    .nics = {.src = NicId{nic_c}, .dst = NicId{nic_a}},
+                                    .frame = forged_route});
+    const auto cross = udp4(mac_of(nic_a), mac_of(nic_c), nic_c, nic_a);
+    f.board(two).role->vtep().send({.vtep = vtep(self_tail),
+                                    .vni = vpc,
+                                    .nics = {.src = NicId{nic_c}, .dst = NicId{nic_a}},
+                                    .frame = cross});
+    f.pump();
+    BOOST_TEST(!f.take(one, fn0).has_value());
+    BOOST_TEST(f.vswitch(one).rx_drop_route_mismatch == 1U);
+    BOOST_TEST(f.vswitch(one).rx_drop_cross_subnet == 1U);
 }

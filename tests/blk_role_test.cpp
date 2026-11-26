@@ -564,6 +564,8 @@ struct Rig {
                                        .verify_config = verify,
                                        .storage_tls = storage_tls,
                                        .initiator = {},
+                                       .khold_initiator = {},
+                                       .max_trim_bytes = std::uint32_t{16} << 20U,
                                        .clock = [this] { return now; }},
                                       {&t0, &t1});
         BOOST_REQUIRE(r);

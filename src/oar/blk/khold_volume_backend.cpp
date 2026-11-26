@@ -93,8 +93,7 @@ auto KholdVolumeBackend::submit_write_zeroes(std::uint64_t offset, std::uint64_t
     publish();
 }
 
-auto KholdVolumeBackend::submit_hydrate(std::uint64_t /*offset*/,
-                                        std::span<const std::byte> /*in*/,
+auto KholdVolumeBackend::submit_hydrate(std::uint64_t /*offset*/, std::span<const std::byte> /*in*/,
                                         BackendCompletion done) -> void {
     done(std::unexpected(BackendError::io));  // khold hydration is phase 2
 }

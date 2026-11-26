@@ -39,6 +39,8 @@ constexpr auto frame_limit(mctp::VendorType type) noexcept -> std::size_t {
             return oar::max_group_members_frame;
         case mctp::VendorType::instance_metadata:
             return oar::max_instance_metadata_frame;
+        case mctp::VendorType::volume_layout:
+            return oar::max_volume_layout_frame;
         default:
             return oar::max_cert_chain;
     }
@@ -251,6 +253,13 @@ auto OarLink::group_members(std::span<const std::byte> frame) -> std::expected<v
         return std::unexpected(bad_request());
     }
     return send_chunked(mctp::VendorType::group_members, frame);
+}
+
+auto OarLink::volume_layout(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
+    if (frame.empty() || frame.size() > oar::max_volume_layout_frame) {
+        return std::unexpected(bad_request());
+    }
+    return send_chunked(mctp::VendorType::volume_layout, frame);
 }
 
 auto OarLink::instance_metadata(std::span<const std::byte> frame)
@@ -744,6 +753,7 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
         case mctp::VendorType::tunnel_peers:
         case mctp::VendorType::group_members:
         case mctp::VendorType::instance_metadata:
+        case mctp::VendorType::volume_layout:
         case mctp::VendorType::role_certificate:
             return status_only(frame_chunk(handler, type, body));
         case mctp::VendorType::group_membership: {
@@ -890,6 +900,9 @@ auto OarEndpoint::frame_chunk(OarHandler& handler, mctp::VendorType type,
             break;
         case mctp::VendorType::instance_metadata:
             status = handler.instance_metadata(_frame);
+            break;
+        case mctp::VendorType::volume_layout:
+            status = handler.volume_layout(_frame);
             break;
         default:
             status = handler.role_certificate(_frame);

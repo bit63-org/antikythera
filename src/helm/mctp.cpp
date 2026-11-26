@@ -88,6 +88,7 @@ constexpr auto known_vendor_type(std::uint8_t raw) noexcept -> bool {
         case VendorType::group_membership:
         case VendorType::instance_metadata:
         case VendorType::copy_volume:
+        case VendorType::volume_layout:
             return true;
     }
     return false;

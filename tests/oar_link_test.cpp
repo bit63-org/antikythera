@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "helm/oar_link.hpp"
+#include "proto/volume_layout.hpp"
 #include "test_support.hpp"
 
 namespace ak::helm {
@@ -736,6 +737,11 @@ public:
         records.emplace_back(frame.begin(), frame.end());
         return oar::Status::ok;
     }
+    std::vector<std::vector<std::byte>> layouts;
+    auto volume_layout(std::span<const std::byte> frame) -> oar::Status override {
+        layouts.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
+    }
     std::vector<std::vector<std::byte>> members;
     auto group_members(std::span<const std::byte> frame) -> oar::Status override {
         members.emplace_back(frame.begin(), frame.end());
@@ -838,6 +844,38 @@ BOOST_AUTO_TEST_CASE(group_members_are_forwarded_in_chunks) {
     BOOST_REQUIRE(role.members.size() == 2U);
     BOOST_TEST(role.members[0] == small);
     BOOST_TEST(role.members[1] == largest);
+}
+
+// kythira khold-block-service Requirement 11.5: helm relays a khold
+// volume's layout to the blk role byte for byte.
+BOOST_AUTO_TEST_CASE(volume_layouts_are_forwarded_in_chunks) {
+    static_assert(oar::max_volume_layout_frame == ak::proto::max_volume_layout_size);
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    MeterRole role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const auto small = pattern(300);
+    const auto largest = pattern(oar::max_volume_layout_frame);
+    {
+        const Server server{endpoint, role};
+        BOOST_TEST(link.volume_layout(small).has_value());
+        BOOST_TEST(link.volume_layout(largest).has_value());
+        BOOST_TEST((link.volume_layout({}).error().code == LinkErrc::bad_request));
+        BOOST_TEST((link.volume_layout(pattern(oar::max_volume_layout_frame + 1)).error().code ==
+                    LinkErrc::bad_request));
+    }
+    BOOST_REQUIRE(role.layouts.size() == 2U);
+    BOOST_TEST(role.layouts[0] == small);
+    BOOST_TEST(role.layouts[1] == largest);
+
+    auto [helm_c, oar_c] = InProcessBinding::make_pair();
+    FakeOar fake;
+    OarEndpoint other{*oar_c, oar_config()};
+    OarLink other_link{*helm_c, config()};
+    const Server server{other, fake};
+    const auto refused = other_link.volume_layout(small);
+    BOOST_REQUIRE(!refused.has_value());
+    BOOST_TEST((refused.error().status == oar::Status::unsupported));
 }
 
 BOOST_AUTO_TEST_CASE(instance_metadata_is_forwarded_in_chunks) {

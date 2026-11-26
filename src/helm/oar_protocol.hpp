@@ -56,6 +56,11 @@
 //                          to max_vpc_config_frame bytes)
 //   group_members       0  total u32 | 4  offset u32 | 8  chunk (as map_update)
 //   instance_metadata   0  total u32 | 4  offset u32 | 8  chunk (as map_update)
+//   volume_layout       0  total u32 | 4  offset u32 | 8  chunk (as map_update): one
+//                          controller proto::VolumeLayout (signed; at most
+//                          max_volume_layout_frame bytes), for a blk role
+//                          attaching khold volumes (kythira khold-block-service
+//                          Requirement 11.5)
 //   group_membership    0  cursor u16 | 2  flags u16 (bit 0: `since` is set)
 //                       4  since u32 (the generation helm last read whole)
 //   copy_volume         0  op u8 (CopyOp) | 1  direction u8 (CopyDirection) | 2  reserved u16
@@ -308,6 +313,11 @@ static_assert(max_group_members_frame <= max_map_frame);
 // 56-byte header, nine strings of up to 255 bytes with their sizes, 16 KiB
 // of user data, a 64-byte signature), pinned the same way.
 inline constexpr std::size_t max_instance_metadata_frame = 0x38 + (9 * 256) + 16384 + 64;
+// Largest VolumeLayout frame (proto::max_volume_layout_size: the header, 64
+// stripe groups of five members, 16 gateways, 16 attachments and the
+// signature).
+inline constexpr std::size_t max_volume_layout_frame =
+    0x78 + (64 * (16 + (5 * 32))) + (16 * 32) + (16 * 24) + 64;
 inline constexpr std::size_t membership_request_size = 8;
 inline constexpr std::size_t membership_head_size = 12;
 inline constexpr std::size_t membership_entry_size = 32;

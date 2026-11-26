@@ -157,6 +157,10 @@ public:
     // tunnel_peers; fails without sending if it is empty or larger than
     // oar::max_instance_metadata_frame.
     auto instance_metadata(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
+    // Sends one controller VolumeLayout frame in chunks, like tunnel_peers,
+    // to a blk role (khold volumes); fails without sending if it is empty
+    // or larger than oar::max_volume_layout_frame.
+    auto volume_layout(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
     // Forwards one controller VpcConfig frame (min_vpc_config_frame to
     // max_vpc_config_frame bytes) to a network role.
     auto vpc_config(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
@@ -302,6 +306,12 @@ public:
     // decoded or verified and are valid only during the call; a role
     // answers hold_reports through an oar::ReportQueue.
     virtual auto replica_config(std::span<const std::byte> /*frame*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    // A khold volume's layout, which only the blk role keeps (kythira
+    // khold-block-service Requirement 11.5): whole and reassembled, not
+    // yet decoded or verified, valid only during the call.
+    virtual auto volume_layout(std::span<const std::byte> /*frame*/) -> oar::Status {
         return oar::Status::unsupported;
     }
     virtual auto volume_op(std::span<const std::byte> /*frame*/) -> oar::Status {

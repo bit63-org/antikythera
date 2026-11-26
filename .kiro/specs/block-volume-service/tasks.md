@@ -1,6 +1,6 @@
 # Implementation Plan — hold: the fault-tolerant block volume service
 
-## Status: 14/24 tasks complete
+## Status: 17/24 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"

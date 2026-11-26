@@ -1,6 +1,6 @@
 # Implementation Plan — helm: the control-plane role
 
-## Status: 12/13 tasks complete
+## Status: 13/14 tasks complete
 
 ## Tasks
 

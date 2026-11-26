@@ -1,7 +1,8 @@
 # Amazon EBS gap analysis
 
-_Status as of 2026-11-24, against `main` (oar-blk tasks 1-6 and 9-14 and
-block-volume-service tasks 1-12 merged; the network volume pieces run in
+_Status as of 2026-11-26, against `main` (oar-blk tasks 1-6 and 9-15,
+block-volume-service tasks 1-14, 19, 20 and 24, and the cloud halves of
+17 and 18 merged; the network volume pieces run in
 the deterministic simulation but not yet in harbor). EBS facts are from
 AWS's public documentation as of late 2025._
 
@@ -51,14 +52,14 @@ Status: **have** (built), **partial**, **spec** (in block-volume-service),
 | Detach and reattach to another instance | yes | same server only | spec | Req 9 |
 | Stop/start instance on other hardware | yes | must return to the volume's server | spec | Req 2.4 |
 | `DeleteOnTermination` | yes | `persist_volumes` per VM | spec | Req 9.4 (per volume) |
-| Hot attach / detach | yes | device-pool flow, force or destroy-VM on timeout | spec | Req 3: cooperative detach, `busy` while mounted, forced detach fenced |
+| Hot attach / detach | yes | cooperative detach for every volume kind: guest eject helper, `busy` while mounted, forced detach refused until the replica config is fenced (block-volume 13) | partial | Req 3: cooperative detach, `busy` while mounted, forced detach fenced |
 | Many volumes per instance | up to ~27 on Nitro (shared with ENIs) | one function each, limited by functions | spec | Req 3.1: at least 16 |
-| Multi-Attach | io1/io2, up to 16 Nitro instances, same AZ | no | spec | Req 4 (16 attachments, any server, rw/ro) |
+| Multi-Attach | io1/io2, up to 16 Nitro instances, same AZ | per-attachment keys, rw/ro mix, linearizable per block in the simulation (block-volume 18.1) | partial | Req 4 (16 attachments, any server, rw/ro) |
 | NVMe reservations for Multi-Attach (io2) | yes | no | later | virtio-blk has none; needs virtio-scsi or NVMe |
 | Volume types | gp3, gp2, io2 Block Express, io1, st1, sc1, standard | one kind | spec | Req 10.1: `general` (gp3-like), `provisioned` (io2-like); HDD classes later |
 | Provisioned IOPS and throughput | gp3: 3000 IOPS/125 MiB/s baseline, up to 80 000 IOPS/2000 MiB/s; io2 BX up to 256 000 IOPS/4000 MiB/s | no limits | spec | Req 10.2 (limits enforced at initiator and hold) |
 | Max volume size | 64 TiB (gp3, io2 BX) | 64 TiB mailbox limit | spec | Req 1.4: at least 16 TiB |
-| Elastic Volumes (grow, change type/IOPS live) | yes, once per 6 h | no | spec | Req 10.3-10.4 |
+| Elastic Volumes (grow, change type/IOPS live) | yes, once per 6 h | online grow with config-change interrupt, class and replica-count changes (block-volume 19) | partial | Req 10.3-10.4 |
 | Encryption at rest | KMS, opt-in or account default | always on, per-VM key | have / spec | Req 12: KMS per-lineage data key, rewrapped to each helm |
 | Encryption in transit | Nitro, in hardware | ciphertext only, over TLS 1.3 with server-bound certificates (block-volume 6) | have | Req 1.2 (ciphertext only), 13.1 (mTLS) |
 | Guest holds no key | yes | yes | have | oar-blk Req 2 |
@@ -67,7 +68,7 @@ Status: **have** (built), **partial**, **spec** (in block-volume-service),
 | Fast snapshot restore | yes | none | spec | Req 11.5 |
 | Provisioned rate for volume initialization | 100-300 MiB/s | none | spec | Req 11.4 (`hydrate_mib_per_s`) |
 | Volume clones (`CopyVolumes`) | yes (2025) | none | spec | Req 11.6 (reflink, same lineage) |
-| Live move between storage servers | internal to AWS | none | spec | Req 8 (live, planned primary handover, drain) |
+| Live move between storage servers | internal to AWS | secondary move, planned primary handover and drain in the simulation (block-volume 17.1) | partial | Req 8 (live, planned primary handover, drain) |
 | Move across AZ/region | via snapshot copy | none | no (one region) | |
 | EBS direct APIs (read snapshot blocks) | yes | none | no | |
 | Snapshot archive tier, Recycle Bin, Data Lifecycle Manager | yes | none | later / kythira | controller policy over Req 11 |

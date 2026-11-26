@@ -1,6 +1,6 @@
 # Implementation Plan — oar-net: the network data plane
 
-## Status: 19/22 tasks complete
+## Status: 21/22 tasks complete
 
 ## Tasks
 
@@ -220,7 +220,7 @@
   because a detached NIC's mapping may already be gone and billing follows
   the attachment helm made. `max_groups_per_nic` is not used until
   snooping (task 14).
-- [ ] 14. IGMP/MLD snooping, per-NIC group cap, join reports through helm
+- [x] 14. IGMP/MLD snooping, per-NIC group cap, join reports through helm
   and per-group VTEP lists. Needs the L3 parser. _Requirements: 10.5_
   - [x] 14.1 Data plane: `src/oar/net/igmp.*` reads IGMPv1-3 and
     MLDv1-2 reports and builds the gateway's general queries (tests,

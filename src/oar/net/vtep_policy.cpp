@@ -66,7 +66,11 @@ auto check_ingress(const geneve::Packet& pkt, const Ipv6Address& outer_src,
     if (src->owner_vtep != outer_src) {
         return std::unexpected(PolicyError::src_wrong_vtep);
     }
-    if (mac_at(pkt.inner, src_mac_offset) != src->mac) {
+    // The source NIC's MAC, or the VNI's gateway MAC on a routed frame;
+    // the source NIC is still the one the tunnel peer and the mapping
+    // authenticate, and the receiver re-runs the route lookup.
+    if (const MacAddress inner_src = mac_at(pkt.inner, src_mac_offset);
+        inner_src != src->mac && inner_src != mappings.gateway_mac(pkt.vni)) {
         return std::unexpected(PolicyError::src_mac_mismatch);
     }
 

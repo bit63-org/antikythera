@@ -214,7 +214,10 @@ auto host_bits_clear(const Ipv6Address& prefix, std::size_t length) noexcept -> 
 auto valid_route(const VpcRoute& r) noexcept -> bool {
     constexpr std::size_t ipv4_bits = 32;
     constexpr std::size_t ipv6_bits = 128;
-    if (r.target == geneve::nic_invalid || r.target == geneve::nic_broadcast) {
+    const bool target_ok =
+        r.local ? r.target == geneve::nic_invalid
+                : r.target != geneve::nic_invalid && r.target != geneve::nic_broadcast;
+    if (!target_ok) {
         return false;
     }
     return r.length <= (r.ipv6 ? ipv6_bits : ipv4_bits) && host_bits_clear(r.prefix, r.length);
@@ -301,6 +304,38 @@ auto validate_subnets(const VpcConfig& c) -> std::expected<void, VpcConfigError>
     return {};
 }
 
+auto validate_tables(const VpcConfig& c) -> std::expected<void, VpcConfigError> {
+    if (c.tables.empty() || c.tables.size() > max_vpc_tables ||
+        std::ranges::count_if(c.tables, &VpcRouteTable::main) != 1 ||
+        std::ranges::adjacent_find(c.tables, std::ranges::greater_equal{}, &VpcRouteTable::table) !=
+            c.tables.end()) {
+        return std::unexpected(VpcConfigError::bad_table);
+    }
+    std::size_t total = 0;
+    for (const VpcRouteTable& t : c.tables) {
+        total += t.routes.size();
+        if (total > max_vpc_routes ||
+            static_cast<std::size_t>(std::ranges::count_if(
+                t.routes, [](const VpcRoute& r) { return !r.local; })) > max_vpc_nic_routes) {
+            return std::unexpected(VpcConfigError::too_many_routes);
+        }
+        for (auto it = t.routes.begin(); it != t.routes.end(); ++it) {
+            const bool twice = std::any_of(t.routes.begin(), it, [&](const VpcRoute& r) {
+                return r.ipv6 == it->ipv6 && r.length == it->length && r.prefix == it->prefix;
+            });
+            if (!valid_route(*it) || twice) {
+                return std::unexpected(VpcConfigError::bad_route);
+            }
+        }
+    }
+    for (const VpcSubnet& s : c.subnets) {
+        if (!std::ranges::binary_search(c.tables, s.table, {}, &VpcRouteTable::table)) {
+            return std::unexpected(VpcConfigError::bad_subnet);
+        }
+    }
+    return {};
+}
+
 auto validate(const VpcConfig& c) -> std::expected<void, VpcConfigError> {
     const MacAddress& m = c.gateway_mac;
     if (all_zero(m) || (m[0] & group_bit) == group_bit || (m[0] & mac_local_bit) != mac_local_bit) {
@@ -324,33 +359,7 @@ auto validate(const VpcConfig& c) -> std::expected<void, VpcConfigError> {
     if (c.lease_seconds < min_lease_seconds || c.lease_seconds > max_lease_seconds) {
         return std::unexpected(VpcConfigError::bad_lease);
     }
-    if (c.routes.size() > max_vpc_routes) {
-        return std::unexpected(VpcConfigError::too_many_routes);
-    }
-    for (auto it = c.routes.begin(); it != c.routes.end(); ++it) {
-        const bool twice = std::any_of(c.routes.begin(), it, [&](const VpcRoute& r) {
-            return r.ipv6 == it->ipv6 && r.length == it->length && r.prefix == it->prefix;
-        });
-        if (!valid_route(*it) || twice) {
-            return std::unexpected(VpcConfigError::bad_route);
-        }
-    }
-    return {};
-}
-
-// The longest-prefix route for a packet's destination, if any.
-auto lookup_route(const VpcConfig& cfg, const packet::ParsedPacket& p) noexcept -> const VpcRoute* {
-    const bool v6 = p.family == packet::IpFamily::ipv6;
-    const std::span<const std::byte> dst =
-        v6 ? std::span<const std::byte>{p.dst6} : std::span<const std::byte>{p.dst4};
-    const VpcRoute* best = nullptr;
-    for (const VpcRoute& r : cfg.routes) {
-        if (r.ipv6 == v6 && (best == nullptr || r.length > best->length) &&
-            matches(dst, r.prefix, r.length)) {
-            best = &r;
-        }
-    }
-    return best;
+    return validate_tables(c);
 }
 
 // A DHCPv4 client message for this VNI's server (Requirement 12.3): UDP
@@ -383,6 +392,33 @@ auto dhcp6_client_message(const packet::ParsedPacket& p, const VpcConfig* cfg) -
 auto metadata_destination(const packet::ParsedPacket& p) noexcept -> bool {
     return is_ipv6(p) ? p.dst6 == metadata_ipv6 : p.dst4 == metadata_ipv4;
 }
+
+// The mapping as check_ingress sees it on receive: the snapshot, plus the
+// VNI's gateway MAC when this VTEP holds a config for it, so a routed
+// frame's source passes (vpc-subnets-routing design "Receive").
+class GatewayView final : public MappingView {
+public:
+    GatewayView(const MappingSnapshot& snap, std::uint32_t vni, const VpcConfig* cfg)
+        : _snap{&snap}, _vni{vni}, _cfg{cfg} {}
+
+    [[nodiscard]] auto lookup(geneve::NicId id) const -> std::optional<NicBinding> override {
+        return _snap->lookup(id);
+    }
+    [[nodiscard]] auto is_local(geneve::NicId id) const -> bool override {
+        return _snap->is_local(id);
+    }
+    [[nodiscard]] auto gateway_mac(std::uint32_t vni) const -> std::optional<MacAddress> override {
+        if (_cfg == nullptr || vni != _vni) {
+            return std::nullopt;
+        }
+        return _cfg->gateway_mac;
+    }
+
+private:
+    const MappingSnapshot* _snap;
+    std::uint32_t _vni;
+    const VpcConfig* _cfg;
+};
 
 auto valid_nic(geneve::NicId id) noexcept -> bool {
     return id != geneve::nic_invalid && id != geneve::nic_broadcast;
@@ -515,6 +551,8 @@ auto to_string(VpcConfigError e) noexcept -> const char* {
             return "bad_route";
         case VpcConfigError::bad_subnet:
             return "bad_subnet";
+        case VpcConfigError::bad_table:
+            return "bad_table";
     }
     return "unknown";
 }
@@ -542,7 +580,19 @@ auto VSwitch::set_vpc_config(std::uint32_t vni, const VpcConfig& config)
     if (auto ok = validate(config); !ok) {
         return ok;
     }
-    _vpc_configs.insert_or_assign(vni, config);
+    // validate() refused duplicate prefixes, so every insert succeeds.
+    VpcState state{.config = config, .tables = {}};
+    state.tables.reserve(config.tables.size());
+    for (const VpcRouteTable& t : config.tables) {
+        CompiledTable& compiled = state.tables.emplace_back();
+        compiled.table = t.table;
+        for (const VpcRoute& r : t.routes) {
+            const RouteTrie::Target target{.local = r.local, .nic = r.target};
+            static_cast<void>(r.ipv6 ? compiled.ipv6.insert(r.prefix, r.length, target)
+                                     : compiled.ipv4.insert(r.prefix, r.length, target));
+        }
+    }
+    _vpc_configs.insert_or_assign(vni, std::move(state));
     return {};
 }
 
@@ -551,6 +601,11 @@ auto VSwitch::clear_vpc_config(std::uint32_t vni) -> void {
 }
 
 auto VSwitch::vpc_config(std::uint32_t vni) const -> const VpcConfig* {
+    const VpcState* const state = vpc_state(vni);
+    return state == nullptr ? nullptr : &state->config;
+}
+
+auto VSwitch::vpc_state(std::uint32_t vni) const -> const VpcState* {
     const auto it = _vpc_configs.find(vni);
     return it == _vpc_configs.end() ? nullptr : &it->second;
 }
@@ -1363,12 +1418,13 @@ auto VSwitch::transmit(const TxFrame& tx) -> void {
         ++_counters.tx_drop_local_only;
         return;
     }
-    if (const VpcConfig* const cfg = vpc_config(binding->vni);
-        cfg != nullptr && dst_mac == cfg->gateway_mac) {
+    if (const VpcState* const state = vpc_state(binding->vni);
+        state != nullptr && dst_mac == state->config.gateway_mac) {
         if (metadata_destination(*pkt)) {
             handle_metadata(tx.source, *pkt);
         } else {
-            route(*snap, tx.source, *binding, *cfg, tx.frame, *pkt);
+            // subnet is set: a NIC without one was dropped above.
+            route(*snap, tx.source, *binding, *state, *subnet, tx.frame, *pkt);
         }
         return;
     }
@@ -1458,32 +1514,69 @@ auto VSwitch::send_unicast(const MappingSnapshot& snap, geneve::NicId src, std::
     return true;
 }
 
-auto VSwitch::route(const MappingSnapshot& snap, geneve::NicId src, const NicBinding& binding,
-                    const VpcConfig& cfg, std::span<const std::byte> frame,
-                    const packet::ParsedPacket& p) -> void {
-    constexpr std::size_t ipv4_ttl_offset = 8;
-    constexpr std::size_t ipv4_checksum_offset = 10;
-    constexpr std::size_t ipv6_hop_limit_offset = 7;
+auto VSwitch::route_target(const MappingSnapshot& snap, std::uint32_t vni, const VpcState& state,
+                           const VpcSubnet& subnet, const packet::ParsedPacket& p) const
+    -> std::expected<std::pair<geneve::NicId, NicBinding>, RouteDrop> {
     constexpr neighbor::Ipv4Address broadcast{std::byte{255}, std::byte{255}, std::byte{255},
                                               std::byte{255}};
     const bool v6 = is_ipv6(p);
-    const VpcRoute* const r = ip_multicast_destination(p) || (!v6 && p.dst4 == broadcast)
-                                  ? nullptr
-                                  : lookup_route(cfg, p);
-    if (r == nullptr) {
-        ++_counters.tx_drop_no_route;
+    if (ip_multicast_destination(p) || (!v6 && p.dst4 == broadcast)) {
+        return std::unexpected(RouteDrop::no_route);  // never routed
+    }
+    // validate() made every subnet's table exist.
+    const auto table =
+        std::ranges::lower_bound(state.tables, subnet.table, {}, &CompiledTable::table);
+    const auto target = v6 ? table->ipv6.lookup(p.dst6) : table->ipv4.lookup(p.dst4);
+    if (!target) {
+        return std::unexpected(RouteDrop::no_route);
+    }
+    if (target->local) {
+        // The NIC owning the destination, in any subnet of the VPC.
+        const auto nic = owner(vni, p, false);
+        const auto binding = nic ? snap.lookup(*nic) : std::nullopt;
+        if (!binding || binding->vni != vni) {
+            return std::unexpected(RouteDrop::no_neighbor);
+        }
+        return std::pair{*nic, *binding};
+    }
+    // A NIC route whose target is not mapped here matches nothing: EC2's
+    // blackhole (Requirement 4.5).
+    const auto binding = snap.lookup(target->nic);
+    if (!binding || binding->vni != vni) {
+        return std::unexpected(RouteDrop::route_target);
+    }
+    return std::pair{target->nic, *binding};
+}
+
+auto VSwitch::route(const MappingSnapshot& snap, geneve::NicId src, const NicBinding& binding,
+                    const VpcState& state, const VpcSubnet& subnet,
+                    std::span<const std::byte> frame, const packet::ParsedPacket& p) -> void {
+    constexpr std::size_t ipv4_ttl_offset = 8;
+    constexpr std::size_t ipv4_checksum_offset = 10;
+    constexpr std::size_t ipv6_hop_limit_offset = 7;
+    const auto target = route_target(snap, binding.vni, state, subnet, p);
+    if (!target) {
+        switch (target.error()) {
+            case RouteDrop::no_route:
+                ++_counters.tx_drop_no_route;
+                break;
+            case RouteDrop::no_neighbor:
+                ++_counters.tx_drop_no_neighbor;
+                break;
+            case RouteDrop::route_target:
+                ++_counters.tx_drop_route_target;
+                break;
+        }
         return;
     }
-    const auto target = snap.lookup(r->target);
-    if (!target || target->vni != binding.vni) {
-        ++_counters.tx_drop_route_target;
-        return;
-    }
-    if (r->target == src) {
+    const auto& [dst, dst_binding] = *target;
+    if (dst == src) {
         ++_counters.tx_drop_hairpin;
         return;
     }
-    if (target->source_dest_check && owner(binding.vni, p, false) != r->target) {
+    // Requirement 12.7: a route leads only to a NIC that owns the
+    // destination or has turned its check off.
+    if (dst_binding.source_dest_check && owner(binding.vni, p, false) != dst) {
         ++_counters.tx_drop_ip_dst;
         return;
     }
@@ -1491,12 +1584,15 @@ auto VSwitch::route(const MappingSnapshot& snap, geneve::NicId src, const NicBin
         ++_counters.tx_drop_ttl;
         return;
     }
-    // A router's rewrite: the target's MAC, one hop fewer. The source MAC
-    // stays the sender's (see the header).
+    // A router's rewrite: the target's MAC from the gateway's, one hop
+    // fewer. The gateway source MAC tells the receiving VTEP the frame was
+    // routed (vpc-subnets-routing design "Decisions").
     std::vector<std::byte> out{frame.begin(), frame.end()};
-    std::copy(target->mac.begin(), target->mac.end(), out.begin());
+    std::copy(dst_binding.mac.begin(), dst_binding.mac.end(), out.begin());
+    std::copy(state.config.gateway_mac.begin(), state.config.gateway_mac.end(),
+              out.begin() + static_cast<std::ptrdiff_t>(src_mac_offset));
     const auto ip_at = static_cast<std::size_t>(p.ip.data() - frame.data());
-    if (v6) {
+    if (is_ipv6(p)) {
         out[ip_at + ipv6_hop_limit_offset] = std::byte(p.hop_limit - 1);
     } else {
         // RFC 1624 incremental update: TTL is the high byte of its 16-bit word.
@@ -1511,9 +1607,25 @@ auto VSwitch::route(const MappingSnapshot& snap, geneve::NicId src, const NicBin
         out[c] = std::byte(updated >> 8U);
         out[c + 1] = std::byte(updated & 0xFFU);
     }
-    if (send_unicast(snap, src, binding.vni, r->target, out)) {
+    if (send_unicast(snap, src, binding.vni, dst, out)) {
         ++_counters.tx_routed;
     }
+}
+
+auto VSwitch::routed_to(const MappingSnapshot& snap, const geneve::Packet& packet,
+                        const NicBinding& src, geneve::NicId dst) const -> bool {
+    const VpcState* const state = vpc_state(packet.vni);
+    const VpcSubnet* const subnet = subnet_of(src);
+    if (state == nullptr || subnet == nullptr ||
+        packet::ethertype(packet.inner) == neighbor::ethertype_arp) {
+        return false;  // the router forwards only IP
+    }
+    const auto p = packet::parse(packet.inner);
+    if (!p) {
+        return false;
+    }
+    const auto target = route_target(snap, packet.vni, *state, *subnet, *p);
+    return target && target->first == dst;
 }
 
 auto VSwitch::handle_arp(const MappingSnapshot& snap, geneve::NicId src, const NicBinding& binding,
@@ -1674,7 +1786,9 @@ auto VSwitch::receive(const geneve::Packet& packet, const Ipv6Address& outer_src
     -> std::expected<geneve::NicId, PolicyError> {
     ++_counters.rx_frames;
     const auto snap = _mappings->snapshot();
-    const auto dst = check_ingress(packet, outer_src, *snap);
+    const VpcConfig* const cfg = vpc_config(packet.vni);
+    const GatewayView view{*snap, packet.vni, cfg};
+    const auto dst = check_ingress(packet, outer_src, view);
     if (!dst) {
         ++_counters.rx_drop_policy.at(static_cast<std::size_t>(dst.error()));
         return dst;
@@ -1682,15 +1796,25 @@ auto VSwitch::receive(const geneve::Packet& packet, const Ipv6Address& outer_src
     // In a VPC with a config, judged by this VTEP's own mapping and config:
     // the source NIC must be in a known subnet, and a switched frame stays
     // inside it (vpc-subnets-routing Requirements 2.6 and 6.4).
-    const bool subnets = vpc_config(packet.vni) != nullptr;
-    std::uint64_t subnet = 0;
+    const bool subnets = cfg != nullptr;
+    std::optional<NicBinding> src_binding;
     if (subnets) {
-        const auto src_binding = snap->lookup(packet.nics->src);
+        src_binding = snap->lookup(packet.nics->src);
         if (!src_binding || subnet_of(*src_binding) == nullptr) {
             ++_counters.rx_drop_no_subnet;
             return dst;
         }
-        subnet = src_binding->subnet_id;
+    }
+    const std::uint64_t subnet = src_binding ? src_binding->subnet_id : 0;
+    // A routed frame: check_ingress accepted the gateway MAC as its source
+    // only because this VTEP holds a config with that MAC (Requirement
+    // 6.5). The router never replicates, and this VTEP's own lookup must
+    // lead to the same NIC.
+    const bool routed = subnets && mac_at(packet.inner, src_mac_offset) == cfg->gateway_mac;
+    if (routed &&
+        (*dst == geneve::nic_broadcast || !routed_to(*snap, packet, *src_binding, *dst))) {
+        ++_counters.rx_drop_route_mismatch;
+        return dst;
     }
     if (*dst == geneve::nic_broadcast) {
         const auto policy_it = _group_policies.find(packet.vni);
@@ -1719,7 +1843,7 @@ auto VSwitch::receive(const geneve::Packet& packet, const Ipv6Address& outer_src
         }
         return dst;
     }
-    if (subnets && snap->lookup(*dst)->subnet_id != subnet) {
+    if (subnets && !routed && snap->lookup(*dst)->subnet_id != subnet) {
         ++_counters.rx_drop_cross_subnet;
         return dst;
     }

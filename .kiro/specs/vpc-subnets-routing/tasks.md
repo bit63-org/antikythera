@@ -1,6 +1,6 @@
 # Implementation Plan — VPC subnets and the implicit router
 
-## Status: 4/12 tasks complete
+## Status: 5/12 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -51,7 +51,7 @@ end) for task 11.
   paths. Mapping and config applied in either order give the same
   state. Unit tests per counter; `fuzz_vswitch` with three subnets.
   _Requirements: 2.6, 3, 5.6, 6.4, 6.6, 6.7_ (cloud)
-- [ ] 5. The distributed router: `RouteTrie` per table and family
+- [x] 5. The distributed router: `RouteTrie` per table and family
   (tests and a fuzz target against a naive scan), route lookup in the
   sender's subnet's table, `local` → owning NIC, NIC routes as oar-net
   Requirement 12.7, gateway MAC as source on routed frames, TTL and

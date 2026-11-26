@@ -37,19 +37,10 @@ constexpr unsigned byte_bits = 8;
 constexpr std::size_t mac_fn_high = 4;
 constexpr std::size_t mac_fn_low = 5;
 
-// The VSwitch's config from a decoded VpcConfig version 2 frame, or
-// nothing for a frame using what the VSwitch cannot apply yet: until the
-// router lands (vpc-subnets-routing task 5) a table may hold only its
-// `local` routes. decode_vpc_config already checked every value; the
-// VSwitch checks the result again.
-auto to_vpc_config(const proto::VpcConfigFrame& f) -> std::optional<VpcConfig> {
-    if (std::ranges::any_of(f.tables, [](const proto::VpcRouteTable& t) {
-            return std::ranges::any_of(t.routes, [](const proto::VpcRoute& r) {
-                return r.kind != proto::RouteKind::local;
-            });
-        })) {
-        return std::nullopt;
-    }
+// The VSwitch's config from a decoded VpcConfig version 2 frame.
+// decode_vpc_config already checked every value; the VSwitch checks the
+// result again.
+auto to_vpc_config(const proto::VpcConfigFrame& f) -> VpcConfig {
     VpcConfig c{.gateway_mac = f.gateway_mac,
                 .ipv4_blocks = {},
                 .ipv6_block = f.ipv6_block,
@@ -58,7 +49,7 @@ auto to_vpc_config(const proto::VpcConfigFrame& f) -> std::optional<VpcConfig> {
                 .dns6 = f.dns6,
                 .domain = f.domain,
                 .lease_seconds = f.lease_seconds,
-                .routes = {}};
+                .tables = {}};
     for (const auto& b : f.ipv4_blocks) {
         c.ipv4_blocks.push_back({.address = b.prefix, .length = b.length});
     }
@@ -68,6 +59,20 @@ auto to_vpc_config(const proto::VpcConfigFrame& f) -> std::optional<VpcConfig> {
                              .gateway = proto::vpc_subnet_gateway(s),
                              .ipv6_prefix = s.ipv6_prefix,
                              .table = s.table});
+    }
+    for (const auto& t : f.tables) {
+        VpcRouteTable& table = c.tables.emplace_back();
+        table.table = t.table;
+        table.main = t.main;
+        for (const auto& r : t.routes) {
+            const bool local = r.kind == proto::RouteKind::local;
+            table.routes.push_back(
+                {.ipv6 = r.family == proto::RouteFamily::ipv6,
+                 .prefix = r.prefix,
+                 .length = r.length,
+                 .target = local ? geneve::nic_invalid : geneve::NicId{r.target_nic},
+                 .local = local});
+        }
     }
     return c;
 }
@@ -427,12 +432,7 @@ auto NetRole::vpc_config(std::span<const std::byte> frame) -> oar::Status {
             return oar::Status::failed;
         }
     }
-    const auto vswitch_config = to_vpc_config(*config);
-    if (!vswitch_config) {
-        ++_counters.vpc_unsupported;
-        return oar::Status::failed;
-    }
-    if (!_vswitch->set_vpc_config(config->vni, *vswitch_config)) {
+    if (!_vswitch->set_vpc_config(config->vni, to_vpc_config(*config))) {
         ++_counters.vpc_rejected;
         return oar::Status::failed;
     }

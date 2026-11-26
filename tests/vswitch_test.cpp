@@ -1237,7 +1237,8 @@ auto config() -> net::VpcConfig {
         .dns4 = {{std::byte{10}, std::byte{0}, std::byte{0}, std::byte{2}}},
         .dns6 = {},
         .domain = "ec2.internal",
-        .lease_seconds = lease};
+        .lease_seconds = lease,
+        .tables = {{.table = 1, .main = true, .routes = {}}}};
 }
 
 auto bcast_ip() -> nb::Ipv4Address {
@@ -1882,9 +1883,9 @@ auto far6() -> net::Ipv6Address {
 // fd99::/16 to b.
 auto routed_config() -> net::VpcConfig {
     auto c = gateway::config();
-    c.routes = {route4({}, 0, nic_b),
-                route4(addr4(192, 168, 0, 0), 16, nic_c),
-                {.ipv6 = true, .prefix = far6(), .length = 16, .target = nic_b}};
+    c.tables[0].routes = {route4({}, 0, nic_b),
+                          route4(addr4(192, 168, 0, 0), 16, nic_c),
+                          {.ipv6 = true, .prefix = far6(), .length = 16, .target = nic_b}};
     return c;
 }
 
@@ -1912,28 +1913,53 @@ struct Routing : Fixture {
 BOOST_AUTO_TEST_CASE(route_validation, *boost::unit_test::timeout(unit_timeout_seconds)) {
     using net::VpcConfigError;
     auto c = routed_config();
-    c.routes.push_back(route4(addr4(10, 1, 0, 1), 16, nic_c));  // host bits
+    c.tables[0].routes.push_back(route4(addr4(10, 1, 0, 1), 16, nic_c));  // host bits
     BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_route));
     c = routed_config();
-    c.routes.push_back(route4({}, 33, nic_c));
+    c.tables[0].routes.push_back(route4({}, 33, nic_c));
     BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_route));
     c = routed_config();
-    c.routes.push_back(route4({}, 0, nic_c));  // the same prefix twice
+    c.tables[0].routes.push_back(route4({}, 0, nic_c));  // the same prefix twice
     BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_route));
     c = routed_config();
-    c.routes.push_back(route4(addr4(172, 16, 0, 0), 12, geneve::nic_invalid));
+    c.tables[0].routes.push_back(route4(addr4(172, 16, 0, 0), 12, geneve::nic_invalid));
     BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_route));
     c = routed_config();
-    c.routes.push_back(route4(addr4(172, 16, 0, 0), 12, geneve::nic_broadcast));
+    c.tables[0].routes.push_back(route4(addr4(172, 16, 0, 0), 12, geneve::nic_broadcast));
     BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_route));
     c = routed_config();
-    for (std::size_t i = c.routes.size(); i <= net::max_vpc_routes; ++i) {
-        c.routes.push_back(route4(addr4(100, static_cast<std::uint8_t>(i), 0, 0), 16, nic_b));
+    for (std::size_t i = c.tables[0].routes.size(); i <= net::max_vpc_nic_routes; ++i) {
+        c.tables[0].routes.push_back(route4(
+            addr4(100, static_cast<std::uint8_t>(i >> 8U), static_cast<std::uint8_t>(i & 0xFFU), 0),
+            24, nic_b));
     }
     BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::too_many_routes));
+    c.tables[0].routes.pop_back();  // 1,000 NIC routes in one table fit
+    BOOST_TEST(sw.set_vpc_config(vpc, c).has_value());
+    // Tables: one main, ascending, and every subnet's table present.
+    c = routed_config();
+    c.tables[0].main = false;
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_table));
+    c = routed_config();
+    c.tables.push_back({.table = 1, .main = false, .routes = {}});
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_table));
+    c.tables[1].table = 2;
+    c.tables[1].main = true;
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_table));
+    c = routed_config();
+    c.tables.clear();
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_table));
+    c = routed_config();
+    c.subnets[0].table = 9;
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_subnet));
+    // A local route names no NIC; a NIC route names one.
+    c = routed_config();
+    c.tables[0].routes.push_back(
+        {.ipv6 = false, .prefix = {}, .length = 8, .target = nic_b, .local = true});
+    BOOST_TEST((sw.set_vpc_config(vpc, c).error() == VpcConfigError::bad_route));
     // The same prefix in the other family is a different route.
     c = routed_config();
-    c.routes.push_back({.ipv6 = true, .prefix = {}, .length = 0, .target = nic_c});
+    c.tables[0].routes.push_back({.ipv6 = true, .prefix = {}, .length = 0, .target = nic_c});
     BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
     BOOST_TEST((*sw.vpc_config(vpc) == c));
 }
@@ -1946,7 +1972,8 @@ BOOST_FIXTURE_TEST_CASE(routed_to_local_and_remote_targets, Routing,
     BOOST_REQUIRE(port_b.frames.size() == 1);
     const auto& local = port_b.frames[0];
     BOOST_TEST(std::ranges::equal(std::span{local}.first(mac_size), mac_of(nic_b)));
-    BOOST_TEST(std::ranges::equal(std::span{local}.subspan(mac_size, mac_size), mac_of(nic_a)));
+    // Routed frames come from the gateway's MAC.
+    BOOST_TEST(std::ranges::equal(std::span{local}.subspan(mac_size, mac_size), gateway::gw_mac()));
     BOOST_TEST(std::to_integer<int>(local[ttl_at]) == fr::default_ttl - 1);
     BOOST_TEST(valid_ipv4_checksum(local));
 
@@ -1980,35 +2007,35 @@ BOOST_FIXTURE_TEST_CASE(unroutable_packets_dropped, Routing,
     BOOST_TEST(sw.counters().tx_drop_no_route == 0);
 
     auto c = gateway::config();
-    c.routes = {route4(addr4(192, 168, 0, 0), 16, nic_c)};
+    c.tables[0].routes = {route4(addr4(192, 168, 0, 0), 16, nic_c)};
     BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
     // No matching route, and no IPv6 routes at all.
     send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8)));
     send(nic_a, udp6(gateway::gw_mac(), mac_of(nic_a), ip6(11), far6()));
     // Broadcast and multicast destinations are never routed.
-    c.routes = {route4({}, 0, nic_b)};
+    c.tables[0].routes = {route4({}, 0, nic_b)};
     BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
     send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(255, 255, 255, 255)));
     send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(239, 0, 0, 1)));
     BOOST_TEST(sw.counters().tx_drop_no_route == 4);
 
     // A target this VTEP does not map, or one in another VPC.
-    c.routes = {route4({}, 0, nic_unmapped)};
+    c.tables[0].routes = {route4({}, 0, nic_unmapped)};
     BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
     send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8)));
-    c.routes = {route4({}, 0, nic_x)};
+    c.tables[0].routes = {route4({}, 0, nic_x)};
     BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
     send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8)));
     BOOST_TEST(sw.counters().tx_drop_route_target == 2);
 
     // A target that keeps its check refuses addresses it does not own.
-    c.routes = {route4({}, 0, nic_d)};
+    c.tables[0].routes = {route4({}, 0, nic_d)};
     BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
     send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), addr4(8, 8, 8, 8)));
     BOOST_TEST(sw.counters().tx_drop_ip_dst == 1);
 
     // The target sending to its own route.
-    c.routes = {route4({}, 0, nic_b)};
+    c.tables[0].routes = {route4({}, 0, nic_b)};
     BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
     send(nic_b, udp4(gateway::gw_mac(), mac_of(nic_b), ip4(22), addr4(8, 8, 8, 8)));
     BOOST_TEST(sw.counters().tx_drop_hairpin == 1);
@@ -2023,7 +2050,7 @@ BOOST_FIXTURE_TEST_CASE(unroutable_packets_dropped, Routing,
     last_hop[ip_at + fr::ipv4_checksum_offset] = static_cast<std::byte>(sum >> 8U);
     last_hop[ip_at + fr::ipv4_checksum_offset + 1] = static_cast<std::byte>(sum & 0xFFU);
     send(nic_a, last_hop);
-    c.routes.push_back({.ipv6 = true, .prefix = far6(), .length = 16, .target = nic_b});
+    c.tables[0].routes.push_back({.ipv6 = true, .prefix = far6(), .length = 16, .target = nic_b});
     BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
     send(nic_a, fr::ipv6(gateway::gw_mac(), mac_of(nic_a), ip6(11), far6(), pk::ipproto_udp,
                          fr::udp(test_port, test_port, {}), 1));
@@ -2366,11 +2393,31 @@ auto subnet(std::uint64_t id, std::uint8_t base, std::optional<std::uint8_t> ipv
             .table = 1};
 }
 
+auto local_route(bool ipv6) -> net::VpcRoute {
+    net::VpcRoute r{.ipv6 = ipv6, .prefix = {}, .length = 8, .target = {}, .local = true};
+    r.prefix[0] = std::byte{10};
+    if (ipv6) {
+        r.prefix[0] = ula_prefix;
+        r.prefix[1] = std::byte{0x10};
+        r.length = net::ipv6_block_length;
+    }
+    return r;
+}
+
+// Table 1 (main) holds the two local routes; table 2 also sends subnet_a
+// (10.0.0.0/27) through d, a middlebox.
 auto three_subnets() -> net::VpcConfig {
     auto c = gateway::config();
     c.subnets = {subnet(subnet_a, 0, 0), subnet(subnet_b, 32, 1), subnet(subnet_c, 64, {})};
+    net::VpcRoute middlebox{.ipv6 = false, .prefix = {}, .length = 27, .target = nic_d};
+    middlebox.prefix[0] = std::byte{10};
+    c.tables = {
+        {.table = 1, .main = true, .routes = {local_route(false), local_route(true)}},
+        {.table = 2, .main = false, .routes = {local_route(false), local_route(true), middlebox}}};
     return c;
 }
+
+constexpr std::size_t ttl_offset = ethernet_header_size + 8;
 
 struct SubnetFixture : Fixture {
     SubnetFixture() {
@@ -2528,6 +2575,94 @@ BOOST_FIXTURE_TEST_CASE(the_querier_speaks_from_each_subnets_gateway, SubnetFixt
     };
     BOOST_TEST((query_source(port_a) == v4(1)));
     BOOST_TEST((query_source(port_b) == v4(33)));
+}
+
+BOOST_FIXTURE_TEST_CASE(the_router_joins_subnets, SubnetFixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    configure();
+    // a (subnet_a) to b (subnet_b, here) and c (subnet_b, peer VTEP)
+    // through the gateway: the local route finds each owner.
+    send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), ip4(22)));
+    BOOST_REQUIRE(port_b.frames.size() == 1U);
+    const auto& routed = port_b.frames[0];
+    BOOST_TEST(std::ranges::equal(std::span{routed}.first(mac_size), mac_of(nic_b)));
+    BOOST_TEST(
+        std::ranges::equal(std::span{routed}.subspan(mac_size, mac_size), gateway::gw_mac()));
+    BOOST_TEST(std::to_integer<int>(routed[ttl_offset]) == fr::default_ttl - 1);
+    send(nic_a, udp6(gateway::gw_mac(), mac_of(nic_a), ip6(11), ip6(33)));
+    BOOST_REQUIRE(underlay.sent.size() == 1U);
+    BOOST_TEST((underlay.sent[0].nics == geneve::NicPair{.src = nic_a, .dst = nic_c}));
+    BOOST_TEST(std::ranges::equal(std::span{underlay.sent[0].frame}.subspan(mac_size, mac_size),
+                                  gateway::gw_mac()));
+    BOOST_TEST(sw.counters().tx_routed == 2);
+    // A destination inside the VPC that no NIC owns.
+    send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), v4(99)));
+    BOOST_TEST(sw.counters().tx_drop_no_neighbor == 1);
+    // Outside every route: no default route here.
+    send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), nb::Ipv4Address{std::byte{8}}));
+    BOOST_TEST(sw.counters().tx_drop_no_route == 1);
+}
+
+BOOST_FIXTURE_TEST_CASE(a_middlebox_route_steers_one_subnets_traffic, SubnetFixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto d = entry(nic_d, third_tail, subnet_a);
+    d.source_dest_check = false;  // an appliance
+    BOOST_REQUIRE(table.apply(
+        {.vni = vpc,
+         .version = 3,
+         .entries = {entry(nic_a, self_tail, subnet_a), entry(nic_b, self_tail, subnet_b),
+                     entry(nic_c, peer_tail, subnet_b), d, entry(nic_e, peer_tail, subnet_b)}}));
+    auto c = three_subnets();
+    c.subnets[1].table = 2;  // subnet_b uses the middlebox table
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
+    send(nic_b, udp4(gateway::gw_mac(), mac_of(nic_b), ip4(22), ip4(11)));
+    BOOST_TEST(port_a.frames.empty());
+    BOOST_REQUIRE(underlay.sent.size() == 1U);
+    BOOST_TEST((underlay.sent[0].nics == geneve::NicPair{.src = nic_b, .dst = nic_d}));
+    // a's way back uses the main table: straight to b.
+    send(nic_a, udp4(gateway::gw_mac(), mac_of(nic_a), ip4(11), ip4(22)));
+    BOOST_TEST(port_b.frames.size() == 1U);
+    // Inside its own subnet b still switches at L2, whatever table 2 says.
+    send(nic_b, frame(mac_of(nic_c), mac_of(nic_b)));
+    BOOST_REQUIRE(underlay.sent.size() == 2U);
+    BOOST_TEST((underlay.sent[1].nics.dst == nic_c));
+}
+
+BOOST_FIXTURE_TEST_CASE(routed_frames_are_checked_on_receive, SubnetFixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    const auto routed = [](NicId src, NicId dst, const nb::Ipv4Address& to) {
+        return Inbound{
+            src, dst, vpc,
+            udp4(mac_of(dst), gateway::gw_mac(), ip4(static_cast<std::uint8_t>(src.value)), to)};
+    };
+    // Without a config here the gateway MAC is nobody's source.
+    const auto c_to_a = routed(nic_c, nic_a, ip4(11));
+    BOOST_TEST(!sw.receive(c_to_a.packet, vtep(peer_tail)).has_value());
+    configure();
+    // c (subnet_b, main table) to a: the local route leads to a.
+    BOOST_TEST(sw.receive(c_to_a.packet, vtep(peer_tail)).has_value());
+    BOOST_REQUIRE(port_a.frames.size() == 1U);
+    // A forged routed frame for an address a does not own.
+    const auto c_to_a_wrong = routed(nic_c, nic_a, ip4(22));
+    BOOST_TEST(sw.receive(c_to_a_wrong.packet, vtep(peer_tail)).has_value());
+    // With subnet_b on the middlebox table, a frame straight to a skips d.
+    auto c = three_subnets();
+    c.subnets[1].table = 2;
+    BOOST_REQUIRE(sw.set_vpc_config(vpc, c));
+    BOOST_TEST(sw.receive(c_to_a.packet, vtep(peer_tail)).has_value());
+    // The router never replicates, and forwards only IP.
+    const Inbound replica{nic_c, geneve::nic_broadcast, vpc,
+                          udp4(mdns_mac(), gateway::gw_mac(), ip4(33),
+                               {std::byte{224}, std::byte{0}, std::byte{0}, std::byte{251}})};
+    BOOST_TEST(sw.receive(replica.packet, vtep(peer_tail)).has_value());
+    auto arp = arp_request(nic_c, ip4(33), ip4(22));
+    std::ranges::copy(mac_of(nic_b), arp.begin());
+    std::ranges::copy(gateway::gw_mac(), arp.begin() + mac_size);
+    const Inbound routed_arp{nic_c, nic_b, vpc, arp};
+    BOOST_TEST(sw.receive(routed_arp.packet, vtep(peer_tail)).has_value());
+    BOOST_TEST(sw.counters().rx_drop_route_mismatch == 4);
+    BOOST_TEST(port_a.frames.size() == 1U);
+    BOOST_TEST(port_b.frames.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

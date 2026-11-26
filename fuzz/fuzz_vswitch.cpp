@@ -22,11 +22,16 @@
 //         gateway's address) may only reach the asking NIC. Its metadata
 //         endpoint must only hear from the NIC a packet came from, with
 //         that NIC's own source address. poll() runs between records.
-//         vpc_one has three subnets (vpc-subnets-routing Requirements 3
-//         and 6): a alone in A, b and remote c in B, remote e in C. No
-//         frame crosses from one subnet to another, on transmit or on
-//         receive.
+//         vpc_one has three subnets (vpc-subnets-routing Requirements 3,
+//         6 and 8.1): a alone in A, b and remote c in B, remote e in C.
+//         Table 1 (A and B) holds the local routes and 10.0.2.0/25 to e;
+//         table 2 (C) the local routes and 10.0.1.0/24 to b. A frame
+//         crosses subnets only through the router: then it carries the
+//         gateway MAC as source, a TTL one lower than the sender's (on
+//         transmit), and reaches only the NIC the source subnet's table
+//         names, on transmit and on receive.
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -135,6 +140,60 @@ auto owns_addresses(std::size_t index) -> bool {
 auto same_subnet(std::size_t sender, std::size_t receiver) -> bool {
     return sender >= nic_count || nic_vnis.at(sender) != vpc_one ||
            nic_subnets.at(sender) == nic_subnets.at(receiver);
+}
+
+constexpr net::MacAddress gateway_mac{locally_administered, std::byte{0xaa}, std::byte{0},
+                                      std::byte{0},         std::byte{0},    std::byte{1}};
+constexpr std::size_t src_mac_at = 6;
+constexpr std::size_t ipv6_block_bytes = 7;
+
+// The NIC the source subnet's table sends `p` to, or nic_count for none:
+// an independent model of the router's lookup (Requirement 8.1).
+auto expected_target(std::size_t sender, const pk::ParsedPacket& p) -> std::size_t {
+    if (sender >= nic_count || nic_vnis.at(sender) != vpc_one) {
+        return nic_count;
+    }
+    const bool table2 = nic_subnets.at(sender) == 2;
+    if (p.family == pk::IpFamily::ipv4) {
+        const auto& d = p.dst4;
+        if (d[0] != std::byte{10} || d[1] != std::byte{0}) {
+            return nic_count;
+        }
+        if (!table2 && d[2] == std::byte{2} && d[3] < std::byte{128}) {
+            return e_index;
+        }
+        if (table2 && d[2] == std::byte{1}) {
+            return b_index;
+        }
+    } else {
+        const auto block = ip6_of(0);
+        if (!std::equal(block.begin(), block.begin() + ipv6_block_bytes, p.dst6.begin())) {
+            return nic_count;
+        }
+    }
+    for (const std::size_t i : {b_index, remote_index, e_index}) {  // the local route
+        if (p.family == pk::IpFamily::ipv4 ? p.dst4 == ip4_of(i) : p.dst6 == ip6_of(i)) {
+            return i;
+        }
+    }
+    return nic_count;
+}
+
+// Whether `frame` from `sender` may reach `receiver`: switched inside the
+// sender's subnet, or routed to the table's target with the gateway MAC
+// as source and (when the sent frame `original` is known) one hop fewer.
+auto from_gateway(std::span<const std::byte> frame) -> bool {
+    return std::equal(gateway_mac.begin(), gateway_mac.end(), frame.begin() + src_mac_at);
+}
+
+auto reach_ok(std::size_t sender, std::size_t receiver, std::span<const std::byte> frame,
+              const pk::ParsedPacket* original) -> bool {
+    if (!from_gateway(frame)) {
+        return same_subnet(sender, receiver);
+    }
+    const auto p = pk::parse(frame);
+    return p && expected_target(sender, *p) == receiver &&
+           (original == nullptr || original->hop_limit == p->hop_limit + 1);
 }
 
 // Requirement 11: a forwarded frame is ARP, or IP from the true sender's
@@ -248,8 +307,7 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
     net::Ipv6Address block6 = ip6_of(0);
     block6[ipv6_last] = std::byte{0};
     net::VpcConfig config{
-        .gateway_mac = {locally_administered, std::byte{0xaa}, std::byte{0}, std::byte{0},
-                        std::byte{0}, std::byte{1}},
+        .gateway_mac = gateway_mac,
         .ipv4_blocks = {{.address = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}},
                          .length = 16}},
         .ipv6_block = block6,
@@ -257,7 +315,24 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
         .dns4 = {},
         .dns6 = {},
         .domain = "fuzz.internal",
-        .lease_seconds = 60};
+        .lease_seconds = 60,
+        .tables = {}};
+    const auto route4 = [](std::uint8_t third, std::uint8_t length, std::size_t target) {
+        return net::VpcRoute{.ipv6 = false,
+                             .prefix = {std::byte{10}, std::byte{0}, std::byte{third}},
+                             .length = length,
+                             .target = geneve::NicId{nic_ids.at(target)}};
+    };
+    const net::VpcRoute local4{.ipv6 = false,
+                               .prefix = {std::byte{10}},
+                               .length = 16,
+                               .target = geneve::nic_invalid,
+                               .local = true};
+    const net::VpcRoute local6{
+        .ipv6 = true, .prefix = block6, .length = 56, .target = geneve::nic_invalid, .local = true};
+    config.tables = {
+        {.table = 1, .main = true, .routes = {local4, local6, route4(2, 25, e_index)}},
+        {.table = 2, .main = false, .routes = {local4, local6, route4(1, 24, b_index)}}};
     for (std::uint8_t i = 0; i < subnet_count; ++i) {
         net::Ipv6Address prefix6 = block6;
         prefix6[7] = std::byte{i};
@@ -267,7 +342,7 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
                       .length = 24},
              .gateway = {std::byte{10}, std::byte{0}, std::byte{i}, std::byte{254}},
              .ipv6_prefix = prefix6,
-             .table = 1});
+             .table = static_cast<std::uint16_t>(i == 2 ? 2 : 1)});
     }
     if (!sw.set_vpc_config(vpc_one, config)) {
         std::abort();
@@ -295,6 +370,8 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
         if (transmit) {
             vni = nic_vnis.at(src);
             sw.transmit({.source = geneve::NicId{nic_ids.at(src)}, .frame = bytes});
+            const auto original = pk::parse(bytes);
+            const pk::ParsedPacket* const sent_ip = original ? &*original : nullptr;
             for (const auto& s : underlay.sent) {
                 if (src == dead_index || s.vni != vni || s.nics.src.value != nic_ids.at(src) ||
                     !forwarded_ok(s.frame, src)) {
@@ -304,14 +381,15 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
                 // to the peer VTEP, which hosts a NIC of B and of C.
                 const std::size_t dst = index_of(s.nics.dst);
                 if (s.nics.dst == geneve::nic_broadcast
-                        ? vni == vpc_one && nic_subnets.at(src) == 0
-                        : dst >= nic_count || !same_subnet(src, dst)) {
+                        ? (vni == vpc_one && nic_subnets.at(src) == 0) || from_gateway(s.frame)
+                        : dst >= nic_count || !reach_ok(src, dst, s.frame, sent_ip)) {
                     std::abort();
                 }
             }
             for (std::size_t i = 0; i < nic_count; ++i) {
                 if (i != src && ports.at(i).frames != before.at(i) &&
-                    (!forwarded_ok(ports.at(i).last, src) || !same_subnet(src, i))) {
+                    (!forwarded_ok(ports.at(i).last, src) ||
+                     !reach_ok(src, i, ports.at(i).last, sent_ip))) {
                     std::abort();
                 }
             }
@@ -342,7 +420,8 @@ auto fuzz_switch(std::span<const std::byte> in) -> void {
                 const std::size_t sender = pkt->nics ? index_of(pkt->nics->src) : nic_count;
                 for (std::size_t i = 0; i < nic_count; ++i) {
                     if (ports.at(i).frames != before.at(i) &&
-                        (!forwarded_ok(ports.at(i).last, sender) || !same_subnet(sender, i))) {
+                        (!forwarded_ok(ports.at(i).last, sender) ||
+                         !reach_ok(sender, i, ports.at(i).last, nullptr))) {
                         std::abort();
                     }
                 }

@@ -779,13 +779,16 @@ BOOST_FIXTURE_TEST_CASE(vpc_configs_are_checked, One,
     BOOST_TEST(role->counters().vpc_rejected == 0U);
     BOOST_TEST(role->vswitch().vpc_config(vpc)->lease_seconds == 7200U);
 
-    // Until the VSwitch applies route tables (vpc-subnets-routing task 5),
-    // a frame with a NIC route is refused whole, and the applied config
-    // stays.
-    BOOST_TEST((role->vpc_config(signed_vpc(server_one, 4, 600, true)) == Status::failed));
-    BOOST_TEST(role->counters().vpc_unsupported == 1U);
-    BOOST_TEST(role->vswitch().vpc_config(vpc)->lease_seconds == 7200U);
-    BOOST_TEST(role->vswitch().vpc_config(vpc)->routes.empty());
+    // Route tables carry their local and NIC routes into the VSwitch.
+    BOOST_TEST((role->vpc_config(signed_vpc(server_one, 4, 600, true)) == Status::ok));
+    const auto* routed = role->vswitch().vpc_config(vpc);
+    BOOST_REQUIRE(routed->tables.size() == 1U);
+    const auto& routes = routed->tables.front().routes;
+    BOOST_TEST(routed->tables.front().main);
+    BOOST_REQUIRE(routes.size() == 3U);
+    BOOST_TEST(std::ranges::count_if(routes, [](const net::VpcRoute& r) { return r.local; }) == 2);
+    BOOST_TEST(std::ranges::any_of(
+        routes, [](const net::VpcRoute& r) { return !r.local && r.target.value == nic_b; }));
 }
 
 auto arp_request(std::uint64_t nic, const proto::Ipv4Address& target) -> std::vector<std::byte> {

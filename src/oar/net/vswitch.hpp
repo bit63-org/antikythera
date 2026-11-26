@@ -127,7 +127,7 @@
 // in the asker's subnet; the querier speaks from the subnet's gateway;
 // unicast to another subnet's NIC MAC is dropped on transmit and receive
 // (tx_drop_cross_subnet / rx_drop_cross_subnet; another subnet is reached
-// through the router, task 5); group frames reach only the sender's
+// through the router, below); group frames reach only the sender's
 // subnet's local NICs and the VTEPs hosting one of its NICs, and the
 // flood-list cap is compared with that list. The subnet is looked up per
 // frame from the snapshot's binding and the config, so a mapping and a
@@ -135,19 +135,29 @@
 // the neighbor table to each NIC's subnet the same way. A VNI with a
 // mapping but no config stays one L2 segment without a gateway.
 //
-// Routing (Requirements 11.10 and 12.7, task 22): a VpcConfig may carry routes, each
-// a prefix and a target NIC in the VNI. A unicast IP packet a guest sends
-// to the gateway MAC (other than metadata) is matched by longest prefix and
-// goes to the target NIC with its destination MAC rewritten to the
-// target's and its TTL or hop limit decremented; the source MAC stays the
-// sender's, so the receiving VTEP's ingress checks (source MAC is the
-// source NIC's) hold unchanged. No route, a target missing from this
-// VTEP's mapping, or a multicast or broadcast destination is dropped and
-// counted. A NIC whose mapping entry turns its source/destination check off
-// may send from addresses it does not own and receive packets addressed to
-// others, on transmit and on receive alike; every other NIC keeps both
-// checks, so a route can only steer traffic to a NIC that has opted out
-// (or to the NIC that owns the destination anyway).
+// Routing (Requirements 11.10 and 12.7, task 22; vpc-subnets-routing
+// Requirement 6, task 5): this VTEP is the VPC router for the NICs it
+// hosts. A VpcConfig carries route tables, each subnet naming one, and
+// set_vpc_config() compiles each table into a RouteTrie per family. A unicast
+// IP packet a guest sends to the gateway MAC (other than metadata) is
+// matched by longest prefix in its subnet's table: a `local` route leads
+// to the NIC owning the destination in any subnet of the VPC
+// (tx_drop_no_neighbor if none), a NIC route to that NIC (a target not in
+// this VTEP's mapping is a blackhole, tx_drop_route_target). The frame
+// goes straight to the target's port or VTEP with its destination MAC
+// rewritten to the target's, its source MAC to the gateway's, and its TTL
+// or hop limit one lower (RFC 1624 checksum update). No route, or a
+// multicast or broadcast destination, is dropped and counted. The
+// receiving VTEP tells a routed frame by its gateway source MAC, which
+// check_ingress accepts only for a VNI this VTEP holds a config for
+// (MappingView::gateway_mac), and repeats the lookup in the source NIC's
+// subnet's table against its own config and mapping: a different target,
+// a replicated or non-IP routed frame is rx_drop_route_mismatch, so a
+// compromised sending VTEP cannot skip a middlebox route. A NIC whose mapping entry turns its
+// source/destination check off may send from addresses it does not own and receive packets
+// addressed to others, on transmit and on receive alike; every other NIC keeps both checks, so a
+// route can only steer traffic to a NIC that has opted out (or to the NIC that owns the destination
+// anyway).
 //
 // Metadata (Requirement 13, task 19): IP packets from a NIC's own address
 // to 169.254.169.254 or fd00:ec2::254 at the gateway MAC go to the
@@ -180,6 +190,7 @@
 #include "oar/net/mapping_table.hpp"
 #include "oar/net/neighbor.hpp"
 #include "oar/net/packet.hpp"
+#include "oar/net/route_trie.hpp"
 #include "oar/net/virtio_net.hpp"
 #include "oar/net/vtep_policy.hpp"
 
@@ -255,15 +266,27 @@ struct Ipv4Prefix {
     friend auto operator==(const Ipv4Prefix&, const Ipv4Prefix&) -> bool = default;
 };
 
-// One route of a VPC's table (Requirement 11.10): a prefix and the NIC that
-// takes what it matches.
+// One route of a VPC route table (Requirement 11.10, vpc-subnets-routing
+// Requirement 4): a prefix and what takes what it matches, the VPC's
+// `local` route (the NIC owning the destination) or one NIC.
 struct VpcRoute {
     bool ipv6{false};
     Ipv6Address prefix{};  // IPv4 in the first four bytes, the rest zero
     std::uint8_t length{0};
-    geneve::NicId target{};
+    geneve::NicId target{};  // nic_invalid for a local route
+    bool local{false};
 
     friend auto operator==(const VpcRoute&, const VpcRoute&) -> bool = default;
+};
+
+// One route table; subnets name it by number (vpc-subnets-routing
+// Requirement 4).
+struct VpcRouteTable {
+    std::uint16_t table{0};          // ascending in the config
+    bool main{false};                // exactly one table is the main one
+    std::vector<VpcRoute> routes{};  // no prefix twice per family
+
+    friend auto operator==(const VpcRouteTable&, const VpcRouteTable&) -> bool = default;
 };
 
 // One subnet of a VPC (vpc-subnets-routing Requirement 2): a slice of one
@@ -292,7 +315,7 @@ struct VpcConfig {
     std::vector<Ipv6Address> dns6{};            // at most max_dns_servers
     std::string domain{};                       // DNS name, at most max_domain_size bytes
     std::uint32_t lease_seconds{0};             // min_lease_seconds .. max_lease_seconds
-    std::vector<VpcRoute> routes{};             // at most max_vpc_routes, no prefix twice
+    std::vector<VpcRouteTable> tables{};        // 1..max_vpc_tables, max_vpc_routes routes in all
 
     friend auto operator==(const VpcConfig&, const VpcConfig&) -> bool = default;
 };
@@ -303,9 +326,11 @@ inline constexpr std::uint32_t min_lease_seconds = 60;
 inline constexpr std::uint32_t max_lease_seconds = 0x7FFF'FFFF;
 inline constexpr std::uint8_t min_ipv4_prefix = 8;
 inline constexpr std::uint8_t max_ipv4_prefix = 30;
-inline constexpr std::size_t max_vpc_routes = 100;     // proto::max_vpc_routes
-inline constexpr std::size_t max_vpc_ipv4_blocks = 5;  // proto::max_vpc_ipv4_blocks
-inline constexpr std::size_t max_vpc_subnets = 200;    // proto::max_vpc_subnets
+inline constexpr std::size_t max_vpc_routes = 4096;      // proto::max_vpc_routes, all tables
+inline constexpr std::size_t max_vpc_nic_routes = 1000;  // proto::max_vpc_nic_routes, per table
+inline constexpr std::size_t max_vpc_tables = 200;       // proto::max_vpc_tables
+inline constexpr std::size_t max_vpc_ipv4_blocks = 5;    // proto::max_vpc_ipv4_blocks
+inline constexpr std::size_t max_vpc_subnets = 200;      // proto::max_vpc_subnets
 inline constexpr std::uint8_t ipv6_block_length = 56;
 
 enum class VpcConfigError : std::uint8_t {
@@ -319,10 +344,11 @@ enum class VpcConfigError : std::uint8_t {
     bad_dns,           // a zero, multicast or broadcast server address
     bad_domain,        // too long, or not a DNS name
     bad_lease,         // outside min_lease_seconds .. max_lease_seconds
-    too_many_routes,   // more than max_vpc_routes
+    too_many_routes,   // more than max_vpc_routes, or max_vpc_nic_routes in one table
     bad_route,         // host bits, a bad length, a bad target, or one prefix twice
+    bad_table,         // none, too many, numbers not ascending, or not exactly one main
     bad_subnet,        // none, too many, id 0 or out of order, outside every block,
-                       // or overlapping another subnet
+                       // overlapping another subnet, or naming no table
 };
 
 // The subnet `id` names in `config`, or null (id 0 and unknown IDs alike).
@@ -477,15 +503,16 @@ struct SwitchCounters {
     std::uint64_t tx_drop_no_subnet{0};         // sender in a VPC with a config but no known subnet
     std::uint64_t tx_drop_cross_subnet{0};      // unicast to a NIC's MAC in another subnet
     std::uint64_t tx_drop_arp_other_subnet{0};  // ARP for another subnet's gateway address
-    std::uint64_t snoop_reports{0};             // IGMP/MLD membership reports read
-    std::uint64_t snoop_joins{0};               // new joins recorded
-    std::uint64_t snoop_leaves{0};              // joins removed by a leave or done
-    std::uint64_t snoop_drop_cap{0};            // joins refused: the NIC or role is at its cap
-    std::uint64_t snoop_malformed{0};           // reports refused (igmp::SnoopError)
-    std::uint64_t snoop_ignored{0};             // reports from a VNI that has not opted in
-    std::uint64_t snoop_expired{0};             // joins that went unrefreshed
-    std::uint64_t queries_sent{0};              // general queries delivered to NICs
-    std::uint64_t tx_replicas_pruned{0};        // group frames sent by a VTEP list, not flooded
+    std::uint64_t tx_drop_no_neighbor{0};  // a local route's destination no NIC in the VPC owns
+    std::uint64_t snoop_reports{0};        // IGMP/MLD membership reports read
+    std::uint64_t snoop_joins{0};          // new joins recorded
+    std::uint64_t snoop_leaves{0};         // joins removed by a leave or done
+    std::uint64_t snoop_drop_cap{0};       // joins refused: the NIC or role is at its cap
+    std::uint64_t snoop_malformed{0};      // reports refused (igmp::SnoopError)
+    std::uint64_t snoop_ignored{0};        // reports from a VNI that has not opted in
+    std::uint64_t snoop_expired{0};        // joins that went unrefreshed
+    std::uint64_t queries_sent{0};         // general queries delivered to NICs
+    std::uint64_t tx_replicas_pruned{0};   // group frames sent by a VTEP list, not flooded
     std::uint64_t arp_replies{0};
     std::uint64_t nd_replies{0};
     std::uint64_t dhcp4_replies{0};
@@ -514,6 +541,9 @@ struct SwitchCounters {
     std::uint64_t rx_drop_ip_dst{0};        // inner IP destination not the destination NIC's
     std::uint64_t rx_drop_no_subnet{0};     // source NIC in no known subnet of the VPC here
     std::uint64_t rx_drop_cross_subnet{0};  // switched frame between two subnets
+    // A routed frame (gateway MAC source) this VTEP's own lookup in the
+    // source subnet's table does not send to the destination NIC.
+    std::uint64_t rx_drop_route_mismatch{0};
     std::array<std::uint64_t, policy_error_count> rx_drop_policy{};  // by PolicyError
     std::uint64_t deliver_failed{0};  // a port refused a frame (it counts why)
 };
@@ -620,6 +650,23 @@ private:
         std::optional<Clock::time_point> last_query{};
     };
 
+    // A VNI's config with its route tables compiled, by table number.
+    struct CompiledTable {
+        std::uint16_t table{0};
+        RouteTrie ipv4{RouteTrie::ipv4_bits};
+        RouteTrie ipv6{RouteTrie::ipv6_bits};
+    };
+    struct VpcState {
+        VpcConfig config;
+        std::vector<CompiledTable> tables;  // ascending by table
+    };
+    // Why the router found no target for a packet.
+    enum class RouteDrop : std::uint8_t {
+        no_route,
+        no_neighbor,
+        route_target
+    };
+
     struct VpcNeighbors {
         std::map<neighbor::Ipv4Address, geneve::NicId> ipv4;
         std::map<Ipv6Address, geneve::NicId> ipv6;
@@ -670,10 +717,24 @@ private:
     auto handle_dhcp6(geneve::NicId src, const NicBinding& binding, const packet::ParsedPacket& p)
         -> void;
     auto handle_metadata(geneve::NicId src, const packet::ParsedPacket& p) -> void;
-    // A packet for the gateway MAC: routed by the VNI's table, or dropped.
+    // The NIC the route table of `subnet` sends `p` to: the owner of the
+    // destination for a local route, the route's NIC otherwise, which
+    // must be in the VNI in `snap` (a blackhole otherwise).
+    [[nodiscard]] auto route_target(const MappingSnapshot& snap, std::uint32_t vni,
+                                    const VpcState& state, const VpcSubnet& subnet,
+                                    const packet::ParsedPacket& p) const
+        -> std::expected<std::pair<geneve::NicId, NicBinding>, RouteDrop>;
+    // A packet for the gateway MAC: routed by the sender's subnet's table,
+    // or dropped.
     auto route(const MappingSnapshot& snap, geneve::NicId src, const NicBinding& binding,
-               const VpcConfig& cfg, std::span<const std::byte> frame,
+               const VpcState& state, const VpcSubnet& subnet, std::span<const std::byte> frame,
                const packet::ParsedPacket& p) -> void;
+    // The receive-side half (Requirement 6.5): true if this VTEP's own
+    // lookup in the source NIC's subnet's table sends the routed packet
+    // to `dst`.
+    [[nodiscard]] auto routed_to(const MappingSnapshot& snap, const geneve::Packet& packet,
+                                 const NicBinding& src, geneve::NicId dst) const -> bool;
+    [[nodiscard]] auto vpc_state(std::uint32_t vni) const -> const VpcState*;
     // Unicast to a NIC already chosen: delivered locally or sent to its VTEP.
     auto send_unicast(const MappingSnapshot& snap, geneve::NicId src, std::uint32_t vni,
                       geneve::NicId dst, std::span<const std::byte> frame) -> bool;
@@ -697,7 +758,7 @@ private:
     Underlay* _underlay;
     std::unordered_map<geneve::NicId, RxPort*, NicIdHash> _ports;
     std::unordered_map<geneve::NicId, std::uint16_t, NicIdHash> _mtus;
-    std::unordered_map<std::uint32_t, VpcConfig> _vpc_configs;
+    std::unordered_map<std::uint32_t, VpcState> _vpc_configs;
     std::unordered_map<geneve::NicId, Clock::time_point, NicIdHash> _last_ra;
     std::unordered_map<geneve::NicId, Bucket, NicIdHash> _metadata_buckets;
     MetadataEndpoint* _metadata{nullptr};

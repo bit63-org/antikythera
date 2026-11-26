@@ -201,8 +201,12 @@ publish, and the config, which the data-plane thread owns, independent,
 and makes "applied in either order" hold by construction. `NetRole`
 filters the neighbor table whenever either input changes
 (`refresh_neighbors`), which is the one derived structure the design
-above keeps; the tries and `subnet_vteps` arrive with task 5 and task 12
-where they are needed.
+above keeps. Task 5 compiles the route tables into the VSwitch's
+per-VNI state when the config is applied (a `RouteTrie` per table and
+family, `src/oar/net/route_trie.hpp`); the local route's target is found
+in the neighbor table at lookup time, so it too needs no rebuild when
+only the mapping changes. `subnet_vteps` arrives with task 12, where it
+is needed.
 
 A VNI with a mapping but no config keeps today's behaviour (one L2
 segment, no gateway), which harbor's fabric tests and the unit tests

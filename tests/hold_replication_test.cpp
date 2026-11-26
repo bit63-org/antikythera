@@ -189,8 +189,9 @@ public:
 
     // Returns the request ID; the reply lands in replies(s).
     auto write(SessionId s, std::uint64_t lba, const Bytes& data, std::uint64_t server_id = 1,
-               std::uint64_t epoch = 1) -> std::uint64_t {
+               std::uint64_t epoch = 1, std::uint16_t flags = 0) -> std::uint64_t {
         auto h = header(HoldOpcode::write, epoch);
+        h.flags = flags;
         h.lba = lba;
         h.blocks = static_cast<std::uint32_t>(data.size() / bs);
         const auto crcs = proto::block_crcs(data, bs);
@@ -444,6 +445,53 @@ BOOST_AUTO_TEST_CASE(replicates_writes_to_every_member,
 
     const auto r = net.read(s, 10, 4);
     BOOST_TEST(net.read_data(s, r) == data);
+}
+
+BOOST_AUTO_TEST_CASE(replicates_hydrate_writes_in_order,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    // A volume restored from a public image (block-volume task 23): oar-blk
+    // hydrates with hydrate writes, which every member stores in the same
+    // order as the guest's writes.
+    Net net;
+    auto c = config(1);
+    c.source = {.kind = proto::SourceKind::image,
+                .store_id = 3,
+                .hydrate_mib_per_s = 50,
+                .manifest_name = {}};
+    c.source.manifest_name[0] = std::byte{1};
+    net.apply(c);
+    net.step();
+    const auto s = net.initiator();
+    const auto r0 = net.read(s, 10, 1);
+    BOOST_TEST((net.status(s, r0) == HoldStatus::not_hydrated));
+    const auto mine = blocks_of(1, 1);
+    const auto image = blocks_of(2, 4);
+    const auto w = net.write(s, 11, mine);
+    const auto h = net.write(s, 10, image, 1, 1, proto::hold_flags::hydrate);
+    BOOST_TEST((net.status(s, w) == HoldStatus::ok));
+    BOOST_TEST((net.status(s, h) == HoldStatus::ok));
+    BOOST_TEST(net.count(HoldOpcode::repl_write) == 4U);
+    auto expect = image;
+    std::ranges::copy(mine, expect.begin() + bs);  // block 11 stays the guest's
+    for (const std::uint64_t id : {std::uint64_t{1}, std::uint64_t{2}, std::uint64_t{3}}) {
+        BOOST_TEST_INFO(id);
+        BOOST_TEST(net.stored(id, 10, 4) == expect);
+        BOOST_TEST(net.hold(id).replica(vol)->last_seq() == 2U);
+        BOOST_TEST(!net.hold(id).replica(vol)->unhydrated(13).value());
+        BOOST_TEST(net.hold(id).replica(vol)->unhydrated(14).value());
+    }
+    const auto r = net.read(s, 10, 4);
+    BOOST_TEST(net.read_data(s, r) == expect);
+    // A guest write after the hydrate write wins everywhere too.
+    const auto later = blocks_of(3, 1);
+    const auto w2 = net.write(s, 12, later);
+    BOOST_TEST((net.status(s, w2) == HoldStatus::ok));
+    const auto h2 = net.write(s, 12, blocks_of(4, 1), 1, 1, proto::hold_flags::hydrate);
+    BOOST_TEST((net.status(s, h2) == HoldStatus::ok));
+    for (const std::uint64_t id : {std::uint64_t{1}, std::uint64_t{2}, std::uint64_t{3}}) {
+        BOOST_TEST_INFO(id);
+        BOOST_TEST(net.stored(id, 12, 1) == later);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(waits_for_every_member, *utf::timeout(ak::test::unit_timeout_seconds)) {

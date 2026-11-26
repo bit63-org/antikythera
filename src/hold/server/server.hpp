@@ -39,8 +39,12 @@
 //
 // READ, WRITE (and WRITE with the hydrate flag: fill only blocks still
 // unhydrated) and FLUSH (a barrier: an acknowledged write is already
-// durable) run in order per volume. Consecutive writes are group-committed
-// as one ReplicaStore batch. PING is answered at once.
+// durable) run in order per volume. Consecutive writes, hydrate writes
+// among them, are group-committed as one ReplicaStore batch, numbered
+// and replicated alike (a hydrate write's REPL_WRITE keeps the flag), so
+// every replica orders oar-blk's hydration (block-volume task 23) with
+// the guest's writes. A read-only attachment may send hydrate writes.
+// PING is answered at once.
 //
 // Replication (task 8, design "Write and read paths"). A primary with
 // other members opens one session to each (SessionSink::dial, then

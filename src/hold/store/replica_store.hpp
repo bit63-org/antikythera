@@ -34,7 +34,12 @@
 // hydrate() fills blocks still marked unhydrated (a snapshot restore's
 // chunks, HYDRATE_FILL): data, sync, checksums, sync, then the bits, so a
 // cleared bit always has its checksum. Ordinary writes clear the bits of
-// the blocks they write.
+// the blocks they write. A Write with `hydrate` set (block-volume task 23,
+// oar-blk's foreign-key restore) is sequenced and logged like any write,
+// so it replicates in order with the guest's writes, but stores only the
+// blocks still unhydrated when its turn comes in the batch: a block an
+// earlier write (in the batch or before it) stored is skipped. A volume
+// without a source has nothing to hydrate: the write stores nothing.
 //
 // reflink() reports whether `data` can be cloned (FICLONE) for snapshot
 // freezes and clones, detected at create and open. Not thread-safe: the
@@ -97,6 +102,11 @@ public:
         std::uint64_t lba{0};
         std::span<const std::byte> data;      // whole blocks
         std::span<const std::uint32_t> crcs;  // one per block
+        // A hydrate write (WRITE with the hydrate flag, its REPL_WRITE):
+        // logged and sequenced like any write, but it stores only the
+        // blocks still unhydrated, so a block the guest has written keeps
+        // the guest's data (design "Restore, hydration and clones").
+        bool hydrate{false};
     };
 
     // A new, empty replica in `dir` (which must not exist). With a source,
@@ -135,7 +145,8 @@ public:
     // point hold (a member's resend after a crash, which may have torn
     // them): data, sync, checksums, sync, with no new intents, so a crash
     // here leaves them in the ring still. Each seq must be one of
-    // intents().
+    // intents(), hydrate flag included; a hydrate write stores again only
+    // the blocks open() marked unhydrated (those that lost their checksum).
     [[nodiscard]] auto rewrite(std::span<const Write> batch) -> std::expected<void, StoreError>;
     // Reads blocks [lba, lba + out/block_size) and their stored CRC32Cs;
     // returns the LBAs whose data does not match (empty: all good). A block
@@ -199,6 +210,15 @@ private:
         -> std::expected<bool, StoreError>;
     [[nodiscard]] auto count_bits(std::uint64_t region, std::uint64_t first, std::uint64_t count)
         -> std::expected<std::uint64_t, StoreError>;
+    // Steps 2 and 3 of write() (and all of rewrite()): data, sync, then the
+    // checksums and bits; a hydrate write stores only its `fills`.
+    [[nodiscard]] auto store(std::span<const Write> batch,
+                             const std::vector<std::vector<std::size_t>>& fills)
+        -> std::expected<void, StoreError>;
+    // For each write of the batch, the blocks (within it) a hydrate write
+    // stores; empty for the others.
+    [[nodiscard]] auto hydrate_fills(std::span<const Write> batch)
+        -> std::expected<std::vector<std::vector<std::size_t>>, StoreError>;
     [[nodiscard]] auto write_checksums(std::uint64_t lba, std::span<const std::uint32_t> crcs)
         -> std::expected<void, StoreError>;
     [[nodiscard]] auto mark_written(std::uint64_t lba, std::uint64_t blocks)

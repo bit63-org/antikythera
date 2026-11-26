@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <set>
 #include <utility>
 
 #include "common/crc32c.hpp"
@@ -203,11 +204,44 @@ auto ReplicaStore::recover() -> std::expected<void, StoreError> {
             _last_seq = std::max(_last_seq, i->seq);
         }
     }
-    // Bits a crash may have lost for writes still in the ring.
+    // Bits a crash may have lost for writes still in the ring: an
+    // ordinary write's blocks are written (a lost checksum shows as a bad
+    // block, repaired from a peer). A hydrate write's block that no
+    // ordinary write in the ring covers and that has no checksum never
+    // got stored, or lost its checksum with the crash: it awaits
+    // hydration again, so oar-blk fetches it once more. Committed writes
+    // older than the ring have durable checksums already.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> plain;  // [lba, end)
     for (const auto& i : _ring) {
-        if (i.seq != 0) {
+        if (i.seq != 0 && !i.hydrate) {
+            plain.emplace_back(i.lba, i.lba + i.blocks);
             if (auto r = mark_written(i.lba, i.blocks); !r) {
                 return r;
+            }
+        }
+    }
+    std::ranges::sort(plain);
+    const auto covered = [&](std::uint64_t lba) {
+        // Any extent starting at or before lba that reaches past it.
+        auto it = std::ranges::upper_bound(plain, std::pair{lba, ~std::uint64_t{0}});
+        return std::any_of(plain.begin(), it, [&](const auto& e) { return e.second > lba; });
+    };
+    if (_meta.source.kind != proto::SourceKind::none) {
+        for (const auto& i : _ring) {
+            if (i.seq == 0 || !i.hydrate) {
+                continue;
+            }
+            std::vector<std::byte> stored(std::size_t{i.blocks} * crc_size);
+            if (!_meta_file->pread(_layout.checksums + (i.lba * crc_size), stored)) {
+                return std::unexpected(StoreError::io);
+            }
+            for (std::uint64_t b = 0; b < i.blocks; ++b) {
+                const auto lba = i.lba + b;
+                if (le32_at(stored, b) == 0 && !past_source(lba) && !covered(lba)) {
+                    if (auto r = set_bits(_layout.unhydrated, lba, 1, true); !r) {
+                        return r;
+                    }
+                }
             }
         }
     }
@@ -388,8 +422,10 @@ auto ReplicaStore::write(std::span<const Write> batch) -> std::expected<void, St
     }
     // 1. Intents, durable before any of the data.
     for (const auto& w : batch) {
-        const Intent i{
-            .seq = w.seq, .lba = w.lba, .blocks = static_cast<std::uint32_t>(w.data.size() / bs)};
+        const Intent i{.seq = w.seq,
+                       .lba = w.lba,
+                       .blocks = static_cast<std::uint32_t>(w.data.size() / bs),
+                       .hydrate = w.hydrate};
         const auto slot = w.seq % intent_ring_entries;
         if (!_meta_file->pwrite(_layout.intents + (slot * intent_entry_size), encode_intent(i))) {
             return std::unexpected(StoreError::io);
@@ -400,26 +436,97 @@ auto ReplicaStore::write(std::span<const Write> batch) -> std::expected<void, St
         return r;
     }
     _meta_synced_seq = _last_seq;  // that sync carried earlier batches' checksums
-    // 2. Data.
-    for (const auto& w : batch) {
-        if (!_data->pwrite(w.lba * bs, w.data)) {
-            return std::unexpected(StoreError::io);
+    // Which blocks of each hydrate write to store: those still unhydrated,
+    // and not written by an earlier write of this batch.
+    auto fills = hydrate_fills(batch);
+    if (!fills) {
+        return std::unexpected(fills.error());
+    }
+    if (auto r = store(batch, *fills); !r) {
+        return r;
+    }
+    _last_seq = batch.back().seq;
+    return {};
+}
+
+auto ReplicaStore::store(std::span<const Write> batch,
+                         const std::vector<std::vector<std::size_t>>& fills)
+    -> std::expected<void, StoreError> {
+    const std::uint32_t bs = _meta.block_size;
+    // Data, then sync.
+    for (std::size_t i = 0; i < batch.size(); ++i) {
+        const auto& w = batch[i];
+        if (!w.hydrate) {
+            if (!_data->pwrite(w.lba * bs, w.data)) {
+                return std::unexpected(StoreError::io);
+            }
+            continue;
+        }
+        for (const auto b : fills[i]) {
+            if (!_data->pwrite((w.lba + b) * bs, w.data.subspan(b * bs, bs))) {
+                return std::unexpected(StoreError::io);
+            }
         }
     }
     if (!_data->sync()) {
         return std::unexpected(StoreError::io);
     }
-    // 3. Checksums and bits, durable with the next sync of meta.
-    for (const auto& w : batch) {
-        if (auto r = write_checksums(w.lba, w.crcs); !r) {
-            return r;
+    // Checksums and bits, durable with the next sync of meta.
+    for (std::size_t i = 0; i < batch.size(); ++i) {
+        const auto& w = batch[i];
+        if (!w.hydrate) {
+            if (auto r = write_checksums(w.lba, w.crcs); !r) {
+                return r;
+            }
+            if (auto r = mark_written(w.lba, w.crcs.size()); !r) {
+                return r;
+            }
+            continue;
         }
-        if (auto r = mark_written(w.lba, w.crcs.size()); !r) {
-            return r;
+        for (const auto b : fills[i]) {
+            if (auto r = write_checksums(w.lba + b, w.crcs.subspan(b, 1)); !r) {
+                return r;
+            }
+            // Hydration is not a change since a snapshot: only the bit.
+            if (auto r = set_bits(_layout.unhydrated, w.lba + b, 1, false); !r) {
+                return r;
+            }
         }
     }
-    _last_seq = batch.back().seq;
     return {};
+}
+
+auto ReplicaStore::hydrate_fills(std::span<const Write> batch)
+    -> std::expected<std::vector<std::vector<std::size_t>>, StoreError> {
+    std::vector<std::vector<std::size_t>> fills(batch.size());
+    if (_meta.source.kind == proto::SourceKind::none ||
+        std::ranges::none_of(batch, &Write::hydrate)) {
+        return fills;  // nothing awaits hydration, or nothing hydrates
+    }
+    const std::uint32_t bs = _meta.block_size;
+    std::set<std::uint64_t> stored;  // blocks an earlier write of the batch stores
+    for (std::size_t i = 0; i < batch.size(); ++i) {
+        const auto& w = batch[i];
+        const std::uint64_t blocks = w.data.size() / bs;
+        if (!w.hydrate) {
+            for (std::uint64_t b = 0; b < blocks; ++b) {
+                stored.insert(w.lba + b);
+            }
+            continue;
+        }
+        const std::uint64_t lo = w.lba / 8;
+        const std::uint64_t hi = (w.lba + blocks - 1) / 8;
+        std::vector<std::byte> bits(hi - lo + 1);
+        if (!_meta_file->pread(_layout.unhydrated + lo, bits)) {
+            return std::unexpected(StoreError::io);
+        }
+        for (std::uint64_t b = 0; b < blocks; ++b) {
+            if (bit(bits, w.lba + b - (lo * 8)) && stored.insert(w.lba + b).second) {
+                fills[i].push_back(b);
+            }
+        }
+    }
+    return fills;
 }
 
 auto ReplicaStore::read(std::uint64_t lba, std::span<std::byte> out, std::span<std::uint32_t> crcs)
@@ -516,7 +623,8 @@ auto ReplicaStore::rewrite(std::span<const Write> batch) -> std::expected<void, 
         }
         if (w.seq <= _commit_seq || w.seq > _last_seq ||
             std::ranges::none_of(_ring, [&](const Intent& i) {
-                return i.seq == w.seq && i.lba == w.lba && i.blocks == w.crcs.size();
+                return i.seq == w.seq && i.lba == w.lba && i.blocks == w.crcs.size() &&
+                       i.hydrate == w.hydrate;
             })) {
             return std::unexpected(StoreError::bad_seq);
         }
@@ -526,21 +634,14 @@ auto ReplicaStore::rewrite(std::span<const Write> batch) -> std::expected<void, 
             }
         }
     }
-    for (const auto& w : batch) {
-        if (!_data->pwrite(w.lba * bs, w.data)) {
-            return std::unexpected(StoreError::io);
-        }
+    // A hydrate write again: open() put back the unhydrated bit of each
+    // of its blocks that never got a checksum, so it stores those.
+    auto fills = hydrate_fills(batch);
+    if (!fills) {
+        return std::unexpected(fills.error());
     }
-    if (!_data->sync()) {
-        return std::unexpected(StoreError::io);
-    }
-    for (const auto& w : batch) {
-        if (auto r = write_checksums(w.lba, w.crcs); !r) {
-            return r;
-        }
-        if (auto r = mark_written(w.lba, w.crcs.size()); !r) {
-            return r;
-        }
+    if (auto r = store(batch, *fills); !r) {
+        return r;
     }
     return sync_meta();
 }

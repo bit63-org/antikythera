@@ -30,8 +30,8 @@ auto find_attachment(const proto::ReplicaConfig& c, std::uint64_t attachment_id)
     return it == c.attachments.end() ? nullptr : &*it;
 }
 
-auto is_plain_write(const proto::HoldHeader& h) noexcept -> bool {
-    return h.opcode == HoldOpcode::write && (h.flags & proto::hold_flags::hydrate) == 0;
+auto is_hydrate(const proto::HoldHeader& h) noexcept -> bool {
+    return (h.flags & proto::hold_flags::hydrate) != 0;
 }
 
 auto status_of(store::StoreError e) noexcept -> HoldStatus {
@@ -459,7 +459,9 @@ auto HoldServer::check(const Session& s, const proto::HoldHeader& h) const -> Ve
     if (proto::is_block_opcode(h.opcode) && h.lba + h.blocks > c.capacity_blocks) {
         return {.status = HoldStatus::range};
     }
-    if (h.opcode == HoldOpcode::write && att->mode == proto::AttachMode::ro) {
+    // A hydrate write stores only what the volume already holds (its
+    // source's blocks), so a read-only attachment may hydrate too.
+    if (h.opcode == HoldOpcode::write && !is_hydrate(h) && att->mode == proto::AttachMode::ro) {
         return {.status = HoldStatus::read_only};
     }
     return {};
@@ -724,7 +726,9 @@ auto HoldServer::serve(Volume& v, std::size_t budget, Clock::time_point now) -> 
             continue;
         }
         const bool repl = r.header.opcode == HoldOpcode::repl_write;
-        const bool plain = is_plain_write(r.header) || repl;
+        // Writes with the hydrate flag too: sequenced, group-committed and
+        // replicated like the guest's, so every replica orders them alike.
+        const bool plain = r.header.opcode == HoldOpcode::write || repl;
         const std::uint64_t bytes = r.header.opcode == HoldOpcode::flush
                                         ? 0
                                         : std::uint64_t{r.header.blocks} * r.block_size;
@@ -773,7 +777,11 @@ auto HoldServer::commit(Volume& v, std::vector<Request>& batch) -> void {
     writes.reserve(batch.size());
     std::uint64_t seq = std::max(v.store->last_seq(), v.seq_floor);
     for (const auto& r : batch) {
-        writes.push_back({.seq = ++seq, .lba = r.header.lba, .data = r.data, .crcs = r.crcs});
+        writes.push_back({.seq = ++seq,
+                          .lba = r.header.lba,
+                          .data = r.data,
+                          .crcs = r.crcs,
+                          .hydrate = is_hydrate(r.header)});
     }
     auto status = HoldStatus::ok;
     if (auto res = v.store->write(writes); res) {
@@ -863,14 +871,6 @@ auto HoldServer::execute(Volume& v, Request& r) -> void {
             const auto crc = crc_bytes(crcs);
             respond(r.session, r.header, HoldStatus::ok,
                     proto::BlockData{.block_size = r.block_size, .crcs = crc, .data = data});
-            return;
-        }
-        case HoldOpcode::write: {  // hydrate
-            if (auto n = v.store->hydrate(r.header.lba, r.data, r.crcs); !n) {
-                fail(n.error());
-                return;
-            }
-            respond(r.session, r.header, HoldStatus::ok);
             return;
         }
         case HoldOpcode::flush:
@@ -1062,6 +1062,7 @@ auto HoldServer::send_repl(Volume& v, Link& l, const Replicating& w) -> void {
     h.epoch = v.config.epoch;
     h.lba = r.header.lba;
     h.blocks = r.header.blocks;
+    h.flags = r.header.flags & proto::hold_flags::hydrate;  // a hydrate write stays one
     const auto crcs = crc_bytes(r.crcs);
     send_link(v, l,
               {.header = h,
@@ -1286,8 +1287,11 @@ auto HoldServer::commit_replicas(Volume& v, std::vector<Request>& batch) -> void
             // A resend. Above the commit point it may be one a crash tore
             // here (still in the ring): write it again; else it is durable.
             if (r.seq > v.store->commit_seq() && r.seq <= v.store->last_seq()) {
-                again.push_back(
-                    {.seq = r.seq, .lba = r.header.lba, .data = r.data, .crcs = r.crcs});
+                again.push_back({.seq = r.seq,
+                                 .lba = r.header.lba,
+                                 .data = r.data,
+                                 .crcs = r.crcs,
+                                 .hydrate = is_hydrate(r.header)});
                 rewritten.push_back(i);
             }
             continue;
@@ -1305,7 +1309,11 @@ auto HoldServer::commit_replicas(Volume& v, std::vector<Request>& batch) -> void
         if (sit != _sessions.end()) {
             sit->second.replicated = true;
         }
-        writes.push_back({.seq = r.seq, .lba = r.header.lba, .data = r.data, .crcs = r.crcs});
+        writes.push_back({.seq = r.seq,
+                          .lba = r.header.lba,
+                          .data = r.data,
+                          .crcs = r.crcs,
+                          .hydrate = is_hydrate(r.header)});
         written.push_back(i);
         last = r.seq;
     }

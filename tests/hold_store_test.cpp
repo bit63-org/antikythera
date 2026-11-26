@@ -110,14 +110,23 @@ auto block_of(const Bytes& b, std::uint32_t bs, std::uint64_t i) -> Bytes {
             b.begin() + static_cast<std::ptrdiff_t>((i + 1) * bs)};
 }
 
+auto block_range(const Bytes& b, std::uint32_t bs, std::uint64_t first, std::uint64_t n) -> Bytes {
+    return {b.begin() + static_cast<std::ptrdiff_t>(first * bs),
+            b.begin() + static_cast<std::ptrdiff_t>((first + n) * bs)};
+}
+
 // Holds the bytes a batch of ReplicaStore::Write spans points at.
 class Batch {
 public:
     explicit Batch(std::uint32_t bs) : _bs{bs} {}
-    auto add(std::uint64_t seq, std::uint64_t lba, Bytes data) -> Batch& {
+    auto add(std::uint64_t seq, std::uint64_t lba, Bytes data, bool hydrate = false) -> Batch& {
         _data.push_back(std::move(data));
         _crcs.push_back(crcs_of(_data.back(), _bs));
-        _writes.push_back({.seq = seq, .lba = lba, .data = _data.back(), .crcs = _crcs.back()});
+        _writes.push_back({.seq = seq,
+                           .lba = lba,
+                           .data = _data.back(),
+                           .crcs = _crcs.back(),
+                           .hydrate = hydrate});
         return *this;
     }
     [[nodiscard]] auto writes() const -> std::span<const ReplicaStore::Write> { return _writes; }
@@ -290,8 +299,12 @@ BOOST_AUTO_TEST_CASE(intents_round_trip, *utf::timeout(ak::test::unit_timeout_se
                MetaError::bad_field);
     BOOST_TEST(decode_intent(encode_intent({.seq = 1, .lba = ~0ULL, .blocks = 2}), 32).error() ==
                MetaError::bad_field);
+    // Flag bit 0 marks a hydrate write; every other bit is reserved.
+    const Intent hyd{.seq = 9, .lba = 4, .blocks = 2, .hydrate = true};
+    BOOST_TEST((decode_intent(encode_intent(hyd), 32).value() == hyd));
+    BOOST_TEST(!decode_intent(e, 32).value().hydrate);
     auto rsvd = e;
-    rsvd[20] = std::byte{1};
+    rsvd[20] = std::byte{2};
     const auto crc = ak::crc32c::of(std::span{rsvd}.first(28));
     for (std::size_t k = 0; k < 4; ++k) {
         rsvd[28 + k] = static_cast<std::byte>((crc >> (8U * k)) & 0xFFU);
@@ -651,6 +664,103 @@ BOOST_AUTO_TEST_CASE(hydrates_restored_blocks, *utf::timeout(ak::test::unit_time
     BOOST_TEST(!p->unhydrated(0).value());
 }
 
+BOOST_AUTO_TEST_CASE(hydrate_writes_fill_only_unwritten_blocks,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    MemFiles files;
+    auto s = create(files, make_meta(24, proto::block_size_512, 12, proto::SourceKind::image));
+    const auto src = content(100, 512, 24);
+    const auto w1 = content(1, 512, 1);
+    const auto w3 = content(3, 512, 1);
+    // One batch: a write to block 1, a hydrate write of 0-3, then a write
+    // to block 2. The hydrate write stores blocks 0, 2 and 3 (block 1 was
+    // written before it); the later write still wins block 2.
+    Batch b{512};
+    b.add(1, 1, w1);
+    b.add(2, 0, block_range(src, 512, 0, 4), true);
+    b.add(3, 2, w3);
+    BOOST_TEST_REQUIRE(s->write(b.writes()).has_value());
+    BOOST_TEST(s->last_seq() == 3U);
+    const auto r = read_blocks(*s, 0, 4);
+    BOOST_TEST_REQUIRE(r.has_value());
+    BOOST_TEST(r->bad.empty());
+    BOOST_TEST((block_of(r->data, 512, 0) == block_of(src, 512, 0)));
+    BOOST_TEST((block_of(r->data, 512, 1) == w1));
+    BOOST_TEST((block_of(r->data, 512, 2) == w3));
+    BOOST_TEST((block_of(r->data, 512, 3) == block_of(src, 512, 3)));
+    // Logged like any write, flagged as a hydrate write.
+    const auto in = s->intents();
+    BOOST_TEST_REQUIRE(in.size() == 3U);
+    BOOST_TEST(in[1].hydrate);
+    BOOST_TEST(!in[0].hydrate);
+    // Hydrating again stores nothing over the guest's later writes.
+    const auto w5 = content(5, 512, 1);
+    BOOST_TEST_REQUIRE(write_one(*s, 4, 3, w5).has_value());
+    Batch again{512};
+    again.add(5, 0, block_range(src, 512, 0, 8), true);
+    BOOST_TEST_REQUIRE(s->write(again.writes()).has_value());
+    BOOST_TEST((read_blocks(*s, 3, 1)->data == w5));
+    BOOST_TEST((read_blocks(*s, 7, 1)->data == block_of(src, 512, 7)));
+    BOOST_TEST(s->unhydrated(8).value());
+    // Hydration changes no chunk; the guest's writes do (chunk 0).
+    BOOST_TEST((s->changed_chunks().value() == std::vector<std::uint64_t>{0}));
+    // On a volume without a source a hydrate write stores nothing.
+    MemFiles plain;
+    auto p = create(plain, make_meta(24));
+    Batch hp{512};
+    hp.add(1, 0, block_range(src, 512, 0, 2), true);
+    BOOST_TEST_REQUIRE(p->write(hp.writes()).has_value());
+    BOOST_TEST((read_blocks(*p, 0, 2)->data == Bytes(1024)));
+}
+
+BOOST_AUTO_TEST_CASE(reopens_a_hydrate_write_that_lost_its_checksums,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    const auto src = content(100, 512, 24);
+    const auto w = content(1, 512, 1);
+    std::size_t lost = 0;
+    for (std::uint64_t seed = 1; seed <= 40; ++seed) {
+        BOOST_TEST_INFO("seed " << seed);
+        MemFiles files;
+        auto s = create(files, make_meta(24, proto::block_size_512, 12, proto::SourceKind::image));
+        // Block 9 written by the guest, then a hydrate write of 8-11;
+        // nothing syncs meta after it, so a crash may lose its checksums
+        // and cleared bits.
+        BOOST_TEST_REQUIRE(write_one(*s, 1, 9, w).has_value());
+        Batch b{512};
+        b.add(2, 8, block_range(src, 512, 8, 4), true);
+        BOOST_TEST_REQUIRE(s->write(b.writes()).has_value());
+        s.reset();
+        files.crash(seed);
+        auto o = ReplicaStore::open(files, vdir);
+        BOOST_TEST_REQUIRE(o.has_value());
+        s = std::move(*o);
+        // The guest's block counts as written (its intent says so); a
+        // hydrated block with no checksum awaits hydration again.
+        BOOST_TEST(!s->unhydrated(9).value());
+        for (const std::uint64_t lba : {8U, 10U, 11U}) {
+            lost += s->unhydrated(lba).value() ? 1U : 0U;
+        }
+        // The resend stores what awaits hydration again; a block whose
+        // checksum tore reads bad, for a peer to repair.
+        s->set_commit(1);
+        BOOST_TEST_REQUIRE(s->rewrite(b.writes()).has_value());
+        for (const std::uint64_t lba : {8U, 10U, 11U}) {
+            BOOST_TEST_INFO("block " << lba);
+            BOOST_TEST(!s->unhydrated(lba).value());
+            const auto r = read_blocks(*s, lba, 1);
+            BOOST_TEST_REQUIRE(r.has_value());
+            if (r->bad.empty()) {
+                BOOST_TEST((r->data == block_of(src, 512, lba)));
+            }
+        }
+        const auto g = read_blocks(*s, 9, 1);
+        BOOST_TEST_REQUIRE(g.has_value());
+        if (g->bad.empty()) {
+            BOOST_TEST((g->data == w));  // never the image's copy
+        }
+    }
+    BOOST_TEST(lost > 0U);  // some crash lost a hydrated block's checksum
+}
+
 BOOST_AUTO_TEST_CASE(grows_in_place, *utf::timeout(ak::test::unit_timeout_seconds)) {
     MemFiles files;
     auto s = create(files, make_meta(64, proto::block_size_512, 12));  // 8 blocks a chunk
@@ -818,6 +928,7 @@ struct Op {
         std::uint64_t seq;
         std::uint64_t lba;
         Bytes data;
+        bool hydrate{false};  // the source's blocks, as oar-blk sends them
     };
     Kind kind{Kind::write};
     std::vector<W> writes;  // write
@@ -848,7 +959,11 @@ public:
             case Op::Kind::write:
                 for (const auto& w : op.writes) {
                     for (std::uint64_t i = 0; i < w.data.size() / _bs; ++i) {
-                        _inflight[w.lba + i].push_back(block_of(w.data, _bs, i));
+                        if (w.hydrate) {
+                            _hydrate_tried[w.lba + i] = true;  // the source, if unwritten
+                        } else {
+                            _inflight[w.lba + i].push_back(block_of(w.data, _bs, i));
+                        }
                     }
                 }
                 break;
@@ -871,6 +986,10 @@ public:
     auto acked(const Op& op) -> void {
         if (op.kind == Op::Kind::write) {
             for (const auto& w : op.writes) {
+                if (w.hydrate) {
+                    _last_seq = w.seq;  // stores only blocks no write stored
+                    continue;
+                }
                 for (std::uint64_t i = 0; i < w.data.size() / _bs; ++i) {
                     _written[w.lba + i] = block_of(w.data, _bs, i);
                 }
@@ -955,7 +1074,8 @@ private:
     std::uint64_t _last_seq{0};
 };
 
-auto scenario(const ReplicaMeta& m, std::uint64_t seed, std::size_t ops) -> std::vector<Op> {
+auto scenario(const ReplicaMeta& m, const Bytes& source, std::uint64_t seed, std::size_t ops)
+    -> std::vector<Op> {
     std::minstd_rand rng{static_cast<std::minstd_rand::result_type>(seed)};
     const bool sourced = m.source.kind != proto::SourceKind::none;
     const std::uint64_t cap = m.capacity_blocks;
@@ -980,6 +1100,14 @@ auto scenario(const ReplicaMeta& m, std::uint64_t seed, std::size_t ops) -> std:
                 const std::uint64_t lba = rng() % cap;
                 const std::uint64_t blocks = 1 + (rng() % std::min<std::uint64_t>(4, cap - lba));
                 ++seq;
+                if (sourced && rng() % 3 == 0) {
+                    // A hydrate write (oar-blk's foreign-key restore).
+                    op.writes.push_back({.seq = seq,
+                                         .lba = lba,
+                                         .data = block_range(source, m.block_size, lba, blocks),
+                                         .hydrate = true});
+                    continue;
+                }
                 op.writes.push_back(
                     {.seq = seq, .lba = lba, .data = content(seq, m.block_size, blocks)});
             }
@@ -999,7 +1127,7 @@ auto run(ReplicaStore& s, const std::vector<Op>& ops, Model& model) -> void {
             case Op::Kind::write: {
                 Batch b{bs};
                 for (const auto& w : op.writes) {
-                    b.add(w.seq, w.lba, w.data);
+                    b.add(w.seq, w.lba, w.data, w.hydrate);
                 }
                 ok = s.write(b.writes()).has_value();
                 if (ok) {
@@ -1049,8 +1177,8 @@ auto crash_and_check(MemFiles& files, const Model& model, std::uint64_t k, std::
 }
 
 auto sweep(const ReplicaMeta& m, std::uint64_t scenario_seed, std::size_t n_ops) -> void {
-    const auto ops = scenario(m, scenario_seed, n_ops);
     const auto source = content(7777, m.block_size, m.capacity_blocks);
+    const auto ops = scenario(m, source, scenario_seed, n_ops);
     std::uint64_t total = 0;
     {
         MemFiles files;

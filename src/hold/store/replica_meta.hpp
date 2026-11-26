@@ -34,8 +34,9 @@
 //   unhydrated  one bit per block, set while the block awaits hydration;
 //   changed     one bit per chunk written since the last snapshot freeze;
 //   intents     a ring of 4096 entries of 32 bytes, slot = seq % 4096:
-//               seq u64 (0: empty), lba u64, blocks u32, reserved [8] = 0,
-//               le32 CRC32C over the first 28 bytes.
+//               seq u64 (0: empty), lba u64, blocks u32, flags u64
+//               (bit 0: a hydrate write; the rest zero), le32 CRC32C
+//               over the first 28 bytes.
 
 #include <array>
 #include <cstddef>
@@ -54,6 +55,7 @@ inline constexpr std::size_t meta_fields_size = 0xE0;
 inline constexpr std::size_t meta_digest_size = 32;
 inline constexpr std::size_t intent_entry_size = 32;
 inline constexpr std::size_t intent_ring_entries = 4096;
+inline constexpr std::uint64_t intent_flag_hydrate = 1;
 inline constexpr std::size_t meta_align = 4096;
 inline constexpr std::uint8_t min_chunk_shift = 12;  // 4 KiB
 inline constexpr std::uint8_t max_chunk_shift = 30;  // 1 GiB
@@ -111,6 +113,7 @@ struct Intent {
     std::uint64_t seq{0};
     std::uint64_t lba{0};
     std::uint32_t blocks{0};
+    bool hydrate{false};  // stored only the blocks still unhydrated
     friend auto operator==(const Intent&, const Intent&) -> bool = default;
 };
 

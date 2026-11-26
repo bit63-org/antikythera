@@ -133,6 +133,8 @@ set_tests_properties(hold_store_test PROPERTIES TIMEOUT 180)
 ak_add_test(hold_server_test      SOURCES hold_server_test.cpp      LIBS ak::hold_server)
 ak_add_test(hold_replication_test SOURCES hold_replication_test.cpp LIBS ak::hold_server)
 ak_add_test(hold_role_test        SOURCES hold_role_test.cpp        LIBS ak::hold_role)
+ak_add_test(khold_role_test       SOURCES khold_role_test.cpp       LIBS ak::khold_role)
+ak_add_test(khold_launch_test     SOURCES khold_launch_test.cpp     LIBS ak::khold_role)
 # The simulation (block-volume-service task 9): a short seed sweep in every
 # run, and a long one under `ctest -C Nightly -L nightly`.
 ak_add_test(hold_sim_test SOURCES hold_sim_test.cpp

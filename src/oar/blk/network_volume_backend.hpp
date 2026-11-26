@@ -4,16 +4,15 @@
 #pragma once
 
 // A network volume as a BlockBackend (.kiro/specs/block-volume-service/
-// task 7): the InitiatorCore (initiator.hpp) on the role thread, and one
-// I/O thread that carries its frames to the volume's primary hold over
-// mutually authenticated TLS 1.3 on the storage segment.
+// task 7): the InitiatorCore (initiator.hpp) on the role thread, and a
+// HoldTransport (hold_transport.hpp) that carries its frames to the
+// volume's primary hold over mutually authenticated TLS 1.3 on the storage
+// segment, on an I/O thread of its own.
 //
-// Threads. The role thread owns the core: submits, poll() and set_route()
-// run there, and so do completions. The I/O thread owns the connection.
-// They share a small mailbox: the target session and the frames for it
-// one way, connection events and received frames the other. The inbox's
-// eventfd and a timerfd armed for the core's next wake sit in one epoll
-// descriptor, which is wake_fd(); poll() drains both.
+// The role thread owns the core: submits, poll() and set_route() run
+// there, and so do completions. wake_fd() is the transport's: it becomes
+// readable when the I/O thread posted connection events or frames, or at
+// the core's next wake; poll() takes them.
 //
 // Connecting (Requirement 13.1). Each session gets a fresh TLS context
 // that pins the primary's address from the route (its IP SAN), and the
@@ -40,6 +39,7 @@
 #include <span>
 #include <vector>
 
+#include "oar/blk/hold_transport.hpp"
 #include "oar/blk/hydration_target.hpp"
 #include "oar/blk/initiator.hpp"
 #include "oar/blk/virtio_blk_function.hpp"
@@ -55,14 +55,21 @@ struct NetworkVolumeConfig {
     std::chrono::milliseconds write_timeout{2000};
 };
 
-enum class NetworkVolumeError : std::uint8_t {
-    tls,     // the TLS configuration does not load
-    system,  // an eventfd, timerfd, epoll descriptor or the thread failed
+// What BlkRole needs of an attached network volume, whichever backend
+// serves it (hold: NetworkVolumeBackend; khold: KholdVolumeBackend).
+// It takes hydrate writes too, so HydratingBackend can sit in front of
+// either; khold refuses them until its own hydration (phase 2).
+class AttachedVolume : public HydrationTarget {
+public:
+    // A renewed storage certificate: the next connection presents it; an
+    // open session keeps the one it was made with.
+    virtual auto set_tls(const tls::Config& config) -> void = 0;
+    [[nodiscard]] virtual auto routed() const noexcept -> bool = 0;
+    [[nodiscard]] virtual auto fenced() const noexcept -> bool = 0;
+    [[nodiscard]] virtual auto take_faults() -> std::vector<FaultEvent> = 0;
 };
 
-[[nodiscard]] auto to_string(NetworkVolumeError e) noexcept -> const char*;
-
-class NetworkVolumeBackend final : public HydrationTarget {
+class NetworkVolumeBackend final : public AttachedVolume {
 public:
     [[nodiscard]] static auto create(NetworkVolumeConfig config)
         -> std::expected<std::unique_ptr<NetworkVolumeBackend>, NetworkVolumeError>;
@@ -71,18 +78,16 @@ public:
     auto operator=(const NetworkVolumeBackend&) -> NetworkVolumeBackend& = delete;
     NetworkVolumeBackend(NetworkVolumeBackend&&) = delete;
     auto operator=(NetworkVolumeBackend&&) -> NetworkVolumeBackend& = delete;
-    // Stops the I/O thread (after at most one connect_timeout); requests
+    // Stops the I/O threads (after at most one connect_timeout); requests
     // still pending are dropped without their completions.
     ~NetworkVolumeBackend() override;
 
     // helm: the volume's ReplicaConfig, first and after each change.
     [[nodiscard]] auto set_route(const proto::ReplicaConfig& c) -> std::expected<void, RouteError>;
-    // A renewed storage certificate: the next connection presents it; an
-    // open session keeps the one it was made with.
-    auto set_tls(const tls::Config& config) -> void;
-    [[nodiscard]] auto routed() const noexcept -> bool;
-    [[nodiscard]] auto fenced() const noexcept -> bool;
-    [[nodiscard]] auto take_faults() -> std::vector<FaultEvent>;
+    auto set_tls(const tls::Config& config) -> void override;
+    [[nodiscard]] auto routed() const noexcept -> bool override;
+    [[nodiscard]] auto fenced() const noexcept -> bool override;
+    [[nodiscard]] auto take_faults() -> std::vector<FaultEvent> override;
     [[nodiscard]] auto session_open() const noexcept -> bool;
 
     // BlockBackend. size_bytes() is 0 until the route arrives.
@@ -99,14 +104,14 @@ public:
     [[nodiscard]] auto wake_fd() const noexcept -> int override;
 
 private:
-    struct Shared;
-    NetworkVolumeBackend(NetworkVolumeConfig config, std::unique_ptr<Shared> shared) noexcept;
+    NetworkVolumeBackend(NetworkVolumeConfig config,
+                         std::unique_ptr<HoldTransport> transport) noexcept;
 
     auto publish() -> void;
 
     NetworkVolumeConfig _config;
     InitiatorCore _core;
-    std::unique_ptr<Shared> _shared;
+    std::unique_ptr<HoldTransport> _transport;
 };
 
 }  // namespace ak::oar::blk

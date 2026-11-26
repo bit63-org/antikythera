@@ -284,11 +284,14 @@ target_link_libraries(ak_oar_blk_image
   PRIVATE ak::warnings ak::hardening)
 
 # oar-blk network volumes (.kiro/specs/block-volume-service/ task 7): the
-# initiator's protocol core and the backend that carries it over TLS to
-# the volume's primary hold.
+# initiator's protocol cores and the backends that carry them over TLS:
+# hold wire version 1 to a hold volume's primary, version 2 to the leaders
+# of a khold volume's stripe groups (kythira khold-block-service task 16).
 add_library(ak_oar_blk_volume
   oar/blk/initiator.cpp
+  oar/blk/hold_transport.cpp
   oar/blk/khold_initiator.cpp
+  oar/blk/khold_volume_backend.cpp
   oar/blk/network_volume_backend.cpp)
 add_library(ak::oar_blk_volume ALIAS ak_oar_blk_volume)
 target_link_libraries(ak_oar_blk_volume

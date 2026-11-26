@@ -334,13 +334,17 @@ auto split(std::string_view s, char sep) -> std::vector<std::string_view> {
     }
 }
 
-// NIC,MAC,VTEP[,GUEST_IP ...][,nocheck]: one mapping entry and the guest
-// addresses (IPv4 or IPv6) its NIC owns, appended to `m`. `nocheck` turns
-// the NIC's source/destination check off (MapUpdate format v3).
+// NIC,MAC,VTEP[,GUEST_IP ...][,nocheck][,sg][,subnet=ID]: one mapping
+// entry and the guest addresses (IPv4 or IPv6) its NIC owns, appended to
+// `m`. `nocheck` turns the NIC's source/destination check off (MapUpdate
+// format v3), `sg` marks its security groups enforced and `subnet=ID`
+// names its subnet (format v4; without it the subnet is 0, none).
 auto add_map_entry(std::string_view s, SendMapUpdate& m) -> std::expected<void, std::string> {
+    constexpr std::string_view subnet_key = "subnet=";
     const auto fields = split(s, ',');
     if (fields.size() < 3) {
-        return std::unexpected("map entry must be NIC,MAC,VTEP[,GUEST_IP ...][,nocheck]");
+        return std::unexpected(
+            "map entry must be NIC,MAC,VTEP[,GUEST_IP ...][,nocheck][,sg][,subnet=ID]");
     }
     auto nic = number<std::uint64_t>(fields[0], "NIC id");
     auto addr = mac(fields[1]);
@@ -358,6 +362,18 @@ auto add_map_entry(std::string_view s, SendMapUpdate& m) -> std::expected<void, 
     for (const auto ip : std::span{fields}.subspan(3)) {
         if (ip == "nocheck") {
             m.entries.back().source_dest_check = false;
+            continue;
+        }
+        if (ip == "sg") {
+            m.entries.back().security_groups_enforced = true;
+            continue;
+        }
+        if (ip.starts_with(subnet_key)) {
+            auto id = number<std::uint64_t>(ip.substr(subnet_key.size()), "subnet id");
+            if (!id) {
+                return std::unexpected(id.error());
+            }
+            m.entries.back().subnet_id = *id;
             continue;
         }
         const std::string text{ip};
@@ -982,7 +998,8 @@ auto parse_line(std::string_view line) -> std::expected<std::optional<Action>, s
     if (verb == "map-update") {
         if (args.size() < 2) {
             return std::unexpected(
-                "map-update: want VNI VERSION [NIC,MAC,VTEP[,GUEST_IP ...][,nocheck] ...]");
+                "map-update: want VNI VERSION "
+                "[NIC,MAC,VTEP[,GUEST_IP ...][,nocheck][,sg][,subnet=ID] ...]");
         }
         auto vni = number<std::uint32_t>(args[0], "VNI");
         auto version = number<std::uint64_t>(args[1], "mapping version");

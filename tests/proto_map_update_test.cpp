@@ -47,6 +47,8 @@ constexpr std::uint8_t ula_guest = 0xFD;
 constexpr std::size_t entry_mac = 0x08;
 constexpr std::size_t entry_pad = 0x0E;
 constexpr std::size_t entry_vtep = 0x10;
+constexpr std::size_t entry_subnet = 0x20;
+constexpr std::uint64_t sample_subnet = 0x5B01;
 
 auto entry(std::uint64_t nic, std::uint8_t tag) -> proto::MapEntry {
     proto::MapEntry e{.nic_id = nic};
@@ -54,6 +56,7 @@ auto entry(std::uint64_t nic, std::uint8_t tag) -> proto::MapEntry {
     e.mac[proto::mac_size - 1] = std::byte{tag};
     e.owner_vtep[0] = std::byte{ula_prefix};
     e.owner_vtep[last] = std::byte{tag};
+    e.subnet_id = sample_subnet;
     return e;
 }
 
@@ -132,8 +135,8 @@ BOOST_AUTO_TEST_SUITE(map_update, *boost::unit_test::timeout(unit_timeout_second
 
 BOOST_AUTO_TEST_CASE(layout) {
     static_assert(proto::map_update_size(0) == 104);
-    static_assert(proto::map_update_size(2) == 168);
-    static_assert(proto::map_update_size(1, 1, 1) == 176);
+    static_assert(proto::map_update_size(2) == 184);
+    static_assert(proto::map_update_size(1, 1, 1) == 184);
     static_assert(proto::max_map_update_size == proto::map_update_size(proto::max_map_entries,
                                                                        proto::max_guest_addresses,
                                                                        proto::max_guest_addresses));
@@ -141,12 +144,13 @@ BOOST_AUTO_TEST_CASE(layout) {
     const auto b = encoded(m);
     BOOST_REQUIRE_EQUAL(b.size(), proto::map_update_size(1, 1, 1));
     const auto header = ak::test::bytes_of(
-        'A', 'K', 'M', 'U', 0x03, 0x00, 0x0B, 0x0A, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+        'A', 'K', 'M', 'U', 0x04, 0x00, 0x0B, 0x0A, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
         0xEF, 0xCD, 0xAB, 0x00, 0x01, 0x00, 0x01, 0x00, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
         0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
     BOOST_TEST(std::ranges::equal(std::span{b}.first(proto::map_update_header_size), header));
-    const auto e = ak::test::bytes_of(0x00, 0x01, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0, 0, 0x01, 0, 0,
-                                      0xFD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01);
+    const auto e =
+        ak::test::bytes_of(0x00, 0x01, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0, 0, 0x01, 0, 0, 0xFD, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x01, 0x5B, 0, 0, 0, 0, 0, 0);
     BOOST_TEST(std::ranges::equal(std::span{b}.subspan(entry_at(0), proto::map_entry_size), e));
     const auto v4 = ak::test::bytes_of(0x00, 0x01, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1, 0, 0, 0, 0);
     BOOST_TEST(std::ranges::equal(std::span{b}.subspan(ipv4_at(m, 0), proto::map_ipv4_size), v4));
@@ -267,7 +271,8 @@ BOOST_AUTO_TEST_CASE(header_fields_are_checked) {
     b[0] = std::byte{0};
     BOOST_TEST((decode_error(b) == DecodeError::bad_magic));
 
-    for (const auto v : {1, 2, 4}) {  // 1 had no guest addresses, 2 no NIC flags
+    // 1 had no guest addresses, 2 no NIC flags, 3 no subnet IDs.
+    for (const auto v : {1, 2, 3, 5}) {
         b = encoded();
         b[4] = std::byte(v);
         BOOST_TEST((decode_error(b) == DecodeError::bad_version));
@@ -315,8 +320,8 @@ BOOST_AUTO_TEST_CASE(header_fields_are_checked) {
 }
 
 BOOST_AUTO_TEST_CASE(entry_padding_must_be_zero) {
-    // The flags byte defines only bit 0; the byte after it is padding.
-    for (const auto& [off, value] : {std::pair<std::size_t, int>{0, 0x02}, {0, 0x80}, {1, 0x01}}) {
+    // The flags byte defines bits 0 and 1; the byte after it is padding.
+    for (const auto& [off, value] : {std::pair<std::size_t, int>{0, 0x04}, {0, 0x80}, {1, 0x01}}) {
         auto b = encoded();
         b[entry_at(1) + entry_pad + off] = std::byte(value);
         BOOST_TEST((decode_error(b) == DecodeError::reserved_not_zero));
@@ -337,6 +342,43 @@ BOOST_AUTO_TEST_CASE(the_source_dest_check_flag_round_trips) {
     BOOST_TEST(!back->entries[1].source_dest_check);
     BOOST_TEST(back->entries[0].source_dest_check);
     BOOST_TEST((*back == m));
+}
+
+// Version 4: bit 1 marks the NIC's security groups as enforced
+// (vpc-security-groups Requirement 6), independent of bit 0.
+BOOST_AUTO_TEST_CASE(the_security_groups_flag_round_trips) {
+    auto m = sample();
+    BOOST_TEST(!m.entries[0].security_groups_enforced);
+    m.entries[0].security_groups_enforced = true;
+    m.entries[2].security_groups_enforced = true;
+    m.entries[2].source_dest_check = false;
+    const auto b = encoded(m);
+    BOOST_TEST(std::to_integer<int>(b[entry_at(0) + entry_pad]) == 2);
+    BOOST_TEST(std::to_integer<int>(b[entry_at(1) + entry_pad]) == 0);
+    BOOST_TEST(std::to_integer<int>(b[entry_at(2) + entry_pad]) == 3);
+    auto back = proto::decode_map_update(b);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST(back->entries[0].security_groups_enforced);
+    BOOST_TEST(!back->entries[1].security_groups_enforced);
+    BOOST_TEST((*back == m));
+}
+
+// Version 4: each entry carries its NIC's subnet ID (vpc-subnets-routing
+// Requirement 2.4), any 64-bit value; 0 means no subnet.
+BOOST_AUTO_TEST_CASE(the_subnet_id_round_trips) {
+    auto m = sample();
+    m.entries[0].subnet_id = 0;
+    m.entries[1].subnet_id = 0xFFFF'FFFF'FFFF'FFFF;
+    m.entries[2].subnet_id = 0x0102'0304'0506'0708;
+    const auto b = encoded(m);
+    BOOST_TEST(
+        std::ranges::equal(std::span{b}.subspan(entry_at(2) + entry_subnet, 8),
+                           ak::test::bytes_of(0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01)));
+    BOOST_TEST(proto::detail::all_zero(std::span{b}.subspan(entry_at(0) + entry_subnet, 8)));
+    auto back = proto::decode_map_update(b);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST((*back == m));
+    BOOST_TEST(back->entries[1].subnet_id == 0xFFFF'FFFF'FFFF'FFFFU);
 }
 
 BOOST_AUTO_TEST_CASE(nic_ids_are_non_zero_and_strictly_ascending) {

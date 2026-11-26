@@ -3,7 +3,10 @@
 
 // Fuzzes the MapUpdate decoder: an accepted frame must re-encode to
 // identical bytes (the encoding is canonical) and its entries must satisfy
-// the invariants oar-net's MappingTable and ARP/ND proxy rely on.
+// the invariants oar-net's MappingTable and ARP/ND proxy rely on. Version 4
+// flags and subnet IDs ride along in the re-encode check: a flag bit the
+// decoder accepted but the encoder dropped, or a subnet ID read from the
+// wrong offset, changes the bytes.
 
 #include <algorithm>
 #include <cstddef>

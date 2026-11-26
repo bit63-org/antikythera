@@ -48,10 +48,12 @@
 //                        task 23.2)
 //   create-network VNI
 //   delete-network VNI
-//   map-update VNI VERSION [NIC,MAC,VTEP[,GUEST_IP ...][,nocheck] ...]
-//                        e.g. 0x10,02:00:00:00:00:10,fd00::1,10.0.0.5,fd12::5
+//   map-update VNI VERSION [NIC,MAC,VTEP[,GUEST_IP ...][,nocheck][,sg][,subnet=ID] ...]
+//                        e.g. 0x10,02:00:00:00:00:10,fd00::1,10.0.0.5,fd12::5,subnet=7
 //                        (guest IPs are what the ARP/ND proxy answers for;
-//                        nocheck turns the NIC's source/destination check off)
+//                        nocheck turns the NIC's source/destination check off,
+//                        sg marks its security groups enforced, subnet=ID
+//                        names its subnet; 0, none, when left out)
 //   group-policy VNI VERSION drop
 //   group-policy VNI VERSION multicast RATE_FRAMES BURST_FRAMES RATE_BYTES BURST_BYTES
 //                MAX_REMOTE_VTEPS [MAX_GROUPS_PER_NIC]

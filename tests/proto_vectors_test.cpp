@@ -42,6 +42,8 @@ constexpr std::uint8_t local_unicast = 0x02;
 constexpr std::uint8_t ula_prefix = 0xFD;
 constexpr std::uint64_t map2_nic_a = 0x10;
 constexpr std::uint64_t map2_nic_b = 0x11;
+constexpr std::uint64_t map2_subnet_a = 0x5B01;
+constexpr std::uint64_t map2_subnet_b = 0x5B02;
 constexpr std::size_t last = 15;
 constexpr std::uint8_t guest_net = 10;
 constexpr std::uint8_t guest_ula_second = 0x12;
@@ -56,10 +58,12 @@ auto verifier() -> ak::hull::SignatureVerifier {
     return std::move(*v);
 }
 
-auto map2_entry(std::uint64_t nic, std::uint8_t vtep_last, bool source_dest_check = true)
-    -> proto::MapEntry {
+auto map2_entry(std::uint64_t nic, std::uint8_t vtep_last, std::uint64_t subnet,
+                bool source_dest_check = true, bool security_groups = false) -> proto::MapEntry {
     proto::MapEntry e{.nic_id = nic};
     e.source_dest_check = source_dest_check;
+    e.security_groups_enforced = security_groups;
+    e.subnet_id = subnet;
     e.mac[0] = std::byte{local_unicast};
     e.mac[proto::mac_size - 1] = std::byte{static_cast<std::uint8_t>(nic)};
     e.owner_vtep[0] = std::byte{ula_prefix};
@@ -211,7 +215,8 @@ BOOST_AUTO_TEST_CASE(map2_reproduces_and_verifies) {
                       .key_id = vec::map2_key_id,
                       .vni = vec::map2_vni,
                       .map_version = vec::map2_map_version,
-                      .entries = {map2_entry(map2_nic_a, 1), map2_entry(map2_nic_b, 2, false)},
+                      .entries = {map2_entry(map2_nic_a, 1, map2_subnet_a, true, true),
+                                  map2_entry(map2_nic_b, 2, map2_subnet_b, false)},
                       .ipv4 = {guest_ipv4(map2_nic_a), guest_ipv4(map2_nic_b)},
                       .ipv6 = {guest_ipv6(map2_nic_a)},
                       .signature = {}},

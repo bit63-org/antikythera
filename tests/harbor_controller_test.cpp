@@ -261,6 +261,19 @@ BOOST_AUTO_TEST_CASE(map_updates_parse_and_sort) {
     for (const auto& e : nm.entries) {
         BOOST_TEST(e.source_dest_check == (e.nic_id != 0x11U));
     }
+
+    // `subnet=ID` names a NIC's subnet and `sg` enforces its security
+    // groups (MapUpdate format v4); both default off.
+    auto v = action(
+        "map-update 5 5 0x11,02:00:00:00:00:11,fd00::2,subnet=0x5b01,sg,10.0.0.9 "
+        "0x10,02:00:00:00:00:10,fd00::1");
+    const auto& vm = std::get<harbor::SendMapUpdate>(v);
+    BOOST_REQUIRE(vm.entries.size() == 2U);
+    BOOST_TEST(vm.entries[0].subnet_id == 0U);
+    BOOST_TEST(!vm.entries[0].security_groups_enforced);
+    BOOST_TEST(vm.entries[1].subnet_id == 0x5B01U);
+    BOOST_TEST(vm.entries[1].security_groups_enforced);
+    BOOST_TEST(vm.entries[1].source_dest_check);
 }
 
 BOOST_AUTO_TEST_CASE(vpc_configs_parse_and_sort) {
@@ -406,6 +419,9 @@ BOOST_AUTO_TEST_CASE(mistakes_are_named) {
     BOOST_TEST(parse_error("map-update 5 1 0x10").find("NIC,MAC,VTEP") != std::string::npos);
     BOOST_TEST(parse_error("map-update 5 1 0x10,02:00:00:00:00:10,fd00::1,10.0.0.300")
                    .find("guest address") != std::string::npos);
+    BOOST_TEST(
+        parse_error("map-update 5 1 0x10,02:00:00:00:00:10,fd00::1,subnet=x").find("subnet id") !=
+        std::string::npos);
     // Values hull's strict decoder refuses fail here, not as `malformed`.
     BOOST_TEST(parse_error("create-network 0").find("invalid command") != std::string::npos);
     BOOST_TEST(parse_error("create-network 0x1000000").find("invalid command") !=

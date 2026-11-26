@@ -362,7 +362,8 @@ enum class VolumeFaultKind : std::uint8_t {
     stale_epoch = 3,      // a peer or initiator spoke an epoch older than the reporter's
     checksum_unrepairable = 4,
     media_error = 5,
-    lease_lost = 6,  // the primary's lease ran out before an acknowledgement came back
+    lease_lost = 6,         // the primary's lease ran out before an acknowledgement came back
+    checksum_mismatch = 7,  // initiator: a block read back failed its CRC32C (retried once)
 };
 
 enum class FaultReporter : std::uint8_t {
@@ -795,7 +796,7 @@ namespace detail {
     return s >= ReplicaState::in_sync && s <= ReplicaState::stale;
 }
 [[nodiscard]] constexpr auto known(VolumeFaultKind k) noexcept -> bool {
-    return k >= VolumeFaultKind::member_timeout && k <= VolumeFaultKind::lease_lost;
+    return k >= VolumeFaultKind::member_timeout && k <= VolumeFaultKind::checksum_mismatch;
 }
 [[nodiscard]] constexpr auto known(FaultReporter r) noexcept -> bool {
     return r == FaultReporter::hold || r == FaultReporter::initiator;

@@ -897,7 +897,7 @@ BOOST_AUTO_TEST_CASE(volume_event_rules_are_enforced_both_ways) {
     auto fault_epoch = fault;
     fault_epoch.epoch = 0;
     auto fault_kind = fault;
-    fault_kind.kind = static_cast<proto::VolumeFaultKind>(7);
+    fault_kind.kind = static_cast<proto::VolumeFaultKind>(8);
     auto fault_reporter = fault;
     fault_reporter.reporter = static_cast<proto::FaultReporter>(0);
     auto att_gen = sample_attachment();

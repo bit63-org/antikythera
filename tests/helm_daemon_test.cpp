@@ -1200,6 +1200,42 @@ BOOST_AUTO_TEST_CASE(hold_reports_are_relayed_by_kind) {
     BOOST_TEST(r.reports.size() == before + 1);  // each once
 }
 
+// kythira khold-block-service Requirement 9.9: a blk role's initiator
+// faults reach the controller, stamped with the role's slot; other kinds
+// from a blk role are dropped.
+BOOST_AUTO_TEST_CASE(blk_initiator_faults_are_relayed_with_the_slot) {
+    Rig r;
+    (void)r.daemon.boot();
+    const auto before = r.reports.size();
+    const proto::VolumeFault fault{.volume_id = 0x100,
+                                   .epoch = 2,
+                                   .suspect = 9,
+                                   .kind = proto::VolumeFaultKind::checksum_mismatch,
+                                   .reporter = proto::FaultReporter::initiator,
+                                   .slot = 0};
+    const proto::AttachmentStatus fenced{.attachment_id = 7,
+                                         .volume_id = 0x100,
+                                         .generation = 1,
+                                         .state = proto::AttachmentState::fenced,
+                                         .slot = 0,
+                                         .in_flight = 0};
+    BOOST_REQUIRE(r.blk.role.queue_report(1, hold_report(fault)));
+    BOOST_REQUIRE(r.blk.role.queue_report(2, hold_report(fenced)));
+    BOOST_REQUIRE(
+        r.blk.role.queue_report(3, hold_report(proto::DemotionConfirmed{
+                                       .volume_id = 0x100, .epoch = 2, .last_seq = 1, .slot = 0})));
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.reports.size() == before + 2);
+    auto want_fault = fault;
+    want_fault.slot = blk_slot;
+    auto want_fenced = fenced;
+    want_fenced.slot = blk_slot;
+    BOOST_TEST((r.last<proto::VolumeFault>() == want_fault));
+    BOOST_TEST((r.last<proto::AttachmentStatus>() == want_fenced));
+    BOOST_TEST(r.daemon.stats().hold_reports == 2U);
+    BOOST_TEST(r.daemon.stats().hold_reports_dropped == 1U);
+}
+
 BOOST_AUTO_TEST_CASE(storage_roles_enroll_through_the_controller) {
     Rig r{link_timeout, nullptr, true};
     const auto blk_csr = ak::test::bytes_of(0x30, 0x02, 0x11, 0x11);

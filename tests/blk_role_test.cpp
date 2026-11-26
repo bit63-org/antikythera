@@ -1622,6 +1622,49 @@ BOOST_AUTO_TEST_CASE(conversion_refuses_what_it_cannot_copy) {
     BOOST_TEST((start_copy(bare, to_net, vol_two, k, k).error() == oar::Status::failed));
 }
 
+// kythira khold-block-service Requirement 9.9: the initiator's faults go
+// to helm as reports; here, a config that drops the attachment fences it.
+BOOST_AUTO_TEST_CASE(network_volume_faults_become_reports) {
+    ak::test::TestCa ca{"storage CA"};
+    Hold hold{ca};
+    Rig rig{false, compute_tls(ca)};
+    BOOST_REQUIRE((rig.role->replica_config(frame_of(net_config(compute_id, hold.port()))) ==
+                   oar::Status::ok));
+    BOOST_REQUIRE((rig.role->prepare_function(
+                       {.fn = fn0,
+                        .type = ak::helm::FunctionType::blk_fn,
+                        .vm_id = vm_one,
+                        .config = oar::BlkConfig{.volume_id = vol_one,
+                                                 .attachment_id = net_attachment,
+                                                 .generation = 1}}) == oar::Status::ok));
+    static_cast<void>(rig.role->poll());
+    auto none = rig.role->hold_reports({.ack = 0, .offset = 0});
+    BOOST_REQUIRE(none.has_value());
+    BOOST_TEST(none->total == 0U);
+
+    auto detached = net_config(compute_id, hold.port(), 2);
+    detached.attachments.clear();
+    BOOST_TEST((rig.role->replica_config(frame_of(detached)) == oar::Status::ok));
+    static_cast<void>(rig.role->poll());
+    auto chunk = rig.role->hold_reports({.ack = 0, .offset = 0});
+    BOOST_REQUIRE(chunk.has_value());
+    BOOST_REQUIRE(chunk->total != 0U);
+    BOOST_REQUIRE(chunk->chunk.size() == chunk->total);
+    const auto rep = ak::proto::decode_report(chunk->chunk);
+    BOOST_REQUIRE(rep.has_value());
+    BOOST_TEST(rep->server_id == compute_id);
+    const auto* st = std::get_if<ak::proto::AttachmentStatus>(&rep->body);
+    BOOST_REQUIRE(st != nullptr);
+    BOOST_TEST(st->attachment_id == net_attachment);
+    BOOST_TEST(st->volume_id == vol_one);
+    BOOST_TEST(st->generation == 1U);
+    BOOST_TEST((st->state == ak::proto::AttachmentState::fenced));
+    // Acknowledged: gone.
+    auto after = rig.role->hold_reports({.ack = chunk->report_seq, .offset = 0});
+    BOOST_REQUIRE(after.has_value());
+    BOOST_TEST(after->total == 0U);
+}
+
 BOOST_AUTO_TEST_CASE(network_volume_configs_must_be_signed_for_this_server) {
     ak::test::TestCa ca{"storage CA"};
     {

@@ -36,6 +36,13 @@ auto disconnected() -> std::unexpected<LinkError> {
            std::holds_alternative<proto::SnapshotProgress>(body);
 }
 
+// What a blk role reports: its initiators' faults (kythira
+// khold-block-service Requirement 9.9).
+[[nodiscard]] auto blk_kind(const proto::ReportBody& body) -> bool {
+    return std::holds_alternative<proto::VolumeFault>(body) ||
+           std::holds_alternative<proto::AttachmentStatus>(body);
+}
+
 // Reports taken from one role per pass, so a chatty role cannot hold the loop.
 constexpr std::size_t max_reports_per_pass = 64;
 
@@ -729,16 +736,28 @@ auto HelmDaemon::replay_configs(SlotState& slot) -> void {
 
 auto HelmDaemon::take_hold_reports() -> void {
     for (auto& [n, slot] : _slots) {
-        if (!is_hold(*slot)) {
+        const bool blk = is_blk(*slot);
+        if (!is_hold(*slot) && !blk) {
             continue;
         }
         auto taken = slot->link->hold_reports(max_reports_per_pass);
         if (!taken) {
-            continue;  // tried again next pass; the role keeps them
+            continue;  // tried again next pass (or a role without reports); it keeps them
         }
         for (const auto& bytes : *taken) {
             auto rep = proto::decode_report(bytes);
-            if (!rep || !hold_kind(rep->body)) {
+            if (rep && blk && blk_kind(rep->body)) {
+                // The role does not know its data-plane slot; helm does.
+                std::visit(
+                    [&]<typename T>(T& b) {
+                        if constexpr (std::is_same_v<T, proto::VolumeFault> ||
+                                      std::is_same_v<T, proto::AttachmentStatus>) {
+                            b.slot = n;
+                        }
+                    },
+                    rep->body);
+            }
+            if (!rep || !(blk ? blk_kind(rep->body) : hold_kind(rep->body))) {
                 const std::scoped_lock lock{_inbox_mutex};
                 ++_stats.hold_reports_dropped;
                 continue;

@@ -45,7 +45,34 @@ auto to_string(RouteError e) noexcept -> const char* {
     return "unknown";
 }
 
+auto to_string(InitiatorFault f) noexcept -> const char* {
+    switch (f) {
+        case InitiatorFault::primary_timeout:
+            return "primary_timeout";
+        case InitiatorFault::fenced:
+            return "fenced";
+        case InitiatorFault::checksum:
+            return "checksum";
+        case InitiatorFault::media_error:
+            return "media_error";
+    }
+    return "unknown";
+}
+
 InitiatorCore::InitiatorCore(InitiatorConfig config) noexcept : _config{config} {}
+
+auto InitiatorCore::fault(InitiatorFault kind) -> void {
+    std::uint64_t server = 0;
+    std::uint64_t epoch = 0;
+    if (_route) {
+        epoch = _route->config.epoch;
+        if (const auto* p = proto::primary_member(_route->config);
+            p != nullptr && kind != InitiatorFault::fenced) {
+            server = p->server_id;
+        }
+    }
+    _faults.push_back({.kind = kind, .server = server, .epoch = epoch});
+}
 
 auto InitiatorCore::capacity_bytes() const noexcept -> std::uint64_t {
     return _route ? _route->config.capacity_blocks * _route->config.block_size : 0;
@@ -415,7 +442,7 @@ auto InitiatorCore::on_reply(std::deque<Part>::iterator it, const proto::HoldFra
                 good = crc32c::of(block) == crc || (crc == 0 && all_zero(block));
             }
             if (!good) {
-                _faults.push_back(InitiatorFault::checksum);
+                fault(InitiatorFault::checksum);
                 if (it->retries < read_retries) {
                     ++it->retries;
                     it->sent = false;
@@ -464,6 +491,10 @@ auto InitiatorCore::on_reply(std::deque<Part>::iterator it, const proto::HoldFra
             complete(it->op, std::unexpected(it->kind == Kind::read ? BackendError::not_hydrated
                                                                     : BackendError::io));
             return;
+        case HoldStatus::io_error:
+            fault(InitiatorFault::media_error);
+            complete(it->op, std::unexpected(BackendError::io));
+            return;
         default:
             complete(it->op, std::unexpected(BackendError::io));
             return;
@@ -501,7 +532,7 @@ auto InitiatorCore::fail_all(BackendError e) -> void {
 
 auto InitiatorCore::fence() -> void {
     if (!_fenced) {
-        _faults.push_back(InitiatorFault::fenced);
+        fault(InitiatorFault::fenced);
     }
     _fenced = true;
     fail_all(BackendError::io);
@@ -525,7 +556,7 @@ auto InitiatorCore::tick(Clock::time_point now) -> void {
     }
     if (_state != State::down && (outstanding() || _state == State::hello) &&
         now - _last_heard >= _config.primary_timeout) {
-        _faults.push_back(InitiatorFault::primary_timeout);
+        fault(InitiatorFault::primary_timeout);
         drop_session(now + _config.retry_backoff);
     }
     if (_state == State::open && !outstanding() &&
@@ -580,7 +611,7 @@ auto InitiatorCore::take_output() -> std::vector<std::vector<std::byte>> {
     return std::exchange(_out, {});
 }
 
-auto InitiatorCore::take_faults() -> std::vector<InitiatorFault> {
+auto InitiatorCore::take_faults() -> std::vector<FaultEvent> {
     return std::exchange(_faults, {});
 }
 

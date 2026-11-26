@@ -1144,6 +1144,9 @@ auto Master::on_fault(std::uint64_t server, const proto::VolumeFault& f, Time no
             break;
         case proto::VolumeFaultKind::lease_lost:
         case proto::VolumeFaultKind::stale_epoch:
+        case proto::VolumeFaultKind::checksum_mismatch:
+            // An initiator's evidence only: never a membership change alone
+            // (khold Requirement 9.9).
             break;
     }
 }

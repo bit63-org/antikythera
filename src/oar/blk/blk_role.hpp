@@ -96,6 +96,14 @@
 // progress until release forgets it; prepare_function, rewrap_volume and
 // a second copy of either volume are busy meanwhile, and delete_volume of
 // either drops the copy first.
+// Faults (kythira khold-block-service Requirement 9.9, closing the
+// take_faults() gap for hold volumes too). poll() takes each network
+// attachment's initiator faults and queues them as reports, which helm
+// reads with hold_reports and relays to the controller: a leader or
+// primary timeout, a checksum mismatch and a media error become a
+// volume_fault (reporter initiator, suspect the server), and fencing an
+// attachment_status (fenced). A report is evidence for the controller,
+// never a membership change on its own.
 //
 // The volume files are named vol-<16 hex digits>.akv in the volume
 // directory. The role checks a volume's header against the request: a
@@ -126,6 +134,7 @@
 #include "oar/blk/lazy_image_backend.hpp"
 #include "oar/blk/network_volume_backend.hpp"
 #include "objstore/object_store.hpp"
+#include "proto/report.hpp"
 #include "oar/blk/virtio_blk_function.hpp"
 #include "oar/blk/volume_copier.hpp"
 
@@ -239,6 +248,8 @@ public:
         -> std::expected<helm::oar::EjectState, helm::oar::Status> override;
     auto copy_volume(const helm::oar::CopyVolume& request)
         -> std::expected<helm::oar::CopyAnswer, helm::oar::Status> override;
+    auto hold_reports(const helm::oar::ReportRequest& request)
+        -> std::expected<helm::oar::ReportChunk, helm::oar::Status> override;
 
     // Enrollment through `enrollment` (must outlive the role); its Apply
     // should call set_storage_tls.
@@ -275,6 +286,8 @@ private:
         LazyImageBackend* image{nullptr};  // the active function's backend, for an image volume
         NetworkVolumeBackend* network{nullptr};  // ... for a network volume
         HydratingBackend* hydrating{nullptr};    // ... in front of it, restoring from an image
+        std::uint64_t attachment_id{0};          // the network attachment, for reports
+        std::uint32_t generation{0};
     };
 
     explicit BlkRole(RoleConfig config) : _config{std::move(config)} {}
@@ -302,6 +315,9 @@ private:
     auto serve_active(Slot& s, std::unique_ptr<VirtioBlkFunction> f, std::uint64_t volume,
                       LazyImageBackend* image, NetworkVolumeBackend* network,
                       HydratingBackend* hydrating = nullptr) -> helm::oar::Status;
+    // Queues the initiator faults of a network attachment as reports.
+    auto report_faults(const Slot& s, const std::vector<FaultEvent>& faults) -> void;
+    auto queue_report(proto::ReportBody body) -> void;
 
     // A local <-> network copy, by its local volume.
     struct Copy {
@@ -318,6 +334,8 @@ private:
     std::map<std::uint64_t, proto::ReplicaConfig> _configs;  // network volumes, newest
     RoleConfig::Clock::time_point _started;
     helm::RoleEnrollment* _enrollment{nullptr};
+    helm::oar::ReportQueue _reports;
+    std::uint64_t _next_report{1};
 };
 
 }  // namespace ak::oar::blk

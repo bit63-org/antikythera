@@ -46,6 +46,7 @@
 #include "proto/test_vectors.hpp"
 #include "proto/tunnel_peers.hpp"
 #include "proto/instance_metadata.hpp"
+#include "proto/volume_layout.hpp"
 #include "proto/vpc_config.hpp"
 #include "test_support.hpp"
 #include "tls_test_support.hpp"
@@ -71,6 +72,7 @@ constexpr unsigned e2e_timeout_seconds = 60;
 constexpr SlotNumber net_slot = 1;
 constexpr SlotNumber blk_slot = 2;
 constexpr SlotNumber hold_slot = 3;
+constexpr SlotNumber khold_slot = 4;
 constexpr std::uint16_t net_functions = 2;
 constexpr std::uint16_t blk_functions = 1;
 constexpr std::uint64_t server = 7;
@@ -327,6 +329,26 @@ public:
         return _reports.serve(r);  // the chunk outlives the lock: one helm, one request at a time
     }
 
+    // A khold (or blk) role's layouts, and a khold role's self-tests.
+    std::atomic<oar::Status> layout_status{oar::Status::ok};
+    std::atomic<int> self_tests{0};
+    [[nodiscard]] auto layouts() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _layouts;
+    }
+    auto volume_layout(std::span<const std::byte> frame) -> oar::Status override {
+        const std::scoped_lock lock{_mutex};
+        _layouts.emplace_back(frame.begin(), frame.end());
+        return layout_status.load();
+    }
+    auto self_test() -> oar::Status override {
+        if (_inventory.role != oar::Role::khold) {
+            return oar::Status::unsupported;
+        }
+        ++self_tests;
+        return oar::Status::ok;
+    }
+
     // A storage role's enrollment: the request it answers with (none once
     // a certificate is taken), and the chains it was given.
     std::atomic<bool> enrolls{false};
@@ -360,6 +382,7 @@ private:
     oar::Inventory _inventory;
     mutable std::mutex _mutex;
     std::vector<std::vector<std::byte>> _configs;
+    std::vector<std::vector<std::byte>> _layouts;
     std::vector<std::vector<std::byte>> _ops;
     std::vector<oar::LeaseGrant> _grants;
     oar::ReportQueue _reports;
@@ -561,28 +584,41 @@ struct Rig {
     Board net{net_slot, oar::Role::net, FunctionType::nic_vf, net_functions};
     Board blk{blk_slot, oar::Role::blk, FunctionType::blk_fn, blk_functions};
     Board hold{hold_slot, oar::Role::hold, FunctionType::blk_fn, 0};
+    Board khold{khold_slot, oar::Role::khold, FunctionType::blk_fn, 0};
     std::vector<proto::ReportBody> reports;  // loop thread only (the test thread)
     helm::HelmDaemon daemon;
 
     explicit Rig(std::chrono::milliseconds slot_link_timeout = link_timeout,
-                 helm::HostPort* host_port = nullptr, bool with_hold = false)
-        : daemon{config(slot_link_timeout, with_hold),
+                 helm::HostPort* host_port = nullptr, bool with_hold = false,
+                 bool with_khold = false)
+        : daemon{config(slot_link_timeout, with_hold, with_khold),
                  keys,
                  audit,
                  host_port != nullptr ? *host_port : host,
                  backplane,
                  [this](SlotNumber s) {
-                     return s == net_slot ? net.connect()
-                                          : (s == blk_slot ? blk.connect() : hold.connect());
+                     switch (s) {
+                         case net_slot:
+                             return net.connect();
+                         case blk_slot:
+                             return blk.connect();
+                         case khold_slot:
+                             return khold.connect();
+                         default:
+                             return hold.connect();
+                     }
                  },
                  [this](proto::ReportBody b) { reports.push_back(std::move(b)); }} {}
 
-    static auto config(std::chrono::milliseconds slot_link_timeout, bool with_hold = false)
-        -> helm::DaemonConfig {
+    static auto config(std::chrono::milliseconds slot_link_timeout, bool with_hold = false,
+                       bool with_khold = false) -> helm::DaemonConfig {
         helm::DaemonConfig c;
         std::vector<SlotNumber> slots{net_slot, blk_slot};
         if (with_hold) {
             slots.push_back(hold_slot);
+        }
+        if (with_khold) {
+            slots.push_back(khold_slot);
         }
         c.report_interval = 0ms;  // every pass takes hold reports
         for (const auto s : slots) {
@@ -889,6 +925,42 @@ auto hold_report(proto::ReportBody body) -> std::vector<std::byte> {
     auto b = proto::encode_report({.server_id = server, .report_seq = 1, .body = std::move(body)});
     BOOST_REQUIRE(b.has_value());
     return *b;
+}
+
+// A khold layout for `server` as the ControllerSession hands it over. One
+// stripe group of three data members starting at server `first_member`,
+// and an attachment on server `attached_on` (0: none). helm checks no
+// signature, so a fixed one does.
+auto khold_layout(std::uint64_t volume, std::uint64_t epoch, std::uint64_t first_member,
+                  std::uint64_t attached_on = 0)
+    -> std::pair<proto::VolumeLayout, std::vector<std::byte>> {
+    proto::VolumeLayout l;
+    l.key_id = 1;
+    l.server_id = server;
+    l.volume_id = volume;
+    l.epoch = epoch;
+    l.lineage_id = 0x2EE;
+    l.capacity_blocks = 1024;
+    l.qos = {.iops = 100, .mib_per_s = 10, .burst_iops = 100, .burst_mib = 10};
+    l.timings = {.member_deadline_ms = 1000, .election_min_ms = 1000, .resync_window_s = 900};
+    proto::StripeGroup g{.group_id = 0x5001, .members = {}};
+    for (std::uint64_t m = first_member; m < first_member + 3; ++m) {
+        proto::LayoutMember member{.server_id = m, .endpoint = {}, .port = 7400};
+        member.endpoint[0] = std::byte{0xFD};
+        member.endpoint[15] = std::byte{static_cast<std::uint8_t>(m)};
+        g.members.push_back(member);
+    }
+    l.groups = {g};
+    if (attached_on != 0) {
+        l.attachments = {{.attachment_id = 0xA1,
+                          .server_id = attached_on,
+                          .generation = 1,
+                          .mode = proto::AttachMode::rw}};
+    }
+    l.signature.fill(std::byte{sig_fill});
+    auto b = proto::encode_volume_layout(l);
+    BOOST_REQUIRE(b.has_value());
+    return {l, *b};
 }
 
 }  // namespace
@@ -1286,6 +1358,167 @@ BOOST_AUTO_TEST_CASE(storage_roles_enroll_through_the_controller) {
     r.blk.role.set_csr(ak::test::bytes_of(1, 2, 3));
     r.daemon.run_once(0ms);
     BOOST_TEST(r.count<proto::CertRequest>() == 3U);
+}
+
+// kythira khold-block-service task 17: a layout goes to the khold roles
+// when this server keeps one of the volume's replicas, to the blk roles
+// when it hosts one of its attachments, and only when it is newer.
+BOOST_AUTO_TEST_CASE(khold_layouts_reach_the_roles_that_serve_the_volume) {
+    Rig r{link_timeout, nullptr, false, true};
+    (void)r.daemon.boot();
+    BOOST_TEST(r.daemon.attached(khold_slot));
+    BOOST_TEST(r.free_functions() == net_functions + blk_functions);  // the khold role adds none
+
+    const auto [m2, member2] = khold_layout(0x200, 2, server - 1);  // server is a member
+    const auto [m1, member1] = khold_layout(0x200, 1, server - 1);
+    r.daemon.on_volume_layout(m2, member2);
+    r.daemon.on_volume_layout(m1, member1);  // older: dropped
+    r.daemon.on_volume_layout(m2, member2);  // the same again: dropped
+    const auto [a3, attached3] = khold_layout(0x300, 3, server + 10, server);  // attached here
+    r.daemon.on_volume_layout(a3, attached3);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.khold.role.layouts().size() == 1U);
+    BOOST_TEST((r.khold.role.layouts()[0] == member2));
+    BOOST_REQUIRE(r.blk.role.layouts().size() == 1U);
+    BOOST_TEST((r.blk.role.layouts()[0] == attached3));
+    BOOST_TEST(r.net.role.layouts().empty());
+    BOOST_TEST(r.daemon.stats().volume_layouts == 2U);
+    BOOST_TEST(r.daemon.stats().volume_layouts_stale == 2U);
+    BOOST_TEST(r.daemon.stats().volume_layouts_refused == 0U);
+
+    // An epoch that moves the replicas off this server still reaches the
+    // khold role, which lets the volume go; then helm forgets it.
+    const auto [m3, moved3] = khold_layout(0x200, 3, server + 1);
+    r.daemon.on_volume_layout(m3, moved3);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.khold.role.layouts().size() == 2U);
+    BOOST_TEST((r.khold.role.layouts()[1] == moved3));
+    BOOST_TEST(r.blk.role.layouts().size() == 1U);
+
+    // A restarted khold role gets what it still serves: nothing.
+    r.daemon.on_slot_recovered(khold_slot);
+    BOOST_TEST(r.khold.role.layouts().size() == 2U);
+    BOOST_TEST(r.khold.connects == 2);
+
+    // A role that refuses one is counted.
+    r.blk.role.layout_status = oar::Status::failed;
+    const auto [a4, attached4] = khold_layout(0x300, 4, server + 10, server);
+    r.daemon.on_volume_layout(a4, attached4);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().volume_layouts_refused == 1U);
+}
+
+// design "Failure modes": helm restarts on a storage server, or the role
+// does; helm replays the newest layouts so the role catches up without
+// the controller. A blk role gets its layouts before the router could
+// prepare a function on it.
+BOOST_AUTO_TEST_CASE(a_restarted_khold_or_blk_role_gets_its_layouts_again) {
+    Rig r{link_timeout, nullptr, false, true};
+    (void)r.daemon.boot();
+    const auto [m4, member4] = khold_layout(0x200, 4, server);
+    const auto [m5, member5] = khold_layout(0x200, 5, server);
+    const auto [a2, attached2] = khold_layout(0x300, 2, server + 10, server);
+    r.daemon.on_volume_layout(m4, member4);
+    r.daemon.on_volume_layout(m5, member5);
+    r.daemon.on_volume_layout(a2, attached2);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.khold.role.layouts().size() == 2U);
+    r.daemon.on_slot_recovered(khold_slot);
+    BOOST_REQUIRE(r.khold.role.layouts().size() == 3U);
+    BOOST_TEST((r.khold.role.layouts()[2] == member5));  // the newest only
+    r.daemon.on_slot_recovered(blk_slot);
+    BOOST_REQUIRE(r.blk.role.layouts().size() == 2U);
+    BOOST_TEST((r.blk.role.layouts()[1] == attached2));
+}
+
+BOOST_AUTO_TEST_CASE(khold_reports_are_relayed_by_kind_with_the_slot) {
+    Rig r{link_timeout, nullptr, false, true};
+    (void)r.daemon.boot();
+    const auto before = r.reports.size();
+    const proto::GroupStatus status{.slot = 0,
+                                    .entries = {{.volume_id = 0x200,
+                                                 .group_id = 0x5001,
+                                                 .epoch = 2,
+                                                 .term = 3,
+                                                 .commit_index = 10,
+                                                 .applied_index = 9,
+                                                 .kind = 1,
+                                                 .state = proto::GroupMemberState::leader,
+                                                 .lagging = 0,
+                                                 .drive = 0,
+                                                 .allocated_bytes = 4096}}};
+    const proto::Capacity capacity{.slot = 0,
+                                   .link_mbps = 25000,
+                                   .drives = {{.drive = 0,
+                                               .state = proto::DriveState::ok,
+                                               .capacity_bytes = 1U << 30U,
+                                               .allocated_bytes = 4096,
+                                               .reserved_bytes = 0,
+                                               .read_iops = 90000,
+                                               .write_iops = 40000,
+                                               .read_mib_per_s = 3000,
+                                               .write_mib_per_s = 2000,
+                                               .replicas = 1}}};
+    const proto::GroupFault fault{.volume_id = 0x200,
+                                  .group_id = 0x5001,
+                                  .epoch = 2,
+                                  .term = 3,
+                                  .suspect = 9,
+                                  .kind = proto::GroupFaultKind::lagging,
+                                  .slot = 0,
+                                  .drive = 0};
+    BOOST_REQUIRE(r.khold.role.queue_report(1, hold_report(status)));
+    BOOST_REQUIRE(r.khold.role.queue_report(2, hold_report(capacity)));
+    BOOST_REQUIRE(r.khold.role.queue_report(3, hold_report(fault)));
+    BOOST_REQUIRE(r.khold.role.queue_report(
+        4, hold_report(proto::DemotionConfirmed{
+               .volume_id = 0x100, .epoch = 2, .last_seq = 1, .slot = 0})));
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.reports.size() == before + 3);
+    auto want_status = status;
+    want_status.slot = khold_slot;
+    auto want_capacity = capacity;
+    want_capacity.slot = khold_slot;
+    auto want_fault = fault;
+    want_fault.slot = khold_slot;
+    BOOST_TEST((r.last<proto::GroupStatus>() == want_status));
+    BOOST_TEST((r.last<proto::Capacity>() == want_capacity));
+    BOOST_TEST((r.last<proto::GroupFault>() == want_fault));
+    BOOST_TEST(r.daemon.stats().hold_reports == 3U);
+    BOOST_TEST(r.daemon.stats().hold_reports_dropped == 1U);
+}
+
+// Requirement 12.1: the controller can ask for a fresh self-test.
+BOOST_AUTO_TEST_CASE(self_tests_reach_the_khold_role_asked) {
+    Rig r{link_timeout, nullptr, false, true};
+    (void)r.daemon.boot();
+    r.daemon.on_self_test({.server_id = server, .slot = 0, .scope = proto::SelfTestScope::all});
+    r.daemon.on_self_test(
+        {.server_id = server, .slot = khold_slot, .scope = proto::SelfTestScope::slot});
+    r.daemon.on_self_test(
+        {.server_id = server, .slot = blk_slot, .scope = proto::SelfTestScope::slot});
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.khold.role.self_tests.load() == 2);
+    BOOST_TEST(r.daemon.stats().self_tests == 2U);
+    BOOST_TEST(r.daemon.stats().self_tests_refused == 1U);  // no khold role in the blk slot
+}
+
+BOOST_AUTO_TEST_CASE(khold_roles_enroll_as_khold) {
+    Rig r{link_timeout, nullptr, false, true};
+    const auto csr = ak::test::bytes_of(0x30, 0x02, 0x33, 0x33);
+    r.khold.role.set_csr(csr);
+    r.khold.role.enrolls = true;
+    (void)r.daemon.boot();
+    BOOST_REQUIRE(r.count<proto::CertRequest>() == 1U);
+    const auto c = r.last<proto::CertRequest>();
+    BOOST_TEST(c.slot == khold_slot);
+    BOOST_TEST((c.role == proto::StorageRole::khold));
+    BOOST_TEST((c.csr == csr));
+    const auto chain = ak::test::bytes_of(0x30, 0x01, 0x07);
+    r.daemon.on_role_certificate({.server_id = server, .slot = khold_slot, .chain = chain});
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.khold.role.chains().size() == 1U);
+    BOOST_TEST(r.daemon.stats().role_certificates == 1U);
 }
 
 BOOST_AUTO_TEST_CASE(volume_keys_are_opened_and_kept_per_attachment) {

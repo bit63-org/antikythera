@@ -515,6 +515,11 @@ auto OarLink::hold_reports(std::size_t max)
     return out;
 }
 
+auto OarLink::self_test() -> std::expected<void, LinkError> {
+    std::vector<std::byte> body;
+    return expect_empty(transact(mctp::VendorType::self_test, body));
+}
+
 auto OarLink::health() -> std::expected<oar::Health, LinkError> {
     std::vector<std::byte> body;
     auto response = transact(mctp::VendorType::health, body);
@@ -768,6 +773,9 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
             }
             return with_body(oar::encode_membership_page(*page, req->cursor));
         }
+        case mctp::VendorType::self_test:
+            return status_only(oar::decode_empty(body) ? handler.self_test()
+                                                       : oar::Status::bad_request);
         case mctp::VendorType::cert_request: {
             if (!oar::decode_empty(body)) {
                 return status_only(oar::Status::bad_request);

@@ -112,8 +112,25 @@
 // attaches the volume on ATTACH_VOLUME) and to every storage (blk) role,
 // and again to a storage role whose sideband (re)opens.
 //
+// khold (kythira .kiro/specs/khold-block-service/ task 17). A khold role
+// is a storage role with no functions, like hold. A VolumeLayout frame
+// goes unmodified to every khold role when this server is a member or
+// gateway of the volume, and to every blk role when one of the volume's
+// attachments names this server; the roles verify it. helm keeps the
+// newest epoch of each volume and hands those layouts again to a khold or
+// blk role whose sideband (re)opens (before the router registers a blk
+// role's functions, so an attach finds its layout), so a restarted role
+// catches up without the controller. A layout that drops this server
+// still goes to the roles that had the volume, so they learn they are
+// out, and is then forgotten. An older or identical layout is dropped.
+// A controller self_test goes to the khold role it names (or all of
+// them), which measures its drives and link and reports the result as a
+// capacity report. helm takes a khold role's queued reports with the
+// hold roles' and relays the kinds it sends (group status, capacity,
+// group faults, volume faults), stamping the role's slot in each.
+//
 // Enrollment. Every identity_interval, and as soon as its sideband opens,
-// helm asks each storage role (blk, hold) for its certificate request.
+// helm asks each storage role (blk, hold, khold) for its certificate request.
 // A request it has not reported for that slot (or reported more than
 // identity_retry ago) goes to the controller as a cert_request report; a
 // role that wants nothing answers with none, and one that does not take
@@ -216,14 +233,20 @@ struct DaemonStats {
     std::uint64_t replica_configs{0};  // received from the controller
     std::uint64_t volume_ops{0};
     std::uint64_t lease_grants{0};
-    std::uint64_t hold_refused{0};               // a hold role refused or missed a frame or grant
-    std::uint64_t hold_reports{0};               // relayed to the controller (hold and blk roles)
-    std::uint64_t hold_reports_dropped{0};       // undecodable, or of a kind that role never sends
-    std::uint64_t volume_keys{0};                // opened and kept (KeyStore::put_attachment_key)
-    std::uint64_t volume_keys_refused{0};        // did not open, stale, or too many
-    std::uint64_t image_keys{0};                 // opened and kept (KeyStore::put_image_key)
-    std::uint64_t image_keys_refused{0};         // did not open, or too many
-    std::uint64_t blk_configs_refused{0};        // a storage role refused a network volume's config
+    std::uint64_t hold_refused{0};          // a hold role refused or missed a frame or grant
+    std::uint64_t hold_reports{0};          // relayed to the controller (hold and blk roles)
+    std::uint64_t hold_reports_dropped{0};  // undecodable, or of a kind that role never sends
+    std::uint64_t volume_keys{0};           // opened and kept (KeyStore::put_attachment_key)
+    std::uint64_t volume_keys_refused{0};   // did not open, stale, or too many
+    std::uint64_t image_keys{0};            // opened and kept (KeyStore::put_image_key)
+    std::uint64_t image_keys_refused{0};    // did not open, or too many
+    std::uint64_t blk_configs_refused{0};   // a storage role refused a network volume's config
+    // khold.
+    std::uint64_t volume_layouts{0};             // kept: newer than the last for the volume
+    std::uint64_t volume_layouts_stale{0};       // older or identical: dropped
+    std::uint64_t volume_layouts_refused{0};     // a khold or blk role refused or missed one
+    std::uint64_t self_tests{0};                 // started on a khold role
+    std::uint64_t self_tests_refused{0};         // refused, missed, or no khold role in that slot
     std::uint64_t cert_requests{0};              // storage role requests reported to the controller
     std::uint64_t role_certificates{0};          // certificates a storage role took
     std::uint64_t role_certificates_refused{0};  // refused, or for a slot with no storage role
@@ -307,6 +330,9 @@ public:
         -> void override;
     auto on_instance_metadata(const proto::InstanceMetadata& metadata,
                               std::span<const std::byte> frame) -> void override;
+    auto on_volume_layout(const proto::VolumeLayout& layout, std::span<const std::byte> frame)
+        -> void override;
+    auto on_self_test(const proto::SelfTest& request) -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
     // The newest published snapshot (ControllerSession's InventorySource).
@@ -361,9 +387,17 @@ private:
         std::uint64_t metadata_version{0};
         std::vector<std::byte> frame;
     };
+    struct LayoutFrame {
+        std::uint64_t volume_id{0};
+        std::uint64_t epoch{0};
+        bool member{false};    // this server is a member or gateway: for khold roles
+        bool attached{false};  // an attachment names this server: for blk roles
+        std::vector<std::byte> frame;
+    };
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
                               proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
-                              ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame, MetadataFrame>;
+                              ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame, MetadataFrame,
+                              LayoutFrame, proto::SelfTest>;
     // Where a NIC with a kept record is plugged: its network role's slot
     // and function.
     struct MetadataHome {
@@ -457,6 +491,12 @@ private:
     auto forward_grant(const proto::LeaseGrant& grant) -> void;
     auto replay_configs(SlotState& slot) -> void;
     auto take_hold_reports() -> void;
+    // khold: layouts to khold and blk roles, self-tests to khold roles.
+    [[nodiscard]] static auto is_khold(const SlotState& slot) -> bool;
+    auto forward_layout(LayoutFrame& layout) -> void;
+    auto replay_layouts(SlotState& slot) -> void;
+    auto count_layout_refusal(const std::expected<void, LinkError>& r) -> void;
+    auto forward_self_test(const proto::SelfTest& request) -> void;
     [[nodiscard]] static auto is_storage(const SlotState& slot) -> bool;
     auto poll_identity(SlotState& slot) -> void;
     auto deliver_certificate(const proto::RoleCertificate& certificate) -> void;
@@ -485,6 +525,7 @@ private:
     Clock::time_point _next_reports;
     Clock::time_point _next_identity;
     std::map<std::uint64_t, ConfigFrame> _volume_configs;  // the newest, by volume
+    std::map<std::uint64_t, LayoutFrame> _layouts;         // the newest khold layout, by volume
     TunnelKeyring _keyring;
     std::map<std::uint32_t, VpcFrame> _vpc_configs;         // the newest, by VNI
     std::map<std::uint64_t, MetadataFrame> _metadata;       // the newest, by NIC ID

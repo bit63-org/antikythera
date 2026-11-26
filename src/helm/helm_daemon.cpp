@@ -36,6 +36,38 @@ auto disconnected() -> std::unexpected<LinkError> {
            std::holds_alternative<proto::SnapshotProgress>(body);
 }
 
+// What a khold role reports (kythira khold-block-service design "Running
+// on antikythera"): its stripe groups, drives and link, the faults its
+// groups saw, and faults on the volumes it serves.
+[[nodiscard]] auto khold_kind(const proto::ReportBody& body) -> bool {
+    return std::holds_alternative<proto::GroupStatus>(body) ||
+           std::holds_alternative<proto::Capacity>(body) ||
+           std::holds_alternative<proto::GroupFault>(body) ||
+           std::holds_alternative<proto::VolumeFault>(body);
+}
+
+// Whether `server` is a member of one of the layout's stripe groups or one
+// of its gateways (it keeps replicas or translates for initiators), and
+// whether one of its attachments names `server` (it hosts an initiator).
+struct LayoutRoles {
+    bool member{false};
+    bool attached{false};
+};
+
+[[nodiscard]] auto layout_roles(const proto::VolumeLayout& l, std::uint64_t server) -> LayoutRoles {
+    const auto in_group = [&](const proto::StripeGroup& g) {
+        return std::ranges::any_of(
+            g.members, [&](const proto::LayoutMember& m) { return m.server_id == server; });
+    };
+    return {.member = std::ranges::any_of(l.groups, in_group) ||
+                      std::ranges::any_of(
+                          l.gateways,
+                          [&](const proto::LayoutGateway& g) { return g.server_id == server; }),
+            .attached = std::ranges::any_of(l.attachments, [&](const proto::VolumeAttachment& a) {
+                return a.server_id == server;
+            })};
+}
+
 // What a blk role reports: its initiators' faults (kythira
 // khold-block-service Requirement 9.9).
 [[nodiscard]] auto blk_kind(const proto::ReportBody& body) -> bool {
@@ -358,6 +390,21 @@ auto HelmDaemon::on_instance_metadata(const proto::InstanceMetadata& metadata,
                           .frame = {frame.begin(), frame.end()}});
 }
 
+auto HelmDaemon::on_volume_layout(const proto::VolumeLayout& layout,
+                                  std::span<const std::byte> frame) -> void {
+    // The session checked that the frame is addressed to this server.
+    const auto roles = layout_roles(layout, layout.server_id);
+    enqueue(LayoutFrame{.volume_id = layout.volume_id,
+                        .epoch = layout.epoch,
+                        .member = roles.member,
+                        .attached = roles.attached,
+                        .frame = {frame.begin(), frame.end()}});
+}
+
+auto HelmDaemon::on_self_test(const proto::SelfTest& request) -> void {
+    enqueue(request);
+}
+
 auto HelmDaemon::post_host_slot(const mailbox::Slot& slot) -> void {
     enqueue(slot);
 }
@@ -434,6 +481,10 @@ auto HelmDaemon::handle(Item& item) -> void {
         _groups.on_group_members(members->members, members->frame);
     } else if (auto* vpc = std::get_if<VpcFrame>(&item)) {
         forward_vpc_config(*vpc);
+    } else if (auto* layout = std::get_if<LayoutFrame>(&item)) {
+        forward_layout(*layout);
+    } else if (const auto* test = std::get_if<proto::SelfTest>(&item)) {
+        forward_self_test(*test);
     }
 }
 
@@ -622,7 +673,7 @@ auto HelmDaemon::poll_health(SlotState& slot) -> void {
 // ---- enrollment ---------------------------------------------------------------
 
 auto HelmDaemon::is_storage(const SlotState& slot) -> bool {
-    return is_blk(slot) || is_hold(slot);
+    return is_blk(slot) || is_hold(slot) || is_khold(slot);
 }
 
 auto HelmDaemon::poll_identity(SlotState& slot) -> void {
@@ -636,11 +687,17 @@ auto HelmDaemon::poll_identity(SlotState& slot) -> void {
     if (asked->csr == slot.reported_csr && now() < slot.reported_at + _config.identity_retry) {
         return;  // already with the controller
     }
-    proto::CertRequest request{.slot = slot.number,
-                               .role = asked->role == oar::Role::hold
-                                           ? proto::StorageRole::hold
-                                           : proto::StorageRole::initiator,
-                               .csr = std::move(asked->csr)};
+    const auto role = [&] {
+        switch (asked->role) {
+            case oar::Role::hold:
+                return proto::StorageRole::hold;
+            case oar::Role::khold:
+                return proto::StorageRole::khold;
+            default:
+                return proto::StorageRole::initiator;
+        }
+    }();
+    proto::CertRequest request{.slot = slot.number, .role = role, .csr = std::move(asked->csr)};
     if (!proto::detail::check_body(request)) {
         return;  // not a DER request: the controller would refuse the report
     }
@@ -737,27 +794,34 @@ auto HelmDaemon::replay_configs(SlotState& slot) -> void {
 auto HelmDaemon::take_hold_reports() -> void {
     for (auto& [n, slot] : _slots) {
         const bool blk = is_blk(*slot);
-        if (!is_hold(*slot) && !blk) {
+        const bool khold = is_khold(*slot);
+        if (!is_hold(*slot) && !blk && !khold) {
             continue;
         }
+        const auto wanted = [&](const proto::ReportBody& body) {
+            return blk ? blk_kind(body) : (khold ? khold_kind(body) : hold_kind(body));
+        };
         auto taken = slot->link->hold_reports(max_reports_per_pass);
         if (!taken) {
             continue;  // tried again next pass (or a role without reports); it keeps them
         }
         for (const auto& bytes : *taken) {
             auto rep = proto::decode_report(bytes);
-            if (rep && blk && blk_kind(rep->body)) {
+            if (rep && (blk || khold) && wanted(rep->body)) {
                 // The role does not know its data-plane slot; helm does.
                 std::visit(
                     [&]<typename T>(T& b) {
                         if constexpr (std::is_same_v<T, proto::VolumeFault> ||
-                                      std::is_same_v<T, proto::AttachmentStatus>) {
+                                      std::is_same_v<T, proto::AttachmentStatus> ||
+                                      std::is_same_v<T, proto::GroupStatus> ||
+                                      std::is_same_v<T, proto::Capacity> ||
+                                      std::is_same_v<T, proto::GroupFault>) {
                             b.slot = n;
                         }
                     },
                     rep->body);
             }
-            if (!rep || !(blk ? blk_kind(rep->body) : hold_kind(rep->body))) {
+            if (!rep || !wanted(rep->body)) {
                 const std::scoped_lock lock{_inbox_mutex};
                 ++_stats.hold_reports_dropped;
                 continue;
@@ -769,6 +833,85 @@ auto HelmDaemon::take_hold_reports() -> void {
             report(std::move(rep->body));  // renumbered by the controller session
         }
     }
+}
+
+// ---- khold --------------------------------------------------------------------
+
+auto HelmDaemon::is_khold(const SlotState& slot) -> bool {
+    return slot.link && slot.inventory && slot.inventory->role == oar::Role::khold;
+}
+
+auto HelmDaemon::count_layout_refusal(const std::expected<void, LinkError>& r) -> void {
+    if (!r) {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.volume_layouts_refused;
+    }
+}
+
+auto HelmDaemon::forward_layout(LayoutFrame& layout) -> void {
+    const auto it = _layouts.find(layout.volume_id);
+    bool was_member = false;
+    bool was_attached = false;
+    if (it != _layouts.end()) {
+        // The roles refuse an older epoch themselves; keeping only the
+        // newest bounds the replay, and an identical resend changes nothing.
+        if (it->second.epoch > layout.epoch ||
+            (it->second.epoch == layout.epoch && it->second.frame == layout.frame)) {
+            const std::scoped_lock lock{_inbox_mutex};
+            ++_stats.volume_layouts_stale;
+            return;
+        }
+        was_member = it->second.member;
+        was_attached = it->second.attached;
+    }
+    {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.volume_layouts;
+    }
+    // A layout that drops this server still goes to the roles that had the
+    // volume: it is how they learn to let it go.
+    const bool to_khold = layout.member || was_member;
+    const bool to_blk = layout.attached || was_attached;
+    for (auto& [n, slot] : _slots) {
+        if ((to_khold && is_khold(*slot)) || (to_blk && is_blk(*slot))) {
+            count_layout_refusal(slot->link->volume_layout(layout.frame));
+        }
+    }
+    if (!layout.member && !layout.attached) {
+        if (it != _layouts.end()) {
+            _layouts.erase(it);
+        }
+        return;
+    }
+    _layouts[layout.volume_id] = std::move(layout);
+}
+
+auto HelmDaemon::replay_layouts(SlotState& slot) -> void {
+    const bool khold = is_khold(slot);
+    const bool blk = is_blk(slot);
+    for (const auto& [volume, layout] : _layouts) {
+        if ((khold && layout.member) || (blk && layout.attached)) {
+            count_layout_refusal(slot.link->volume_layout(layout.frame));
+        }
+    }
+}
+
+auto HelmDaemon::forward_self_test(const proto::SelfTest& request) -> void {
+    std::uint64_t started = 0;
+    std::uint64_t refused = 0;
+    for (auto& [n, slot] : _slots) {
+        if (!is_khold(*slot) ||
+            (request.scope == proto::SelfTestScope::slot && n != request.slot)) {
+            continue;
+        }
+        ++(slot->link->self_test() ? started : refused);
+    }
+    if (started == 0 && refused == 0) {
+        refused = 1;  // no khold role there to ask
+    }
+    const std::scoped_lock lock{_inbox_mutex};
+    _stats.self_tests += started;
+    _stats.self_tests_refused += refused;
 }
 
 auto HelmDaemon::apply_map(MapFrame& map) -> void {
@@ -837,12 +980,17 @@ auto HelmDaemon::attach(SlotState& slot) -> bool {
         replay_configs(slot);  // a hold role has no functions for the router
         return true;
     }
+    if (inv->role == oar::Role::khold) {
+        replay_layouts(slot);  // nor has a khold role
+        return true;
+    }
     replay_vpc_configs(slot);  // before the router can prepare a NIC here
     replay_metadata(slot);     // the records of NICs plugged here, in NIC ID order
     if (inv->role == oar::Role::net) {
         // Every kept group policy before the router can prepare a NIC here.
         _groups.add_slot(slot.number, slot.port);
     }
+    replay_layouts(slot);  // blk roles: before an attach can need one
     _router.add_slot(slot.number, slot.port, *inv);
     if (is_blk(slot)) {
         for (const auto frame : _router.network_configs()) {

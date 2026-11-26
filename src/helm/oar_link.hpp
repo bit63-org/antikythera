@@ -196,6 +196,9 @@ public:
     auto copy_volume(const oar::CopyVolume& request, std::optional<ScopedKey> local_key = {},
                      std::optional<ScopedKey> network_key = {})
         -> std::expected<oar::CopyAnswer, LinkError>;
+    // Asks a khold role to run its storage self-test; the results come
+    // back as a capacity report through hold_reports.
+    auto self_test() -> std::expected<void, LinkError>;
 
     [[nodiscard]] auto stats() const noexcept -> const LinkStats& { return _stats; }
 
@@ -308,9 +311,10 @@ public:
     virtual auto replica_config(std::span<const std::byte> /*frame*/) -> oar::Status {
         return oar::Status::unsupported;
     }
-    // A khold volume's layout, which only the blk role keeps (kythira
-    // khold-block-service Requirement 11.5): whole and reassembled, not
-    // yet decoded or verified, valid only during the call.
+    // A khold volume's layout, which the blk role (kythira
+    // khold-block-service Requirement 11.5) and the khold role keep: whole
+    // and reassembled, not yet decoded or verified, valid only during the
+    // call.
     virtual auto volume_layout(std::span<const std::byte> /*frame*/) -> oar::Status {
         return oar::Status::unsupported;
     }
@@ -324,7 +328,7 @@ public:
         -> std::expected<oar::ReportChunk, oar::Status> {
         return std::unexpected(oar::Status::unsupported);
     }
-    // Enrollment, which only storage roles (blk, hold) take part in. The
+    // Enrollment, which only storage roles (blk, hold, khold) take part in. The
     // answer's csr must stay valid until the call returns to the endpoint;
     // `chain` (a whole, reassembled chain, not yet parsed) only during the
     // call.
@@ -334,6 +338,9 @@ public:
     virtual auto role_certificate(std::span<const std::byte> /*chain*/) -> oar::Status {
         return oar::Status::unsupported;
     }
+    // Starts the storage self-test, which only the khold role runs; its
+    // results arrive later as a capacity report.
+    virtual auto self_test() -> oar::Status { return oar::Status::unsupported; }
     // Cooperative detach, which only the storage role (blk) implements.
     virtual auto eject(const oar::Eject& /*request*/)
         -> std::expected<oar::EjectState, oar::Status> {

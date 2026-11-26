@@ -1185,6 +1185,54 @@ BOOST_AUTO_TEST_CASE(roles_without_replicas_answer_unsupported) {
                                   .network_key = std::nullopt})
                     .error()
                     .status == oar::Status::unsupported));
+    BOOST_TEST((link.self_test().error().status == oar::Status::unsupported));
+}
+
+namespace {
+
+// A khold role's self-test trigger (kythira khold-block-service task 17).
+class SelfTestingRole final : public ak::helm::OarHandler {
+public:
+    auto function_inventory() -> std::expected<oar::Inventory, oar::Status> override {
+        return oar::Inventory{.role = oar::Role::khold, .vtep = {}, .functions = {}};
+    }
+    auto prepare_function(const oar::PrepareFunction& /*r*/) -> oar::Status override {
+        return oar::Status::unknown_function;
+    }
+    auto clean_function(const oar::CleanFunction& /*r*/) -> oar::Status override {
+        return oar::Status::unknown_function;
+    }
+    auto deliver_key(const oar::DeliverKey& /*r*/) -> oar::Status override {
+        return oar::Status::unknown_function;
+    }
+    auto drop_key(const oar::DropKey& /*r*/) -> oar::Status override {
+        return oar::Status::unknown_function;
+    }
+    auto map_update(std::span<const std::byte> /*f*/) -> oar::Status override {
+        return oar::Status::unsupported;
+    }
+    auto health() -> std::expected<oar::Health, oar::Status> override { return oar::Health{}; }
+    auto self_test() -> oar::Status override {
+        ++tests;
+        return tests > 1 ? oar::Status::busy : oar::Status::ok;
+    }
+    int tests{0};
+};
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(self_test_requests_cross_and_carry_the_answer) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    SelfTestingRole role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    {
+        const Server server{endpoint, role};
+        BOOST_TEST((link.function_inventory().value().role == oar::Role::khold));
+        BOOST_TEST(link.self_test().has_value());
+        BOOST_TEST((link.self_test().error().status == oar::Status::busy));
+    }
+    BOOST_TEST(role.tests == 2);
 }
 
 namespace {

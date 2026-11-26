@@ -60,7 +60,8 @@
 //                          controller proto::VolumeLayout (signed; at most
 //                          max_volume_layout_frame bytes), for a blk role
 //                          attaching khold volumes (kythira khold-block-service
-//                          Requirement 11.5)
+//                          Requirement 11.5) or a khold role serving them
+//   self_test           (empty)
 //   group_membership    0  cursor u16 | 2  flags u16 (bit 0: `since` is set)
 //                       4  since u32 (the generation helm last read whole)
 //   copy_volume         0  op u8 (CopyOp) | 1  direction u8 (CopyDirection) | 2  reserved u16
@@ -133,8 +134,16 @@
 // oldest report if that is the one, so a lost response costs a resend,
 // never a report. A role with nothing to report answers total 0.
 //
-// Enrollment (block-volume-service task 12), to a storage role (blk or
-// hold): cert_request asks the role whether it wants a certificate, and
+// The khold requests (kythira khold-block-service task 17) go to the
+// khold role: volume_layout as above, hold_reports as for a hold role
+// (group_status, capacity, group_fault and volume_fault reports), and
+// self_test, which starts the role's storage self-test (drive capacity,
+// random 4 KiB IOPS, sequential throughput, link speed) and answers at
+// once; the measurements arrive as the role's next capacity report. A
+// self_test while one runs answers ok and starts nothing.
+//
+// Enrollment (block-volume-service task 12), to a storage role (blk,
+// hold or khold): cert_request asks the role whether it wants a certificate, and
 // the role answers with its PKCS#10 request (DER), or csr_len 0 while the
 // certificate it holds is good. helm reports a request to the controller
 // (proto::CertRequest) and passes the controller's answer down with
@@ -181,7 +190,7 @@
 //                       6  uptime_seconds u32
 //   hold_reports        2  report_seq u64 | 10 total u32 | 14 offset u32 | 18 chunk
 //                       (total 0: nothing to report, and the rest zero and empty)
-//   cert_request        2  role u8 (Role: blk or hold) | 3  reserved u8 | 4  csr_len u16
+//   cert_request        2  role u8 (Role: blk, hold or khold) | 3  reserved u8 | 4  csr_len u16
 //                       6  csr [csr_len] (0..max_csr bytes)
 //   eject               2  state u8 (EjectState) | 3  reserved u8
 //   copy_volume         2  state u8 (CopyVolumeState) | 3  failure u8 (CopyVolumeFailure)
@@ -364,7 +373,8 @@ enum class Role : std::uint8_t {
     net = 1,
     blk = 2,
     gpu = 3,
-    hold = 4,  // block volume replicas: no functions
+    hold = 4,   // block volume replicas: no functions
+    khold = 5,  // khold stripe group members (kythira khold-block-service): no functions
 };
 
 // Values are wire protocol.
@@ -421,6 +431,10 @@ enum class CopyVolumeFailure : std::uint8_t {
 
 [[nodiscard]] auto to_string(Status s) noexcept -> const char*;
 [[nodiscard]] auto to_string(Role r) noexcept -> const char*;
+// Whether a role takes part in enrollment (blk, hold, khold).
+[[nodiscard]] constexpr auto is_storage_role(Role r) noexcept -> bool {
+    return r == Role::blk || r == Role::hold || r == Role::khold;
+}
 [[nodiscard]] auto to_string(HealthState h) noexcept -> const char*;
 
 // Whether a role may report functions of `type`.

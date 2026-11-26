@@ -46,7 +46,7 @@ auto known_status(std::uint8_t v) noexcept -> bool {
 }
 
 auto known_role(std::uint8_t v) noexcept -> bool {
-    return v >= std::to_underlying(Role::net) && v <= std::to_underlying(Role::hold);
+    return v >= std::to_underlying(Role::net) && v <= std::to_underlying(Role::khold);
 }
 
 auto known_health(std::uint8_t v) noexcept -> bool {
@@ -247,6 +247,7 @@ auto role_serves(Role role, FunctionType type) noexcept -> bool {
         case Role::gpu:
             return is_gpu(type);
         case Role::hold:
+        case Role::khold:
             return false;
     }
     return false;
@@ -1178,7 +1179,7 @@ auto decode_copy_answer(std::span<const std::byte> body) noexcept
 }
 
 auto encode_cert_answer(const CertAnswer& a) -> std::expected<std::vector<std::byte>, BodyError> {
-    if (a.role != Role::blk && a.role != Role::hold) {
+    if (!is_storage_role(a.role)) {
         return std::unexpected(BodyError::unknown_enum);
     }
     if (a.csr.size() > max_csr) {
@@ -1206,7 +1207,7 @@ auto decode_cert_answer(std::span<const std::byte> body) noexcept
     if (reserved != 0) {
         return std::unexpected(BodyError::reserved_not_zero);
     }
-    if (role != Role::blk && role != Role::hold) {
+    if (!is_storage_role(role)) {
         return std::unexpected(BodyError::unknown_enum);
     }
     if (len > max_csr) {
@@ -1669,6 +1670,8 @@ auto to_string(Role r) noexcept -> const char* {
             return "gpu";
         case Role::hold:
             return "hold";
+        case Role::khold:
+            return "khold";
     }
     return "unknown";
 }

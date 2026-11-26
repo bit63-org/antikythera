@@ -1310,6 +1310,8 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::vpc_config:
         case proto::RecordType::group_members:
         case proto::RecordType::instance_metadata:
+        case proto::RecordType::volume_layout:
+        case proto::RecordType::self_test:
             break;
     }
     return std::unexpected("helm sent a controller-only record");

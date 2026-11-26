@@ -98,7 +98,7 @@ BOOST_AUTO_TEST_CASE(oversized_record_fails_before_its_payload_arrives) {
 BOOST_AUTO_TEST_CASE(bad_type_and_reserved_break_the_stream) {
     for (const auto& [bytes, want] :
          {std::pair{bytes_of(0, 0, 0, 0, 0, 0, 0, 0), DecodeError::bad_record_type},
-          std::pair{bytes_of(0, 0, 0, 0, 17, 0, 0, 0), DecodeError::bad_record_type},
+          std::pair{bytes_of(0, 0, 0, 0, 19, 0, 0, 0), DecodeError::bad_record_type},
           std::pair{bytes_of(0, 0, 0, 0, 1, 0, 0, 1), DecodeError::reserved_not_zero}}) {
         proto::RecordDecoder d;
         d.feed(bytes);
@@ -123,8 +123,51 @@ BOOST_AUTO_TEST_CASE(largest_instance_metadata_fits_a_record) {
     BOOST_TEST(proto::max_record_payload >= proto::max_instance_metadata_size);
 }
 
+BOOST_AUTO_TEST_CASE(largest_volume_layout_fits_a_record) {
+    BOOST_TEST(static_cast<std::uint16_t>(RecordType::volume_layout) == 17U);
+    BOOST_TEST(static_cast<std::uint16_t>(RecordType::self_test) == 18U);
+    BOOST_TEST(proto::max_record_payload >= proto::max_volume_layout_size);
+}
+
+BOOST_AUTO_TEST_CASE(self_test_round_trips_and_is_strict) {
+    const proto::SelfTest t{
+        .server_id = 0x0102'0304'0506'0708, .slot = 4, .scope = proto::SelfTestScope::slot};
+    auto b = proto::encode_self_test(t);
+    BOOST_REQUIRE(b.has_value());
+    BOOST_TEST(b->size() == proto::self_test_size);
+    const auto want = ak::test::bytes_of(0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x04, 0x01,
+                                         0, 0, 0, 0, 0, 0);
+    BOOST_TEST((*b == want));
+    auto back = proto::decode_self_test(*b);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST((*back == t));
+    for (std::size_t n = 0; n < b->size(); ++n) {
+        BOOST_TEST(
+            (proto::decode_self_test(std::span{*b}.first(n)).error() == DecodeError::truncated));
+    }
+    auto longer = *b;
+    longer.push_back(std::byte{0});
+    BOOST_TEST((proto::decode_self_test(longer).error() == DecodeError::trailing_bytes));
+    for (std::size_t off = 10; off < proto::self_test_size; ++off) {
+        auto reserved = *b;
+        reserved[off] = std::byte{1};
+        BOOST_TEST((proto::decode_self_test(reserved).error() == DecodeError::reserved_not_zero));
+    }
+    auto scope = *b;
+    scope[9] = std::byte{3};
+    BOOST_TEST((proto::decode_self_test(scope).error() == DecodeError::unknown_value));
+    BOOST_TEST((proto::encode_self_test({.server_id = 0}).error() == DecodeError::bad_server_id));
+    // Scope all names no slot.
+    BOOST_TEST(
+        proto::encode_self_test({.server_id = 1, .slot = 0, .scope = proto::SelfTestScope::all})
+            .has_value());
+    BOOST_TEST(
+        (proto::encode_self_test({.server_id = 1, .slot = 2, .scope = proto::SelfTestScope::all})
+             .error() == DecodeError::reserved_not_zero));
+}
+
 BOOST_AUTO_TEST_CASE(encode_refuses_what_decode_would) {
-    auto bad_type = proto::encode_record(static_cast<RecordType>(17), {});
+    auto bad_type = proto::encode_record(static_cast<RecordType>(19), {});
     BOOST_REQUIRE(!bad_type.has_value());
     BOOST_TEST((bad_type.error() == DecodeError::bad_record_type));
     const std::vector<std::byte> huge(proto::max_record_payload + 1);
@@ -226,7 +269,7 @@ BOOST_AUTO_TEST_CASE(block_volume_frames_fit_a_record) {
     }
     BOOST_TEST(
         proto::encode_record(RecordType::role_certificate, std::vector<std::byte>(4)).has_value());
-    BOOST_TEST(!proto::encode_record(static_cast<RecordType>(17), {}).has_value());
+    BOOST_TEST(!proto::encode_record(static_cast<RecordType>(19), {}).has_value());
 }
 
 namespace {

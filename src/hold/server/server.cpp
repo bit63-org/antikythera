@@ -1836,6 +1836,11 @@ auto HoldServer::take_reports(Clock::time_point now) -> std::vector<proto::Repor
                 (v.synced == 0 || !_sessions.contains(v.synced))) {
                 state = proto::ReplicaState::joining;  // the copy is not complete
             }
+            // Fill progress (task 23.2): what no longer awaits hydration,
+            // so a restore is complete when it reaches total_bytes.
+            const auto& m = v.store->meta();
+            const std::uint64_t total = m.capacity_blocks * m.block_size;
+            const std::uint64_t hydrated = total - (v.store->unhydrated_blocks() * m.block_size);
             status.entries.push_back(
                 {.volume_id = id,
                  .epoch = v.config.epoch,
@@ -1846,8 +1851,8 @@ auto HoldServer::take_reports(Clock::time_point now) -> std::vector<proto::Repor
                  .last_seq = v.store->last_seq(),
                  .commit_seq = v.store->commit_seq(),
                  .synced_bytes = 0,
-                 .total_bytes = 0,
-                 .hydrated_bytes = 0,
+                 .total_bytes = total,
+                 .hydrated_bytes = hydrated,
                  .lease_remaining_ms = static_cast<std::uint32_t>(left.count()),
                  .checksum_errors = v.checksum_errors,
                  .checksum_repairs = v.checksum_repairs,

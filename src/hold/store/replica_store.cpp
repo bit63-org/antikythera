@@ -138,6 +138,9 @@ auto ReplicaStore::create(FileLayer& files, const std::filesystem::path& dir, Re
     }
     std::unique_ptr<ReplicaStore> s{
         new ReplicaStore(files, dir, meta, std::move(*data), std::move(*mf))};
+    if (meta.source.kind != proto::SourceKind::none) {
+        s->_unhydrated_blocks = meta.capacity_blocks;
+    }
     s->_reflink = detect_reflink(files, dir);
     return s;
 }
@@ -190,7 +193,33 @@ auto ReplicaStore::destroy(FileLayer& files, const std::filesystem::path& dir)
     return {};
 }
 
+auto ReplicaStore::count_unhydrated() -> std::expected<void, StoreError> {
+    _unhydrated_blocks = 0;
+    if (_meta.source.kind == proto::SourceKind::none) {
+        return {};
+    }
+    // Bits past the capacity in the last byte are never set (create sets
+    // only the tail's, and a grow adds blocks that await nothing).
+    const std::uint64_t bytes = (_meta.capacity_blocks + 7) / 8;
+    std::vector<std::byte> buf(fill_chunk);
+    for (std::uint64_t at = 0; at < bytes; at += buf.size()) {
+        const auto part = std::span{buf}.first(
+            static_cast<std::size_t>(std::min<std::uint64_t>(buf.size(), bytes - at)));
+        if (!_meta_file->pread(_layout.unhydrated + at, part)) {
+            return std::unexpected(StoreError::io);
+        }
+        for (const auto b : part) {
+            _unhydrated_blocks +=
+                static_cast<std::uint64_t>(std::popcount(std::to_integer<unsigned>(b)));
+        }
+    }
+    return {};
+}
+
 auto ReplicaStore::recover() -> std::expected<void, StoreError> {
+    if (auto r = count_unhydrated(); !r) {
+        return r;
+    }
     std::vector<std::byte> ring(intent_ring_entries * intent_entry_size);
     if (!_meta_file->pread(_layout.intents, ring)) {
         return std::unexpected(StoreError::io);
@@ -322,13 +351,20 @@ auto ReplicaStore::set_bits(std::uint64_t region, std::uint64_t first, std::uint
     if (!_meta_file->pread(region + lo, bytes)) {
         return std::unexpected(StoreError::io);
     }
+    std::uint64_t flipped = 0;
     for (std::uint64_t i = first; i < first + count; ++i) {
         auto& b = bytes[(i / 8) - lo];
         const auto mask = static_cast<std::byte>(1U << (i % 8));
+        flipped += ((b & mask) != std::byte{0}) != value ? 1U : 0U;
         b = value ? (b | mask) : (b & ~mask);
     }
     if (!_meta_file->pwrite(region + lo, bytes)) {
         return std::unexpected(StoreError::io);
+    }
+    if (region == _layout.unhydrated) {
+        // A write that failed above leaves the count as it was; the
+        // replica is reopened after an io error and counts again.
+        _unhydrated_blocks = value ? _unhydrated_blocks + flipped : _unhydrated_blocks - flipped;
     }
     return {};
 }

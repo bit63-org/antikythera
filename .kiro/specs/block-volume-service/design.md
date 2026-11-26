@@ -310,6 +310,24 @@ instead of a `ReplicaConfig`, and khold roles report `group_status`,
 unchanged; a server peeks the version byte (`hold_frame_version`) to pick
 the decoder, and each decoder refuses the other version.
 
+**The khold role on antikythera** (kythira khold task 17). `ak-khold`
+(`src/khold/`) is the storage role helm launches for khold, sideband role
+`khold` (5), beside or instead of `ak-hold`. It enrolls through
+`cert_request` with `StorageRole::khold`, launches kythira's `khold_node`
+and restarts it with backoff, and hands it each verified `VolumeLayout`
+through `RUN_DIR/layouts/<volume>.vlay` (written atomically, the exact
+signed bytes), taking its reports back from `RUN_DIR/reports/*.rpt`
+(`src/khold/node_process.hpp` has the whole file contract). The
+controller sends layouts as `volume_layout` link records (17); helm keeps
+the newest epoch per volume and relays it to the khold roles when this
+server is a member or gateway and to the blk roles when an attachment
+names it, replaying them to a role whose sideband reopens, and the role
+replays them to a restarted node. A `self_test` record (18), or the role
+starting or taking a new certificate, runs the storage self-test
+(`src/khold/self_test.hpp`: per-drive capacity, random 4 KiB IOPS and
+sequential MiB/s, the storage link's speed), whose result the role merges
+with the node's own placement figures into one `capacity` report per slot.
+
 ## ReplicaStore (hold)
 
 One directory per replica, `vol-<id>.<replica_gen>/`:

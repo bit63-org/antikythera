@@ -200,6 +200,25 @@ target_link_libraries(ak-hold
   PRIVATE ak::hold_role ak::hull OpenSSL::Crypto ak::warnings ak::hardening)
 install(TARGETS ak-hold RUNTIME DESTINATION bin)
 
+# The khold role (kythira .kiro/specs/khold-block-service/ task 17): its
+# end of helm's sideband (KholdRole), the storage self-test that fills its
+# capacity reports, and the launcher that runs kythira's khold node beside
+# it (NodeProcess). ak-khold is the role process helm's slot directive
+# starts on a storage server.
+add_library(ak_khold_role
+  khold/khold_role.cpp
+  khold/node_process.cpp
+  khold/self_test.cpp)
+add_library(ak::khold_role ALIAS ak_khold_role)
+target_include_directories(ak_khold_role PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ak_khold_role
+  PUBLIC ak::helm ak::proto
+  PRIVATE ak::warnings ak::hardening)
+add_executable(ak-khold khold/khold_main.cpp)
+target_link_libraries(ak-khold
+  PRIVATE ak::khold_role ak::hull ak::tls OpenSSL::Crypto ak::warnings ak::hardening)
+install(TARGETS ak-khold RUNTIME DESTINATION bin)
+
 # harbor's test controller: signs commands and mapping updates and drives
 # one helm over the ControllerLink, standing in for kythira's EC2 module
 # until it exists (.kiro/specs/controller-interface/ task 5).

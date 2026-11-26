@@ -564,6 +564,28 @@ BOOST_AUTO_TEST_CASE(hydrates_restored_volumes, *utf::timeout(ak::test::unit_tim
     BOOST_TEST((rig.read_data() == expect));
 }
 
+BOOST_AUTO_TEST_CASE(lets_read_only_attachments_hydrate,
+                     *utf::timeout(ak::test::unit_timeout_seconds)) {
+    Rig rig;
+    auto c = config(1);
+    c.source = {.kind = proto::SourceKind::image,
+                .store_id = 3,
+                .hydrate_mib_per_s = 50,
+                .manifest_name = {}};
+    c.source.manifest_name[0] = std::byte{1};
+    c.attachments[0].mode = proto::AttachMode::ro;
+    rig.apply(c);
+    const auto s = rig.session();
+    BOOST_TEST((rig.write(s, 4, blocks_of(1, 1)) == HoldStatus::read_only));
+    const auto image = blocks_of(5, 2);
+    rig.write(s, 4, image, 1, proto::hold_flags::hydrate);
+    rig.run();
+    BOOST_TEST((rig.sink().last().header.status == HoldStatus::ok));
+    rig.read(s, 4, 2);
+    rig.run();
+    BOOST_TEST((rig.read_data() == image));
+}
+
 BOOST_AUTO_TEST_CASE(fails_reads_of_corrupt_blocks, *utf::timeout(ak::test::unit_timeout_seconds)) {
     Rig rig;
     rig.apply(config(1));

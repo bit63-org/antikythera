@@ -190,7 +190,7 @@ auto encode_intent(const Intent& i) -> std::array<std::byte, intent_entry_size> 
     w.le64(i.seq);
     w.le64(i.lba);
     w.le32(i.blocks);
-    w.le64(0);
+    w.le64(i.hydrate ? intent_flag_hydrate : 0);
     w.le32(crc32c::of(v));
     std::array<std::byte, intent_entry_size> out{};
     std::ranges::copy(v, out.begin());
@@ -207,14 +207,15 @@ auto decode_intent(std::span<const std::byte> entry, std::uint64_t capacity_bloc
     i.seq = r.le64().value_or(0);
     i.lba = r.le64().value_or(0);
     i.blocks = r.le32().value_or(0);
-    const std::uint64_t rsvd = r.le64().value_or(1);
+    const std::uint64_t flags = r.le64().value_or(~std::uint64_t{0});
     const std::uint32_t crc = r.le32().value_or(0);
     if (crc != crc32c::of(entry.first(intent_crc_offset))) {
         return std::unexpected(MetaError::bad_digest);
     }
-    if (rsvd != 0) {
+    if ((flags & ~intent_flag_hydrate) != 0) {
         return std::unexpected(MetaError::nonzero_reserved);
     }
+    i.hydrate = (flags & intent_flag_hydrate) != 0;
     if (i.seq == 0 || i.blocks == 0 || i.lba > capacity_blocks ||
         i.blocks > capacity_blocks - i.lba) {
         return std::unexpected(MetaError::bad_field);

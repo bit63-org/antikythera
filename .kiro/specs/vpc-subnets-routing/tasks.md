@@ -1,6 +1,6 @@
 # Implementation Plan — VPC subnets and the implicit router
 
-## Status: 7/12 tasks complete
+## Status: 8/12 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -81,7 +81,7 @@ end) for task 11.
   other subnet's address goes unanswered; a full-size TCP transfer at
   the planned MTU. Runs in CI's sudo job next to
   `tests/geneve_interop.sh`. _Requirements: 3, 6, 8.3_ (cloud)
-- [ ] 8. Benchmark the router: frames per second for switched versus
+- [x] 8. Benchmark the router: frames per second for switched versus
   routed traffic through one role, with 4,096 routes and 200 subnets,
   recorded in the spec as a baseline for security groups to compare
   against. _Requirements: 6_ (cloud)

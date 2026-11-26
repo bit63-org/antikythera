@@ -1,6 +1,6 @@
 # Implementation Plan — VPC subnets and the implicit router
 
-## Status: 5/12 tasks complete
+## Status: 6/12 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -63,7 +63,7 @@ end) for task 11.
 
 ### Phase C: end to end
 
-- [ ] 6. Multi-role tests in process (`net_role_test`), two and three
+- [x] 6. Multi-role tests in process (`net_role_test`), two and three
   roles over the WireGuard tunnel: routing between subnets on one role
   and across roles in both families; a middlebox route to an appliance
   on a third role, with the appliance forwarding back; same-subnet

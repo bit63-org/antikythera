@@ -244,26 +244,36 @@ never disagree, and a VNI whose map carries no addresses carries no IP.
 
 ### Routing
 
-`VpcConfig::routes` (from the signed frame's route table, Requirement
-12.7) is searched longest prefix first, per family, for unicast IP
-packets sent to the gateway MAC that are not metadata. The packet goes to
-the route's target NIC like a unicast frame (`send_unicast`, local port or
-tunnel) after a router's rewrite: destination MAC set to the target's,
-TTL or hop limit minus one, the IPv4 header checksum updated
-incrementally (RFC 1624). The source MAC stays the sender's, because the
-Geneve ingress policy ties a frame's inner source MAC to its source NIC
-and the target is often a virtual appliance that does not care. Drops:
+`VpcConfig::tables` (from the signed frame's route tables, Requirement
+12.7, vpc-subnets-routing Requirement 4) are compiled into a `RouteTrie`
+per table and family when the config is applied. Unicast IP packets sent
+to the gateway MAC that are not metadata are looked up, longest prefix
+first, in the sender's subnet's table. A `local` route's target is the
+NIC owning the destination (any subnet of the VPC), a NIC route's the
+route's NIC. The packet goes to the target like a unicast frame
+(`send_unicast`, local port or tunnel) after a router's rewrite:
+destination MAC set to the target's, source MAC to the gateway MAC, TTL
+or hop limit minus one, the IPv4 header checksum updated incrementally
+(RFC 1624). The gateway source MAC is how the receiving VTEP tells a
+routed frame from a switched one (vpc-subnets-routing design
+"Decisions"); `check_ingress` accepts it as the inner source only for a
+VNI whose config this VTEP holds (`MappingView::gateway_mac`). Drops:
 `tx_drop_no_route` (no route, broadcast or multicast),
+`tx_drop_no_neighbor` (a local route's destination nobody owns),
 `tx_drop_route_target` (target unmapped here or in another VNI),
 `tx_drop_hairpin` (the sender is the target), `tx_drop_ip_dst` (the
 target keeps its check and does not own the destination) and
 `tx_drop_ttl`. Routed packets count as `tx_routed` and also as
 `tx_local` or `tx_remote`.
 
-The receiving VTEP does not trust the sender's route lookup: its inner
-destination check passes only if the target owns the destination or its
-own mapping turns the target's check off, so a hostile VTEP cannot use a
-routed hop to reach an address the controller never gave it.
+The receiving VTEP does not trust the sender's route lookup: it repeats
+it in the source NIC's subnet's table against its own config and mapping
+and drops a routed frame whose result is not the destination NIC, or
+that is replicated or not IP (`rx_drop_route_mismatch`). Its inner
+destination check still passes only if the target owns the destination
+or its own mapping turns the target's check off, so a hostile VTEP can
+neither skip a middlebox route nor reach an address the controller never
+gave it.
 
 ### VPC gateway: DHCP and router advertisements
 

@@ -31,6 +31,7 @@ add_library(ak_oar_net
   oar/net/neighbor.cpp
   oar/net/oam.cpp
   oar/net/packet.cpp
+  oar/net/route_trie.cpp
   oar/net/tunnel.cpp
   oar/net/tunnel_peers.cpp
   oar/net/udp_endpoint.cpp

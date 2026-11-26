@@ -48,6 +48,13 @@ public:
     [[nodiscard]] virtual auto lookup(geneve::NicId id) const -> std::optional<NicBinding> = 0;
     // True if the NIC is attached to a function on this VTEP.
     [[nodiscard]] virtual auto is_local(geneve::NicId id) const -> bool = 0;
+    // The VNI's VPC gateway MAC, when this VTEP holds a VpcConfig for it:
+    // a routed frame's inner source (vpc-subnets-routing Requirement 6.5).
+    // The mapping alone knows none.
+    [[nodiscard]] virtual auto gateway_mac(std::uint32_t /*vni*/) const
+        -> std::optional<MacAddress> {
+        return std::nullopt;
+    }
 
 protected:
     MappingView() = default;
@@ -62,7 +69,7 @@ enum class PolicyError : std::uint8_t {
     unknown_src,
     src_wrong_vni,
     src_wrong_vtep,
-    src_mac_mismatch,
+    src_mac_mismatch,  // neither the source NIC's MAC nor the VNI's gateway MAC
     unknown_dst,
     dst_not_local,
     dst_wrong_vni,

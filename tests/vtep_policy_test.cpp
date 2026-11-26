@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <map>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -83,6 +84,14 @@ public:
         return std::nullopt;
     }
     [[nodiscard]] auto is_local(NicId id) const -> bool override { return _local.contains(id); }
+    [[nodiscard]] auto gateway_mac(std::uint32_t vni) const
+        -> std::optional<net::MacAddress> override {
+        if (gateway && vni == vpc) {
+            return gateway;
+        }
+        return std::nullopt;
+    }
+    std::optional<net::MacAddress> gateway;  // vpc's gateway MAC, if configured
 
 private:
     std::map<NicId, net::NicBinding> _bindings;
@@ -132,6 +141,27 @@ BOOST_AUTO_TEST_CASE(accepts_valid_broadcast, *boost::unit_test::timeout(unit_ti
     auto r = net::check_ingress(c.pkt, addr(remote_vtep_tail), t);
     BOOST_REQUIRE(r.has_value());
     BOOST_TEST((*r == geneve::nic_broadcast));
+}
+
+// vpc-subnets-routing Requirement 6.5: a routed frame's inner source is the
+// VNI's gateway MAC, accepted only where this VTEP holds that VNI's config.
+BOOST_AUTO_TEST_CASE(accepts_the_gateway_mac_only_with_a_config,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    constexpr std::uint8_t gateway_tail = 0xEE;
+    Table t;
+    auto c = make(local_nic, mac(local_mac_tail), mac(gateway_tail));
+    BOOST_TEST((net::check_ingress(c.pkt, addr(remote_vtep_tail), t).error() ==
+                PolicyError::src_mac_mismatch));
+    t.gateway = mac(gateway_tail);
+    BOOST_TEST((net::check_ingress(c.pkt, addr(remote_vtep_tail), t).value() == local_nic));
+    // Another VNI's gateway grants nothing, and the source NIC must still
+    // come from its own VTEP.
+    t.gateway = mac(gateway_tail + 1);
+    BOOST_TEST((net::check_ingress(c.pkt, addr(remote_vtep_tail), t).error() ==
+                PolicyError::src_mac_mismatch));
+    t.gateway = mac(gateway_tail);
+    BOOST_TEST((net::check_ingress(c.pkt, addr(spoofed_vtep_tail), t).error() ==
+                PolicyError::src_wrong_vtep));
 }
 
 BOOST_AUTO_TEST_CASE(rejects_spoofed_source_vtep,

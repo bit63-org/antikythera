@@ -52,28 +52,30 @@ constexpr unsigned byte_bits = 8;
 constexpr std::size_t mac_fn_high = 4;
 constexpr std::size_t mac_fn_low = 5;
 
-// The VSwitch's config from a decoded frame. decode_vpc_config already
-// checked every value against the same rules; the VSwitch checks them
-// again.
-auto to_vpc_config(const proto::VpcConfigFrame& f) -> VpcConfig {
+// The VSwitch's config from a decoded VpcConfig version 2 frame, or
+// nothing for a frame using what the VSwitch cannot apply yet. Until the
+// subnet model and the router land (vpc-subnets-routing tasks 4 and 5) the
+// VSwitch holds one L2 segment per VNI, so only a VPC with one subnet and
+// one (main) table holding nothing but its local routes maps onto it: the
+// subnet's prefix and its base + 1 gateway become the segment's, its /64
+// the segment's IPv6 prefix. decode_vpc_config already checked every value;
+// the VSwitch checks the result again.
+auto to_vpc_config(const proto::VpcConfigFrame& f) -> std::optional<VpcConfig> {
+    if (f.subnets.size() != 1 || f.tables.size() != 1 ||
+        std::ranges::any_of(f.tables.front().routes, [](const proto::VpcRoute& r) {
+            return r.kind != proto::RouteKind::local;
+        })) {
+        return std::nullopt;
+    }
+    const auto& subnet = f.subnets.front();
     VpcConfig c{.gateway_mac = f.gateway_mac,
-                .ipv4 = {.address = f.ipv4_prefix, .length = f.ipv4_length},
-                .ipv4_gateway = f.ipv4_gateway,
-                .ipv6_prefix = std::nullopt,
+                .ipv4 = {.address = subnet.ipv4_prefix, .length = subnet.ipv4_length},
+                .ipv4_gateway = proto::vpc_subnet_gateway(subnet),
+                .ipv6_prefix = subnet.ipv6_prefix,
                 .dns4 = f.dns4,
                 .dns6 = f.dns6,
                 .domain = f.domain,
                 .lease_seconds = f.lease_seconds};
-    if (f.has_ipv6) {
-        c.ipv6_prefix = f.ipv6_prefix;
-    }
-    c.routes.reserve(f.routes.size());
-    for (const auto& r : f.routes) {
-        c.routes.push_back({.ipv6 = r.family == proto::RouteFamily::ipv6,
-                            .prefix = r.prefix,
-                            .length = r.length,
-                            .target = geneve::NicId{r.target_nic}});
-    }
     return c;
 }
 
@@ -422,7 +424,12 @@ auto NetRole::vpc_config(std::span<const std::byte> frame) -> oar::Status {
             return oar::Status::failed;
         }
     }
-    if (!_vswitch->set_vpc_config(config->vni, to_vpc_config(*config))) {
+    const auto vswitch_config = to_vpc_config(*config);
+    if (!vswitch_config) {
+        ++_counters.vpc_unsupported;
+        return oar::Status::failed;
+    }
+    if (!_vswitch->set_vpc_config(config->vni, *vswitch_config)) {
         ++_counters.vpc_rejected;
         return oar::Status::failed;
     }

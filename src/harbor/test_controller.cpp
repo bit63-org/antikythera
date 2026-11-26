@@ -418,57 +418,156 @@ auto prefix(std::string_view s) -> std::expected<Prefix, std::string> {
     return std::unexpected("bad prefix address " + text);
 }
 
-// vpc-config VNI VERSION GATEWAY_MAC IPV4_PREFIX/LEN IPV4_GATEWAY then
-// key=value options: ipv6=PREFIX/64, dns=ADDRESS (repeatable, either
-// family), domain=NAME, lease=SECONDS (default 3600) and
-// route=PREFIX/LEN,NIC (repeatable).
+// vpc-config VNI VERSION then key=value options (VpcConfig version 2,
+// vpc-subnets-routing design "Test controller and harbor"):
+//   gateway=MAC                       the VPC's gateway MAC (required)
+//   block=PREFIX/LEN                  an IPv4 block; the first is the primary
+//   block6=PREFIX/56                  the IPv6 block
+//   subnet=ID,PREFIX/LEN[,PREFIX/64],TABLE
+//   table=N[,main]                    exactly one main table
+//   route=TABLE,PREFIX/LEN,local|NIC  local routes are added for every
+//                                     block in every table when left out
+//   dns=ADDRESS (repeatable, either family), domain=NAME,
+//   lease=SECONDS (default 3600)
+auto vpc_route_option(std::string_view value, proto::VpcConfigFrame& c)
+    -> std::expected<void, std::string> {
+    const auto fields = split(value, ',');
+    if (fields.size() != 3) {
+        return std::unexpected("vpc-config: route wants TABLE,PREFIX/LEN,local|NIC");
+    }
+    auto table = number<std::uint16_t>(fields[0], "route table");
+    auto p = prefix(fields[1]);
+    if (!table) {
+        return std::unexpected(table.error());
+    }
+    if (!p) {
+        return std::unexpected(p.error());
+    }
+    proto::VpcRoute r{.kind = proto::RouteKind::local,
+                      .family = p->ipv6 ? proto::RouteFamily::ipv6 : proto::RouteFamily::ipv4,
+                      .length = p->length,
+                      .prefix = p->address,
+                      .target_nic = 0};
+    if (fields[2] != "local") {
+        auto nic = number<std::uint64_t>(fields[2], "route target NIC");
+        if (!nic) {
+            return std::unexpected(nic.error());
+        }
+        r.kind = proto::RouteKind::nic;
+        r.target_nic = *nic;
+    }
+    const auto t = std::ranges::find(c.tables, *table, &proto::VpcRouteTable::table);
+    if (t == c.tables.end()) {
+        return std::unexpected("vpc-config: route names table " + std::string{fields[0]} +
+                               " before its table= option");
+    }
+    t->routes.push_back(r);
+    return {};
+}
+
+auto vpc_subnet_option(std::string_view value, proto::VpcConfigFrame& c)
+    -> std::expected<void, std::string> {
+    const auto fields = split(value, ',');
+    if (fields.size() != 3 && fields.size() != 4) {
+        return std::unexpected("vpc-config: subnet wants ID,PREFIX/LEN[,PREFIX/64],TABLE");
+    }
+    auto id = number<std::uint64_t>(fields[0], "subnet id");
+    auto p4 = prefix(fields[1]);
+    auto table = number<std::uint16_t>(fields.back(), "subnet table");
+    if (!id) {
+        return std::unexpected(id.error());
+    }
+    if (!p4 || p4->ipv6) {
+        return std::unexpected(p4 ? "vpc-config: a subnet's first prefix must be IPv4"
+                                  : p4.error());
+    }
+    if (!table) {
+        return std::unexpected(table.error());
+    }
+    proto::VpcSubnet sub{.subnet_id = *id,
+                         .table = *table,
+                         .ipv4_prefix = {},
+                         .ipv4_length = p4->length,
+                         .ipv6_prefix = std::nullopt};
+    std::copy_n(p4->address.begin(), sub.ipv4_prefix.size(), sub.ipv4_prefix.begin());
+    if (fields.size() == 4) {
+        auto p6 = prefix(fields[2]);
+        if (!p6 || !p6->ipv6 || p6->length != proto::vpc_ipv6_subnet_length) {
+            return std::unexpected("vpc-config: a subnet's IPv6 prefix must be a /64");
+        }
+        sub.ipv6_prefix = p6->address;
+    }
+    c.subnets.push_back(sub);
+    return {};
+}
+
 auto vpc_config(std::span<const std::string_view> args)
     -> std::expected<SendVpcConfig, std::string> {
     constexpr std::uint32_t default_lease = 3600;
-    if (args.size() < 5) {
+    if (args.size() < 2) {
         return std::unexpected(
-            "vpc-config: want VNI VERSION GATEWAY_MAC IPV4_PREFIX/LEN IPV4_GATEWAY "
-            "[ipv6=PREFIX/64] [dns=ADDRESS ...] [domain=NAME] [lease=SECONDS] "
-            "[route=PREFIX/LEN,NIC ...]");
+            "vpc-config: want VNI VERSION gateway=MAC block=PREFIX/LEN [block6=PREFIX/56] "
+            "subnet=ID,PREFIX/LEN[,PREFIX/64],TABLE ... table=N[,main] ... "
+            "[route=TABLE,PREFIX/LEN,local|NIC ...] [dns=ADDRESS ...] [domain=NAME] "
+            "[lease=SECONDS]");
     }
     auto vni = number<std::uint32_t>(args[0], "VNI");
     auto version = number<std::uint64_t>(args[1], "config version");
-    auto gw_mac = mac(args[2]);
-    auto v4 = prefix(args[3]);
     if (!vni) {
         return std::unexpected(vni.error());
     }
     if (!version) {
         return std::unexpected(version.error());
     }
-    if (!gw_mac) {
-        return std::unexpected(gw_mac.error());
-    }
-    if (!v4 || v4->ipv6) {
-        return std::unexpected(v4 ? "vpc-config: the VPC prefix must be IPv4" : v4.error());
-    }
     SendVpcConfig out{};
     auto& c = out.config;
     c.vni = *vni;
     c.config_version = *version;
-    c.gateway_mac = *gw_mac;
-    std::copy_n(v4->address.begin(), c.ipv4_prefix.size(), c.ipv4_prefix.begin());
-    c.ipv4_length = v4->length;
     c.lease_seconds = default_lease;
-    if (inet_pton(AF_INET, std::string{args[4]}.c_str(), c.ipv4_gateway.data()) != 1) {
-        return std::unexpected("bad gateway address " + std::string{args[4]});
-    }
-    for (const auto opt : args.subspan(5)) {
+    bool have_gateway = false;
+    for (const auto opt : args.subspan(2)) {
         const auto eq = opt.find('=');
         const auto key = opt.substr(0, eq);
         const auto value = eq == std::string_view::npos ? std::string_view{} : opt.substr(eq + 1);
-        if (key == "ipv6") {
-            auto p = prefix(value);
-            if (!p || !p->ipv6 || p->length != 64) {
-                return std::unexpected("vpc-config: ipv6 wants an IPv6 /64");
+        if (key == "gateway") {
+            auto m = mac(value);
+            if (!m) {
+                return std::unexpected(m.error());
             }
-            c.has_ipv6 = true;
-            c.ipv6_prefix = p->address;
+            c.gateway_mac = *m;
+            have_gateway = true;
+        } else if (key == "block") {
+            auto p = prefix(value);
+            if (!p || p->ipv6) {
+                return std::unexpected(p ? "vpc-config: block wants an IPv4 prefix" : p.error());
+            }
+            proto::VpcIpv4Block b{.prefix = {}, .length = p->length};
+            std::copy_n(p->address.begin(), b.prefix.size(), b.prefix.begin());
+            c.ipv4_blocks.push_back(b);
+        } else if (key == "block6") {
+            auto p = prefix(value);
+            if (!p || !p->ipv6 || p->length != proto::vpc_ipv6_block_length) {
+                return std::unexpected("vpc-config: block6 wants an IPv6 /56");
+            }
+            c.ipv6_block = p->address;
+        } else if (key == "subnet") {
+            if (auto ok = vpc_subnet_option(value, c); !ok) {
+                return std::unexpected(ok.error());
+            }
+        } else if (key == "table") {
+            const auto fields = split(value, ',');
+            auto n = number<std::uint16_t>(fields[0], "table number");
+            if (!n) {
+                return std::unexpected(n.error());
+            }
+            if (fields.size() > 2 || (fields.size() == 2 && fields[1] != "main")) {
+                return std::unexpected("vpc-config: table wants N[,main]");
+            }
+            c.tables.push_back({.table = *n, .main = fields.size() == 2, .routes = {}});
+        } else if (key == "route") {
+            if (auto ok = vpc_route_option(value, c); !ok) {
+                return std::unexpected(ok.error());
+            }
         } else if (key == "dns") {
             const std::string text{value};
             proto::Ipv4Address a4{};
@@ -488,31 +587,51 @@ auto vpc_config(std::span<const std::string_view> args)
                 return std::unexpected(lease.error());
             }
             c.lease_seconds = *lease;
-        } else if (key == "route") {
-            const auto comma = value.find(',');
-            if (comma == std::string_view::npos) {
-                return std::unexpected("vpc-config: route wants PREFIX/LEN,NIC");
-            }
-            auto p = prefix(value.substr(0, comma));
-            auto nic = number<std::uint64_t>(value.substr(comma + 1), "route target NIC");
-            if (!p) {
-                return std::unexpected(p.error());
-            }
-            if (!nic) {
-                return std::unexpected(nic.error());
-            }
-            c.routes.push_back(
-                {.family = p->ipv6 ? proto::RouteFamily::ipv6 : proto::RouteFamily::ipv4,
-                 .length = p->length,
-                 .prefix = p->address,
-                 .target_nic = *nic});
         } else {
             return std::unexpected("vpc-config: unknown option " + std::string{opt});
         }
     }
-    // The frame's canonical order; duplicates are left for the encoder to
-    // refuse.
-    std::ranges::sort(c.routes, proto::detail::vpc_route_key_less);
+    if (!have_gateway) {
+        return std::unexpected("vpc-config: gateway=MAC is required");
+    }
+    // Every table routes the VPC's own blocks locally; add what the script
+    // left out, so it only has to spell out the NIC routes.
+    for (auto& t : c.tables) {
+        const auto add_local = [&t](proto::VpcRoute r) {
+            if (std::ranges::none_of(t.routes, [&r](const proto::VpcRoute& have) {
+                    return have.family == r.family && have.prefix == r.prefix &&
+                           have.length == r.length;
+                })) {
+                t.routes.push_back(r);
+            }
+        };
+        for (const auto& b : c.ipv4_blocks) {
+            proto::VpcRoute r{.kind = proto::RouteKind::local,
+                              .family = proto::RouteFamily::ipv4,
+                              .length = b.length,
+                              .prefix = {},
+                              .target_nic = 0};
+            std::ranges::copy(b.prefix, r.prefix.begin());
+            add_local(r);
+        }
+        if (c.ipv6_block) {
+            add_local({.kind = proto::RouteKind::local,
+                       .family = proto::RouteFamily::ipv6,
+                       .length = proto::vpc_ipv6_block_length,
+                       .prefix = *c.ipv6_block,
+                       .target_nic = 0});
+        }
+        // The frame's canonical order; duplicates are left for the
+        // encoder to refuse.
+        std::ranges::sort(t.routes, proto::detail::vpc_route_key_less);
+    }
+    if (c.ipv4_blocks.size() > 2) {
+        std::ranges::sort(
+            c.ipv4_blocks.begin() + 1, c.ipv4_blocks.end(), {},
+            [](const proto::VpcIpv4Block& b) { return proto::detail::vpc_u32(b.prefix); });
+    }
+    std::ranges::sort(c.subnets, {}, &proto::VpcSubnet::subnet_id);
+    std::ranges::sort(c.tables, {}, &proto::VpcRouteTable::table);
     // Check now with placeholder IDs, so a typo fails at parse time.
     auto check = c;
     check.server_id = 1;

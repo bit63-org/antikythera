@@ -264,9 +264,13 @@ auto vpc_config_record(std::uint64_t to) -> std::vector<std::byte> {
     c.config_version = 3;
     c.gateway_mac = {std::byte{0x02}, std::byte{0}, std::byte{0},
                      std::byte{0},    std::byte{0}, std::byte{0xFE}};
-    c.ipv4_prefix = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}};
-    c.ipv4_length = 24;
-    c.ipv4_gateway = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{1}};
+    // One block, one subnet, the main table with the block's local route.
+    const proto::Ipv4Address ten{std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}};
+    c.ipv4_blocks = {{.prefix = ten, .length = 24}};
+    c.subnets = {{.subnet_id = 1, .table = 1, .ipv4_prefix = ten, .ipv4_length = 24}};
+    proto::VpcRoute local{.kind = proto::RouteKind::local, .length = 24, .prefix = {}};
+    std::ranges::copy(ten, local.prefix.begin());
+    c.tables = {{.table = 1, .main = true, .routes = {local}}};
     c.lease_seconds = 3600;
     auto b = proto::encode_vpc_config(c);
     BOOST_REQUIRE(b.has_value());

@@ -669,15 +669,8 @@ BOOST_AUTO_TEST_CASE(group_policy_frame_and_usage_request) {
 BOOST_AUTO_TEST_CASE(vpc_config_mirrors_match_proto) {
     BOOST_TEST(oar::min_vpc_config_frame == ak::proto::min_vpc_config_size);
     BOOST_TEST(oar::max_vpc_config_frame == ak::proto::max_vpc_config_size);
-    BOOST_TEST(oar::max_vpc_config_frame <= oar::max_body_size);
-    const std::vector<std::byte> frame(oar::min_vpc_config_frame + 20, std::byte{6});
-    BOOST_TEST(
-        oar::decode_vpc_config_frame(oar::encode_vpc_config_frame(frame).value()).value().size() ==
-        frame.size());
-    BOOST_TEST((oar::decode_vpc_config_frame(std::vector<std::byte>(oar::min_vpc_config_frame - 1))
-                    .error() == BodyError::truncated));
-    BOOST_TEST((oar::encode_vpc_config_frame(std::vector<std::byte>(oar::max_vpc_config_frame + 1))
-                    .error() == BodyError::trailing_bytes));
+    // Version 2 frames outgrow one message, so they travel in chunks.
+    BOOST_TEST(oar::max_vpc_config_frame > oar::max_body_size);
 }
 
 BOOST_AUTO_TEST_CASE(hold_mirrors_match_proto) {

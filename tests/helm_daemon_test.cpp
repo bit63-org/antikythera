@@ -203,9 +203,15 @@ public:
         const std::scoped_lock lock{_mutex};
         return _vpc_configs;
     }
+    // How many prepares the role had seen when each VPC config arrived.
+    [[nodiscard]] auto vpc_prepares_before() const -> std::vector<std::size_t> {
+        const std::scoped_lock lock{_mutex};
+        return _vpc_prepares_before;
+    }
     auto vpc_config(std::span<const std::byte> frame) -> oar::Status override {
         const std::scoped_lock lock{_mutex};
         _vpc_configs.emplace_back(frame.begin(), frame.end());
+        _vpc_prepares_before.push_back(_prepared.size());
         return vpc_status.load();
     }
 
@@ -404,6 +410,7 @@ private:
     std::vector<oar::PrepareFunction> _prepared;
     std::vector<std::vector<std::byte>> _frames;
     std::vector<std::vector<std::byte>> _vpc_configs;
+    std::vector<std::size_t> _vpc_prepares_before;
     std::vector<Metadata> _metadata;
 };
 
@@ -833,8 +840,9 @@ BOOST_AUTO_TEST_CASE(map_updates_reach_net_roles_only) {
 namespace {
 
 // A VpcConfig as the ControllerSession hands it over: helm never checks
-// the signature, so any bytes there do.
-auto vpc_frame(std::uint32_t net, std::uint64_t version)
+// the signature, so any bytes there do. `nic_routes` NIC routes in the
+// main table make it longer than one sideband message.
+auto vpc_frame(std::uint32_t net, std::uint64_t version, std::size_t nic_routes = 0)
     -> std::pair<proto::VpcConfigFrame, std::vector<std::byte>> {
     proto::VpcConfigFrame c{};
     c.server_id = server;
@@ -843,9 +851,21 @@ auto vpc_frame(std::uint32_t net, std::uint64_t version)
     c.config_version = version;
     c.gateway_mac = {std::byte{0x02}, std::byte{0}, std::byte{0},
                      std::byte{0},    std::byte{0}, std::byte{0xFE}};
-    c.ipv4_prefix = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}};
-    c.ipv4_length = 24;
-    c.ipv4_gateway = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{1}};
+    // One block, one subnet, the main table with the block's local route.
+    const proto::Ipv4Address ten{std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}};
+    c.ipv4_blocks = {{.prefix = ten, .length = 24}};
+    c.subnets = {{.subnet_id = 1, .table = 1, .ipv4_prefix = ten, .ipv4_length = 24}};
+    proto::VpcRoute local{.kind = proto::RouteKind::local, .length = 24, .prefix = {}};
+    std::ranges::copy(ten, local.prefix.begin());
+    c.tables = {{.table = 1, .main = true, .routes = {local}}};
+    for (std::size_t i = 0; i < nic_routes; ++i) {
+        proto::VpcRoute r{
+            .kind = proto::RouteKind::nic, .length = 24, .prefix = {}, .target_nic = 0x21};
+        r.prefix[0] = std::byte{11};
+        r.prefix[1] = std::byte(i >> 8U);
+        r.prefix[2] = std::byte(i & 0xFFU);
+        c.tables[0].routes.push_back(r);
+    }
     c.lease_seconds = static_cast<std::uint32_t>(version) * 60;
     auto b = proto::encode_vpc_config(c);
     BOOST_REQUIRE(b.has_value());
@@ -878,14 +898,36 @@ BOOST_AUTO_TEST_CASE(vpc_configs_reach_net_roles_and_follow_a_restart) {
     BOOST_TEST(r.daemon.stats().vpc_configs_stale == 1U);
 
     // A refusal is counted; helm still keeps the frame for the next role.
+    // This one spans several sideband messages (vpc-subnets-routing task
+    // 3) and arrives whole.
     r.net.role.vpc_status = oar::Status::failed;
-    const auto [v3, frame3] = vpc_frame(vni, 3);
+    const auto [v3, frame3] = vpc_frame(vni, 3, 300);
+    BOOST_REQUIRE(frame3.size() > 2 * oar::max_body_size);
     r.daemon.on_vpc_config(v3, frame3);
     r.daemon.run_once(0ms);
     BOOST_TEST(r.daemon.stats().vpc_configs_refused == 1U);
+    BOOST_TEST((r.net.role.vpc_configs().back() == frame3));
     r.net.role.vpc_status = oar::Status::ok;
 
-    // A restarted role gets the newest of each VNI again, in VNI order.
+    // Plug a NIC, so the restarted role has one to prepare again.
+    r.daemon.on_envelope(
+        envelope(1, mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib}));
+    r.daemon.run_once(0ms);
+    r.daemon.post_host_slot(response(1, mb::Type::create_vm));
+    const mb::DeviceRef device{.slot = net_slot, .type = mb::DeviceType::nic_vf, .function = 0};
+    mb::AttachDevice attach{
+        .vm_id = vm_one, .device = device, .vni = vni, .nic_id = nic_id, .mac = {}};
+    attach.mac[0] = std::byte{0x02};
+    r.daemon.on_envelope(envelope(2, attach));
+    r.daemon.run_once(0ms);
+    r.daemon.post_host_slot(response(2, mb::Type::attach_device));
+    r.daemon.run_once(0ms);
+    const auto prepares = r.net.role.prepared().size();
+    BOOST_REQUIRE(prepares >= 1U);
+
+    // A restarted role gets the newest of each VNI again, in VNI order,
+    // the multi-chunk frame replayed whole ahead of any prepare on the new
+    // sideband.
     r.backplane.dropped.insert(net_slot);
     r.daemon.run_once(0ms);
     BOOST_REQUIRE(r.net.connects.load() == 2);
@@ -893,6 +935,9 @@ BOOST_AUTO_TEST_CASE(vpc_configs_reach_net_roles_and_follow_a_restart) {
     BOOST_REQUIRE(got.size() == 6U);
     BOOST_TEST((got[4] == frame3));
     BOOST_TEST((got[5] == other_frame));
+    const auto before = r.net.role.vpc_prepares_before();
+    BOOST_TEST(before[4] == prepares);
+    BOOST_TEST(before[5] == prepares);
 }
 
 namespace {

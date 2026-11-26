@@ -278,40 +278,69 @@ BOOST_AUTO_TEST_CASE(map_updates_parse_and_sort) {
 
 BOOST_AUTO_TEST_CASE(vpc_configs_parse_and_sort) {
     auto a = action(
-        "vpc-config 100 4 02:00:00:00:ff:01 10.0.0.0/16 10.0.0.1 ipv6=fd10::/64 dns=10.0.0.2 "
-        "dns=fd10::2 domain=ec2.internal lease=7200 route=0.0.0.0/0,0x21 "
-        "route=fd20::/48,0x22 route=192.168.0.0/24,0x23");
+        "vpc-config 100 4 gateway=02:00:00:00:ff:01 block=10.0.0.0/16 block=100.64.0.0/24 "
+        "block6=2001:db8:1200::/56 subnet=0x12,10.0.2.0/24,2 "
+        "subnet=0x11,10.0.1.0/24,2001:db8:1200:1::/64,1 table=2 table=1,main "
+        "route=1,10.0.2.0/24,0x21 route=2,0.0.0.0/0,0x22 route=1,10.0.0.0/16,local "
+        "dns=10.0.0.2 dns=2001:db8:1200::2 domain=ec2.internal lease=7200");
     BOOST_REQUIRE(std::holds_alternative<harbor::SendVpcConfig>(a));
     const auto& c = std::get<harbor::SendVpcConfig>(a).config;
     BOOST_TEST(c.vni == 100U);
     BOOST_TEST(c.config_version == 4U);
     BOOST_TEST(std::to_integer<int>(c.gateway_mac[5]) == 1);
-    BOOST_TEST(c.ipv4_length == 16U);
-    BOOST_TEST(std::to_integer<int>(c.ipv4_gateway[3]) == 1);
-    BOOST_TEST(c.has_ipv6);
-    BOOST_TEST(std::to_integer<int>(c.ipv6_prefix[1]) == 0x10);
+    BOOST_REQUIRE(c.ipv4_blocks.size() == 2U);
+    BOOST_TEST(c.ipv4_blocks[0].length == 16U);
+    BOOST_TEST(std::to_integer<int>(c.ipv4_blocks[1].prefix[0]) == 100);
+    BOOST_REQUIRE(c.ipv6_block.has_value());
+    BOOST_TEST(std::to_integer<int>((*c.ipv6_block)[4]) == 0x12);
     BOOST_REQUIRE(c.dns4.size() == 1U);
     BOOST_REQUIRE(c.dns6.size() == 1U);
     BOOST_TEST(c.domain == "ec2.internal");
     BOOST_TEST(c.lease_seconds == 7200U);
-    // Sorted into the frame's order: IPv4 by prefix, then IPv6.
-    BOOST_REQUIRE(c.routes.size() == 3U);
-    BOOST_TEST(c.routes[0].target_nic == 0x21U);
-    BOOST_TEST(c.routes[1].target_nic == 0x23U);
-    BOOST_TEST((c.routes[2].family == proto::RouteFamily::ipv6));
+    // Subnets and tables sorted into the frame's order.
+    BOOST_REQUIRE(c.subnets.size() == 2U);
+    BOOST_TEST(c.subnets[0].subnet_id == 0x11U);
+    BOOST_TEST(c.subnets[0].table == 1U);
+    BOOST_TEST(c.subnets[0].ipv6_prefix.has_value());
+    BOOST_TEST(!c.subnets[1].ipv6_prefix.has_value());
+    BOOST_REQUIRE(c.tables.size() == 2U);
+    BOOST_TEST(c.tables[0].table == 1U);
+    BOOST_TEST(c.tables[0].main);
+    BOOST_TEST(!c.tables[1].main);
+    // Every table has a local route per block (one named, the rest added),
+    // with its NIC routes in order.
+    BOOST_REQUIRE(c.tables[0].routes.size() == 4U);
+    BOOST_TEST((c.tables[0].routes[0].kind == proto::RouteKind::local));
+    BOOST_TEST(c.tables[0].routes[1].target_nic == 0x21U);
+    BOOST_TEST((c.tables[0].routes[2].kind == proto::RouteKind::local));
+    BOOST_TEST((c.tables[0].routes[3].family == proto::RouteFamily::ipv6));
+    BOOST_REQUIRE(c.tables[1].routes.size() == 4U);
+    BOOST_TEST(c.tables[1].routes[0].target_nic == 0x22U);
 
     // The defaults, and mistakes the encoder would refuse, named at parse time.
-    auto d = action("vpc-config 100 1 02:00:00:00:ff:01 10.0.0.0/24 10.0.0.1");
+    auto d = action(
+        "vpc-config 100 1 gateway=02:00:00:00:ff:01 block=10.0.0.0/24 "
+        "subnet=1,10.0.0.0/24,0 table=0,main");
     BOOST_TEST(std::get<harbor::SendVpcConfig>(d).config.lease_seconds == 3600U);
-    BOOST_TEST(parse_error("vpc-config 100 1 02:00:00:00:ff:01 10.0.0.0/24").find("want VNI") !=
-               std::string::npos);
-    BOOST_TEST(
-        parse_error("vpc-config 100 1 02:00:00:00:ff:01 10.0.0.1/24 10.0.0.1").find("VPC config") !=
-        std::string::npos);
-    BOOST_TEST(parse_error("vpc-config 100 1 02:00:00:00:ff:01 10.0.0.0/24 10.0.0.1 "
-                           "route=10.1.0.1/16,5")
+    BOOST_TEST(parse_error("vpc-config 100").find("want VNI") != std::string::npos);
+    BOOST_TEST(parse_error("vpc-config 100 1 block=10.0.0.0/24 subnet=1,10.0.0.0/24,0 table=0,main")
+                   .find("gateway") != std::string::npos);
+    BOOST_TEST(parse_error("vpc-config 100 1 gateway=02:00:00:00:ff:01 block=10.0.0.1/24 "
+                           "subnet=1,10.0.0.0/24,0 table=0,main")
+                   .find("VPC config") != std::string::npos);
+    BOOST_TEST(parse_error("vpc-config 100 1 gateway=02:00:00:00:ff:01 block=10.0.0.0/24 "
+                           "subnet=1,10.0.0.0/24,0 table=0,main route=0,10.1.0.1/16,5")
                    .find("route") != std::string::npos);
-    BOOST_TEST(parse_error("vpc-config 100 1 02:00:00:00:ff:01 10.0.0.0/24 10.0.0.1 color=red")
+    BOOST_TEST(parse_error("vpc-config 100 1 gateway=02:00:00:00:ff:01 route=3,10.0.0.0/8,5")
+                   .find("table") != std::string::npos);
+    BOOST_TEST(parse_error("vpc-config 100 1 gateway=02:00:00:00:ff:01 subnet=1,fd00::/64,0")
+                   .find("IPv4") != std::string::npos);
+    BOOST_TEST(parse_error("vpc-config 100 1 gateway=02:00:00:00:ff:01 table=1,primary")
+                   .find("N[,main]") != std::string::npos);
+    BOOST_TEST(
+        parse_error("vpc-config 100 1 gateway=02:00:00:00:ff:01 block6=fd00::/64").find("/56") !=
+        std::string::npos);
+    BOOST_TEST(parse_error("vpc-config 100 1 gateway=02:00:00:00:ff:01 color=red")
                    .find("unknown option") != std::string::npos);
 }
 

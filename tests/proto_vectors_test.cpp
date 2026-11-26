@@ -27,6 +27,7 @@
 #include "proto/test_vectors.hpp"
 #include "proto/volume_layout.hpp"
 #include "proto/volume_op.hpp"
+#include "proto/vpc_config.hpp"
 #include "test_support.hpp"
 
 namespace mb = ak::helm::mailbox;
@@ -286,6 +287,72 @@ BOOST_AUTO_TEST_CASE(vop5_reproduces_and_verifies) {
         [](std::span<const std::byte> b) { return proto::decode_volume_op(b); },
         [](std::span<const std::byte> b) { return proto::volume_op_signed_bytes(b); },
         [](std::span<std::byte> b, const auto& sig) { proto::set_volume_op_signature(b, sig); });
+}
+
+// Vector 12: VpcConfig version 2 (vpc-subnets-routing task 2).
+BOOST_AUTO_TEST_CASE(vpc12_reproduces_and_verifies) {
+    const auto a4 = [](std::uint8_t c, std::uint8_t d) -> proto::Ipv4Address {
+        return {std::byte{guest_net}, std::byte{0}, std::byte{c}, std::byte{d}};
+    };
+    // 2001:db8:1200:<fourth>::
+    const auto a6 = [](std::uint8_t fourth) {
+        proto::Ipv6Address a{};
+        a[0] = std::byte{0x20};
+        a[1] = std::byte{0x01};
+        a[2] = std::byte{0x0D};
+        a[3] = std::byte{0xB8};
+        a[4] = std::byte{0x12};
+        a[7] = std::byte{fourth};
+        return a;
+    };
+    const auto route4 = [](proto::RouteKind kind, proto::Ipv4Address p, std::uint8_t length,
+                           std::uint64_t nic) {
+        proto::VpcRoute r{.kind = kind,
+                          .family = proto::RouteFamily::ipv4,
+                          .length = length,
+                          .prefix = {},
+                          .target_nic = nic};
+        std::ranges::copy(p, r.prefix.begin());
+        return r;
+    };
+    const proto::VpcRoute local6{.kind = proto::RouteKind::local,
+                                 .family = proto::RouteFamily::ipv6,
+                                 .length = 56,
+                                 .prefix = a6(0),
+                                 .target_nic = 0};
+    const auto local4 = route4(proto::RouteKind::local, a4(0, 0), 16, 0);
+    proto::VpcConfigFrame fields{};
+    fields.server_id = vec::vpc12_server_id;
+    fields.key_id = vec::vpc12_key_id;
+    fields.vni = vec::vpc12_vni;
+    fields.config_version = vec::vpc12_config_version;
+    fields.gateway_mac = {std::byte{local_unicast}, {}, {}, {}, std::byte{0xFF}, std::byte{0x01}};
+    fields.ipv4_blocks = {{.prefix = a4(0, 0), .length = 16}};
+    fields.ipv6_block = a6(0);
+    fields.dns4 = {a4(0, 2)};
+    fields.domain = "ec2.internal";
+    fields.lease_seconds = 3600;
+    fields.subnets = {{.subnet_id = 0x5B01,
+                       .table = 1,
+                       .ipv4_prefix = a4(1, 0),
+                       .ipv4_length = 24,
+                       .ipv6_prefix = a6(1)},
+                      {.subnet_id = 0x5B02,
+                       .table = 2,
+                       .ipv4_prefix = a4(2, 0),
+                       .ipv4_length = 24,
+                       .ipv6_prefix = std::nullopt}};
+    fields.tables = {
+        {.table = 1,
+         .main = true,
+         .routes = {local4, route4(proto::RouteKind::nic, a4(2, 0), 24, map2_nic_b), local6}},
+        {.table = 2, .main = false, .routes = {local4, local6}}};
+    check_signed_vector(
+        vec::vpc12, vec::vpc12_signature, fields, TestSigner{vec::key1_secret},
+        [](const proto::VpcConfigFrame& c) { return proto::encode_vpc_config(c); },
+        [](std::span<const std::byte> b) { return proto::decode_vpc_config(b); },
+        [](std::span<const std::byte> b) { return proto::vpc_config_signed_bytes(b); },
+        [](std::span<std::byte> b, const auto& sig) { proto::set_vpc_config_signature(b, sig); });
 }
 
 BOOST_AUTO_TEST_CASE(layout6_reproduces_and_verifies) {

@@ -64,6 +64,7 @@ constexpr std::uint64_t server_one = 7;
 constexpr std::uint64_t server_two = 8;
 constexpr std::uint16_t key_id = 1;
 constexpr std::uint32_t vpc = 0x00AB'CD01;
+constexpr std::uint64_t vpc_subnet = 0x5B01;
 constexpr std::uint32_t underlay_mtu = 1500;
 constexpr std::size_t function_count = 2;
 constexpr oar::FunctionNumber fn0 = 0;
@@ -152,8 +153,9 @@ auto signed_map(std::uint64_t server, std::uint64_t version,
     return *bytes;
 }
 
-// A VpcConfig for `vpc` (10.0.0.0/24, gateway .1), signed like the
-// controller signs it. `routes` adds a default route to nic_b.
+// A VpcConfig for `vpc`: block 10.0.0.0/16 and fd10::/56, one subnet
+// 10.0.0.0/24 (gateway .1) with fd10::/64, signed like the controller signs
+// it. `routes` adds a default route to nic_b to the main table.
 auto signed_vpc(std::uint64_t server, std::uint64_t version, std::uint32_t lease = 3600,
                 bool routes = false) -> std::vector<std::byte> {
     proto::VpcConfigFrame c{};
@@ -163,19 +165,41 @@ auto signed_vpc(std::uint64_t server, std::uint64_t version, std::uint32_t lease
     c.config_version = version;
     c.gateway_mac = {std::byte{0x02}, std::byte{0}, std::byte{0},
                      std::byte{0},    std::byte{0}, std::byte{0xFE}};
-    c.ipv4_prefix = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}};
-    c.ipv4_length = 24;
-    c.ipv4_gateway = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{1}};
-    c.has_ipv6 = true;
-    c.ipv6_prefix[0] = std::byte{0xFD};
-    c.ipv6_prefix[1] = std::byte{0x10};
+    c.ipv4_blocks = {
+        {.prefix = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}}, .length = 16}};
+    proto::Ipv6Address ula{};
+    ula[0] = std::byte{0xFD};
+    ula[1] = std::byte{0x10};
+    c.ipv6_block = ula;
+    c.subnets = {{.subnet_id = vpc_subnet,
+                  .table = 1,
+                  .ipv4_prefix = {std::byte{10}, std::byte{0}, std::byte{0}, std::byte{0}},
+                  .ipv4_length = 24,
+                  .ipv6_prefix = ula}};
+    proto::VpcRouteTable main{.table = 1, .main = true, .routes = {}};
+    if (routes) {
+        main.routes.push_back({.kind = proto::RouteKind::nic,
+                               .family = proto::RouteFamily::ipv4,
+                               .length = 0,
+                               .prefix = {},
+                               .target_nic = nic_b});
+    }
+    proto::VpcRoute local4{.kind = proto::RouteKind::local,
+                           .family = proto::RouteFamily::ipv4,
+                           .length = 16,
+                           .prefix = {},
+                           .target_nic = 0};
+    local4.prefix[0] = std::byte{10};
+    main.routes.push_back(local4);
+    main.routes.push_back({.kind = proto::RouteKind::local,
+                           .family = proto::RouteFamily::ipv6,
+                           .length = 56,
+                           .prefix = ula,
+                           .target_nic = 0});
+    c.tables = {main};
     c.dns4 = {{std::byte{10}, std::byte{0}, std::byte{0}, std::byte{2}}};
     c.domain = "ec2.internal";
     c.lease_seconds = lease;
-    if (routes) {
-        c.routes = {
-            {.family = proto::RouteFamily::ipv4, .length = 0, .prefix = {}, .target_nic = nic_b}};
-    }
     auto bytes = proto::encode_vpc_config(c);
     BOOST_REQUIRE(bytes.has_value());
     const auto sig = signer().sign(proto::vpc_config_signed_bytes(*bytes));
@@ -665,7 +689,7 @@ BOOST_FIXTURE_TEST_CASE(vpc_configs_are_checked, One,
     BOOST_TEST(role->counters().vpc_wrong_server == 1U);
 
     auto tampered = good;
-    tampered[0x40] ^= std::byte{0x01};  // lease_seconds
+    tampered[0x28] ^= std::byte{0x01};  // lease_seconds
     BOOST_TEST((role->vpc_config(tampered) == Status::failed));
     BOOST_TEST(role->counters().vpc_bad_signature == 1U);
     BOOST_TEST(role->vswitch().vpc_config(vpc) == nullptr);
@@ -693,17 +717,19 @@ BOOST_FIXTURE_TEST_CASE(vpc_configs_are_checked, One,
     BOOST_TEST(role->counters().vpc_stale == 1U);
     BOOST_TEST(role->vswitch().vpc_config(vpc)->lease_seconds == 3600U);
 
-    // A newer config replaces it, route table included.
-    BOOST_TEST((role->vpc_config(signed_vpc(server_one, 3, 7200, true)) == Status::ok));
+    // A newer config replaces it.
+    BOOST_TEST((role->vpc_config(signed_vpc(server_one, 3, 7200)) == Status::ok));
     BOOST_TEST(role->counters().vpc_applied == 2U);
     BOOST_TEST(role->counters().vpc_rejected == 0U);
-    const auto* routed = role->vswitch().vpc_config(vpc);
-    BOOST_REQUIRE(routed != nullptr);
-    BOOST_TEST(routed->lease_seconds == 7200U);
-    BOOST_REQUIRE(routed->routes.size() == 1U);
-    BOOST_TEST(!routed->routes[0].ipv6);
-    BOOST_TEST(routed->routes[0].length == 0U);
-    BOOST_TEST(routed->routes[0].target.value == nic_b);
+    BOOST_TEST(role->vswitch().vpc_config(vpc)->lease_seconds == 7200U);
+
+    // Until the VSwitch applies route tables (vpc-subnets-routing task 5),
+    // a frame with a NIC route is refused whole, and the applied config
+    // stays.
+    BOOST_TEST((role->vpc_config(signed_vpc(server_one, 4, 600, true)) == Status::failed));
+    BOOST_TEST(role->counters().vpc_unsupported == 1U);
+    BOOST_TEST(role->vswitch().vpc_config(vpc)->lease_seconds == 7200U);
+    BOOST_TEST(role->vswitch().vpc_config(vpc)->routes.empty());
 }
 
 auto arp_request(std::uint64_t nic, const proto::Ipv4Address& target) -> std::vector<std::byte> {

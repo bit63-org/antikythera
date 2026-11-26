@@ -52,8 +52,9 @@
 //   cert_request        (empty)
 //   role_certificate    0  total u32 | 4  offset u32 | 8  chunk (as map_update)
 //   eject               0  fn u16 | 2  op u8 (EjectOp) | 3  reserved u8
-//   vpc_config          0  frame (proto::VpcConfigFrame, signed; min_vpc_config_frame
-//                          to max_vpc_config_frame bytes)
+//   vpc_config          0  total u32 | 4  offset u32 | 8  chunk (as map_update): one
+//                          controller proto::VpcConfigFrame (signed;
+//                          min_vpc_config_frame to max_vpc_config_frame bytes)
 //   group_members       0  total u32 | 4  offset u32 | 8  chunk (as map_update)
 //   instance_metadata   0  total u32 | 4  offset u32 | 8  chunk (as map_update)
 //   volume_layout       0  total u32 | 4  offset u32 | 8  chunk (as map_update): one
@@ -110,9 +111,10 @@
 // page, so an interrupted read loses nothing (UsagePager).
 //
 // vpc_config forwards one controller VpcConfig frame
-// (src/proto/vpc_config.hpp: a VPC's gateway, DHCP settings and routes)
-// unmodified, like group_policy; even the largest fits one message. Only
-// the network role implements it (oar-net task 20).
+// (src/proto/vpc_config.hpp: a VPC's blocks, subnets, route tables, gateway
+// and DHCP settings) unmodified, in map_update's chunks: a version 2 frame
+// is up to 136 KiB (.kiro/specs/vpc-subnets-routing/ task 3). Only the
+// network role implements it (oar-net task 20).
 //
 // tunnel_peers forwards one controller TunnelPeers frame
 // (src/proto/tunnel_peers.hpp: the signed public keys of one VTEP's
@@ -307,12 +309,14 @@ inline constexpr std::uint8_t usage_detached = 0x01;
 // members and sixteen attachments); tests/oar_protocol_test.cpp pins them.
 inline constexpr std::size_t min_replica_config_frame = 0x88 + 0x20 + 64;
 inline constexpr std::size_t max_replica_config_frame = 0x88 + (5 * 0x20) + (16 * 0x18) + 64;
-// proto::VpcConfigFrame sizes, mirrored (no lists; four DNS servers per
-// family, 100 routes and a 253-byte domain); tests/oar_protocol_test.cpp
-// pins them.
-inline constexpr std::size_t min_vpc_config_frame = 0x48 + 64;
+// proto::VpcConfigFrame version 2 sizes, mirrored (one block, subnet,
+// table and local route; five blocks, four DNS servers per family, 200
+// subnets, 200 tables, 4,096 routes and a 253-byte domain);
+// tests/oar_protocol_test.cpp pins them.
+inline constexpr std::size_t min_vpc_config_frame = 0x48 + 0x08 + 0x20 + 0x08 + 0x20 + 64;
 inline constexpr std::size_t max_vpc_config_frame =
-    0x48 + (4 * 4) + (4 * 16) + (100 * 0x20) + 253 + 64;
+    0x48 + (5 * 0x08) + (4 * 4) + (4 * 16) + (200 * 0x20) + (200 * 0x08) + (4096 * 0x20) + 253 + 64;
+static_assert(max_vpc_config_frame <= max_map_frame);
 // Largest GroupMembers frame (proto::max_group_members_size: 32-byte
 // header, 512 groups of 24 bytes, 4096 VTEPs of 16, 64-byte signature),
 // pinned the same way.
@@ -711,10 +715,6 @@ struct MapChunk {
 [[nodiscard]] auto decode_replica_config_frame(std::span<const std::byte> body) noexcept
     -> std::expected<std::span<const std::byte>, BodyError>;
 // vpc_config bodies, the same way.
-[[nodiscard]] auto encode_vpc_config_frame(std::span<const std::byte> frame)
-    -> std::expected<std::vector<std::byte>, BodyError>;
-[[nodiscard]] auto decode_vpc_config_frame(std::span<const std::byte> body) noexcept
-    -> std::expected<std::span<const std::byte>, BodyError>;
 [[nodiscard]] auto encode_volume_op_frame(std::span<const std::byte> frame)
     -> std::expected<std::vector<std::byte>, BodyError>;
 [[nodiscard]] auto decode_volume_op_frame(std::span<const std::byte> body) noexcept

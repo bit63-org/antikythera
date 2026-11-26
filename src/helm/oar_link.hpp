@@ -161,8 +161,9 @@ public:
     // to a blk role (khold volumes); fails without sending if it is empty
     // or larger than oar::max_volume_layout_frame.
     auto volume_layout(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
-    // Forwards one controller VpcConfig frame (min_vpc_config_frame to
-    // max_vpc_config_frame bytes) to a network role.
+    // Sends one controller VpcConfig frame in chunks, like tunnel_peers,
+    // to a network role; fails without sending if it is shorter than
+    // oar::min_vpc_config_frame or longer than oar::max_vpc_config_frame.
     auto vpc_config(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
     // Block volumes, to a hold role: one controller ReplicaConfig or
     // VolumeOp frame unmodified, and a lease acknowledgement.

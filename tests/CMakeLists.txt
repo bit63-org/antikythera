@@ -121,6 +121,7 @@ ak_add_test(vmm_launcher_test SOURCES vmm_launcher_test.cpp LIBS ak::hull
             ARGS -- $<TARGET_FILE:fake_vmm>)
 ak_add_test(proto_envelope_test   SOURCES proto_envelope_test.cpp   LIBS ak::proto ak::helm)
 ak_add_test(proto_map_update_test SOURCES proto_map_update_test.cpp LIBS ak::proto)
+ak_add_test(proto_ec2_id_test     SOURCES proto_ec2_id_test.cpp     LIBS ak::proto)
 ak_add_test(proto_report_test     SOURCES proto_report_test.cpp     LIBS ak::proto ak::helm)
 ak_add_test(proto_link_test       SOURCES proto_link_test.cpp       LIBS ak::proto)
 ak_add_test(proto_volume_test     SOURCES proto_volume_test.cpp     LIBS ak::proto)

@@ -5,7 +5,8 @@
 // task 3): the allow-list, the inventory file, the server ID sources and
 // the controller key list. None may crash; an accepted inventory must
 // survive a format/parse round trip unchanged; an accepted config must
-// name valid ports and no slot twice.
+// name valid ports, no slot or SR-IOV port twice, and no SR-IOV PF a
+// slot could hand out.
 
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,17 @@ extern "C" auto LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t siz
         for (const auto& s : c->slots) {
             if (!valid_bdf(s.port) || s.slot == 0xFF || !slots.insert(s.slot).second) {
                 std::abort();
+            }
+        }
+        std::set<std::string_view> ports;
+        for (const auto& r : c->sriov) {
+            if (!valid_bdf(r.port) || r.vfs == 0 || !ports.insert(r.port).second) {
+                std::abort();
+            }
+            for (const auto& s : c->slots) {
+                if (s.port == r.port && s.id == r.pf) {
+                    std::abort();
+                }
             }
         }
     }

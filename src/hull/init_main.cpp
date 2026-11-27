@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // hull-init: /init in hull's initramfs (.kiro/specs/hull-host-agent/
-// task 3, Requirements 3.1, 4.4, 5.1, 5.2; design.md "Init"). A C++
+// task 3, Requirements 3.1, 4.4, 5.1, 5.2, 5.3; design.md "Init"). A C++
 // program, because the image has no shell.
 //
 //   1. mount /proc, /sys, /dev, /run, /dev/hugepages (1 GiB pages) and the
 //      cgroup v2 hierarchy, and enable the controllers the per-VM cgroups
 //      use at its root;
-//   2. read the allow-list (/etc/hull/hull.conf, host_setup.hpp);
+//   2. read the allow-list (/etc/hull/hull.conf, host_setup.hpp), and for
+//      each SR-IOV board bind its PF to vfio-pci and set its VF count
+//      (Requirement 5.3), so the VFs exist before step 3 looks for them;
 //   3. find the mailbox and every slot's functions, bind each to vfio-pci
 //      and check the binding took;
 //   4. check every one is alone in its IOMMU group;
@@ -139,6 +141,26 @@ auto main(int argc, char** argv) -> int {
     if (!config) {
         die(opt.config.string() + ":" + std::to_string(config.error().line) + ": " +
             config.error().reason);
+    }
+
+    for (const auto& rule : config->sriov) {
+        const auto pf = find_sriov_pf(rule, opt.sysfs);
+        if (!pf) {
+            die(pf.error().step + ": " + pf.error().detail);
+        }
+        if (auto b = bind_to_vfio(*pf, opt.sysfs); !b) {
+            die(b.error().step + " " + b.error().detail + ": " +
+                std::strerror(b.error().sys_errno));
+        }
+        if (!bound_to_vfio(*pf, opt.sysfs)) {
+            die("bind " + *pf + ": vfio-pci did not take it");
+        }
+        if (auto v = create_vfs(*pf, rule.vfs, opt.sysfs); !v) {
+            die(v.error().step + ": " + v.error().detail +
+                (v.error().sys_errno != 0 ? std::string{": "} + std::strerror(v.error().sys_errno)
+                                          : std::string{}));
+        }
+        std::printf("hull-init: PF %s has %u VF(s)\n", pf->c_str(), unsigned{rule.vfs});
     }
 
     auto found = discover(*config, opt.sysfs);

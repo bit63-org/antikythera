@@ -152,7 +152,8 @@ auto sysfs_hex16(const fs::path& p) -> std::optional<std::uint16_t> {
 }
 
 auto write_attr(const fs::path& file, std::string_view value) -> int {
-    const int fd = ::open(file.c_str(), O_WRONLY | O_CLOEXEC);
+    // O_TRUNC as a shell's `echo value > file` does; sysfs ignores it.
+    const int fd = ::open(file.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC);
     if (fd < 0) {
         return errno;
     }
@@ -163,6 +164,39 @@ auto write_attr(const fs::path& file, std::string_view value) -> int {
     const int err = n == static_cast<ssize_t>(value.size()) ? 0 : (n < 0 ? errno : EIO);
     ::close(fd);
     return err;
+}
+
+auto sysfs_decimal(const fs::path& p) -> std::optional<unsigned> {
+    const auto s = read_small(p);
+    if (!s) {
+        return std::nullopt;
+    }
+    return decimal<unsigned>(*s, 0xFFFF);
+}
+
+// Whether the device at the real (canonical) path `real` sits below the
+// port `port`: one of its ancestor directories is named after the port.
+auto below_port(const fs::path& real, const std::string& port) -> bool {
+    for (auto p = real.parent_path(); p.has_relative_path() && p != p.parent_path();
+         p = p.parent_path()) {
+        if (p.filename() == port) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The canonical PCI addresses under <sysfs>/bus/pci/devices, sorted.
+auto pci_devices(const fs::path& sysfs, std::error_code& ec) -> std::vector<std::string> {
+    std::vector<std::string> bdfs;
+    for (const auto& e : fs::directory_iterator{sysfs / "bus" / "pci" / "devices", ec}) {
+        const auto name = e.path().filename().string();
+        if (valid_bdf(name)) {
+            bdfs.push_back(name);
+        }
+    }
+    std::ranges::sort(bdfs);
+    return bdfs;
 }
 
 auto fail(std::string step, std::string detail, int err = 0) -> std::unexpected<SetupFailure> {
@@ -208,79 +242,103 @@ auto parse_host_config(std::string_view text) -> std::expected<HostConfig, Parse
         return std::expected<void, ParseFailure>{std::unexpect,
                                                  ParseFailure{.line = n, .reason = std::move(why)}};
     };
-    auto r =
-        each_line(text,
-                  [&](std::size_t n,
-                      const std::vector<std::string_view>& w) -> std::expected<void, ParseFailure> {
-                      if (w[0] == "mailbox") {
-                          if (w.size() != 2) {
-                              return bad(n, "mailbox takes one <vendor>:<device>");
-                          }
-                          if (have_mailbox) {
-                              return bad(n, "second mailbox line");
-                          }
-                          const auto id = parse_pci_id(w[1]);
-                          if (!id) {
-                              return bad(n, "bad PCI ID");
-                          }
-                          cfg.mailbox = *id;
-                          have_mailbox = true;
-                          return {};
-                      }
-                      if (w[0] == "slot") {
-                          if (w.size() != 8 || w[2] != "port" || w[4] != "type" || w[6] != "id") {
-                              return bad(n, "slot <n> port <bdf> type <type> id <vendor>:<device>");
-                          }
-                          const auto slot = decimal<unsigned>(w[1], 0xFE);  // 0xFF means "no slot"
-                          const auto type = device_type(w[5]);
-                          const auto id = parse_pci_id(w[7]);
-                          if (!slot) {
-                              return bad(n, "bad slot number");
-                          }
-                          if (!valid_bdf(w[3])) {
-                              return bad(n, "bad port address");
-                          }
-                          if (!type) {
-                              return bad(n, "unknown function type");
-                          }
-                          if (!id) {
-                              return bad(n, "bad PCI ID");
-                          }
-                          for (const auto& s : cfg.slots) {
-                              if (s.slot == *slot) {
-                                  return bad(n, "slot listed twice");
-                              }
-                              if (s.port == w[3]) {
-                                  return bad(n, "port listed twice");
-                              }
-                          }
-                          cfg.slots.push_back(SlotRule{.slot = static_cast<std::uint8_t>(*slot),
-                                                       .port = std::string{w[3]},
-                                                       .type = *type,
-                                                       .id = *id});
-                          return {};
-                      }
-                      if (w[0] == "server-id") {
-                          if (have_server_id) {
-                              return bad(n, "second server-id line");
-                          }
-                          if (w.size() == 2 && w[1] == "cmdline") {
-                              cfg.server_id_source = ServerIdSource::cmdline;
-                          } else if (w.size() == 3 && w[1] == "file" && w[2].starts_with('/')) {
-                              const fs::path p{w[2]};
-                              if (p.lexically_normal() != p) {
-                                  return bad(n, "server-id file path is not normal");
-                              }
-                              cfg.server_id_source = ServerIdSource::file;
-                              cfg.server_id_file = p;
-                          } else {
-                              return bad(n, "server-id cmdline | server-id file <absolute path>");
-                          }
-                          have_server_id = true;
-                          return {};
-                      }
-                      return bad(n, "unknown keyword");
-                  });
+    auto r = each_line(
+        text,
+        [&](std::size_t n,
+            const std::vector<std::string_view>& w) -> std::expected<void, ParseFailure> {
+            if (w[0] == "mailbox") {
+                if (w.size() != 2) {
+                    return bad(n, "mailbox takes one <vendor>:<device>");
+                }
+                if (have_mailbox) {
+                    return bad(n, "second mailbox line");
+                }
+                const auto id = parse_pci_id(w[1]);
+                if (!id) {
+                    return bad(n, "bad PCI ID");
+                }
+                cfg.mailbox = *id;
+                have_mailbox = true;
+                return {};
+            }
+            if (w[0] == "slot") {
+                if (w.size() != 8 || w[2] != "port" || w[4] != "type" || w[6] != "id") {
+                    return bad(n, "slot <n> port <bdf> type <type> id <vendor>:<device>");
+                }
+                const auto slot = decimal<unsigned>(w[1], 0xFE);  // 0xFF means "no slot"
+                const auto type = device_type(w[5]);
+                const auto id = parse_pci_id(w[7]);
+                if (!slot) {
+                    return bad(n, "bad slot number");
+                }
+                if (!valid_bdf(w[3])) {
+                    return bad(n, "bad port address");
+                }
+                if (!type) {
+                    return bad(n, "unknown function type");
+                }
+                if (!id) {
+                    return bad(n, "bad PCI ID");
+                }
+                for (const auto& s : cfg.slots) {
+                    if (s.slot == *slot) {
+                        return bad(n, "slot listed twice");
+                    }
+                    if (s.port == w[3]) {
+                        return bad(n, "port listed twice");
+                    }
+                }
+                cfg.slots.push_back(SlotRule{.slot = static_cast<std::uint8_t>(*slot),
+                                             .port = std::string{w[3]},
+                                             .type = *type,
+                                             .id = *id});
+                return {};
+            }
+            if (w[0] == "sriov") {
+                if (w.size() != 7 || w[1] != "port" || w[3] != "pf" || w[5] != "vfs") {
+                    return bad(n, "sriov port <bdf> pf <vendor>:<device> vfs <n>");
+                }
+                const auto id = parse_pci_id(w[4]);
+                const auto vfs = decimal<unsigned>(w[6], 0xFFFF);
+                if (!valid_bdf(w[2])) {
+                    return bad(n, "bad port address");
+                }
+                if (!id) {
+                    return bad(n, "bad PCI ID");
+                }
+                if (!vfs || *vfs == 0) {
+                    return bad(n, "bad VF count");
+                }
+                for (const auto& other : cfg.sriov) {
+                    if (other.port == w[2]) {
+                        return bad(n, "sriov port listed twice");
+                    }
+                }
+                cfg.sriov.push_back(SriovRule{
+                    .port = std::string{w[2]}, .pf = *id, .vfs = static_cast<std::uint16_t>(*vfs)});
+                return {};
+            }
+            if (w[0] == "server-id") {
+                if (have_server_id) {
+                    return bad(n, "second server-id line");
+                }
+                if (w.size() == 2 && w[1] == "cmdline") {
+                    cfg.server_id_source = ServerIdSource::cmdline;
+                } else if (w.size() == 3 && w[1] == "file" && w[2].starts_with('/')) {
+                    const fs::path p{w[2]};
+                    if (p.lexically_normal() != p) {
+                        return bad(n, "server-id file path is not normal");
+                    }
+                    cfg.server_id_source = ServerIdSource::file;
+                    cfg.server_id_file = p;
+                } else {
+                    return bad(n, "server-id cmdline | server-id file <absolute path>");
+                }
+                have_server_id = true;
+                return {};
+            }
+            return bad(n, "unknown keyword");
+        });
     if (!r) {
         return std::unexpected(r.error());
     }
@@ -289,6 +347,16 @@ auto parse_host_config(std::string_view text) -> std::expected<HostConfig, Parse
     }
     if (!have_server_id) {
         return std::unexpected(ParseFailure{.line = 0, .reason = "no server-id line"});
+    }
+    // A PF is never handed out (Requirement 5.3), so no slot below the same
+    // port may claim functions with its ID.
+    for (const auto& board : cfg.sriov) {
+        for (const auto& s : cfg.slots) {
+            if (s.port == board.port && s.id == board.pf) {
+                return std::unexpected(ParseFailure{
+                    .line = 0, .reason = "sriov PF ID is also a slot's ID on its port"});
+            }
+        }
     }
     return cfg;
 }
@@ -322,17 +390,10 @@ auto discover(const HostConfig& config, const fs::path& sysfs)
     -> std::expected<HostDiscovery, SetupFailure> {
     const auto devices = sysfs / "bus" / "pci" / "devices";
     std::error_code ec;
-    std::vector<std::string> bdfs;
-    for (const auto& e : fs::directory_iterator{devices, ec}) {
-        const auto name = e.path().filename().string();
-        if (valid_bdf(name)) {
-            bdfs.push_back(name);
-        }
-    }
+    const auto bdfs = pci_devices(sysfs, ec);
     if (ec) {
         return fail("enumerate", devices.string(), ec.value());
     }
-    std::ranges::sort(bdfs);
 
     HostDiscovery out;
     std::map<std::uint8_t, std::uint16_t> next_function;
@@ -359,16 +420,7 @@ auto discover(const HostConfig& config, const fs::path& sysfs)
             if (id != rule.id) {
                 continue;
             }
-            // Below the port: one of the device's ancestors is the port.
-            bool below = false;
-            for (auto p = real.parent_path(); p.has_relative_path() && p != p.parent_path();
-                 p = p.parent_path()) {
-                if (p.filename() == rule.port) {
-                    below = true;
-                    break;
-                }
-            }
-            if (!below) {
+            if (!below_port(real, rule.port)) {
                 continue;
             }
             const auto fn = next_function[rule.slot]++;
@@ -385,6 +437,79 @@ auto discover(const HostConfig& config, const fs::path& sysfs)
         return fail("mailbox", "no function with the mailbox's ID");
     }
     return out;
+}
+
+auto find_sriov_pf(const SriovRule& rule, const fs::path& sysfs)
+    -> std::expected<std::string, SetupFailure> {
+    const auto devices = sysfs / "bus" / "pci" / "devices";
+    std::error_code ec;
+    const auto bdfs = pci_devices(sysfs, ec);
+    if (ec) {
+        return fail("enumerate", devices.string(), ec.value());
+    }
+    std::string found;
+    for (const auto& bdf : bdfs) {
+        const auto dir = devices / bdf;
+        const auto vendor = sysfs_hex16(dir / "vendor");
+        const auto device = sysfs_hex16(dir / "device");
+        if (!vendor || !device || PciId{.vendor = *vendor, .device = *device} != rule.pf) {
+            continue;
+        }
+        const auto real = fs::canonical(dir, ec);
+        if (ec || !below_port(real, rule.port)) {
+            continue;
+        }
+        if (!found.empty()) {
+            return fail("sriov", "two PFs below " + rule.port + ": " + found + " and " + bdf);
+        }
+        found = bdf;
+    }
+    if (found.empty()) {
+        return fail("sriov", "no PF with the rule's ID below " + rule.port);
+    }
+    return found;
+}
+
+auto create_vfs(const std::string& pf, std::uint16_t count, const fs::path& sysfs)
+    -> std::expected<void, SetupFailure> {
+    if (!valid_bdf(pf) || count == 0) {
+        return fail("sriov", pf, EINVAL);
+    }
+    const auto dir = sysfs / "bus" / "pci" / "devices" / pf;
+    const auto total = sysfs_decimal(dir / "sriov_totalvfs");
+    if (!total) {
+        return fail("sriov", pf + ": not SR-IOV capable (no sriov_totalvfs)");
+    }
+    if (count > *total) {
+        return fail("sriov", pf + ": " + std::to_string(count) + " VFs asked, " +
+                                 std::to_string(*total) + " supported");
+    }
+    const auto numvfs = dir / "sriov_numvfs";
+    const auto current = sysfs_decimal(numvfs);
+    if (!current) {
+        return fail("sriov", numvfs.string() + " unreadable");
+    }
+    if (*current == count) {
+        return {};
+    }
+    // vfio-pci refuses sriov_configure unless this parameter is on; it is
+    // writable at run time, so the image needs no extra command-line word.
+    const auto param = sysfs / "module" / "vfio_pci" / "parameters" / "enable_sriov";
+    if (const int err = write_attr(param, "1"); err != 0) {
+        return fail("sriov", param.string(), err);
+    }
+    if (*current != 0) {
+        if (const int err = write_attr(numvfs, "0"); err != 0) {
+            return fail("sriov", numvfs.string() + " = 0", err);
+        }
+    }
+    if (const int err = write_attr(numvfs, std::to_string(count)); err != 0) {
+        return fail("sriov", numvfs.string() + " = " + std::to_string(count), err);
+    }
+    if (sysfs_decimal(numvfs) != std::optional<unsigned>{count}) {
+        return fail("sriov", pf + ": sriov_numvfs did not take " + std::to_string(count));
+    }
+    return {};
 }
 
 auto bind_to_vfio(const std::string& bdf, const fs::path& sysfs)

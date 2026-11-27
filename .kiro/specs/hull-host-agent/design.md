@@ -38,6 +38,26 @@ As built (task 3):
 - A shared IOMMU group stops the boot rather than only that function, and
   the mailbox's group is checked too: a host whose topology is not what
   the image expects should not run guests at all.
+- SR-IOV boards (Requirement 5.3) get an allow-list line
+  `sriov port <bdf> pf <vendor>:<device> vfs <n>`. Before discovery init
+  finds that one PF below the port (none or two stops the boot), binds it
+  to `vfio-pci`, writes `1` to `/sys/module/vfio_pci/parameters/
+  enable_sriov` (writable at run time, so the UKI command line needs no
+  extra word) and sets `sriov_numvfs`, clearing a different non-zero
+  count first and checking against `sriov_totalvfs`. The kernel creates
+  the VFs before the write returns, and `vfio-pci` sets their
+  `driver_override` itself, so the ordinary slot lines then find and bind
+  them. Init never opens the PF, so it has no IOMMU container and no DMA
+  mapping, and it is not in the inventory: a slot whose ID equals the PF's
+  on the same port is refused, so no command can name it. The PF's own
+  IOMMU group is not checked, since nothing is ever assigned from it.
+- Open: a VF whose PF is bound to `vfio-pci` can only be opened with a VF
+  token (the PF's token, all zeros until someone sets it). Cloud
+  Hypervisor's VFIO open path is not known to pass one, so a VM may fail
+  to take such a VF with `EACCES` (kernel log: "VF token required").
+  This needs checking on the first real SR-IOV board; the likely fixes
+  are a Cloud Hypervisor change, or the agent opening the VF cdev with
+  the token and handing the fd over (the `SCM_RIGHTS` path above).
 - Init writes the inventory to `/run/hull/inventory`
   (`<slot> <type> <function> <bdf> <group> <reset>` per line) and execs
   the agent with `--mailbox`, `--inventory` and `--server-id`; the agent

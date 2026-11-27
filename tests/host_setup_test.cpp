@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // .kiro/specs/hull-host-agent/ task 3 (Requirements 3.1, 4.1, 4.4, 5.1,
-// 5.2): the allow-list parser, discovery, vfio-pci binding and the IOMMU
-// group check against a fake sysfs tree, the inventory file, the server ID
-// sources and the compiled-in controller keys; and hull-init end to end,
-// exec'ing a stand-in agent that records its arguments.
+// 5.2, 5.3): the allow-list parser, discovery, SR-IOV VF creation,
+// vfio-pci binding and the IOMMU group check against a fake sysfs tree, the inventory file, the
+// server ID sources and the compiled-in controller keys; and hull-init end to end, exec'ing a
+// stand-in agent that records its arguments.
 
 #define BOOST_TEST_MODULE host_setup_test
 #include <boost/test/unit_test.hpp>
@@ -125,6 +125,18 @@ public:
         device("0000:03:00.1", "0000:00:03.0", "8086:1889", 9, true);
     }
 
+    // Makes the standard host's PF (0000:01:00.0, 8086:1592, below port
+    // 01.0) an SR-IOV PF bound to vfio-pci with `total` VFs possible and
+    // `current` made. The fake cannot make VFs appear; the standard host
+    // already has the two the slot line expects.
+    void sriov_pf(unsigned total, unsigned current) const {
+        const fs::path dir = _root / "devices/pci0000:00/0000:00:01.0/0000:01:00.0";
+        fs::create_symlink(_root / "bus/pci/drivers/vfio-pci", dir / "driver");
+        std::ofstream{dir / "sriov_totalvfs"} << total << "\n";
+        std::ofstream{dir / "sriov_numvfs"} << current << "\n";
+        touch("module/vfio_pci/parameters/enable_sriov");
+    }
+
     [[nodiscard]] auto root() const -> const fs::path& { return _root; }
 
 private:
@@ -197,6 +209,43 @@ BOOST_AUTO_TEST_CASE(rejects_a_bad_allow_list) {
     const auto r = parse_host_config(head + "\nbogus\n");
     BOOST_TEST_REQUIRE(!r.has_value());
     BOOST_TEST(r.error().line == 4U);
+}
+
+BOOST_AUTO_TEST_CASE(parses_sriov_boards) {
+    const std::string head = "mailbox 1af4:10ff\nserver-id cmdline\n";
+    const auto c = parse_host_config(head + "sriov port 0000:00:01.0 pf 8086:1592 vfs 16\n" +
+                                     "slot 0 port 0000:00:01.0 type nic_vf id 8086:1889\n" +
+                                     "sriov port 0000:00:02.0 pf 8086:1592 vfs 65535\n");
+    BOOST_TEST_REQUIRE(c.has_value());
+    BOOST_TEST_REQUIRE(c->sriov.size() == 2U);
+    BOOST_TEST(c->sriov[0].port == "0000:00:01.0");
+    BOOST_TEST((c->sriov[0].pf == PciId{.vendor = 0x8086, .device = 0x1592}));
+    BOOST_TEST(c->sriov[0].vfs == 16U);
+    BOOST_TEST(c->sriov[1].vfs == 65535U);
+    BOOST_TEST(parse_host_config(good_config)->sriov.empty());
+
+    BOOST_TEST(reason(head + "sriov port 0000:00:01.0 pf 8086:1592 vfs 0\n") == "bad VF count");
+    BOOST_TEST(reason(head + "sriov port 0000:00:01.0 pf 8086:1592 vfs 65536\n") == "bad VF count");
+    BOOST_TEST(reason(head + "sriov port 0000:00:01.0 pf 8086:1592 vfs 08\n") == "bad VF count");
+    BOOST_TEST(reason(head + "sriov port 0000:00:01.0 pf 8086:1592 vfs -1\n") == "bad VF count");
+    BOOST_TEST(reason(head + "sriov port 00:01.0 pf 8086:1592 vfs 4\n") == "bad port address");
+    BOOST_TEST(reason(head + "sriov port 0000:00:01.0 pf 8086 vfs 4\n") == "bad PCI ID");
+    BOOST_TEST(reason(head + "sriov port 0000:00:01.0 pf 8086:1592\n") ==
+               "sriov port <bdf> pf <vendor>:<device> vfs <n>");
+    BOOST_TEST(reason(head + "sriov port 0000:00:01.0 id 8086:1592 vfs 4\n") ==
+               "sriov port <bdf> pf <vendor>:<device> vfs <n>");
+    BOOST_TEST(reason(head + "sriov port 0000:00:01.0 pf 8086:1592 vfs 4\n" +
+                      "sriov port 0000:00:01.0 pf 8086:1593 vfs 4\n") == "sriov port listed twice");
+    // The PF is never handed out, whichever line comes first.
+    BOOST_TEST(reason(head + "slot 0 port 0000:00:01.0 type nic_vf id 8086:1592\n" +
+                      "sriov port 0000:00:01.0 pf 8086:1592 vfs 4\n") ==
+               "sriov PF ID is also a slot's ID on its port");
+    BOOST_TEST(reason(head + "sriov port 0000:00:01.0 pf 8086:1592 vfs 4\n" +
+                      "slot 0 port 0000:00:01.0 type nic_vf id 8086:1592\n") ==
+               "sriov PF ID is also a slot's ID on its port");
+    // The same ID below another port is another board.
+    BOOST_TEST(reason(head + "sriov port 0000:00:01.0 pf 8086:1592 vfs 4\n" +
+                      "slot 0 port 0000:00:02.0 type nic_vf id 8086:1592\n") == "accepted");
 }
 
 BOOST_AUTO_TEST_CASE(pci_addresses_are_canonical) {
@@ -281,6 +330,95 @@ BOOST_AUTO_TEST_CASE(refuses_a_missing_or_ambiguous_mailbox) {
     const auto ambiguous = discover(*parse_host_config(good_config), two.root());
     BOOST_TEST_REQUIRE(!ambiguous.has_value());
     BOOST_TEST(ambiguous.error().step == "mailbox");
+}
+
+BOOST_AUTO_TEST_CASE(finds_the_sriov_pf_below_its_port) {
+    FakeSysfs sys;
+    sys.standard_host();
+    const SriovRule rule{
+        .port = "0000:00:01.0", .pf = {.vendor = 0x8086, .device = 0x1592}, .vfs = 2};
+    const auto pf = find_sriov_pf(rule, sys.root());
+    BOOST_TEST_REQUIRE(pf.has_value());
+    BOOST_TEST(*pf == "0000:01:00.0");
+
+    auto elsewhere = rule;
+    elsewhere.port = "0000:00:02.0";
+    const auto none = find_sriov_pf(elsewhere, sys.root());
+    BOOST_TEST_REQUIRE(!none.has_value());
+    BOOST_TEST(none.error().step == "sriov");
+
+    sys.device("0000:01:00.1", "0000:00:01.0", "8086:1592", 21);
+    const auto two = find_sriov_pf(rule, sys.root());
+    BOOST_TEST_REQUIRE(!two.has_value());
+    BOOST_TEST(two.error().detail.find("two PFs") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(creates_vfs_on_the_pf) {
+    const auto pf_dir = [](const FakeSysfs& s) {
+        return s.root() / "bus/pci/devices/0000:01:00.0";
+    };
+    const auto param = [](const FakeSysfs& s) {
+        return s.root() / "module/vfio_pci/parameters/enable_sriov";
+    };
+    {
+        FakeSysfs sys;
+        sys.standard_host();
+        sys.sriov_pf(8, 0);
+        BOOST_TEST_REQUIRE(create_vfs("0000:01:00.0", 4, sys.root()).has_value());
+        BOOST_TEST(slurp(pf_dir(sys) / "sriov_numvfs") == "4");
+        BOOST_TEST(slurp(param(sys)) == "1");
+    }
+    {
+        // A different non-zero count is cleared first, then replaced.
+        FakeSysfs sys;
+        sys.standard_host();
+        sys.sriov_pf(16, 2);
+        BOOST_TEST_REQUIRE(create_vfs("0000:01:00.0", 16, sys.root()).has_value());
+        BOOST_TEST(slurp(pf_dir(sys) / "sriov_numvfs") == "16");
+    }
+    {
+        // Already right (an agent restart, or a kernel that kept them):
+        // nothing is written, not even the module parameter.
+        FakeSysfs sys;
+        sys.standard_host();
+        sys.sriov_pf(8, 4);
+        BOOST_TEST_REQUIRE(create_vfs("0000:01:00.0", 4, sys.root()).has_value());
+        BOOST_TEST(slurp(param(sys)).empty());
+    }
+    {
+        FakeSysfs sys;
+        sys.standard_host();
+        sys.sriov_pf(8, 0);
+        const auto too_many = create_vfs("0000:01:00.0", 9, sys.root());
+        BOOST_TEST_REQUIRE(!too_many.has_value());
+        BOOST_TEST(too_many.error().detail.find("8 supported") != std::string::npos);
+        BOOST_TEST(slurp(pf_dir(sys) / "sriov_numvfs") == "0\n");
+    }
+    {
+        // Not an SR-IOV device at all.
+        FakeSysfs sys;
+        sys.standard_host();
+        const auto plain = create_vfs("0000:02:00.0", 1, sys.root());
+        BOOST_TEST_REQUIRE(!plain.has_value());
+        BOOST_TEST(plain.error().detail.find("not SR-IOV capable") != std::string::npos);
+    }
+    {
+        // No vfio_pci enable_sriov parameter (a kernel without SR-IOV in
+        // vfio-pci): the count is left alone.
+        FakeSysfs sys;
+        sys.standard_host();
+        sys.sriov_pf(8, 0);
+        fs::remove(param(sys));
+        const auto no_param = create_vfs("0000:01:00.0", 2, sys.root());
+        BOOST_TEST_REQUIRE(!no_param.has_value());
+        BOOST_TEST(no_param.error().sys_errno == ENOENT);
+        BOOST_TEST(slurp(pf_dir(sys) / "sriov_numvfs") == "0\n");
+    }
+    {
+        FakeSysfs sys;
+        BOOST_TEST(!create_vfs("../x", 1, sys.root()).has_value());
+        BOOST_TEST(!create_vfs("0000:01:00.0", 0, sys.root()).has_value());
+    }
 }
 
 BOOST_AUTO_TEST_CASE(binds_to_vfio_pci) {
@@ -459,6 +597,21 @@ BOOST_AUTO_TEST_CASE(writes_the_inventory_and_execs_the_agent) {
                                           "\n--server-id\n77\n--vmm-stderr\n");
 }
 
+BOOST_AUTO_TEST_CASE(creates_vfs_before_looking_for_them) {
+    FakeSysfs sys;
+    sys.standard_host();
+    sys.sriov_pf(4, 0);
+    const std::string config =
+        std::string{good_config} + "sriov port 0000:00:01.0 pf 8086:1592 vfs 2\n";
+    BOOST_TEST_REQUIRE(run_init(sys, config, "hull.server_id=9\n") == 0);
+    BOOST_TEST(slurp(sys.root() / "bus/pci/devices/0000:01:00.0/sriov_numvfs") == "2");
+    BOOST_TEST(slurp(sys.root() / "module/vfio_pci/parameters/enable_sriov") == "1");
+    // The PF is not in the inventory; its VFs are.
+    BOOST_TEST(slurp(sys.root() / "init/run/inventory") ==
+               "0 nic_vf 0 0000:01:01.0 4 flr\n0 nic_vf 1 0000:01:01.1 5 flr\n1 blk_fn 0 "
+               "0000:02:00.0 7 bus\n");
+}
+
 BOOST_AUTO_TEST_CASE(fails_closed) {
     {
         FakeSysfs sys;
@@ -487,6 +640,26 @@ BOOST_AUTO_TEST_CASE(fails_closed) {
         FakeSysfs sys;
         sys.standard_host();
         BOOST_TEST(run_init(sys, "mailbox 1af4:10ff\n", "hull.server_id=1\n") == 1);
+    }
+    {
+        // More VFs than the PF supports.
+        FakeSysfs sys;
+        sys.standard_host();
+        sys.sriov_pf(4, 0);
+        BOOST_TEST(
+            run_init(sys, std::string{good_config} + "sriov port 0000:00:01.0 pf 8086:1592 vfs 5\n",
+                     "hull.server_id=1\n") == 1);
+        BOOST_TEST(!fs::exists(sys.root() / "init/args"));
+    }
+    {
+        // The PF never becomes vfio-pci's (here it has no driver at all and
+        // nothing plays the PCI core).
+        FakeSysfs sys;
+        sys.standard_host();
+        BOOST_TEST(
+            run_init(sys, std::string{good_config} + "sriov port 0000:00:01.0 pf 8086:1592 vfs 2\n",
+                     "hull.server_id=1\n") == 1);
+        BOOST_TEST(!fs::exists(sys.root() / "init/args"));
     }
 }
 

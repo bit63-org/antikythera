@@ -19,7 +19,7 @@
   (2026-11-18).
   _Requirements: 5.2_
 - [x] 3. Init binary: mounts, `vfio-pci` binding by allow-list, IOMMU group
-  check. _Requirements: 3.1, 5.1, 5.2_ — `src/hull/init_main.cpp`
+  check. _Requirements: 3.1, 5.1, 5.2, 5.3_ — `src/hull/init_main.cpp`
   (`hull-init`) over `src/hull/host_setup.*`: mounts `/proc`
   (`hidepid=2`), `/sys`, `/dev`, `/run`, 1 GiB hugetlbfs and cgroup v2
   with the VM controllers on; reads the allow-list `/etc/hull/hull.conf`
@@ -40,9 +40,14 @@
   loop over the MSI-X eventfd and the VMMs' pidfds. Tested over a fake
   sysfs tree, including `hull-init` end to end with a stand-in agent
   (`tests/host_setup_test.cpp`) and the capability drop in a child;
-  parsers fuzzed by `fuzz_host_config`. Not yet: creating SR-IOV VFs
-  from the PF (Requirement 5.3), which waits for a board that needs it;
-  today the VFs must exist before init runs.
+  parsers fuzzed by `fuzz_host_config`. SR-IOV boards (Requirement 5.3):
+  an allow-list `sriov port <bdf> pf <vendor>:<device> vfs <n>` line
+  makes init find that one PF below the port, bind it to `vfio-pci`, turn
+  on `vfio_pci`'s `enable_sriov` parameter and set `sriov_numvfs` before
+  discovery, so the slot lines pick up the VFs; the PF is never opened,
+  never in the inventory, and may not share an ID with a slot on its
+  port. Tested over the fake tree. Not yet run against a real SR-IOV
+  board; guest use of such VFs needs the VF token (design.md "Init").
 - [x] 4. MailboxClient over VFIO (BAR0 mmap, MSI-X eventfd, no DMA).
   _Requirements: 3_ — `src/hull/`: `MailboxClient` (doorbell check, one
   copy of `CMD_SLOT` with 32-bit reads, `authenticate()`, body decode,

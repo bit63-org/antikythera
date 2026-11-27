@@ -28,6 +28,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -260,7 +261,7 @@ auto main(int argc, char** argv) -> int {
         }
         if ((fds[0].revents & POLLIN) != 0) {
             std::uint64_t count = 0;
-            (void)::read(fds[0].fd, &count, sizeof(count));
+            static_cast<void>(::eventfd_read(fds[0].fd, &count));
         }
         // The doorbell is the truth; a lost or merged interrupt only delays.
         while (client.service()) {

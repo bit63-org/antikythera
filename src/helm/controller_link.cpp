@@ -375,13 +375,12 @@ auto ControllerLink::create(LinkOptions options, ControllerSession& session)
 }
 
 auto ControllerLink::wake() noexcept -> void {
-    const std::uint64_t one = 1;
-    (void)::write(_wake_fd, &one, sizeof(one));
+    static_cast<void>(::eventfd_write(_wake_fd, 1));
 }
 
 auto ControllerLink::drain_wake() noexcept -> void {
     std::uint64_t value = 0;
-    (void)::read(_wake_fd, &value, sizeof(value));
+    static_cast<void>(::eventfd_read(_wake_fd, &value));
 }
 
 auto ControllerLink::report(proto::ReportBody body) -> std::uint64_t {

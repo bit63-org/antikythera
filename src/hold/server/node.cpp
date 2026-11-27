@@ -199,8 +199,7 @@ auto Node::dial(SessionId session, std::uint64_t server_id, const proto::Storage
                 const std::scoped_lock lock{dials->mutex};
                 dials->done.push_back(std::move(d));
             }
-            const std::uint64_t one = 1;
-            static_cast<void>(::write(dials->wake, &one, sizeof one));
+            static_cast<void>(::eventfd_write(dials->wake, 1));
         }});
 }
 
@@ -226,7 +225,7 @@ auto Node::hang_up(SessionId session) -> void {
 
 auto Node::take_dials(Clock::time_point now) -> void {
     std::uint64_t n = 0;
-    static_cast<void>(::read(_dials.wake, &n, sizeof n));
+    static_cast<void>(::eventfd_read(_dials.wake, &n));
     std::vector<Dialed> done;
     {
         const std::scoped_lock lock{_dials.mutex};

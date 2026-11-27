@@ -38,8 +38,7 @@ auto close_fd(int fd) noexcept -> void {
 }
 
 auto signal(int fd) noexcept -> void {
-    const std::uint64_t one = 1;
-    static_cast<void>(::write(fd, &one, sizeof one));
+    static_cast<void>(::eventfd_write(fd, 1));
 }
 
 auto drain(int fd) noexcept -> void {

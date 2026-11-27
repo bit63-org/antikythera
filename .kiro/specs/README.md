@@ -19,6 +19,7 @@ Steering that applies to all of them is in `../steering/`.
 | [vpc-internet-gateways](vpc-internet-gateways/) | Internet and egress-only gateways, Elastic IPs and NAT gateways: a stateless edge fleet doing 1:1 translation, NAT in port blocks at the source VTEP | 0/16 |
 | [cold-start](cold-start/) | Server side of kythira's AZ cold start: helm's sealed store, LKG boot, local staggered power-on, standing starts of pinned instances, replay protection across reboots | 0/11 |
 | [fleet-scale-networking](fleet-scale-networking/) | Certified VTEP credentials instead of peer lists, stable tunnel keys, VPC delta streams, bulk frames over Ethernet, mapping lookups, edge groups, reusable VNIs and MACs | 0/18 |
+| [server-provisioning](server-provisioning/) | helm's side of the kythira metal host lifecycle: enrollment, host power and boot, decommission | 0/7 |
 | [backplane-hardware](backplane-hardware/) | Physical PCIe backplane requirements | deferred |
 | [build-and-ci](build-and-ci/) | Toolchain, vcpkg, caching and CI, following kythira | 9/11 |
 

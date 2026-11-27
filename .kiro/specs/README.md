@@ -16,6 +16,7 @@ Steering that applies to all of them is in `../steering/`.
 | [controller-interface](controller-interface/) | Signed commands, mappings, inventory; kythira EC2 mapping | 14/16 |
 | [vpc-subnets-routing](vpc-subnets-routing/) | VPC CIDR blocks, subnets, the distributed implicit router, route tables (`local` and NIC targets) | 0/12 |
 | [vpc-security-groups](vpc-security-groups/) | Stateful security groups: per-NIC connection tracking and rules in oar-net, the signed `SecurityPolicy` frame | 0/13 |
+| [vpc-internet-gateways](vpc-internet-gateways/) | Internet and egress-only gateways, Elastic IPs and NAT gateways: a stateless edge fleet doing 1:1 translation, NAT in port blocks at the source VTEP | 0/16 |
 | [cold-start](cold-start/) | Server side of kythira's AZ cold start: helm's sealed store, LKG boot, local staggered power-on, standing starts of pinned instances, replay protection across reboots | 0/11 |
 | [backplane-hardware](backplane-hardware/) | Physical PCIe backplane requirements | deferred |
 | [build-and-ci](build-and-ci/) | Toolchain, vcpkg, caching and CI, following kythira | 9/11 |

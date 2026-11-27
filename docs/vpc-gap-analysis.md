@@ -72,10 +72,10 @@ spec).
 | Security groups | specced | Refused by controller Req 6.4. Spec: `vpc-security-groups` (per-NIC conntrack and rules at the NIC's own VTEP, `SecurityPolicy` frame; SG references resolved by oar-net from the mapping rather than expanded by the controller) | The single most important gap. Stateful per-NIC allow rules (protocol, port range, CIDR or another SG as source/destination) enforced in oar-net, so neither host nor guest can bypass them. Needs connection tracking per function (TCP/UDP/ICMP state, timeouts, a per-NIC table limit), rule evaluation on egress at the source VTEP and on ingress at the destination VTEP, and SG-to-SG references expanded by the controller into address sets. Distributed as a signed per-VPC `SecurityPolicy` frame. Fuzz target over hostile flows |
 | Network ACLs | missing | None | Stateless, ordered, per-subnet allow/deny rules, evaluated at subnet boundaries. Simpler than SGs once the L3 parser and rule distribution exist; can share the `SecurityPolicy` frame |
 | Source/destination check | done | Source MAC must be the NIC's mapped MAC; ARP sender and NA target checked; IP source and destination checked against the NIC's mapped addresses on transmit and receive, with an EtherType allowlist and per-cause counters (oar-net 16, #61); per-NIC opt-out (AWS `SourceDestCheck=false`) with NIC route targets (oar-net 22, #107) | Route tables themselves (see "Route tables") |
-| Internet gateway | missing | oar-net spec explicitly has no uplink ("no uplink by default") | A gateway role: a VTEP with an external interface that terminates Geneve for VPCs with an IGW attached, does 1:1 NAT between public and private addresses, and advertises public prefixes upstream (BGP). Needs its own spec (placement, HA pairs, capacity) and route-table targets |
-| Elastic IPs / public IPs | missing | Refused by controller Req 6.4 | Public address pool in the controller, allocation and association with a NIC's private address, programmed into the gateway role's NAT table. Depends on the IGW |
-| NAT gateway | missing | None | Source NAT (many private → one EIP) with port allocation and connection tracking in the gateway role. Reuses the SG conntrack code |
-| Egress-only IGW (IPv6) | missing | None | Stateful IPv6 outbound-only gateway in the gateway role; small once the IGW and conntrack exist |
+| Internet gateway | specced | Spec: `vpc-internet-gateways`. A stateless, horizontally scalable edge fleet (network roles in edge mode with an outside port, on the encrypted underlay) wraps and unwraps VPC traffic; hosts route to `igw` and pick an edge per flow; inbound is checked by a reverse route lookup at the host | The build (that spec's tasks), then BGP toward upstream (its task 15) |
+| Elastic IPs / public IPs | specced | Spec: `vpc-internet-gateways`. 1:1 translation at the edge from a signed regional edge table (snapshots plus ordered deltas); public pools are operator-defined prefixes, a LAN prefix included | The build and the kythira EC2 API side |
+| NAT gateway | specced | Spec: `vpc-internet-gateways`. Source NAT at the sending NIC's network role, in the security-group flow table, to the NAT gateway's private address and a port from a 1,024-port block the controller gave that server; the edge maps the private address to the Elastic IP and routes returns by port, so it stays stateless | The build, after security groups' flow table |
+| Egress-only IGW (IPv6) | specced | Spec: `vpc-internet-gateways`. IPv6 is routed from public pools; `eigw` routes record outbound gateway flows at the source role, and inbound needs a matching flow | The build |
 | VPC peering | missing | VNIs are fully isolated; no cross-VNI forwarding | Route-table target that forwards from one VNI to another at the source VTEP (re-encapsulate with the peer VNI), with the controller enforcing non-overlapping CIDRs and both sides' consent. The mapping for the peer VPC's addresses must reach the source VTEP, so MapUpdate distribution has to follow peering, not just NIC placement |
 | Transit gateway | missing | None | A hub that routes between many VPCs, VPNs and on-premises links with its own route tables. Best built as a gateway-role function after peering and the IGW; not needed early |
 | VPC endpoints (gateway type) | missing | None | Route-table targets that send traffic for a kythira service (S3- or DynamoDB-compatible API) to that service without an IGW. Needs the gateway role plus a service-side ingress |
@@ -143,6 +143,8 @@ spec).
 7. **Gateway role spec and build:** IGW with Elastic IPs, then NAT gateway
    and the egress-only IGW, then the DNS resolver behind it. Route-table
    targets for each.
+   Specced in `.kiro/specs/vpc-internet-gateways/` (IGW, Elastic IPs,
+   NAT gateway, egress-only IGW); the DNS resolver gets its own spec.
 8. **VPC peering,** then gateway endpoints for kythira services.
 9. **Site-to-site VPN** (IPsec/IKEv2 + BGP) and **transit gateway.**
 10. **PrivateLink, traffic mirroring, client VPN** as demand appears.
@@ -201,8 +203,10 @@ and guest:
 
 ## Open questions
 
-- Where does the gateway role run: on dedicated servers with a public
-  uplink, or as a placement option of the existing oar-net boards?
+- ~~Where does the gateway role run?~~ Decided 2026-11-27: a stateless
+  edge fleet of network roles in edge mode on dedicated edge servers,
+  the same boards and code, each in every zone
+  (`vpc-internet-gateways`).
 - Which kythira services get gateway endpoints first?
 - Is security-group state per NIC on the oar-net board small enough for
   the target hardware, and what is the per-NIC connection limit? The spec

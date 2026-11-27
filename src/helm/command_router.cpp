@@ -581,10 +581,12 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
         if (!reserved) {
             return std::unexpected(reserved.error());
         }
-        auto ok =
-            port_for(a->device.slot)
-                ->prepare_function(
-                    {.fn = a->device.function, .type = type, .vm_id = a->vm_id, .config = config});
+        auto* port = port_for(a->device.slot);
+        if (port == nullptr) {  // reserve() checked; say so to the optimizer
+            return std::unexpected(Status::unknown_device);
+        }
+        auto ok = port->prepare_function(
+            {.fn = a->device.function, .type = type, .vm_id = a->vm_id, .config = config});
         if (!ok) {
             return std::unexpected(link_status(ok.error()));
         }
@@ -641,7 +643,11 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
                 return std::unexpected(Status::internal_error);
             }
         }
-        auto stored = port_for(*slot)->create_volume(
+        auto* port = port_for(*slot);
+        if (port == nullptr) {  // storage_slot() checked; say so to the optimizer
+            return std::unexpected(Status::insufficient_resources);
+        }
+        auto stored = port->create_volume(
             {.volume_id = c->volume_id,
              .owner_vm = c->owner_vm,
              .capacity_sectors = std::uint64_t{c->size_gib} << gib_sector_shift,
@@ -683,14 +689,18 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
         if (!wrapped) {
             return std::unexpected(Status::internal_error);
         }
-        auto stored = port_for(*slot)->create_volume(
-            {.volume_id = c->volume_id,
-             .owner_vm = c->owner_vm,
-             .capacity_sectors = std::uint64_t{c->size_gib} << gib_sector_shift,
-             .block_size = oar::sector_size,
-             .wrapped_key = wrapped->key.bytes(),
-             .image_store = 0,
-             .image_name = {}});
+        auto* port = port_for(*slot);
+        if (port == nullptr) {  // storage_slot() checked; say so to the optimizer
+            return std::unexpected(Status::insufficient_resources);
+        }
+        auto stored =
+            port->create_volume({.volume_id = c->volume_id,
+                                 .owner_vm = c->owner_vm,
+                                 .capacity_sectors = std::uint64_t{c->size_gib} << gib_sector_shift,
+                                 .block_size = oar::sector_size,
+                                 .wrapped_key = wrapped->key.bytes(),
+                                 .image_store = 0,
+                                 .image_name = {}});
         if (!stored) {
             // Not marked for undo: a refused create (the volume exists on
             // the media, say) must not be answered by erasing it.
@@ -734,6 +744,9 @@ auto CommandRouter::prepare(std::uint64_t seq, const mailbox::Body& body, Undo& 
             return std::unexpected(reserved.error());
         }
         auto* port = port_for(a->device.slot);
+        if (port == nullptr) {  // reserve() checked; say so to the optimizer
+            return std::unexpected(Status::unknown_device);
+        }
         auto ok = port->prepare_function({.fn = a->device.function,
                                           .type = FunctionType::blk_fn,
                                           .vm_id = a->vm_id,
@@ -1306,6 +1319,9 @@ auto CommandRouter::prepare_network_attach(const mailbox::AttachVolume& attach, 
         return std::unexpected(reserved.error());
     }
     auto* port = port_for(attach.device.slot);
+    if (port == nullptr) {  // reserve() checked; say so to the optimizer
+        return std::unexpected(mailbox::Status::unknown_device);
+    }
     if (auto ok = port->replica_config(_network.at(attach.volume_id).frame); !ok) {
         return std::unexpected(link_status(ok.error()));
     }

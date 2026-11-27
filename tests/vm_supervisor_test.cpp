@@ -161,8 +161,7 @@ public:
 
     auto exit_now(int wait_status) -> void {
         _status = wait_status;
-        const std::uint64_t one = 1;
-        (void)::write(_fd, &one, sizeof(one));
+        static_cast<void>(::eventfd_write(_fd, 1));
     }
     FakeApi& fake_api() { return _api; }
 

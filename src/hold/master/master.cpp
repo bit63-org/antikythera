@@ -1342,9 +1342,9 @@ auto Master::commit_snapshot(Snapshot& s, Time now) -> void {
 auto Master::abort_snapshot(Snapshot& s, Time now) -> void {
     for (const auto& part : s.parts) {
         const Volume* v = volume(part.volume_id);
-        if (v != nullptr && primary_of(*v) != nullptr) {
-            send_op(*v, primary_of(*v)->server_id, proto::SnapshotAbort{.cut_id = s.snapshot_id},
-                    now);
+        const Member* primary = v == nullptr ? nullptr : primary_of(*v);
+        if (primary != nullptr) {
+            send_op(*v, primary->server_id, proto::SnapshotAbort{.cut_id = s.snapshot_id}, now);
         }
     }
     s.status = SnapshotStatus::failed;

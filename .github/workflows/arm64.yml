@@ -19,8 +19,7 @@
 # Not a required check: with path filters a required check would block
 # every pull request that skips it.
 #
-# Debug, like ci.yml. Release turns on _FORTIFY_SOURCE and -O2 flow
-# warnings that the tree does not yet build clean under on any target.
+# Debug, like ci.yml, to keep the hosted job short.
 
 name: arm64
 

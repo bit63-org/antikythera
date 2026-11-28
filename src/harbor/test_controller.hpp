@@ -101,6 +101,13 @@
 //   credential-revocations CELL VERSION [SERIAL,NOT_AFTER ...]
 //                        a cell's signed revocation list; NOT_AFTER is the
 //                        revoked credential's, in Unix seconds
+//   frame-notice KIND SCOPE SEQUENCE FILE
+//                        announces FILE's bytes as a frame (link record 33;
+//                        KIND vpc_stream, edge_mapping or security_policy,
+//                        SCOPE its VNI or scope), its size and SHA-256 taken
+//                        from the file when the line runs; with a frame
+//                        store attached the frame is put there first
+//                        (fleet-scale-networking task 12)
 //   expect STATUS        the last command's outcome must be STATUS
 //                        (ok, accepted, bad_signature, stale_sequence, wrong_server,
 //                        busy, ...)
@@ -137,6 +144,8 @@
 #include "proto/instance_metadata.hpp"
 #include "proto/vpc_config.hpp"
 #include "proto/vtep_credential.hpp"
+#include "harbor/frame_store.hpp"
+#include "proto/frame_notice.hpp"
 #include "tls/tls.hpp"
 
 namespace ak::harbor {
@@ -247,6 +256,12 @@ struct SendRevocations {
     std::uint64_t list_version{0};
     std::vector<proto::Revocation> entries;
 };
+struct SendFrameNotice {
+    proto::FrameKind kind{proto::FrameKind::vpc_stream};
+    std::uint32_t scope{0};
+    std::uint64_t sequence{0};
+    std::string path;  // the frame, read when the action runs
+};
 struct ExpectOutcome {
     proto::CommandStatus status{proto::CommandStatus::ok};
 };
@@ -256,7 +271,7 @@ struct WaitReport {
 
 using Action = std::variant<SendCommand, SendMapUpdate, SendGroupPolicy, SendTunnelPeers,
                             SendVpcConfig, SendGroupMembers, SendInstanceMetadata, IssueCredential,
-                            SendRevocations, ExpectOutcome, WaitReport>;
+                            SendRevocations, SendFrameNotice, ExpectOutcome, WaitReport>;
 
 // One script line: an action, nothing (blank or comment), or a message
 // saying what is wrong with it.
@@ -286,6 +301,10 @@ public:
 
     // Runs one action. Errors name what failed.
     [[nodiscard]] auto run(const Action& action) -> std::expected<void, std::string>;
+
+    // Where frame-notice puts each frame before announcing it (task 12);
+    // null (the default) announces only. `store` must outlive this.
+    auto set_frame_store(FrameStore* store) noexcept -> void { _frame_store = store; }
 
     // The sequence number the next command gets.
     [[nodiscard]] auto next_seq() const noexcept -> std::uint64_t { return _next_seq; }
@@ -317,6 +336,7 @@ private:
     std::optional<proto::Inventory> _inventory;
     std::vector<proto::Report> _backlog;  // reports read but not yet waited for
     std::uint64_t _next_serial{1};        // the next VtepCredential serial
+    FrameStore* _frame_store{nullptr};
 };
 
 }  // namespace ak::harbor

@@ -12,10 +12,15 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 
+#include <unistd.h>
+
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <atomic>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -26,6 +31,7 @@
 #include "helm/controller_link.hpp"
 #include "helm/mailbox.hpp"
 #include "hull/signature_verifier.hpp"
+#include "oar/net/bulk_fetch.hpp"
 #include "proto/test_vectors.hpp"
 #include "test_support.hpp"
 #include "tls_test_support.hpp"
@@ -452,6 +458,18 @@ BOOST_AUTO_TEST_CASE(expectations_parse) {
     BOOST_TEST((std::get<harbor::WaitReport>(w).kind == proto::ReportKind::map_applied));
 }
 
+BOOST_AUTO_TEST_CASE(frame_notices_parse) {
+    auto a = action("frame-notice edge_mapping 3 0x10 /tmp/frame.bin");
+    const auto& n = std::get<harbor::SendFrameNotice>(a);
+    BOOST_TEST((n.kind == proto::FrameKind::edge_mapping));
+    BOOST_TEST(n.scope == 3U);
+    BOOST_TEST(n.sequence == 16U);
+    BOOST_TEST(n.path == "/tmp/frame.bin");
+    BOOST_TEST(parse_error("frame-notice vpc_stream 5 1").find("want KIND") != std::string::npos);
+    BOOST_TEST(parse_error("frame-notice bogus 5 1 f").find("KIND is") != std::string::npos);
+    BOOST_TEST(parse_error("frame-notice vpc_stream 5 0 f").find("non-zero") != std::string::npos);
+}
+
 BOOST_AUTO_TEST_CASE(mistakes_are_named) {
     BOOST_TEST(parse_error("launch 7").find("unknown action") != std::string::npos);
     BOOST_TEST(parse_error("create-vm 7 2").find("wrong number") != std::string::npos);
@@ -511,7 +529,13 @@ struct FakeHelm final : helm::ControllerSink {
     helm::ControllerLink* link = nullptr;
     std::atomic<std::uint64_t> last_seq{0};
     std::atomic<int> problems{0};
+    std::mutex notices_mutex;
+    std::vector<proto::FrameNotice> notices;  // guarded by notices_mutex
 
+    auto on_frame_notice(const proto::FrameNotice& n) -> void override {
+        const std::scoped_lock lock{notices_mutex};
+        notices.push_back(n);
+    }
     auto on_envelope(const proto::Envelope& env) -> void override {
         auto msg = mb::decode(env.slot);
         if (!msg) {
@@ -620,6 +644,59 @@ BOOST_AUTO_TEST_CASE(drives_a_controller_link) {
 
     BOOST_TEST(printed.size() >= 4U);
     BOOST_TEST(printed.front().find("kind=inventory") != std::string::npos);
+
+    // fleet-scale-networking task 12: frame-notice puts the frame in the
+    // attached store and announces it; a role holding a certificate from
+    // the server CA fetches exactly the announced bytes.
+    auto store = harbor::FrameStore::create({.role = tls::Role::server,
+                                             .ca_pem = server_ca.cert_pem(),
+                                             .cert_pem = controller_cert.cert,
+                                             .key_pem = controller_cert.key,
+                                             .peer_name = {}},
+                                            loopback, 0);
+    BOOST_REQUIRE_MESSAGE(store.has_value(), (store ? std::string{} : store.error()));
+    controller->set_frame_store(store->get());
+    const auto path =
+        (std::filesystem::temp_directory_path() / ("ak-frame-" + std::to_string(::getpid())))
+            .string();
+    std::vector<std::byte> frame(20'000);
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        frame[i] = static_cast<std::byte>(i % 251);
+    }
+    {
+        std::ofstream out{path, std::ios::binary};
+        out.write(reinterpret_cast<const char*>(frame.data()),
+                  static_cast<std::streamsize>(frame.size()));
+    }
+    auto sent = controller->run(action("frame-notice vpc_stream 5 9 " + path));
+    std::filesystem::remove(path);
+    BOOST_REQUIRE_MESSAGE(sent.has_value(), (sent ? std::string{} : sent.error()));
+    std::optional<proto::FrameNotice> got;
+    for (int i = 0; i < 500 && !got; ++i) {
+        {
+            const std::scoped_lock lock{fake.notices_mutex};
+            if (!fake.notices.empty()) {
+                got = fake.notices.front();
+            }
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    BOOST_REQUIRE(got.has_value());
+    BOOST_TEST(got->vni_or_scope == 5U);
+    BOOST_TEST(got->sequence_or_version == 9U);
+    BOOST_TEST(got->size == frame.size());
+    auto source = ak::oar::net::TlsFrameSource::create({.role = tls::Role::client,
+                                                        .ca_pem = controller_ca.cert_pem(),
+                                                        .cert_pem = helm_cert.cert,
+                                                        .key_pem = helm_cert.key,
+                                                        .peer_name = {}});
+    BOOST_REQUIRE(source.has_value());
+    ak::oar::net::BulkFetchConfig bulk;
+    bulk.endpoints = {{.host = loopback, .port = (*store)->port()}};
+    ak::oar::net::BulkFetcher fetcher{**source, bulk};
+    const auto fetched = fetcher.fetch(*got);
+    BOOST_TEST((fetched.outcome == ak::oar::net::FetchOutcome::fetched));
+    BOOST_TEST((fetched.frame == frame));
     runner.request_stop();
 }
 

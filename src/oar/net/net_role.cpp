@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <format>
+#include <iterator>
 #include <limits>
 #include <utility>
 #include <variant>
@@ -779,13 +780,90 @@ auto NetRole::frame_notice(std::span<const std::byte> notice) -> oar::Status {
         ++_counters.frame_notices_refused;
         return oar::Status::bad_request;
     }
+    ++_counters.frame_notices;
+    route_notice(*n);
+    return oar::Status::ok;
+}
+
+auto NetRole::route_notice(const proto::FrameNotice& n) -> void {
+    if (_bulk_worker && _bulk_worker->submit(n)) {
+        return;
+    }
+    if (_bulk_worker) {
+        ++_counters.bulk_fallbacks;  // the worker's queue is full
+    }
+    keep_for_oarlink(n);
+}
+
+auto NetRole::keep_for_oarlink(const proto::FrameNotice& n) -> void {
     if (_notices.size() >= max_pending_notices) {
         _notices.pop_front();
         ++_counters.frame_notices_dropped;
     }
-    _notices.push_back(*n);
-    ++_counters.frame_notices;
-    return oar::Status::ok;
+    _notices.push_back(n);
+}
+
+auto NetRole::set_bulk_tls(const tls::Config& config) -> void {
+    _bulk_tls = config;
+    start_bulk();
+}
+
+auto NetRole::set_bulk_channel(BulkFetchConfig config) -> void {
+    _bulk_config = std::move(config);
+    start_bulk();
+}
+
+auto NetRole::start_bulk() -> void {
+    if (!_bulk_config || !_bulk_tls) {
+        return;
+    }
+    if (_bulk_source != nullptr) {
+        if (!_bulk_source->set_config(*_bulk_tls)) {
+            ++_counters.bulk_setup_failed;  // keeps the certificate it had
+        }
+        return;
+    }
+    if (_bulk_worker) {
+        return;  // a worker the caller supplied
+    }
+    auto source = TlsFrameSource::create(*_bulk_tls);
+    if (!source) {
+        ++_counters.bulk_setup_failed;
+        return;
+    }
+    auto* raw = source->get();
+    auto worker = BulkWorker::create(std::move(*source), *_bulk_config);
+    if (!worker) {
+        ++_counters.bulk_setup_failed;
+        return;
+    }
+    set_bulk_worker(std::move(*worker));
+    _bulk_source = raw;
+}
+
+auto NetRole::set_bulk_worker(std::unique_ptr<BulkWorker> worker) -> void {
+    _bulk_source = nullptr;
+    _bulk_worker = std::move(worker);
+    if (!_bulk_worker) {
+        return;
+    }
+    auto waiting = std::exchange(_notices, {});
+    for (const auto& n : waiting) {
+        route_notice(n);
+    }
+}
+
+auto NetRole::bulk_poll_fds(std::vector<pollfd>& out) const -> void {
+    if (_bulk_worker) {
+        out.push_back({.fd = _bulk_worker->fd(), .events = POLLIN, .revents = 0});
+    }
+}
+
+auto NetRole::take_fetched() -> std::vector<FetchResult> {
+    std::vector<FetchResult> out{std::make_move_iterator(_fetched.begin()),
+                                 std::make_move_iterator(_fetched.end())};
+    _fetched.clear();
+    return out;
 }
 
 auto NetRole::cert_request() -> std::expected<oar::CertAnswer, oar::Status> {
@@ -837,6 +915,27 @@ auto NetRole::pump(UdpEndpoint& endpoint, std::span<std::byte> buffer, std::size
 
 auto NetRole::poll() -> bool {
     bool more = false;
+    if (_bulk_worker) {
+        for (auto& r : _bulk_worker->take()) {
+            switch (r.outcome) {
+                case FetchOutcome::fetched:
+                    ++_counters.bulk_fetched;
+                    if (_fetched.size() >= max_pending_notices) {
+                        _fetched.pop_front();
+                        ++_counters.bulk_fetched_dropped;
+                    }
+                    _fetched.push_back(std::move(r));
+                    break;
+                case FetchOutcome::fallback:
+                    ++_counters.bulk_fallbacks;
+                    keep_for_oarlink(r.notice);
+                    break;
+                case FetchOutcome::rejected:
+                    ++_counters.bulk_rejected;
+                    break;
+            }
+        }
+    }
     for (auto& s : _slots) {
         more = s.function->pci().poll() || more;
     }

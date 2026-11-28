@@ -229,10 +229,13 @@ install(TARGETS ak-khold RUNTIME DESTINATION bin)
 # harbor's test controller: signs commands and mapping updates and drives
 # one helm over the ControllerLink, standing in for kythira's EC2 module
 # until it exists (.kiro/specs/controller-interface/ task 5).
-add_library(ak_harbor_controller harbor/test_controller.cpp)
+# The frame store (fleet-scale-networking task 12) serves network roles'
+# bulk channels for harbor and the tests.
+add_library(ak_harbor_controller harbor/test_controller.cpp harbor/frame_store.cpp)
 add_library(ak::harbor_controller ALIAS ak_harbor_controller)
+find_package(Threads REQUIRED)
 target_link_libraries(ak_harbor_controller
-  PUBLIC ak::helm ak::proto ak::tls
+  PUBLIC ak::helm ak::proto ak::tls Threads::Threads
   PRIVATE OpenSSL::Crypto ak::warnings ak::hardening)
 add_executable(ak-test-controller harbor/ak_test_controller.cpp)
 target_link_libraries(ak-test-controller
@@ -278,8 +281,18 @@ target_link_libraries(ak_oar_blk
 add_library(ak_oar_net_role oar/net/net_role.cpp)
 add_library(ak::oar_net_role ALIAS ak_oar_net_role)
 target_link_libraries(ak_oar_net_role
-  PUBLIC ak::oar_net ak::helm ak::proto
+  PUBLIC ak::oar_net ak::oar_net_bulk ak::helm ak::proto
   PRIVATE ak::warnings ak::hardening)
+
+# The network role's bulk channel (fleet-scale-networking task 12): a
+# TLS 1.3 HTTP/1.1 client that fetches announced frames from a frame
+# store, checks them against their notice, and falls back to OarLink.
+add_library(ak_oar_net_bulk oar/net/bulk_fetch.cpp)
+add_library(ak::oar_net_bulk ALIAS ak_oar_net_bulk)
+find_package(Threads REQUIRED)
+target_link_libraries(ak_oar_net_bulk
+  PUBLIC ak::proto ak::tls Threads::Threads
+  PRIVATE ak::http_response OpenSSL::Crypto ak::warnings ak::hardening)
 
 # Images and snapshots in object storage, shared by oar-blk image volumes
 # and hold's snapshots and hydration (.kiro/specs/block-volume-service/
@@ -334,14 +347,21 @@ install(TARGETS ak-image-pack RUNTIME DESTINATION bin)
 # The S3 client behind image volumes and snapshots: HTTP/1.1 range GETs,
 # HEADs and PUTs over TCP or TLS with Signature V4 (oar-blk task 11,
 # block-volume-service task 20).
+# The strict, fuzzed HTTP/1.1 response head parser, on its own so the
+# network role's bulk fetcher (fleet-scale-networking task 12) can use it
+# without the S3 client.
+add_library(ak_http_response objstore/http_response.cpp)
+add_library(ak::http_response ALIAS ak_http_response)
+target_include_directories(ak_http_response PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ak_http_response PUBLIC ak::common PRIVATE ak::warnings ak::hardening)
+
 add_library(ak_objstore_s3
-  objstore/http_response.cpp
   objstore/image_store_config.cpp
   objstore/s3_object_store.cpp
   objstore/sigv4.cpp)
 add_library(ak::objstore_s3 ALIAS ak_objstore_s3)
 target_link_libraries(ak_objstore_s3
-  PUBLIC ak::objstore OpenSSL::SSL OpenSSL::Crypto
+  PUBLIC ak::objstore ak::http_response OpenSSL::SSL OpenSSL::Crypto
   PRIVATE ak::warnings ak::hardening)
 
 # The storage role as helm drives it over the sideband: volume files and

@@ -141,6 +141,7 @@
 
 #include "helm/oar_link.hpp"
 #include "helm/role_enrollment.hpp"
+#include "oar/net/bulk_fetch.hpp"
 #include "oar/net/mapping_table.hpp"
 #include "oar/net/metadata_server.hpp"
 #include "oar/net/metadata_store.hpp"
@@ -252,6 +253,16 @@ struct RoleCounters {
     std::uint64_t frame_notices{0};
     std::uint64_t frame_notices_refused{0};
     std::uint64_t frame_notices_dropped{0};
+    // The bulk channel (task 12): frames fetched and verified, notices
+    // handed back for OarLink delivery (the fetcher gave up, or its queue
+    // was full), frames whose digest matched but verify refused, fetched
+    // frames dropped unconsumed (oldest first) past max_pending_notices,
+    // and channels that could not start (a bad role certificate).
+    std::uint64_t bulk_fetched{0};
+    std::uint64_t bulk_fallbacks{0};
+    std::uint64_t bulk_rejected{0};
+    std::uint64_t bulk_fetched_dropped{0};
+    std::uint64_t bulk_setup_failed{0};
     // GroupPolicy frames (task 13), counted like map_updates.
     std::uint64_t group_applied{0};
     std::uint64_t group_redelivered{0};
@@ -311,13 +322,33 @@ public:
     auto tunnel_peers(std::span<const std::byte> frame) -> helm::oar::Status override;
     auto vtep_credential(std::span<const std::byte> frame) -> helm::oar::Status override;
     auto credential_revocations(std::span<const std::byte> frame) -> helm::oar::Status override;
-    // A frame to fetch over the bulk channel: decoded and kept, in arrival
-    // order, until the bulk fetcher (task 12) takes it.
+    // A frame to fetch over the bulk channel: decoded, then handed to the
+    // bulk worker when the channel is up, or kept for OarLink delivery.
     auto frame_notice(std::span<const std::byte> notice) -> helm::oar::Status override;
     static constexpr std::size_t max_pending_notices = 1024;
+    // Notices whose frames must come over OarLink instead, oldest first:
+    // those that arrived with no bulk channel, and those the fetcher gave
+    // up on (at most max_pending_notices; the oldest goes first). helm
+    // learns of them through stream_status (task 12a).
     [[nodiscard]] auto pending_notices() const noexcept -> const std::deque<proto::FrameNotice>& {
         return _notices;
     }
+
+    // The bulk channel (fleet-scale-networking task 12). The channel
+    // starts once both its configuration (the frame stores, retry policy
+    // and per-kind verify) and a role certificate (set_bulk_tls) are
+    // present; a renewed certificate is used from the next connection.
+    // Notices already pending when it starts are submitted at once.
+    auto set_bulk_channel(BulkFetchConfig config) -> void;
+    // Uses `worker` as the channel instead (tests, with a fake source).
+    auto set_bulk_worker(std::unique_ptr<BulkWorker> worker) -> void;
+    [[nodiscard]] auto bulk_worker() noexcept -> BulkWorker* { return _bulk_worker.get(); }
+    // Appends the worker's eventfd, so the caller's poll wakes for
+    // finished fetches; poll() then takes them.
+    auto bulk_poll_fds(std::vector<pollfd>& out) const -> void;
+    // Frames fetched and verified, oldest first, for the stream applier
+    // (task 6); at most max_pending_notices are kept.
+    [[nodiscard]] auto take_fetched() -> std::vector<FetchResult>;
 
     // Enrollment (fleet-scale-networking task 10): the role certificate its
     // bulk channel presents to frame stores. Without set_enrollment the
@@ -328,7 +359,7 @@ public:
     auto set_enrollment(helm::RoleEnrollment& enrollment) noexcept -> void {
         _enrollment = &enrollment;
     }
-    auto set_bulk_tls(const tls::Config& config) -> void { _bulk_tls = config; }
+    auto set_bulk_tls(const tls::Config& config) -> void;
     // The bulk channel's client configuration, once a certificate passed.
     [[nodiscard]] auto bulk_tls() const noexcept -> const std::optional<tls::Config>& {
         return _bulk_tls;
@@ -396,6 +427,12 @@ private:
     // Disconnects the slot's NIC and puts its placeholder back.
     auto release(helm::oar::FunctionNumber fn, Slot& s) -> bool;
     auto start_metadata() -> std::expected<void, std::string>;
+    // Starts the bulk channel (or hands the source a renewed certificate)
+    // once both its configuration and a certificate are present.
+    auto start_bulk() -> void;
+    // Submits a notice to the channel, or keeps it for OarLink delivery.
+    auto route_notice(const proto::FrameNotice& n) -> void;
+    auto keep_for_oarlink(const proto::FrameNotice& n) -> void;
     // Notes which up peers still lack mtu_ok, and since when.
     auto track_mtu(VtepClock::time_point now) -> void;
     // Hands the VSwitch the VNI's guest addresses from its last map_update,
@@ -415,6 +452,10 @@ private:
     helm::RoleEnrollment* _enrollment{nullptr};
     std::deque<proto::FrameNotice> _notices;
     std::optional<tls::Config> _bulk_tls;
+    std::optional<BulkFetchConfig> _bulk_config;
+    std::unique_ptr<BulkWorker> _bulk_worker;
+    TlsFrameSource* _bulk_source{nullptr};  // owned by _bulk_worker, when it made it
+    std::deque<FetchResult> _fetched;
     std::unique_ptr<Vtep> _vtep;
     std::unique_ptr<VSwitch> _vswitch;
     std::map<std::uint32_t, std::uint64_t> _vpc_versions;      // applied config version, by VNI

@@ -367,6 +367,37 @@ FrameNotice {                 // controller link record 33 / vendor type 0x33
   own decoder and signature check. Retries with backoff across the
   listed endpoints; after a configured failure count it asks helm to
   fall back to OarLink chunks for that notice.
+  As built (task 12): `BulkFetcher` takes the frame stores, the attempt
+  count before fallback (4), a per-attempt deadline (10 s) and backoff
+  (100 ms doubling to 2 s); each attempt goes to the next store in turn,
+  and each notice starts on the store after the last one tried. An
+  attempt fails on no connection, a refused handshake, a deadline, a
+  store that hangs up mid-body, a status other than 200, a head the S3
+  client's strict parser (`objstore/http_response.hpp`, now its own
+  `ak_http_response` library) refuses, a Content-Length other than the
+  notice's size, or a body whose digest is not the notice's; each
+  reason is counted. A frame whose digest matches but which the per-kind
+  `verify` refuses is dropped at once and counted, since every store
+  would serve the same bytes. `BulkWorker` runs the fetcher on its own
+  thread and signals finished results on an eventfd the role's poll
+  loop watches, so the data plane never waits on the network; a backoff
+  wait ends at once when the role stops. `NetRole` starts the channel
+  once it has both the configuration (ak-oar-net `--frame-store
+  HOST:PORT`, repeatable, which needs the identity options) and a role
+  certificate, gives a renewed certificate to the next connection, hands
+  notices to the worker (and any that waited for the channel), keeps
+  fetched frames (up to 1,024) for the stream applier, and keeps
+  notices the fetcher gave up on with those that arrived while the
+  channel was down, for OarLink delivery. Reporting those to helm, and
+  helm's chunked resend, come with `stream_status` (task 12a); until
+  then the role holds them. No frame kind has a decoder yet, so
+  `verify` is empty and tasks 5, 15 and the security-group spec fill it
+  in per kind. harbor's `FrameStore` (`src/harbor/frame_store.*`,
+  `fuzz_frame_request`) is the test store: `ak-test-controller
+  --frame-store HOST:PORT [--store-ca PEM]` serves it, and a script's
+  `frame-notice KIND SCOPE SEQUENCE FILE` puts the file there and
+  announces it; faults cut a body, flip a byte, answer another status
+  or drop a connection for the next N requests.
 - **Notice format.** `src/proto/frame_notice.hpp`. Kinds 1 `vpc_stream`
   (the scope is a VNI, 1 to 2^24-1), 2 `edge_mapping`, 3
   `security_policy` (the scope is the kind's own). The sequence or

@@ -4,7 +4,7 @@ Depends on `server-provisioning` (enrollment, boot function, host power)
 and `helm-control-plane`. Pairs with kythira's
 `.kiro/specs/az-cold-start/`. Each task is one PR unless noted.
 
-- [ ] 1. Record and report codecs
+- [x] 1. Record and report codecs
   - `standing_set` (23), `power_policy` (24), `cold_start` (27),
     `boot_cache` (28); vectors and libFuzzer targets
   - _Requirements: 8.3_

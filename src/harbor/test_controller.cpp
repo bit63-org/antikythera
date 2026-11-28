@@ -910,6 +910,8 @@ constexpr std::array kind_names{
     std::pair{"capacity", proto::ReportKind::capacity},
     std::pair{"group_fault", proto::ReportKind::group_fault},
     std::pair{"conversion_progress", proto::ReportKind::conversion_progress},
+    std::pair{"cold_start", proto::ReportKind::cold_start},
+    std::pair{"boot_cache", proto::ReportKind::boot_cache},
 };
 
 template<typename T, std::size_t N>
@@ -1403,6 +1405,18 @@ auto to_string(const proto::Report& report) -> std::string {
                    << " state=" << static_cast<int>(b.state)
                    << " failure=" << static_cast<int>(b.failure) << " bytes=" << b.done_bytes << "/"
                    << b.total_bytes;
+            } else if constexpr (std::is_same_v<T, proto::ColdStart>) {
+                os << " boot_source=" << static_cast<int>(b.boot_source)
+                   << " waited_ms=" << b.waited_ms << " flags=" << int{b.flags}
+                   << " store_faults=" << b.store_faults << " standing=" << b.standing.size();
+                for (const auto& e : b.standing) {
+                    os << " [vm=" << e.vm_id << " result=" << static_cast<int>(e.result)
+                       << " attempts=" << e.attempts << "]";
+                }
+            } else if constexpr (std::is_same_v<T, proto::BootCache>) {
+                os << " standing_generation=" << b.standing_generation
+                   << " policy_version=" << b.policy_version << " store_free=" << b.store_free_bytes
+                   << "/" << b.store_total_bytes;
             } else {
                 static_assert(std::is_same_v<T, proto::SnapshotProgress>);
                 os << " volume=" << b.volume_id << " cut=" << b.cut_id
@@ -1514,6 +1528,8 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::instance_metadata:
         case proto::RecordType::volume_layout:
         case proto::RecordType::self_test:
+        case proto::RecordType::standing_set:
+        case proto::RecordType::power_policy:
             break;
     }
     return std::unexpected("helm sent a controller-only record");

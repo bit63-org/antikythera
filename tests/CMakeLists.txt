@@ -173,6 +173,7 @@ ak_add_test(proto_group_members_test SOURCES proto_group_members_test.cpp LIBS a
 ak_add_test(proto_instance_metadata_test SOURCES proto_instance_metadata_test.cpp LIBS ak::proto ak::hull)
 ak_add_test(group_usage_test SOURCES group_usage_test.cpp LIBS ak::helm)
 ak_add_test(proto_tunnel_peers_test SOURCES proto_tunnel_peers_test.cpp LIBS ak::proto)
+ak_add_test(proto_cold_start_test SOURCES proto_cold_start_test.cpp LIBS ak::proto ak::helm ak::hull)
 ak_add_test(proto_vectors_test    SOURCES proto_vectors_test.cpp    LIBS ak::proto ak::hull)
 ak_add_test(controller_session_test SOURCES controller_session_test.cpp LIBS ak::helm)
 ak_add_test(controller_link_test    SOURCES controller_link_test.cpp    LIBS ak::helm OpenSSL::Crypto)

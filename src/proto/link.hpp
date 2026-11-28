@@ -49,6 +49,22 @@
 //                                      storage self-test on the khold role
 //                                      in that slot (scope slot) or on
 //                                      every khold role (scope all, slot 0)
+//   standing_set  controller -> helm   a StandingSet (standing_set.hpp): the
+//                                      pinned instances helm starts after
+//                                      power returns, with no controller
+//   power_policy  controller -> helm   a PowerPolicy (power_policy.hpp): when
+//                                      helm releases the host after power
+//                                      returns, and which image to keep
+//
+// Record numbers 19-22 are claimed by specs still being built
+// (vpc-security-groups, vpc-internet-gateways, server provisioning) and
+// 30-35 by fleet-scale-networking; the AZ cold start (.kiro/specs/
+// cold-start/) owns 23-24. The known types are not one contiguous range.
+//
+// standing_set and power_policy are signed and kept by helm in its sealed
+// store across power loss; helm verifies them itself (it acts on them with
+// no controller), and hull verifies a standing set again before it starts
+// anything from it.
 //
 // The block volume records (.kiro/specs/block-volume-service/ task 12):
 // helm forwards replica_config, volume_op and lease_grant to its storage
@@ -107,8 +123,10 @@
 #include "proto/image_key.hpp"
 #include "proto/instance_metadata.hpp"
 #include "proto/map_update.hpp"
+#include "proto/power_policy.hpp"
 #include "proto/replica_config.hpp"
 #include "proto/report.hpp"
+#include "proto/standing_set.hpp"
 #include "proto/tunnel_peers.hpp"
 #include "proto/volume_key.hpp"
 #include "proto/volume_layout.hpp"
@@ -126,11 +144,26 @@ inline constexpr std::size_t max_cert_chain_size = 16384;
 inline constexpr std::size_t max_cert_chain_certs = 4;
 inline constexpr std::size_t self_test_size = 16;
 inline constexpr std::size_t max_record_payload =
-    std::max({envelope_size, max_map_update_size, max_report_size, report_ack_size, hello_size,
-              max_group_policy_size, max_tunnel_peers_size, max_replica_config_size, volume_op_size,
-              volume_key_size, lease_grant_size, role_certificate_fixed_size + max_cert_chain_size,
-              image_key_size, max_vpc_config_size, max_group_members_size,
-              max_instance_metadata_size, max_volume_layout_size, self_test_size});
+    std::max({envelope_size,
+              max_map_update_size,
+              max_report_size,
+              report_ack_size,
+              hello_size,
+              max_group_policy_size,
+              max_tunnel_peers_size,
+              max_replica_config_size,
+              volume_op_size,
+              volume_key_size,
+              lease_grant_size,
+              role_certificate_fixed_size + max_cert_chain_size,
+              image_key_size,
+              max_vpc_config_size,
+              max_group_members_size,
+              max_instance_metadata_size,
+              max_volume_layout_size,
+              self_test_size,
+              max_standing_set_size,
+              power_policy_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class RecordType : std::uint16_t {
@@ -152,6 +185,8 @@ enum class RecordType : std::uint16_t {
     instance_metadata = 16,
     volume_layout = 17,
     self_test = 18,
+    standing_set = 23,
+    power_policy = 24,
 };
 
 // Which khold roles a self_test record asks.
@@ -202,7 +237,8 @@ struct RoleCertificate {
 namespace detail {
 
 [[nodiscard]] constexpr auto known(RecordType t) noexcept -> bool {
-    return t >= RecordType::envelope && t <= RecordType::self_test;
+    return (t >= RecordType::envelope && t <= RecordType::self_test) ||
+           t == RecordType::standing_set || t == RecordType::power_policy;
 }
 
 }  // namespace detail

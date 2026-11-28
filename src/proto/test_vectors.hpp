@@ -241,4 +241,58 @@ inline constexpr std::string_view vpc12_signature =
     "9e493bd539d96f0178ca155a4c2724a3e0243a65cdc8b7f953fa4ffbb2290c0927a1289b07e9d82cf47b7d8f"
     "e1f7ed59f121474ae992757c8904eac821760104";
 
+// Vector 13: a PowerPolicy (.kiro/specs/cold-start/) for server 7,
+// policy_version 4, time floor 1,795,000,000, tier 0, slot 2, tier delay
+// 0 s, slot interval 5000 ms, jitter 2000 ms, keep_image 0xAB x 32, signed
+// with key 1 (key_id 1).
+inline constexpr std::uint64_t policy13_server_id = 7;
+inline constexpr std::uint16_t policy13_key_id = 1;
+inline constexpr std::uint64_t policy13_version = 4;
+inline constexpr std::uint64_t policy13_time_floor = 1'795'000'000;
+inline constexpr std::string_view policy13 =
+    "414b50500100010007000000000000000400000000000000c086fd6a000000000000020000008813d0070000"
+    "00000000abababababababababababababababababababababababababababababababab24ad06fb6fad4a1b"
+    "cc9f1ba3503f5f47a59be3504f9cb4d872b48739f30047696d6ed92aabc2166e00f6f171b061becd1e51e849"
+    "eb8864494724caa4860eeb0d";
+inline constexpr std::string_view policy13_signature =
+    "24ad06fb6fad4a1bcc9f1ba3503f5f47a59be3504f9cb4d872b48739f30047696d6ed92aabc2166e00f6f171"
+    "b061becd1e51e849eb8864494724caa4860eeb0d";
+
+// Vector 14: a StandingSet (.kiro/specs/cold-start/) for server 7,
+// generation 5, time floor 1,795,000,000, signed with key 1 (key_id 1),
+// one instance: vm 0x1001, manifest digest 0xD1 x 32, one CREATE_VM
+// (vcpus 4, memory_mib 8192, boot_mode volume), no volumes, NIC 0x10 in
+// VNI 0xABCD, and secret "hsm-share" (hpke_enc 0x33 x 32, 20 bytes of
+// ciphertext 0x51).
+inline constexpr std::uint64_t standing14_server_id = 7;
+inline constexpr std::uint16_t standing14_key_id = 1;
+inline constexpr std::uint64_t standing14_generation = 5;
+inline constexpr std::uint64_t standing14_vm_id = 0x1001;
+inline constexpr std::string_view standing14 =
+    "414b53530100010007000000000000000500000000000000c086fd6a00000000010000000000000001100000"
+    "00000000d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d10100010100000000"
+    "01001000011000000000000004000020000001001000000000000000cdab0000000000000900140000000000"
+    "333333333333333333333333333333333333333333333333333333333333333368736d2d7368617265515151"
+    "5151515151515151515151515151515151c2a193267a6e96167e6240dbb27a67fe3634c41a72e94960f61e31"
+    "4138ecb6fbaaa7db0e884e2df0c0f93dc68f0ceb00ac053e6a382cc0d7a508c1468e23d809";
+inline constexpr std::string_view standing14_signature =
+    "c2a193267a6e96167e6240dbb27a67fe3634c41a72e94960f61e314138ecb6fbaaa7db0e884e2df0c0f93dc6"
+    "8f0ceb00ac053e6a382cc0d7a508c1468e23d809";
+
+// Vector 15: an unsigned cold_start report (format v2) from server 7,
+// report_seq 1: power returned at 1,795,000,100 by RTC, time floor
+// 1,795,000,000, waited 1500 ms, booted from LKG, no flags or store
+// faults, vm 0x1001 started on attempt 1.
+inline constexpr std::string_view report_cold_start15 =
+    "414b525002001b000700000000000000010000000000000030000000000000002487fd6a00000000c086fd6a"
+    "00000000dc05000001000100000000000000000001100000000000000100010000000000";
+
+// Vector 16: an unsigned boot_cache report (format v2) from server 7,
+// report_seq 2: LKG image 0xAB x 32, no previous image, standing
+// generation 5, policy version 4, 1 GiB of 2 GiB free.
+inline constexpr std::string_view report_boot_cache16 =
+    "414b525002001c00070000000000000002000000000000006000000000000000abababababababababababab"
+    "abababababababababababababababababababab000000000000000000000000000000000000000000000000"
+    "00000000000000000500000000000000040000000000000000000040000000000000008000000000";
+
 }  // namespace ak::proto::vectors

@@ -792,6 +792,49 @@ auto error_response(RequestError e) -> HttpResponse {
     return status_only(status == 0 ? 400 : status, true);
 }
 
+namespace {
+
+// /instance-secrets and below. `remaining` is set only for a request with
+// a valid token.
+auto secret_answer(std::string_view rest, const MetadataView& view,
+                   std::optional<std::uint32_t> remaining, bool close) -> HttpResponse {
+    if (!remaining) {
+        auto r = status_only(401, close);  // a token is always required here
+        return r;
+    }
+    auto not_found = [&] {
+        auto r = status_only(404, close);
+        r.token_ttl = remaining;
+        return r;
+    };
+    if (view.secrets == nullptr || view.secrets->empty()) {
+        return not_found();
+    }
+    HttpResponse r;
+    r.token_ttl = remaining;
+    r.close = close;
+    if (rest == "/instance-secrets" || rest == "/instance-secrets/") {
+        for (const auto& s : *view.secrets) {
+            if (!r.body.empty()) {
+                r.body += '\n';
+            }
+            r.body += s.name;
+        }
+        return r;
+    }
+    const auto name = rest.substr(std::string_view{"/instance-secrets/"}.size());
+    const auto it = std::ranges::find(*view.secrets, name, &InstanceSecret::name);
+    if (it == view.secrets->end()) {
+        return not_found();
+    }
+    r.content_type = "application/octet-stream";
+    r.body.assign(reinterpret_cast<const char*>(it->value.data()), it->value.size());
+    r.secret = true;
+    return r;
+}
+
+}  // namespace
+
 auto answer(const HttpRequest& request, const MetadataView& view, const TokenKey& key,
             std::uint64_t now) -> HttpResponse {
     if (view.record == nullptr || view.record->http_endpoint != proto::MetadataEndpoint::enabled) {
@@ -847,6 +890,10 @@ auto answer(const HttpRequest& request, const MetadataView& view, const TokenKey
         return status_only(401, close);
     }
 
+    if (versioned && (rest == "/instance-secrets" || rest.starts_with("/instance-secrets/"))) {
+        return secret_answer(rest, view, remaining, close);
+    }
+
     std::optional<std::pair<std::string, std::string_view>> found;
     if (path == "/") {
         found = std::pair{std::string{"latest"}, std::string_view{"text/plain"}};
@@ -867,7 +914,11 @@ auto answer(const HttpRequest& request, const MetadataView& view, const TokenKey
 }
 
 auto render(const HttpResponse& response, bool head_only) -> std::string {
-    std::string out = "HTTP/1.1 " + std::to_string(response.status) + " ";
+    std::string out;
+    // Room for the head and the body, so appending a secret body never
+    // reallocates and leaves a copy behind.
+    out.reserve(256 + response.content_type.size() + response.body.size());
+    out += "HTTP/1.1 " + std::to_string(response.status) + " ";
     out += reason(response.status);
     out += "\r\n";
     if (!response.body.empty()) {

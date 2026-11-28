@@ -46,10 +46,12 @@
 #include <expected>
 #include <map>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include "helm/secure_element.hpp"
 #include "proto/image_key.hpp"
+#include "proto/standing_set.hpp"
 #include "proto/volume_key.hpp"
 
 namespace ak::helm {
@@ -123,6 +125,14 @@ public:
     [[nodiscard]] auto image_key_count() const noexcept -> std::size_t {
         return _image_keys.size();
     }
+
+    // A standing instance's secret (cold-start Requirement 5.4), opened for
+    // `vm` on `server` into `out` (secret.ciphertext less the tag); the
+    // caller wipes it. Nothing is kept: the sealed copy stays in the
+    // standing set. corrupt_key if it does not open for that instance and
+    // name, or `out` is the wrong size.
+    auto open_instance_secret(std::uint64_t server, VmId vm, const proto::InstanceSecret& secret,
+                              std::span<std::byte> out) -> std::expected<void, KeyError>;
 
     // Reload persisted wrapped keys. A volume key's owner must already be
     // known.

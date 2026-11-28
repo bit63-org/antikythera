@@ -743,6 +743,36 @@ auto HelmDaemon::plug_metadata(SlotState& slot, oar::FunctionNumber fn, std::uin
     if (const auto kept = _metadata.find(nic_id); kept != _metadata.end()) {
         count_metadata_refusal(slot.link->instance_metadata(kept->second.frame));
     }
+    send_secrets(slot, nic_id);
+}
+
+auto HelmDaemon::send_secrets(SlotState& slot, std::uint64_t nic_id) -> void {
+    if (_config.standing_set == nullptr || !_config.standing_set->current()) {
+        return;
+    }
+    const auto& set = *_config.standing_set->current();
+    const auto in = std::ranges::find_if(set.instances, [nic_id](const auto& i) {
+        return std::ranges::any_of(i.nics, [nic_id](const auto& n) { return n.nic_id == nic_id; });
+    });
+    if (in == set.instances.end() || in->secrets.empty()) {
+        return;
+    }
+    oar::InstanceSecrets out{.nic_id = nic_id, .vm_id = in->vm_id, .secrets = {}};
+    out.secrets.reserve(in->secrets.size());
+    bool sent = true;
+    for (const auto& s : in->secrets) {
+        oar::InstanceSecretValue v{.name = s.name, .value = {}};
+        v.value.resize(s.ciphertext.size() - proto::aead_tag_size);
+        if (!_keys->open_instance_secret(set.server_id, in->vm_id, s, v.value)) {
+            sent = false;  // the value is zero on failure
+            break;
+        }
+        out.secrets.push_back(std::move(v));
+    }
+    sent = sent && slot.link->instance_secrets(out).has_value();
+    oar::wipe(out);
+    const std::scoped_lock lock{_inbox_mutex};
+    ++(sent ? _stats.instance_secrets : _stats.instance_secrets_refused);
 }
 
 auto HelmDaemon::unplug_metadata(SlotNumber slot, oar::FunctionNumber fn) -> void {
@@ -770,6 +800,7 @@ auto HelmDaemon::replay_metadata(SlotState& slot) -> void {
         if (const auto kept = _metadata.find(nic); kept != _metadata.end()) {
             count_metadata_refusal(slot.link->instance_metadata(kept->second.frame));
         }
+        send_secrets(slot, nic);  // a restarted role lost them
     }
 }
 

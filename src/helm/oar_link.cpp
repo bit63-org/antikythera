@@ -45,6 +45,8 @@ constexpr auto frame_limit(mctp::VendorType type) noexcept -> std::size_t {
             return oar::max_vpc_config_frame;
         case mctp::VendorType::group_policy:
             return oar::max_group_policy_frame;
+        case mctp::VendorType::instance_secrets:
+            return oar::max_instance_secrets_frame;
         default:
             return oar::max_cert_chain;
     }
@@ -274,6 +276,17 @@ auto OarLink::instance_metadata(std::span<const std::byte> frame)
     return send_chunked(mctp::VendorType::instance_metadata, frame);
 }
 
+auto OarLink::instance_secrets(const oar::InstanceSecrets& secrets)
+    -> std::expected<void, LinkError> {
+    auto frame = oar::encode_instance_secrets(secrets);
+    if (!frame) {
+        return std::unexpected(bad_request());
+    }
+    auto sent = send_chunked(mctp::VendorType::instance_secrets, *frame, true);
+    wipe(*frame);
+    return sent;
+}
+
 auto OarLink::group_membership(std::optional<std::uint32_t> since)
     -> std::expected<std::optional<Memberships>, LinkError> {
     Memberships out;
@@ -385,7 +398,7 @@ auto OarLink::copy_volume(const oar::CopyVolume& request, std::optional<ScopedKe
     return *answer;
 }
 
-auto OarLink::send_chunked(mctp::VendorType type, std::span<const std::byte> frame)
+auto OarLink::send_chunked(mctp::VendorType type, std::span<const std::byte> frame, bool secret)
     -> std::expected<void, LinkError> {
     const auto total = static_cast<std::uint32_t>(frame.size());
     for (std::size_t offset = 0; offset < frame.size();) {
@@ -396,7 +409,7 @@ auto OarLink::send_chunked(mctp::VendorType type, std::span<const std::byte> fra
         if (!body) {
             return std::unexpected(bad_request());
         }
-        auto response = transact(type, *body);
+        auto response = transact(type, *body, secret);
         if (!response) {
             return std::unexpected(response.error());
         }
@@ -766,6 +779,7 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
         case mctp::VendorType::vpc_config:
         case mctp::VendorType::group_policy:
         case mctp::VendorType::role_certificate:
+        case mctp::VendorType::instance_secrets:
             return status_only(frame_chunk(handler, type, body));
         case mctp::VendorType::group_membership: {
             auto req = oar::decode_membership_request(body);
@@ -916,6 +930,14 @@ auto OarEndpoint::frame_chunk(OarHandler& handler, mctp::VendorType type,
         case mctp::VendorType::group_policy:
             status = handler.group_policy(_frame);
             break;
+        case mctp::VendorType::instance_secrets: {
+            auto secrets = oar::decode_instance_secrets(_frame);
+            status = secrets ? handler.instance_secrets(*secrets) : oar::Status::bad_request;
+            if (secrets) {
+                oar::wipe(*secrets);
+            }
+            break;
+        }
         default:
             status = handler.role_certificate(_frame);
             break;
@@ -926,6 +948,9 @@ auto OarEndpoint::frame_chunk(OarHandler& handler, mctp::VendorType type,
 
 auto OarEndpoint::reset_frame() noexcept -> void {
     _frame_total = 0;
+    // An instance_secrets transfer holds plaintext secrets; wiping every
+    // transfer costs little and needs no type check.
+    wipe(_frame);
     _frame.clear();
 }
 

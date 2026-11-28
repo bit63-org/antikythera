@@ -201,6 +201,16 @@ public:
         std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
         -> std::expected<WrappedVolumeKey, SeError> = 0;
 
+    // Opens a standing instance's secret (cold-start Requirement 5.4: HPKE,
+    // info proto::instance_secret_info, `aad` proto::instance_secret_aad of
+    // its server, VM and name) into `out`, which must be ciphertext.size()
+    // - hpke::tag_size bytes and is zeroed on failure. authentication_failed
+    // if it was sealed to another key or for another instance or name.
+    virtual auto open_instance_secret(std::span<const std::byte> aad,
+                                      std::span<const std::byte, hpke::enc_size> enc,
+                                      std::span<const std::byte> ciphertext,
+                                      std::span<std::byte> out) -> std::expected<void, SeError> = 0;
+
     // Draws a fresh random volume key that is never wrapped or stored: an
     // image volume's attachment key (oar-blk Requirement 8.6), gone once
     // delivered. The default draws it from OpenSSL's RNG.
@@ -242,6 +252,10 @@ public:
                            const WrappedVolumeKey& volume)
         -> std::expected<WrappedVolumeKey, SeError> override;
     auto transport_public_key() -> std::expected<hpke::PublicKey, SeError> override;
+    auto open_instance_secret(std::span<const std::byte> aad,
+                              std::span<const std::byte, hpke::enc_size> enc,
+                              std::span<const std::byte> ciphertext, std::span<std::byte> out)
+        -> std::expected<void, SeError> override;
     auto open_volume_key(std::span<const std::byte> aad,
                          std::span<const std::byte, hpke::enc_size> enc,
                          std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)

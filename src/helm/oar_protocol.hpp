@@ -66,6 +66,8 @@
 //                          attaching khold volumes (kythira khold-block-service
 //                          Requirement 11.5) or a khold role serving them
 //   self_test           (empty)
+//   instance_secrets    0  total u32 | 4  offset u32 | 8  chunk (as map_update): one
+//                          InstanceSecrets frame (below), for the net role
 //   group_membership    0  cursor u16 | 2  flags u16 (bit 0: `since` is set)
 //                       4  since u32 (the generation helm last read whole)
 //   copy_volume         0  op u8 (CopyOp) | 1  direction u8 (CopyDirection) | 2  reserved u16
@@ -181,6 +183,22 @@
 // state none. The body carries secrets on start, so both ends wipe it,
 // as for deliver_key.
 //
+// instance_secrets (cold-start Requirement 5.4) gives the network role a
+// standing instance's secrets for one NIC, to serve to that NIC's guest
+// through instance metadata only. Unlike the frames above it is helm's,
+// not the controller's: helm opened each secret in its secure element,
+// so the frame is unsigned and its values are plaintext. Both ends wipe
+// every buffer that held it, as for deliver_key. The frame:
+//
+//   0  nic_id u64 | 8  vm_id u64 | 16 count u8 | 17 reserved [7]
+//   24 count x { name_size u8 | reserved u8 | value_size u16 | name | value }
+//
+// with at most proto::max_instance_secrets entries, names strictly
+// ascending and valid secret names (proto::detail::valid_secret_name),
+// and values of 1 to proto::max_secret_size bytes. A frame with no
+// entries removes the NIC's secrets. The role keeps them until it cleans
+// the NIC.
+//
 // Responses (oar -> helm) start with a 2-byte head:
 //
 //   0  status u8 (Status) | 1  reserved u8
@@ -231,6 +249,7 @@
 #include <expected>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -239,6 +258,7 @@
 #include "helm/mctp.hpp"
 #include "helm/scoped_key.hpp"
 #include "helm/secure_element.hpp"
+#include "proto/standing_set.hpp"
 
 namespace ak::helm::oar {
 
@@ -338,6 +358,15 @@ inline constexpr std::size_t max_instance_metadata_frame = 0x38 + (9 * 256) + 16
 // signature).
 inline constexpr std::size_t max_volume_layout_frame =
     0x78 + (64 * (16 + (5 * 32))) + (16 * 32) + (16 * 24) + 64;
+// Largest InstanceSecrets frame: the header and eight entries of the
+// longest name and value.
+inline constexpr std::size_t instance_secrets_head_size = 24;
+inline constexpr std::size_t instance_secret_entry_head_size = 4;
+inline constexpr std::size_t max_instance_secrets_frame =
+    instance_secrets_head_size +
+    (proto::max_instance_secrets *
+     (instance_secret_entry_head_size + proto::max_secret_name_size + proto::max_secret_size));
+static_assert(max_instance_secrets_frame <= max_map_frame);
 inline constexpr std::size_t membership_request_size = 8;
 inline constexpr std::size_t membership_head_size = 12;
 inline constexpr std::size_t membership_entry_size = 32;
@@ -471,6 +500,7 @@ enum class BodyError : std::uint8_t {
     bad_image,          // an image volume's image name is all zero
     bad_csr,            // a certificate request longer than max_csr
     bad_group,          // a membership's family is not 4 or 6, or an IPv4 group has a tail
+    bad_secret,         // a secret name invalid or out of order, or a value empty or too long
 };
 
 [[nodiscard]] auto to_string(BodyError e) noexcept -> const char*;
@@ -972,6 +1002,31 @@ struct ResponseView {
     -> std::expected<std::vector<std::byte>, BodyError>;
 [[nodiscard]] auto decode_cert_answer(std::span<const std::byte> body) noexcept
     -> std::expected<CertAnswer, BodyError>;
+
+// One instance secret in the clear (instance_secrets). `value` is secret:
+// whoever holds one wipes it (secure_zero) before letting it go.
+struct InstanceSecretValue {
+    std::string name;
+    std::vector<std::byte> value;
+    friend auto operator==(const InstanceSecretValue&, const InstanceSecretValue&)
+        -> bool = default;
+};
+
+struct InstanceSecrets {
+    NicId nic_id{0};
+    std::uint64_t vm_id{0};
+    std::vector<InstanceSecretValue> secrets;  // names strictly ascending; empty removes
+    friend auto operator==(const InstanceSecrets&, const InstanceSecrets&) -> bool = default;
+};
+
+// instance_secrets frames. Neither wipes its input; the encoder's output
+// and the decoder's values hold the secrets.
+[[nodiscard]] auto encode_instance_secrets(const InstanceSecrets& s)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_instance_secrets(std::span<const std::byte> frame)
+    -> std::expected<InstanceSecrets, BodyError>;
+// Wipes every value and empties the list.
+auto wipe(InstanceSecrets& s) noexcept -> void;
 
 [[nodiscard]] auto encode_health(const Health& h)
     -> std::expected<std::vector<std::byte>, BodyError>;

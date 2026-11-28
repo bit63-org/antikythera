@@ -348,6 +348,7 @@ auto NetRole::start_metadata() -> std::expected<void, std::string> {
 auto NetRole::metadata_view(std::uint64_t nic_id) const -> MetadataView {
     MetadataView view;
     view.record = _metadata->find(nic_id);
+    view.secrets = _metadata->secrets(nic_id);
     if (view.record == nullptr) {
         return view;
     }
@@ -649,6 +650,17 @@ auto NetRole::group_members(std::span<const std::byte> frame) -> oar::Status {
 
 auto NetRole::instance_metadata(std::span<const std::byte> frame) -> oar::Status {
     return accepted(_metadata->put(frame)) ? oar::Status::ok : oar::Status::failed;
+}
+
+auto NetRole::instance_secrets(const oar::InstanceSecrets& secrets) -> oar::Status {
+    // The endpoint wipes `secrets` after this returns: copy the values.
+    std::vector<InstanceSecret> kept;
+    kept.reserve(secrets.secrets.size());
+    for (const auto& s : secrets.secrets) {
+        kept.push_back({.name = s.name, .value = s.value});
+    }
+    return _metadata->put_secrets(secrets.nic_id, std::move(kept)) ? oar::Status::ok
+                                                                   : oar::Status::failed;
 }
 
 auto NetRole::group_membership(const oar::MembershipRequest& request)

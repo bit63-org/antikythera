@@ -289,9 +289,11 @@ struct DaemonStats {
     std::uint64_t power_policies_refused{0};  // stale, another server's, unsigned or unstorable
     std::uint64_t standing_sets{0};           // verified, newer and kept
     std::uint64_t standing_sets_refused{0};
-    std::uint64_t standing_frames{0};          // network frames kept for standing NICs
-    std::uint64_t standing_frames_refused{0};  // for a standing NIC, but unsigned or unstorable
-    std::uint64_t standing_seeded{0};          // stored frames replayed before standing starts
+    std::uint64_t standing_frames{0};           // network frames kept for standing NICs
+    std::uint64_t standing_frames_refused{0};   // for a standing NIC, but unsigned or unstorable
+    std::uint64_t standing_seeded{0};           // stored frames replayed before standing starts
+    std::uint64_t instance_secrets{0};          // NICs given their standing instance's secrets
+    std::uint64_t instance_secrets_refused{0};  // a secret did not open, or the role refused
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -578,6 +580,10 @@ private:
     auto keep_standing_frame(proto::RecordType type, std::span<const std::byte> frame) -> void;
     // The standing volumes and stored network frames (expect_standing).
     auto seed_standing(const proto::StandingSet& set) -> void;
+    // A standing instance's secrets to the network role of one of its NICs
+    // (cold-start Requirement 5.4), opened in the secure element for the
+    // send and wiped after it. Nothing for a NIC no pinned instance names.
+    auto send_secrets(SlotState& slot, std::uint64_t nic_id) -> void;
     auto poll_health(SlotState& slot) -> void;
     // Opens the sideband, reads the inventory, registers with the router.
     auto attach(SlotState& slot) -> bool;

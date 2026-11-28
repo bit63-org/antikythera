@@ -47,6 +47,10 @@
 //   instance_metadata   verify the controller's InstanceMetadata frame and
 //                       keep it for its NIC (MetadataStore, Requirement 13.4,
 //                       task 21); clean_function drops the NIC's record
+//   instance_secrets    keep a standing instance's secrets, opened by helm,
+//                       for its NIC and serve them under
+//                       /latest/instance-secrets/ (cold-start Requirement
+//                       5.4); clean_function wipes them with the record
 //
 // Volume keys and volumes are not the network role's: deliver_key, drop_key
 // and the volume requests answer unsupported.
@@ -311,6 +315,7 @@ public:
         -> std::expected<helm::oar::UsagePage, helm::oar::Status> override;
     auto group_members(std::span<const std::byte> frame) -> helm::oar::Status override;
     auto instance_metadata(std::span<const std::byte> frame) -> helm::oar::Status override;
+    auto instance_secrets(const helm::oar::InstanceSecrets& secrets) -> helm::oar::Status override;
     auto group_membership(const helm::oar::MembershipRequest& request)
         -> std::expected<helm::oar::MembershipPage, helm::oar::Status> override;
 

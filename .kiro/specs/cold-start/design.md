@@ -119,4 +119,10 @@ and previous image share unchanged chunks.
 2. **Instance secret delivery.** Instance metadata is the only channel
    into a guest that helm does not need to be in the data path for;
    a virtio-vsock or a vTPM would be stronger but neither exists in hull
-   today.
+   today. As built (task 7): the guest reads
+   `/latest/instance-secrets/` (names, one per line) and
+   `/latest/instance-secrets/<name>` (the value's bytes) with an IMDSv2
+   token, which is required there whatever the record's `http_tokens`,
+   so a request relayed through a server-side request forgery cannot
+   read one. The paths sit outside `/meta-data`, so tools that walk the
+   metadata tree never log a secret.

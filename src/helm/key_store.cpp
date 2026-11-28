@@ -176,6 +176,22 @@ auto KeyStore::put_attachment_key(std::span<const std::byte> frame)
     return {};
 }
 
+auto KeyStore::open_instance_secret(std::uint64_t server, VmId vm,
+                                    const proto::InstanceSecret& secret, std::span<std::byte> out)
+    -> std::expected<void, KeyError> {
+    if (secret.ciphertext.size() <= hpke::tag_size ||
+        out.size() != secret.ciphertext.size() - hpke::tag_size) {
+        return std::unexpected(KeyError::corrupt_key);
+    }
+    const auto aad = proto::instance_secret_aad(server, vm, secret.name);
+    if (auto ok = _se->open_instance_secret(aad, secret.hpke_enc, secret.ciphertext, out); !ok) {
+        return std::unexpected(ok.error() == SeError::authentication_failed
+                                   ? KeyError::corrupt_key
+                                   : KeyError::secure_element);
+    }
+    return {};
+}
+
 auto KeyStore::open_attachment_key(AttachmentId attachment, std::uint32_t generation)
     -> std::expected<ScopedKey, KeyError> {
     const auto it = _attachment_keys.find(attachment);

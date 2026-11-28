@@ -34,6 +34,17 @@
 // answer() is the path table and the IMDSv2 rules for one parsed request
 // and one NIC's view: its signed record and what the role's mapping and
 // VPC config say about its addresses.
+//
+// Instance secrets (.kiro/specs/cold-start/ Requirement 5.4) are served
+// beside the record, from what helm opened for the NIC's standing
+// instance: /<version>/instance-secrets/ lists their names, one per line,
+// and /<version>/instance-secrets/<name> answers the value's bytes. Both
+// need an IMDSv2 token whatever the record's http_tokens, so a request
+// relayed through a server-side request forgery on the guest (which
+// cannot PUT for a token) never reads one, and both sit outside
+// /meta-data, so a tool that walks the metadata tree never logs one. A
+// value's response is marked secret, and the server wipes it once
+// written.
 
 #include <array>
 #include <cstddef>
@@ -185,9 +196,16 @@ struct NicNetwork {
     std::optional<Ipv6Address> vpc6;  // the VPC's /56
 };
 
+// One instance secret in the clear, held by MetadataStore for its NIC.
+struct InstanceSecret {
+    std::string name;
+    std::vector<std::byte> value;
+};
+
 struct MetadataView {
     const proto::InstanceMetadata* record{nullptr};  // null: the NIC has none
     NicNetwork network;
+    const std::vector<InstanceSecret>* secrets{nullptr};  // null: none for the NIC
 };
 
 struct HttpResponse {
@@ -197,7 +215,8 @@ struct HttpResponse {
     std::optional<std::uint32_t> token_ttl;  // the TTL header on a token answer
     std::optional<std::uint8_t> hop_limit;   // set on the socket before writing
     bool close{false};                       // close after writing
-    bool reset{false};  // write nothing and reset the connection (endpoint disabled)
+    bool reset{false};   // write nothing and reset the connection (endpoint disabled)
+    bool secret{false};  // the body holds an instance secret: wipe it once written
 };
 
 // Answers `request` from `view` at `now` (steady-clock seconds).

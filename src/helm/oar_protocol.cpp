@@ -1691,10 +1691,121 @@ auto to_string(BodyError e) noexcept -> const char* {
             return "bad_csr";
         case BodyError::bad_group:
             return "bad_group";
+        case BodyError::bad_secret:
+            return "bad_secret";
         case BodyError::status_with_body:
             return "status_with_body";
     }
     return "unknown";
+}
+
+// ---- instance_secrets ------------------------------------------------------------
+
+auto encode_instance_secrets(const InstanceSecrets& s)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (s.nic_id == 0 || s.vm_id == 0) {
+        return std::unexpected(BodyError::zero_id);
+    }
+    if (s.secrets.size() > proto::max_instance_secrets) {
+        return std::unexpected(BodyError::too_many_entries);
+    }
+    std::size_t size = instance_secrets_head_size;
+    for (std::size_t i = 0; i < s.secrets.size(); ++i) {
+        const auto& e = s.secrets[i];
+        if (!proto::detail::valid_secret_name(e.name) || e.value.empty() ||
+            e.value.size() > proto::max_secret_size || (i > 0 && s.secrets[i - 1].name >= e.name)) {
+            return std::unexpected(BodyError::bad_secret);
+        }
+        size += instance_secret_entry_head_size + e.name.size() + e.value.size();
+    }
+    std::vector<std::byte> out;
+    out.reserve(size);  // never reallocated: no stray copy of a value
+    wire::Writer w{out};
+    w.le64(s.nic_id);
+    w.le64(s.vm_id);
+    w.u8(static_cast<std::uint8_t>(s.secrets.size()));
+    for (int i = 0; i < 7; ++i) {
+        w.u8(0);
+    }
+    for (const auto& e : s.secrets) {
+        w.u8(static_cast<std::uint8_t>(e.name.size()));
+        w.u8(0);
+        w.le16(static_cast<std::uint16_t>(e.value.size()));
+        for (const char c : e.name) {
+            w.u8(static_cast<std::uint8_t>(c));
+        }
+        w.bytes(e.value);
+    }
+    return out;
+}
+
+auto decode_instance_secrets(std::span<const std::byte> frame)
+    -> std::expected<InstanceSecrets, BodyError> {
+    if (frame.size() > max_instance_secrets_frame) {
+        return std::unexpected(BodyError::trailing_bytes);
+    }
+    wire::Reader r{frame};
+    if (r.remaining() < instance_secrets_head_size) {
+        return std::unexpected(BodyError::truncated);
+    }
+    InstanceSecrets s;
+    s.nic_id = r.le64().value_or(0);
+    s.vm_id = r.le64().value_or(0);
+    const auto count = r.u8().value_or(0);
+    const auto reserved = r.bytes(7).value_or(std::span<const std::byte>{});
+    if (!all_zero(reserved)) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    if (s.nic_id == 0 || s.vm_id == 0) {
+        return std::unexpected(BodyError::zero_id);
+    }
+    if (count > proto::max_instance_secrets) {
+        return std::unexpected(BodyError::too_many_entries);
+    }
+    // On any failure the values decoded so far are wiped.
+    auto fail = [&s](BodyError e) -> std::expected<InstanceSecrets, BodyError> {
+        wipe(s);
+        return std::unexpected(e);
+    };
+    s.secrets.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (r.remaining() < instance_secret_entry_head_size) {
+            return fail(BodyError::truncated);
+        }
+        const auto name_size = r.u8().value_or(0);
+        const auto pad = r.u8().value_or(0);
+        const auto value_size = r.le16().value_or(0);
+        if (pad != 0) {
+            return fail(BodyError::reserved_not_zero);
+        }
+        auto name = r.bytes(name_size);
+        auto value = name ? r.bytes(value_size) : name;
+        if (!name || !value) {
+            return fail(BodyError::truncated);
+        }
+        InstanceSecretValue e;
+        e.name.reserve(name_size);
+        for (const auto b : *name) {
+            e.name.push_back(static_cast<char>(b));
+        }
+        if (!proto::detail::valid_secret_name(e.name) || value_size == 0 ||
+            value_size > proto::max_secret_size || (i > 0 && s.secrets.back().name >= e.name)) {
+            return fail(BodyError::bad_secret);
+        }
+        e.value.assign(value->begin(), value->end());
+        s.secrets.push_back(std::move(e));
+    }
+    if (r.remaining() != 0) {
+        return fail(BodyError::trailing_bytes);
+    }
+    return s;
+}
+
+auto wipe(InstanceSecrets& s) noexcept -> void {
+    for (auto& e : s.secrets) {
+        secure_zero(e.value);
+    }
+    s.secrets.clear();
 }
 
 }  // namespace ak::helm::oar

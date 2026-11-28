@@ -5,6 +5,8 @@
 
 #include <utility>
 
+#include <openssl/crypto.h>
+
 namespace ak::oar::net {
 
 auto to_string(MetadataResult r) noexcept -> const char* {
@@ -70,7 +72,54 @@ auto MetadataStore::put(std::span<const std::byte> frame) -> MetadataResult {
     return MetadataResult::kept;
 }
 
+namespace {
+
+auto wipe(std::vector<InstanceSecret>& secrets) noexcept -> void {
+    for (auto& s : secrets) {
+        if (!s.value.empty()) {
+            OPENSSL_cleanse(s.value.data(), s.value.size());
+        }
+    }
+    secrets.clear();
+}
+
+}  // namespace
+
+MetadataStore::~MetadataStore() {
+    for (auto& [nic, secrets] : _secrets) {
+        wipe(secrets);
+    }
+}
+
+auto MetadataStore::put_secrets(std::uint64_t nic_id, std::vector<InstanceSecret> secrets) -> bool {
+    auto it = _secrets.find(nic_id);
+    if (it == _secrets.end() && !secrets.empty() && _secrets.size() >= _capacity) {
+        wipe(secrets);
+        return false;
+    }
+    if (it != _secrets.end()) {
+        wipe(it->second);
+        if (secrets.empty()) {
+            _secrets.erase(it);
+            return true;
+        }
+        it->second = std::move(secrets);
+    } else if (!secrets.empty()) {
+        _secrets.emplace(nic_id, std::move(secrets));
+    }
+    return true;
+}
+
+auto MetadataStore::secrets(std::uint64_t nic_id) const -> const std::vector<InstanceSecret>* {
+    const auto it = _secrets.find(nic_id);
+    return it == _secrets.end() ? nullptr : &it->second;
+}
+
 auto MetadataStore::drop(std::uint64_t nic_id) -> bool {
+    if (const auto it = _secrets.find(nic_id); it != _secrets.end()) {
+        wipe(it->second);
+        _secrets.erase(it);
+    }
     if (_records.erase(nic_id) == 0) {
         return false;
     }

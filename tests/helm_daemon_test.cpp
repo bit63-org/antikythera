@@ -237,6 +237,16 @@ public:
             {.frame = {frame.begin(), frame.end()}, .prepares_before = _prepared.size()});
         return metadata_status.load();
     }
+    // A network role's instance secrets (cold-start Requirement 5.4).
+    [[nodiscard]] auto secrets() const -> std::vector<oar::InstanceSecrets> {
+        const std::scoped_lock lock{_mutex};
+        return _secrets;
+    }
+    auto instance_secrets(const oar::InstanceSecrets& s) -> oar::Status override {
+        const std::scoped_lock lock{_mutex};
+        _secrets.push_back(s);  // copied: the endpoint wipes its own
+        return oar::Status::ok;
+    }
 
     // A network role's group policy and meters.
     [[nodiscard]] auto policies() const -> std::vector<std::vector<std::byte>> {
@@ -417,6 +427,7 @@ private:
     std::vector<std::vector<std::byte>> _vpc_configs;
     std::vector<std::size_t> _vpc_prepares_before;
     std::vector<Metadata> _metadata;
+    std::vector<oar::InstanceSecrets> _secrets;
 };
 
 // One slot's board: every connect() opens a fresh in-process sideband and
@@ -1189,6 +1200,77 @@ auto metadata_frame(std::uint64_t nic, std::uint64_t version)
 }
 
 }  // namespace
+
+// cold-start Requirement 5.4: a pinned instance's NIC gets the instance's
+// secrets, opened in the secure element, when it is plugged and again
+// when its role restarts; another NIC gets none.
+BOOST_AUTO_TEST_CASE(a_pinned_instance_s_nic_gets_its_secrets) {
+    struct AcceptOnes final : helm::RecordVerifier {
+        [[nodiscard]] auto verify(std::span<const std::byte> /*message*/,
+                                  std::span<const std::byte, proto::ed25519_signature_size> sig,
+                                  std::uint16_t /*key_id*/) const -> bool override {
+            return sig[0] == std::byte{1};
+        }
+    } verifier;
+    helm::StandingSetKeeper keeper{server, nullptr, nullptr, &verifier};
+    Rig r{link_timeout, nullptr, false, false, nullptr, nullptr, {}, &keeper, nullptr};
+    const std::vector<std::byte> share{std::byte{0x5A}, std::byte{0xA5}};
+    auto sealed = helm::seal_instance_secret(r.se.transport_public_key().value(), server, vm_one,
+                                             "hsm.share", share);
+    BOOST_REQUIRE(sealed.has_value());
+    proto::StandingSet set{.server_id = server,
+                           .key_id = 1,
+                           .generation = 1,
+                           .time_floor = 0,
+                           .instances = {},
+                           .signature = {}};
+    proto::StandingInstance in;
+    in.vm_id = vm_one;
+    in.manifest_digest.fill(std::byte{0xAB});
+    in.commands.push_back({.type = proto::StandingCommandType::create_vm,
+                           .body = std::vector<std::byte>(16, std::byte{1})});
+    in.nics.push_back({.nic_id = nic_id, .vni = vni});
+    in.secrets.push_back(std::move(*sealed));
+    set.instances.push_back(in);
+    set.signature.fill(std::byte{1});
+    const auto set_bytes = proto::encode_standing_set(set);
+    BOOST_REQUIRE(set_bytes.has_value());
+    BOOST_REQUIRE((keeper.offer(*set_bytes) == helm::StandingVerdict::kept));
+
+    (void)r.daemon.boot();
+    const auto [m1, frame1] = metadata_frame(nic_id, 1);
+    r.daemon.on_instance_metadata(m1, frame1);
+    r.daemon.on_envelope(
+        envelope(1, mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib}));
+    r.daemon.run_once(0ms);
+    r.daemon.post_host_slot(response(1, mb::Type::create_vm));
+    const mb::DeviceRef device{.slot = net_slot, .type = mb::DeviceType::nic_vf, .function = 0};
+    mb::AttachDevice attach{
+        .vm_id = vm_one, .device = device, .vni = vni, .nic_id = nic_id, .mac = {}};
+    attach.mac[0] = std::byte{0x02};
+    r.daemon.on_envelope(envelope(2, attach));
+    r.daemon.run_once(0ms);
+    r.daemon.post_host_slot(response(2, mb::Type::attach_device));
+    r.daemon.run_once(0ms);
+
+    auto got = r.net.role.secrets();
+    BOOST_REQUIRE(got.size() == 1U);
+    BOOST_TEST(got[0].nic_id == nic_id);
+    BOOST_TEST(got[0].vm_id == vm_one);
+    BOOST_REQUIRE(got[0].secrets.size() == 1U);
+    BOOST_TEST(got[0].secrets[0].name == "hsm.share");
+    BOOST_TEST((got[0].secrets[0].value == share));
+    BOOST_TEST(r.daemon.stats().instance_secrets == 1U);
+    BOOST_TEST(r.blk.role.secrets().empty());
+
+    // A restarted role gets them again.
+    r.backplane.dropped.insert(net_slot);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.connects.load() == 2);
+    BOOST_TEST(r.net.role.secrets().size() == 2U);
+    BOOST_TEST(r.daemon.stats().instance_secrets == 2U);
+    BOOST_TEST(r.daemon.stats().instance_secrets_refused == 0U);
+}
 
 BOOST_AUTO_TEST_CASE(instance_metadata_goes_to_the_nic_s_role_before_its_prepare) {
     Rig r;

@@ -123,9 +123,11 @@ struct Answers {
     proto::InstanceMetadata m = record();
     net::TokenKey key = test_key();
     std::uint64_t now = 1000;
+    const std::vector<net::InstanceSecret>* secrets{nullptr};
 
     auto operator()(const net::HttpRequest& r) -> net::HttpResponse {
-        return net::answer(r, net::MetadataView{.record = &m, .network = network()}, key, now);
+        return net::answer(
+            r, net::MetadataView{.record = &m, .network = network(), .secrets = secrets}, key, now);
     }
     auto body(std::string_view path) -> std::string {
         const auto r = (*this)(get(path));
@@ -448,6 +450,51 @@ BOOST_AUTO_TEST_CASE(imdsv2_rules) {
     a.m.http_endpoint = proto::MetadataEndpoint::disabled;
     BOOST_TEST(a(put_token("60")).reset);
     BOOST_TEST(net::answer(get("/"), net::MetadataView{}, a.key, a.now).reset);
+}
+
+// cold-start Requirement 5.4: a standing instance's secrets, only with a
+// token, outside /meta-data, and marked for wiping.
+BOOST_AUTO_TEST_CASE(instance_secrets_need_a_token) {
+    Answers a;
+    const std::vector<net::InstanceSecret> secrets{
+        {.name = "hsm.share", .value = {std::byte{0x00}, std::byte{0xFF}, std::byte{'a'}}},
+        {.name = "tls.key", .value = {std::byte{'k'}}}};
+    a.secrets = &secrets;
+    const auto token = a(put_token("60")).body;
+    const auto with = [&](std::string_view path) {
+        return a(get(path, "X-aws-ec2-metadata-token: " + token + "\r\n"));
+    };
+    // Tokens optional for the record, required here.
+    BOOST_TEST(a.status("/latest/instance-secrets/") == 401U);
+    BOOST_TEST(a.status("/latest/instance-secrets/tls.key") == 401U);
+    BOOST_TEST(
+        a(get("/latest/instance-secrets/tls.key", "X-aws-ec2-metadata-token: bogus\r\n")).status ==
+        401U);
+
+    const auto list = with("/latest/instance-secrets/");
+    BOOST_TEST(list.status == 200U);
+    BOOST_TEST(list.body == "hsm.share\ntls.key");
+    BOOST_TEST(!list.secret);
+    BOOST_TEST(with("/latest/instance-secrets").body == list.body);
+
+    const auto value = with("/latest/instance-secrets/hsm.share");
+    BOOST_TEST(value.status == 200U);
+    BOOST_TEST(value.content_type == "application/octet-stream");
+    BOOST_TEST(value.body == std::string("\x00\xFF"
+                                         "a",
+                                         3));
+    BOOST_TEST(value.secret);
+    BOOST_TEST(value.token_ttl.value() == 60U);
+    BOOST_TEST(with("/latest/instance-secrets/nothing").status == 404U);
+    BOOST_TEST(with("/2009-04-04/instance-secrets/tls.key").status == 200U);
+
+    // Not in the metadata tree.
+    BOOST_TEST(a.body("/latest/meta-data/").find("secret") == std::string::npos);
+    BOOST_TEST(a.body("/latest/").find("secret") == std::string::npos);
+
+    // No secrets for the NIC.
+    a.secrets = nullptr;
+    BOOST_TEST(with("/latest/instance-secrets/").status == 404U);
 }
 
 BOOST_AUTO_TEST_CASE(renders_responses) {

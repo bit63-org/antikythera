@@ -13,6 +13,7 @@
 #include <memory>
 #include <span>
 #include <string_view>
+#include <string>
 #include <vector>
 
 #include "ed25519_test_support.hpp"
@@ -129,6 +130,35 @@ BOOST_AUTO_TEST_CASE(holds_at_most_capacity_records) {
     BOOST_TEST((store.put(record(3, 1)) == MetadataResult::kept));
     BOOST_TEST(store.counters().full == 1U);
     BOOST_TEST(std::string_view{net::to_string(MetadataResult::full)} == "full");
+}
+
+// cold-start Requirement 5.4: a NIC's instance secrets, replaced whole,
+// dropped with the NIC, within the same capacity.
+BOOST_AUTO_TEST_CASE(keeps_instance_secrets_per_nic) {
+    net::MetadataStore store{server, 2, verifier()};
+    BOOST_TEST(store.secrets(1) == nullptr);
+    const auto one = [](std::string name, std::byte b) {
+        std::vector<net::InstanceSecret> v;
+        v.push_back({.name = std::move(name), .value = {b}});
+        return v;
+    };
+    BOOST_TEST(store.put_secrets(1, one("a", std::byte{1})));
+    BOOST_TEST(store.put_secrets(2, one("b", std::byte{2})));
+    BOOST_TEST(!store.put_secrets(3, one("c", std::byte{3})));  // full
+    BOOST_TEST(store.secrets(3) == nullptr);
+    BOOST_TEST(store.put_secrets(1, one("z", std::byte{9})));  // replaced whole
+    BOOST_REQUIRE(store.secrets(1) != nullptr);
+    BOOST_REQUIRE(store.secrets(1)->size() == 1U);
+    BOOST_TEST(store.secrets(1)->front().name == "z");
+    BOOST_TEST(store.put_secrets(2, {}));  // removed
+    BOOST_TEST(store.secrets(2) == nullptr);
+    BOOST_TEST(store.put_secrets(3, one("c", std::byte{3})));  // a place again
+    // Cleaning the NIC drops its secrets even with no record.
+    BOOST_TEST(!store.drop(3));
+    BOOST_TEST(store.secrets(3) == nullptr);
+    BOOST_TEST((store.put(record(1, 1)) == MetadataResult::kept));
+    BOOST_TEST(store.drop(1));
+    BOOST_TEST(store.secrets(1) == nullptr);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

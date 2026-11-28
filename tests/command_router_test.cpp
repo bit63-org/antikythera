@@ -31,6 +31,7 @@
 #include "helm/volume_key_seal.hpp"
 #include "proto/envelope.hpp"
 #include "proto/replica_config.hpp"
+#include "proto/standing_set.hpp"
 #include "proto/report.hpp"
 #include "test_support.hpp"
 
@@ -2151,4 +2152,320 @@ BOOST_AUTO_TEST_CASE(a_conversion_that_fails_or_is_lost_is_reported,
         BOOST_TEST(
             proto::encode_report({.server_id = server, .report_seq = 1, .body = b}).has_value());
     }
+}
+
+// ---- standing starts (.kiro/specs/cold-start/ Requirement 4.4-4.7) ----------
+
+namespace {
+
+constexpr VmId vm_three = 103;
+constexpr std::uint64_t standing_generation = 5;
+constexpr auto ready_timeout = std::chrono::seconds{120};
+
+auto standing_command(const mb::Body& body) -> proto::StandingCommand {
+    return {.type = static_cast<proto::StandingCommandType>(mb::type_of(body)),
+            .body = mb::encode_body(body)};
+}
+
+auto create(VmId vm) -> mb::CreateVm {
+    return {.vm_id = vm, .vcpus = vcpus, .memory_mib = memory_mib};
+}
+
+// A standing set whose first instance has a NIC and whose second does not.
+// The router never checks the signature (hull does), so it is a filler.
+struct StandingFixture {
+    proto::StandingSet set;
+    std::vector<std::byte> frame;
+
+    explicit StandingFixture(std::vector<proto::StandingInstance> instances) {
+        set = {.server_id = server,
+               .key_id = key_id,
+               .generation = standing_generation,
+               .time_floor = 0,
+               .instances = std::move(instances),
+               .signature = {}};
+        set.signature.fill(std::byte{sig_fill});
+        auto f = proto::encode_standing_set(set);
+        BOOST_REQUIRE(f);
+        frame = *f;
+    }
+};
+
+auto standing_instance(VmId vm, std::vector<mb::Body> bodies) -> proto::StandingInstance {
+    proto::StandingInstance in;
+    in.vm_id = vm;
+    in.manifest_digest.fill(std::byte{0xAB});
+    for (const auto& b : bodies) {
+        in.commands.push_back(standing_command(b));
+    }
+    return in;
+}
+
+auto two_instances() -> StandingFixture {
+    return StandingFixture{
+        {standing_instance(vm_one, {create(vm_one), nic_attach(vm_one, fn_zero)}),
+         standing_instance(vm_two, {create(vm_two)})}};
+}
+
+// The newest slot helm posted, decoded.
+auto last_posted(const Helm& h) -> std::pair<mb::Header, mb::Body> {
+    BOOST_REQUIRE(!h.host.posted.empty());
+    const auto msg = mb::decode(h.host.posted.back());
+    BOOST_REQUIRE(msg);
+    const auto body = mb::decode_body(*msg);
+    BOOST_REQUIRE(body);
+    return {msg->header, *body};
+}
+
+auto hull_is_up(Helm& h) -> void {
+    h.router.on_host_slot(host_slot(
+        mb::HostFault{.code = mb::FaultCode::agent_restarted, .slot = mb::no_slot, .detail = 0}));
+}
+
+// Answers every STANDING_CHUNK ok until something else is posted; returns
+// the set as hull received it.
+auto take_chunks(Helm& h) -> std::vector<std::byte> {
+    std::vector<std::byte> got;
+    for (;;) {
+        const auto [header, body] = last_posted(h);
+        const auto* chunk = std::get_if<mb::StandingChunk>(&body);
+        if (chunk == nullptr) {
+            return got;
+        }
+        BOOST_TEST(header.key_id == mb::no_key_id);  // helm's own: unsigned
+        BOOST_TEST(header.server_id == server);
+        BOOST_TEST(chunk->offset == got.size());
+        got.insert(got.end(), chunk->chunk_bytes().begin(), chunk->chunk_bytes().end());
+        h.router.on_host_slot(response(header.seq, mb::Type::standing_chunk, mb::Status::ok));
+    }
+}
+
+// Answers the STANDING_START in flight; returns its index.
+auto answer_start(Helm& h, mb::Status status) -> std::uint16_t {
+    const auto [header, body] = last_posted(h);
+    const auto start = std::get<mb::StandingStart>(body);
+    BOOST_TEST(start.generation == standing_generation);
+    h.router.on_host_slot(response(header.seq, mb::Type::standing_start, status));
+    return start.index;
+}
+
+struct Round {
+    std::vector<helm::StandingAttempt> results;
+    int calls{0};
+    auto callback() -> helm::StandingRoundDone {
+        return [this](const std::vector<helm::StandingAttempt>& r) {
+            results = r;
+            ++calls;
+        };
+    }
+};
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(standing_starts_go_before_any_envelope,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    const auto standing = two_instances();
+    Round round;
+    h.router.expect_standing(standing.frame, standing.set, round.callback());
+    BOOST_TEST(h.router.standing());
+
+    // The controller is quick, but its command waits.
+    const auto live = h.send(create(vm_three));
+    BOOST_TEST(h.host.posted.empty());  // hull is not up yet either
+
+    hull_is_up(h);
+    BOOST_TEST((take_chunks(h) == standing.frame));
+    // The first instance was prepared like a live command: its VM key and
+    // its NIC, reserved and prepared on the network role.
+    BOOST_TEST(h.keys.find_vm_key(vm_one).has_value());
+    BOOST_REQUIRE(h.net_role.prepared.size() == 1U);
+    BOOST_TEST(h.net_role.prepared[0].vm_id == vm_one);
+    BOOST_TEST(answer_start(h, mb::Status::ok) == 0U);
+    BOOST_TEST((h.state(net_slot, fn_zero) == FunctionState::assigned));
+    BOOST_TEST(round.calls == 0);
+    BOOST_TEST(answer_start(h, mb::Status::ok) == 1U);
+
+    BOOST_REQUIRE(round.calls == 1);
+    BOOST_TEST((round.results == std::vector<helm::StandingAttempt>{
+                                     {.vm_id = vm_one, .status = mb::Status::ok, .attempts = 1},
+                                     {.vm_id = vm_two, .status = mb::Status::ok, .attempts = 1}}));
+    BOOST_TEST(h.router.stats().standing_started == 2U);
+    BOOST_TEST(h.router.inventory().vms.size() == 2U);
+    // Standing starts report no command outcome; the held command goes now.
+    BOOST_TEST(h.reports.outcomes().empty());
+    BOOST_TEST((h.host.posted.back() == command_slot(live, create(vm_three))));
+    BOOST_TEST(!h.router.standing());
+    const auto text = h.audit_text();
+    BOOST_TEST(text.find("ev=command_relayed seq=") != std::string::npos);
+    BOOST_TEST(text.find("cmd=0x51 vm=101") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(a_failed_standing_start_is_undone_and_retried,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    const StandingFixture standing{
+        {standing_instance(vm_one, {create(vm_one), nic_attach(vm_one, fn_zero)})}};
+    Round round;
+    h.router.expect_standing(standing.frame, standing.set, round.callback());
+    hull_is_up(h);
+    (void)take_chunks(h);
+    BOOST_TEST(answer_start(h, mb::Status::unknown_device) == 0U);
+    // Undone: the VM key is gone and the NIC is cleaned for the pool.
+    BOOST_TEST(!h.keys.find_vm_key(vm_one).has_value());
+    BOOST_TEST((h.state(net_slot, fn_zero) != FunctionState::assigned));
+    BOOST_REQUIRE(round.calls == 1);
+    BOOST_TEST((round.results.at(0).status == mb::Status::unknown_device));
+    BOOST_TEST(round.results.at(0).attempts == 1U);
+    BOOST_TEST(h.router.standing());  // retries pending
+
+    // Retried after 1 s, without uploading the set again.
+    const auto posted = h.host.posted.size();
+    h.t += std::chrono::milliseconds{999};
+    h.router.poll();
+    BOOST_TEST(h.host.posted.size() == posted);
+    h.t += std::chrono::milliseconds{1};
+    h.router.poll();
+    BOOST_REQUIRE(h.host.posted.size() == posted + 1);
+    BOOST_TEST(std::holds_alternative<mb::StandingStart>(last_posted(h).second));
+    (void)answer_start(h, mb::Status::conflict);
+
+    // The next waits 2 s; an envelope meanwhile ends standing starts.
+    h.t += std::chrono::seconds{1};
+    h.router.poll();
+    BOOST_TEST(h.host.posted.size() == posted + 1);
+    const auto live = h.send(create(vm_three));
+    BOOST_TEST((h.host.posted.back() == command_slot(live, create(vm_three))));
+    BOOST_TEST(!h.router.standing());
+    BOOST_TEST(h.router.stats().standing_failed == 2U);
+    BOOST_TEST(h.router.stats().standing_abandoned == 1U);
+    BOOST_TEST(round.calls == 1);  // the round is reported once
+}
+
+BOOST_AUTO_TEST_CASE(standing_retries_back_off_to_the_cap,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    const StandingFixture standing{{standing_instance(vm_two, {create(vm_two)})}};
+    Round round;
+    h.router.expect_standing(standing.frame, standing.set, round.callback());
+    hull_is_up(h);
+    (void)take_chunks(h);
+    (void)answer_start(h, mb::Status::internal_error);
+    // 1, 2, 4, 8, 16, 30, 30 s.
+    for (const int wait_s : {1, 2, 4, 8, 16, 30, 30}) {
+        const auto posted = h.host.posted.size();
+        h.t += std::chrono::seconds{wait_s} - std::chrono::milliseconds{1};
+        h.router.poll();
+        BOOST_TEST(h.host.posted.size() == posted);
+        h.t += std::chrono::milliseconds{1};
+        h.router.poll();
+        BOOST_REQUIRE(h.host.posted.size() == posted + 1);
+        (void)answer_start(h, mb::Status::internal_error);
+    }
+    // Success ends it.
+    h.t += std::chrono::seconds{30};
+    h.router.poll();
+    (void)answer_start(h, mb::Status::ok);
+    BOOST_TEST(!h.router.standing());
+    BOOST_TEST(h.router.inventory().vms.size() == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(a_prepare_that_fails_never_reaches_hull,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    // A NIC on a slot helm does not have, then an instance that is fine.
+    const mb::AttachDevice missing{
+        .vm_id = vm_one,
+        .device = {.slot = 9, .type = mb::DeviceType::nic_vf, .function = 0},
+        .vni = vni,
+        .nic_id = nic_id,
+        .mac = test_nic_config().mac};
+    const StandingFixture standing{{standing_instance(vm_one, {create(vm_one), missing}),
+                                    standing_instance(vm_two, {create(vm_two)})}};
+    Round round;
+    h.router.expect_standing(standing.frame, standing.set, round.callback());
+    hull_is_up(h);
+    (void)take_chunks(h);
+    // The first never went: its VM key was undone. The second is in flight.
+    BOOST_TEST(!h.keys.find_vm_key(vm_one).has_value());
+    BOOST_TEST(answer_start(h, mb::Status::ok) == 1U);
+    BOOST_REQUIRE(round.calls == 1);
+    BOOST_TEST((round.results.at(0).status == mb::Status::unknown_device));
+    BOOST_TEST((round.results.at(1).status == mb::Status::ok));
+}
+
+BOOST_AUTO_TEST_CASE(a_refused_set_ends_the_round,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    const auto standing = two_instances();
+    Round round;
+    h.router.expect_standing(standing.frame, standing.set, round.callback());
+    const auto live = h.send(create(vm_three));
+    hull_is_up(h);
+    const auto [header, body] = last_posted(h);
+    BOOST_REQUIRE(std::holds_alternative<mb::StandingChunk>(body));
+    h.router.on_host_slot(
+        response(header.seq, mb::Type::standing_chunk, mb::Status::bad_signature));
+    BOOST_REQUIRE(round.calls == 1);
+    for (const auto& r : round.results) {
+        BOOST_TEST((r.status == mb::Status::bad_signature));
+        BOOST_TEST(r.attempts == 0U);
+    }
+    BOOST_TEST(!h.router.standing());
+    BOOST_TEST((h.host.posted.back() == command_slot(live, create(vm_three))));
+}
+
+BOOST_AUTO_TEST_CASE(hull_that_never_comes_up_releases_envelopes,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    const auto standing = two_instances();
+    Round round;
+    h.router.expect_standing(standing.frame, standing.set, round.callback());
+    const auto live = h.send(create(vm_three));
+    h.t += ready_timeout - std::chrono::milliseconds{1};
+    h.router.poll();
+    BOOST_TEST(h.host.posted.empty());
+    h.t += std::chrono::milliseconds{1};
+    h.router.poll();
+    BOOST_REQUIRE(round.calls == 1);
+    BOOST_TEST((round.results.at(0).status == mb::Status::timed_out));
+    BOOST_TEST((h.host.posted.back() == command_slot(live, create(vm_three))));
+    // A late hull changes nothing.
+    hull_is_up(h);
+    BOOST_TEST(h.host.posted.size() == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(a_standing_start_that_times_out_is_not_retried,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    const StandingFixture standing{
+        {standing_instance(vm_one, {create(vm_one), nic_attach(vm_one, fn_zero)})}};
+    Round round;
+    h.router.expect_standing(standing.frame, standing.set, round.callback());
+    hull_is_up(h);
+    (void)take_chunks(h);
+    const auto posted = h.host.posted.size();
+    h.t += command_timeout;
+    h.router.poll();
+    BOOST_REQUIRE(round.calls == 1);
+    BOOST_TEST((round.results.at(0).status == mb::Status::timed_out));
+    // hull may have started it: what was reserved stays, and it is never sent twice.
+    BOOST_TEST(h.keys.find_vm_key(vm_one).has_value());
+    BOOST_TEST((h.state(net_slot, fn_zero) == FunctionState::assigned));
+    h.t += std::chrono::minutes{5};
+    h.router.poll();
+    BOOST_TEST(h.host.posted.size() == posted);
+    BOOST_TEST(!h.router.standing());
+}
+
+BOOST_AUTO_TEST_CASE(an_empty_standing_set_holds_nothing,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Helm h;
+    const StandingFixture standing{{}};
+    Round round;
+    h.router.expect_standing(standing.frame, standing.set, round.callback());
+    BOOST_TEST(!h.router.standing());
+    const auto live = h.send(create(vm_three));
+    BOOST_TEST((h.host.posted.back() == command_slot(live, create(vm_three))));
+    BOOST_TEST(round.calls == 0);
 }

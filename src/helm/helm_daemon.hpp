@@ -168,6 +168,7 @@
 #include "helm/mailbox.hpp"
 #include "helm/oar_link.hpp"
 #include "helm/power_on.hpp"
+#include "helm/standing_set_keeper.hpp"
 #include "helm/power_sequencer.hpp"
 #include "helm/sideband_binding.hpp"
 #include "helm/time_floor.hpp"
@@ -215,8 +216,12 @@ struct DaemonConfig {
     // power_policy records from the controller go to it. Null: they are
     // dropped and counted. Not owned; must outlive the daemon.
     PowerPolicyKeeper* power_policy{nullptr};
-    // Raised by the time_floor of every kept power policy (cold-start
-    // Requirement 7.1). Null: not tracked. Not owned.
+    // Keeps the standing set (cold-start Requirement 4.1-4.3): standing_set
+    // records go to it, and expect_standing() starts its instances. Null:
+    // records are dropped and counted. Not owned; must outlive the daemon.
+    StandingSetKeeper* standing_set{nullptr};
+    // Raised by the time_floor of every kept power policy and standing set
+    // (cold-start Requirement 7.1). Null: not tracked. Not owned.
     TimeFloor* time_floor{nullptr};
     // Called on the loop thread after a scheduled boot (schedule_boot).
     std::function<void(const BootResult&)> on_boot;
@@ -276,6 +281,8 @@ struct DaemonStats {
     // Power-on policy (cold-start Requirement 3).
     std::uint64_t power_policies{0};          // verified, newer and kept
     std::uint64_t power_policies_refused{0};  // stale, another server's, unsigned or unstorable
+    std::uint64_t standing_sets{0};           // verified, newer and kept
+    std::uint64_t standing_sets_refused{0};
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -310,6 +317,12 @@ public:
     // whatever the wait, `hold` keeps the host in reset, `none` returns to
     // the scheduled time. No effect once booted.
     auto set_host_power_override(HostPowerOverride override_) -> void;
+    // After helm's power returned (call from on_boot): starts the kept
+    // standing set's instances before any envelope is relayed (cold-start
+    // Requirement 4.4; CommandRouter::expect_standing). False, with
+    // nothing to wait for, when no set is kept or it pins nothing; `done`
+    // is then never called.
+    auto expect_standing(StandingRoundDone done) -> bool;
     [[nodiscard]] auto boot_pending() const noexcept -> bool { return _boot_at.has_value(); }
     [[nodiscard]] auto booted() const noexcept -> bool { return _booted; }
     // Serves queued traffic, router deadlines and sequencer checks until
@@ -362,6 +375,8 @@ public:
         -> void override;
     auto on_self_test(const proto::SelfTest& request) -> void override;
     auto on_power_policy(const proto::PowerPolicy& policy, std::span<const std::byte> frame)
+        -> void override;
+    auto on_standing_set(const proto::StandingSet& set, std::span<const std::byte> frame)
         -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
@@ -431,10 +446,13 @@ private:
         proto::PowerPolicy policy;
         std::vector<std::byte> frame;
     };
+    struct StandingSetFrame {
+        std::vector<std::byte> frame;
+    };
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
                               proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
                               ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame, MetadataFrame,
-                              LayoutFrame, proto::SelfTest, PowerPolicyFrame>;
+                              LayoutFrame, proto::SelfTest, PowerPolicyFrame, StandingSetFrame>;
     // Where a NIC with a kept record is plugged: its network role's slot
     // and function.
     struct MetadataHome {

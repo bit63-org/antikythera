@@ -48,6 +48,39 @@ auto make_cold_start(const ColdStartFacts& facts, const SealedStore* store) -> p
     return c;
 }
 
+auto to_standing_result(mailbox::Status status) noexcept -> proto::StandingResult {
+    using mailbox::Status;
+    switch (status) {
+        case Status::ok:
+        case Status::accepted:
+            return proto::StandingResult::started;
+        case Status::unknown_device:
+            return proto::StandingResult::device_missing;
+        case Status::unknown_volume:
+            return proto::StandingResult::volume_refused;
+        case Status::bad_signature:
+        case Status::wrong_server:
+        case Status::stale_sequence:
+        case Status::conflict:
+        case Status::malformed:
+        case Status::unsupported:
+            return proto::StandingResult::refused;
+        default:
+            return proto::StandingResult::failed;
+    }
+}
+
+auto standing_results(const std::vector<StandingAttempt>& attempts)
+    -> std::vector<proto::StandingStartResult> {
+    std::vector<proto::StandingStartResult> out;
+    out.reserve(attempts.size());
+    for (const auto& a : attempts) {
+        out.push_back(
+            {.vm_id = a.vm_id, .result = to_standing_result(a.status), .attempts = a.attempts});
+    }
+    return out;
+}
+
 auto make_boot_cache(const BootImages& images, std::uint64_t standing_generation,
                      const PowerPolicyKeeper& policy, const SealedStore* store)
     -> proto::BootCache {

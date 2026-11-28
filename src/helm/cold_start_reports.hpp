@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "helm/command_router.hpp"
 #include "helm/power_on.hpp"
 #include "helm/sealed_store.hpp"
 #include "proto/report.hpp"
@@ -48,6 +49,16 @@ struct ColdStartFacts {
 // max_standing_instances, so the report always passes check_body.
 [[nodiscard]] auto make_cold_start(const ColdStartFacts& facts, const SealedStore* store)
     -> proto::ColdStart;
+
+// What hull's (or helm's own) answer to a standing start says about it:
+// ok is started; a function the pool or hull does not have is a device
+// missing; a volume helm or a storage role would not attach is a volume
+// refused; a start hull would not take (signature, server, generation, a
+// signed command already accepted) is refused; anything else failed.
+[[nodiscard]] auto to_standing_result(mailbox::Status status) noexcept -> proto::StandingResult;
+// The router's standing round results, as the cold_start report lists them.
+[[nodiscard]] auto standing_results(const std::vector<StandingAttempt>& attempts)
+    -> std::vector<proto::StandingStartResult>;
 
 struct BootImages {
     proto::ImageDigest lkg{};       // all zero: none

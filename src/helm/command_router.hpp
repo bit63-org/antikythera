@@ -214,6 +214,34 @@
 // exactly those to oar-net to prepare the VF (Requirement 8.1): helm adds
 // no network identity of its own.
 //
+// Standing starts (.kiro/specs/cold-start/ Requirement 4.4-4.7, task 6).
+// After helm's power returned, expect_standing() hands the router the
+// standing set helm keeps, and from then on no controller envelope is
+// dispatched until every standing instance has been tried once:
+//
+//   1. Wait for hull: its first message of a boot is HOST_FAULT
+//      agent_restarted. Nothing comes within standing_ready_timeout:
+//      every instance is reported timed_out and envelopes flow.
+//   2. Upload the set's signed bytes to hull in STANDING_CHUNK commands
+//      (helm's own, unsigned; hull verifies the set). A chunk hull
+//      refuses, or that times out, ends the round: every instance is
+//      reported with that status.
+//   3. For each instance, in VM order: decode its commands, prepare each
+//      exactly as for a live command (the VM key, the reserved and
+//      prepared functions), send STANDING_START, then commit every step
+//      on ok or compensate every step on failure. A start that times out
+//      is not retried and keeps its reservations, as a timed-out command
+//      does.
+//   4. When every instance has been tried once, the round's results go to
+//      the callback (for the cold_start report) and envelopes flow again.
+//
+// A failed start is retried after standing_retry_min, doubling up to
+// standing_retry_max (4.7), while the mailbox is idle and no envelope is
+// waiting. The first envelope dispatched ends standing starts: hull
+// refuses them once it has accepted a signed command, and the controller
+// starts what is left. None of this reports a command outcome or uses a
+// controller sequence number.
+//
 // Not thread-safe: the router, the pool, the key store and the ports
 // belong to helm's event-loop thread.
 
@@ -238,6 +266,7 @@
 #include "proto/envelope.hpp"
 #include "proto/replica_config.hpp"
 #include "proto/report.hpp"
+#include "proto/standing_set.hpp"
 
 namespace ak::helm {
 
@@ -392,6 +421,18 @@ public:
     [[nodiscard]] virtual auto record(std::uint64_t seq) -> bool = 0;
 };
 
+// One standing instance's latest attempt (cold-start Requirement 4.7).
+struct StandingAttempt {
+    std::uint64_t vm_id{0};
+    mailbox::Status status{mailbox::Status::ok};  // ok: started
+    std::uint16_t attempts{0};
+    friend auto operator==(const StandingAttempt&, const StandingAttempt&) -> bool = default;
+};
+
+// Called once, when every standing instance has been tried once (or the
+// round ended without trying them). In VM order.
+using StandingRoundDone = std::function<void(const std::vector<StandingAttempt>&)>;
+
 struct RouterConfig {
     using Clock = std::chrono::steady_clock;
 
@@ -416,6 +457,11 @@ struct RouterConfig {
     std::chrono::milliseconds conversion_poll_interval{std::chrono::seconds{1}};
     // Queries in a row that may fail before a conversion is reported lost.
     unsigned max_conversion_query_failures{3};
+    // Standing starts: how long to wait for hull's first message after
+    // expect_standing(), and the retry backoff of a failed start.
+    std::chrono::milliseconds standing_ready_timeout{std::chrono::seconds{120}};
+    std::chrono::milliseconds standing_retry_min{std::chrono::seconds{1}};
+    std::chrono::milliseconds standing_retry_max{std::chrono::seconds{30}};
     // This server (the ControllerSession's): network volume attachments
     // naming it are the ones it serves.
     std::uint64_t server_id{0};
@@ -443,6 +489,9 @@ struct RouterStats {
     std::uint64_t detaches_withdrawn{0};     // eject requests cleared by WITHDRAW_DETACH
     std::uint64_t conversions_completed{0};
     std::uint64_t conversions_failed{0};  // did not start, failed, or lost
+    std::uint64_t standing_started{0};
+    std::uint64_t standing_failed{0};     // attempts that failed (each may be retried)
+    std::uint64_t standing_abandoned{0};  // never started: the controller took over
 };
 
 class CommandRouter {
@@ -475,6 +524,14 @@ public:
     // The newest kept ReplicaConfig of every network volume, for a storage
     // role whose sideband (re)opened.
     [[nodiscard]] auto network_configs() const -> std::vector<std::span<const std::byte>>;
+    // Standing starts (see above): `frame` is the standing set's exact
+    // signed bytes and `set` its decoding. Holds envelopes from now until
+    // every instance has been tried once. Nothing happens for a set with
+    // no instances.
+    auto expect_standing(std::span<const std::byte> frame, const proto::StandingSet& set,
+                         StandingRoundDone done) -> void;
+    // Standing starts are held, running or may still retry.
+    [[nodiscard]] auto standing() const noexcept -> bool { return _standing.has_value(); }
     // oar-net applied a mapping version (reported and kept for inventory).
     auto on_map_applied(std::uint32_t vni, std::uint64_t map_version) -> void;
     // Expires command, release and cleaning deadlines. Call it at least as
@@ -516,6 +573,31 @@ private:
         mailbox::Body body;
         Undo undo;
         Clock::time_point deadline;
+        // A STANDING_START: the instance and each command's prepare steps.
+        std::optional<std::size_t> standing_entry;
+        std::vector<std::pair<mailbox::Body, Undo>> steps;
+    };
+
+    struct StandingEntry {
+        std::uint64_t vm_id{0};
+        std::uint16_t attempts{0};
+        mailbox::Status last{mailbox::Status::timed_out};
+        bool started{false};
+        bool given_up{false};  // not retried (timed out, or the round ended)
+        Clock::time_point next_try;
+        std::chrono::milliseconds backoff{0};
+    };
+
+    struct Standing {
+        std::vector<std::byte> frame;
+        proto::StandingSet set;
+        StandingRoundDone done;
+        Clock::time_point ready_deadline;
+        bool ready{false};          // hull's first message arrived
+        std::size_t sent{0};        // set bytes hull has taken
+        std::size_t next_first{0};  // the next instance's first attempt
+        bool round_done{false};
+        std::vector<StandingEntry> entries;  // the set's order (VM order)
     };
 
     // A DETACH_VOLUME under `wait`, held until the guest releases the
@@ -639,6 +721,21 @@ private:
                 std::span<const std::byte> payload = {}) -> void;
     auto refuse(std::uint64_t seq, mailbox::Type command, mailbox::Status status) -> void;
 
+    // Standing starts: one step of the first round (true if it did
+    // something), a due retry (true if one started), and their pieces.
+    auto standing_step() -> bool;
+    auto standing_retry(Clock::time_point t) -> bool;
+    auto post_helm_command(const mailbox::Body& body) -> std::optional<std::uint64_t>;
+    auto attempt_standing(std::size_t entry) -> void;
+    auto standing_failed(std::size_t entry, mailbox::Status status) -> void;
+    // Gives up every instance not yet started or tried with `status`.
+    auto end_standing_round(mailbox::Status status) -> void;
+    auto finish_standing_round() -> void;
+    auto on_standing_response(InFlight done, mailbox::Status status) -> void;
+    // The first envelope is dispatched: whatever has not started is left
+    // to the controller.
+    auto abandon_standing() -> void;
+
     auto on_response(const mailbox::Message& msg) -> void;
     auto on_event(const mailbox::Body& body) -> void;
 
@@ -678,6 +775,8 @@ private:
     std::map<VolumeId, NetworkVolume> _network;
     std::map<VolumeId, Conversion> _converting;        // by local volume
     std::map<std::uint32_t, std::uint64_t> _networks;  // vni -> applied map version
+    std::optional<Standing> _standing;
+    std::uint64_t _helm_seq{0};  // header seq of helm's own commands
 
     RouterStats _stats;
 };

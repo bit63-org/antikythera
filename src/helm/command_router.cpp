@@ -4,6 +4,8 @@
 #include "helm/command_router.hpp"
 
 #include <algorithm>
+#include <array>
+#include <ranges>
 #include <utility>
 #include <variant>
 
@@ -283,11 +285,272 @@ auto CommandRouter::on_envelope(const proto::Envelope& envelope) -> void {
 }
 
 auto CommandRouter::pump() -> void {
-    while (!_in_flight && !_waiting && !_queue.empty()) {
+    while (!_in_flight && !_waiting) {
+        if (_standing) {
+            if (!_standing->round_done) {
+                // Envelopes wait for the first round (cold-start 4.4).
+                if (!standing_step()) {
+                    return;
+                }
+                continue;
+            }
+            if (!_queue.empty()) {
+                abandon_standing();
+            } else if (standing_retry(now())) {
+                continue;
+            } else {
+                return;
+            }
+        }
+        if (_queue.empty()) {
+            return;
+        }
         const auto envelope = _queue.front();
         _queue.pop_front();
         dispatch(envelope);
     }
+}
+
+// ---- standing starts -------------------------------------------------------
+
+auto CommandRouter::expect_standing(std::span<const std::byte> frame, const proto::StandingSet& set,
+                                    StandingRoundDone done) -> void {
+    if (set.instances.empty()) {
+        return;  // an empty set unpins everything: nothing to start
+    }
+    Standing s{.frame = {frame.begin(), frame.end()},
+               .set = set,
+               .done = std::move(done),
+               .ready_deadline = now() + _config.standing_ready_timeout,
+               .ready = false,
+               .sent = 0,
+               .next_first = 0,
+               .round_done = false,
+               .entries = {}};
+    s.entries.reserve(set.instances.size());
+    for (const auto& in : set.instances) {
+        s.entries.push_back({.vm_id = in.vm_id,
+                             .attempts = 0,
+                             .last = mailbox::Status::timed_out,
+                             .started = false,
+                             .given_up = false,
+                             .next_try = {},
+                             .backoff = _config.standing_retry_min});
+    }
+    _standing = std::move(s);
+}
+
+auto CommandRouter::post_helm_command(const mailbox::Body& body) -> std::optional<std::uint64_t> {
+    const auto bytes = mailbox::encode_body(body);
+    const auto seq = ++_helm_seq;
+    const auto slot = mailbox::encode({.type = mailbox::type_of(body),
+                                       .seq = seq,
+                                       .body_len = static_cast<std::uint16_t>(bytes.size()),
+                                       .key_id = mailbox::no_key_id,
+                                       .server_id = _config.server_id},
+                                      bytes, std::array<std::byte, mailbox::signature_size>{});
+    if (!slot || !_host->post_command(*slot)) {
+        return std::nullopt;
+    }
+    return seq;
+}
+
+auto CommandRouter::standing_step() -> bool {
+    auto& s = *_standing;
+    if (!s.ready) {
+        return false;  // hull has not said it is up; poll() watches the deadline
+    }
+    if (s.sent < s.frame.size()) {
+        const auto n = std::min(s.frame.size() - s.sent, mailbox::max_standing_chunk);
+        mailbox::StandingChunk chunk{.total = static_cast<std::uint32_t>(s.frame.size()),
+                                     .offset = static_cast<std::uint32_t>(s.sent),
+                                     .len = static_cast<std::uint16_t>(n),
+                                     .bytes = {}};
+        std::copy_n(s.frame.begin() + static_cast<std::ptrdiff_t>(s.sent), n, chunk.bytes.begin());
+        const auto seq = post_helm_command(chunk);
+        if (!seq) {
+            end_standing_round(mailbox::Status::internal_error);
+            return true;
+        }
+        _in_flight = InFlight{.seq = *seq,
+                              .body = chunk,
+                              .undo = {},
+                              .deadline = now() + _config.command_timeout,
+                              .standing_entry = std::nullopt,
+                              .steps = {}};
+        return true;
+    }
+    if (s.next_first < s.entries.size()) {
+        attempt_standing(s.next_first++);
+        return true;
+    }
+    finish_standing_round();
+    return true;
+}
+
+auto CommandRouter::standing_retry(Clock::time_point t) -> bool {
+    auto& entries = _standing->entries;
+    const auto due = std::ranges::find_if(entries, [t](const StandingEntry& e) {
+        return !e.started && !e.given_up && e.next_try <= t;
+    });
+    if (due != entries.end()) {
+        attempt_standing(static_cast<std::size_t>(due - entries.begin()));
+        return true;
+    }
+    if (std::ranges::all_of(entries,
+                            [](const StandingEntry& e) { return e.started || e.given_up; })) {
+        _standing.reset();  // nothing left to retry
+    }
+    return false;
+}
+
+auto CommandRouter::attempt_standing(std::size_t entry) -> void {
+    auto& s = *_standing;
+    auto& e = s.entries[entry];
+    const auto& in = s.set.instances[entry];
+    ++e.attempts;
+    const auto seq = _helm_seq + 1;  // the STANDING_START's, for the audit trail
+
+    std::vector<std::pair<mailbox::Body, Undo>> steps;
+    auto undo_all = [&] {
+        for (auto& step : std::views::reverse(steps)) {
+            compensate(seq, step.second);
+        }
+    };
+    for (const auto& c : in.commands) {
+        // As hull will decode it: the command's body in a message of its type.
+        mailbox::Message msg{};
+        msg.header = {.type = static_cast<mailbox::Type>(std::to_underlying(c.type)),
+                      .seq = 0,
+                      .body_len = static_cast<std::uint16_t>(c.body.size()),
+                      .key_id = s.set.key_id,
+                      .server_id = s.set.server_id};
+        std::ranges::copy(c.body, msg.body.begin());
+        auto body = mailbox::decode_body(msg);
+        if (!body) {
+            undo_all();
+            standing_failed(entry, mailbox::Status::malformed);
+            return;
+        }
+        Undo undo;
+        if (auto ok = prepare(seq, *body, undo); !ok) {
+            compensate(seq, undo);
+            undo_all();
+            standing_failed(entry, ok.error());
+            return;
+        }
+        steps.emplace_back(std::move(*body), undo);
+    }
+    const mailbox::StandingStart start{.generation = s.set.generation,
+                                       .index = static_cast<std::uint16_t>(entry)};
+    if (!audit(AuditRecord::of(AuditEvent::command_relayed)
+                   .with_seq(seq)
+                   .with_command(command_code(mailbox::Type::standing_start))
+                   .with_vm(e.vm_id))) {
+        undo_all();
+        standing_failed(entry, mailbox::Status::internal_error);
+        return;
+    }
+    const auto posted = post_helm_command(start);
+    if (!posted) {
+        undo_all();
+        standing_failed(entry, mailbox::Status::internal_error);
+        return;
+    }
+    _in_flight = InFlight{.seq = *posted,
+                          .body = start,
+                          .undo = {},
+                          .deadline = now() + _config.command_timeout,
+                          .standing_entry = entry,
+                          .steps = std::move(steps)};
+}
+
+auto CommandRouter::standing_failed(std::size_t entry, mailbox::Status status) -> void {
+    auto& e = _standing->entries[entry];
+    ++_stats.standing_failed;
+    e.last = status;
+    e.next_try = now() + e.backoff;
+    e.backoff = std::min(e.backoff * 2, _config.standing_retry_max);
+}
+
+auto CommandRouter::end_standing_round(mailbox::Status status) -> void {
+    for (auto& e : _standing->entries) {
+        if (!e.started && !e.given_up) {
+            e.given_up = true;
+            if (e.attempts == 0) {
+                e.last = status;
+            }
+        }
+    }
+    _standing->next_first = _standing->entries.size();
+    finish_standing_round();
+}
+
+auto CommandRouter::finish_standing_round() -> void {
+    auto& s = *_standing;
+    if (s.round_done) {
+        return;
+    }
+    s.round_done = true;
+    std::vector<StandingAttempt> results;
+    results.reserve(s.entries.size());
+    for (const auto& e : s.entries) {
+        results.push_back({.vm_id = e.vm_id,
+                           .status = e.started ? mailbox::Status::ok : e.last,
+                           .attempts = e.attempts});
+    }
+    if (s.done) {
+        s.done(results);
+    }
+}
+
+auto CommandRouter::on_standing_response(InFlight done, mailbox::Status status) -> void {
+    if (!_standing) {
+        return;
+    }
+    if (const auto* chunk = std::get_if<mailbox::StandingChunk>(&done.body)) {
+        if (succeeded(status)) {
+            _standing->sent = chunk->offset + chunk->len;
+        } else {
+            end_standing_round(status);  // hull refused the set, or never answered
+        }
+        return;
+    }
+    const auto entry = *done.standing_entry;
+    auto& e = _standing->entries[entry];
+    audit(AuditRecord::of(AuditEvent::command_outcome)
+              .with_seq(done.seq)
+              .with_command(command_code(mailbox::Type::standing_start))
+              .with_status(status_code(status))
+              .with_vm(e.vm_id));
+    if (succeeded(status)) {
+        for (const auto& [body, undo] : done.steps) {
+            commit(done.seq, body, undo);
+        }
+        e.started = true;
+        e.last = mailbox::Status::ok;
+        ++_stats.standing_started;
+    } else if (status == mailbox::Status::timed_out) {
+        // hull may have started it: keep what was reserved, as for a
+        // timed-out command, and never start it twice.
+        e.last = status;
+        e.given_up = true;
+        ++_stats.standing_failed;
+    } else {
+        for (auto it = done.steps.rbegin(); it != done.steps.rend(); ++it) {
+            compensate(done.seq, it->second);
+        }
+        standing_failed(entry, status);
+    }
+}
+
+auto CommandRouter::abandon_standing() -> void {
+    for (const auto& e : _standing->entries) {
+        if (!e.started && !e.given_up) {
+            ++_stats.standing_abandoned;
+        }
+    }
+    _standing.reset();
 }
 
 auto CommandRouter::dispatch(const proto::Envelope& envelope) -> void {
@@ -350,8 +613,12 @@ auto CommandRouter::relay(std::uint64_t seq, const mailbox::Slot& slot, const ma
         return;
     }
     ++_stats.relayed;
-    _in_flight = InFlight{
-        .seq = seq, .body = body, .undo = undo, .deadline = now() + _config.command_timeout};
+    _in_flight = InFlight{.seq = seq,
+                          .body = body,
+                          .undo = undo,
+                          .deadline = now() + _config.command_timeout,
+                          .standing_entry = std::nullopt,
+                          .steps = {}};
 }
 
 // ---- cooperative detach ----------------------------------------------------
@@ -1423,6 +1690,11 @@ auto CommandRouter::on_response(const mailbox::Message& msg) -> void {
         rsp.command == mailbox::type_of(_in_flight->body)) {
         auto done = std::move(*_in_flight);
         _in_flight.reset();
+        if (mailbox::is_helm_command(rsp.command)) {
+            on_standing_response(std::move(done), rsp.status);
+            pump();
+            return;
+        }
         audit(AuditRecord::of(AuditEvent::command_outcome)
                   .with_seq(done.seq)
                   .with_command(command_code(rsp.command))
@@ -1483,6 +1755,11 @@ auto CommandRouter::on_event(const mailbox::Body& body) -> void {
     } else if (const auto* f = std::get_if<mailbox::HostFault>(&body)) {
         _reports->report(proto::HostFaultReport{
             .code = static_cast<proto::FaultCode>(f->code), .slot = f->slot, .detail = f->detail});
+        // hull's first message of a boot: it is up, so standing starts may go.
+        if (f->code == mailbox::FaultCode::agent_restarted && _standing && !_standing->ready) {
+            _standing->ready = true;
+            pump();
+        }
     }
 }
 
@@ -1493,6 +1770,18 @@ auto CommandRouter::on_map_applied(std::uint32_t vni, std::uint64_t map_version)
 
 auto CommandRouter::poll() -> void {
     const auto t = now();
+    if (_in_flight && t >= _in_flight->deadline &&
+        mailbox::is_helm_command(mailbox::type_of(_in_flight->body))) {
+        auto done = std::move(*_in_flight);
+        _in_flight.reset();
+        ++_stats.timed_out;
+        on_standing_response(std::move(done), mailbox::Status::timed_out);
+    }
+    if (_standing && !_standing->ready && t >= _standing->ready_deadline) {
+        // hull never came up: the controller takes over (cold-start 4.4).
+        _standing->ready = true;
+        end_standing_round(mailbox::Status::timed_out);
+    }
     if (_in_flight && t >= _in_flight->deadline) {
         const auto seq = _in_flight->seq;
         const auto command = mailbox::type_of(_in_flight->body);
@@ -1507,6 +1796,9 @@ auto CommandRouter::poll() -> void {
                   .with_command(command_code(command)));
         finish(seq, command, mailbox::Status::timed_out);
         pump();
+    }
+    if (_standing) {
+        pump();  // the next standing step, a due retry, or the held envelopes
     }
     poll_ejects(t);
     poll_conversions(t);

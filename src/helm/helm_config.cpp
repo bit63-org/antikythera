@@ -10,6 +10,7 @@
 #include <system_error>
 
 #include "helm/mctp.hpp"
+#include "helm/sealed_store.hpp"
 
 namespace ak::helm {
 
@@ -137,6 +138,12 @@ public:
         if (_config.slots.empty()) {
             return std::unexpected("missing slot");
         }
+        if (_config.store.has_value() != _seen.contains("store-anchor")) {
+            return std::unexpected("store and store-anchor go together");
+        }
+        if (!_config.store && _seen.contains("store-size")) {
+            return std::unexpected("store-size without store");
+        }
         if (_config.controller_name.empty()) {
             _config.controller_name = _config.controller_host;
         }
@@ -187,6 +194,19 @@ private:
         } else if (name == "master-key") {
             if (value != "ephemeral") {
                 _config.master_key = std::filesystem::path{value};
+            }
+        } else if (name == "store") {
+            _config.store = std::filesystem::path{value};
+        } else if (name == "store-size") {
+            const auto v = parse_u64(value);
+            if (!v || *v < min_store_size || *v % store_page_size != 0) {
+                return fail("store-size must be a multiple of 4096, at least " +
+                            std::to_string(min_store_size));
+            }
+            _config.store_size = *v;
+        } else if (name == "store-anchor") {
+            if (value != "ephemeral") {
+                _config.store_anchor = std::filesystem::path{value};
             }
         } else if (name == "command-timeout-ms") {
             return millis(value, _config.command_timeout);

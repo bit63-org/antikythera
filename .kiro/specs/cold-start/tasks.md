@@ -16,7 +16,7 @@ and `helm-control-plane`. Pairs with kythira's
     injection for tests
   - _Requirements: 1.1-1.7_
 
-- [ ] 3. Boot epoch and sequence floor
+- [x] 3. Boot epoch and sequence floor
   - Secure-element boot epoch; last sequence in the store; both in the
     measured provisioning file; hull refuses sequence numbers at or below
     the floor

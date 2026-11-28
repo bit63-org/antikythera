@@ -103,6 +103,34 @@ check-interval-ms 250
     BOOST_TEST((c->check_interval == 250ms));
 }
 
+// cold-start Requirements 1 and 6.3: the optional sealed store.
+BOOST_AUTO_TEST_CASE(store_directives_parse_and_go_together) {
+    auto plain = helm::parse_helm_config(base);
+    BOOST_REQUIRE(plain.has_value());
+    BOOST_TEST(!plain->store.has_value());
+
+    auto c = helm::parse_helm_config(base +
+                                     "store /var/lib/helm/store\nstore-size 0x20000\n"
+                                     "store-anchor /var/lib/helm/anchor\n");
+    BOOST_REQUIRE_MESSAGE(c.has_value(), (c ? std::string{} : c.error()));
+    BOOST_TEST(c->store->string() == "/var/lib/helm/store");
+    BOOST_TEST(c->store_size == 0x20000U);
+    BOOST_TEST(c->store_anchor->string() == "/var/lib/helm/anchor");
+
+    auto e = helm::parse_helm_config(base + "store /s\nstore-anchor ephemeral\n");
+    BOOST_REQUIRE(e.has_value());
+    BOOST_TEST(!e->store_anchor.has_value());
+    BOOST_TEST(e->store_size == std::uint64_t{1} << 20);
+
+    BOOST_TEST(contains(error_of(base + "store /s\n"), "store and store-anchor go together"));
+    BOOST_TEST(contains(error_of(base + "store-anchor /a\n"), "go together"));
+    BOOST_TEST(contains(error_of(base + "store-size 65536\n"), "store-size without store"));
+    BOOST_TEST(contains(error_of(base + "store /s\nstore-anchor /a\nstore-size 4096\n"),
+                        "store-size must be"));
+    BOOST_TEST(contains(error_of(base + "store /s\nstore-anchor /a\nstore-size 20000\n"),
+                        "store-size must be"));
+}
+
 BOOST_AUTO_TEST_CASE(ipv6_controllers_use_brackets) {
     std::string text = base;
     text.replace(text.find("10.0.0.1:7443"), std::string_view{"10.0.0.1:7443"}.size(),

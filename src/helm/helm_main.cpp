@@ -44,13 +44,17 @@
 #include <vector>
 
 #include "helm/audit_log.hpp"
+#include "helm/boot_state.hpp"
 #include "helm/controller_link.hpp"
+#include "helm/flash.hpp"
 #include "helm/helm_config.hpp"
 #include "helm/helm_daemon.hpp"
 #include "helm/key_store.hpp"
 #include "helm/power_sequencer.hpp"
+#include "helm/sealed_store.hpp"
 #include "helm/secure_element.hpp"
 #include "helm/sideband_binding.hpp"
+#include "helm/store_anchor.hpp"
 
 namespace {
 
@@ -164,12 +168,56 @@ auto run(const helm::HelmConfig& cfg) -> int {
         std::println(stderr, "{}: no host process configured; the host stays in reset", log_name);
     }
 
+    // The sealed store, if configured (.kiro/specs/cold-start/
+    // Requirements 1 and 6.3): the router records every relayed sequence
+    // number there and starts from the recorded one.
+    std::unique_ptr<helm::StoreAnchor> anchor;
+    std::unique_ptr<helm::FileFlash> flash;
+    std::optional<helm::SealedStore> store;
+    std::optional<helm::StoreSequenceRecorder> recorder;
+    auto daemon_config = make_daemon_config(cfg);
+    if (cfg.store) {
+        auto a = cfg.store_anchor ? helm::SoftwareStoreAnchor::open(*cfg.store_anchor)
+                                  : helm::SoftwareStoreAnchor::ephemeral();
+        if (!a) {
+            std::println(stderr, "{}: store anchor: {}", log_name, helm::to_string(a.error()));
+            return exit_failed;
+        }
+        anchor = std::move(*a);
+        auto f = helm::FileFlash::open(*cfg.store, cfg.store_size);
+        if (!f) {
+            std::println(stderr, "{}: store {}: {}", log_name, cfg.store->string(),
+                         helm::to_string(f.error()));
+            return exit_failed;
+        }
+        flash = std::move(*f);
+        auto st = helm::SealedStore::open(*flash, *anchor);
+        if (!st) {
+            std::println(stderr, "{}: sealed store: {}", log_name, helm::to_string(st.error()));
+            return exit_failed;
+        }
+        store.emplace(std::move(*st));
+        if (store->rolled_back() || store->degraded()) {
+            std::println(stderr, "{}: sealed store {} ({} fault(s))", log_name,
+                         store->rolled_back() ? "rolled back" : "degraded", store->faults());
+        }
+        const auto floor = helm::load_sequence_floor(*store);
+        if (!floor) {
+            std::println(stderr, "{}: sequence floor: {}", log_name,
+                         helm::to_string(floor.error().error));
+            return exit_failed;
+        }
+        recorder.emplace(*store, *floor);
+        daemon_config.router.last_seq = *floor;
+        daemon_config.router.sequence_recorder = &*recorder;
+    }
+
     DetachedHostPort host;
     std::println(stderr, "{}: no mailbox device yet (helm task 8): commands are refused", log_name);
 
     std::unique_ptr<helm::ControllerLink> link;
     helm::HelmDaemon daemon{
-        make_daemon_config(cfg),
+        std::move(daemon_config),
         keys,
         *audit,
         host,

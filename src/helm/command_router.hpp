@@ -26,7 +26,9 @@
 //      its data-plane role, create a VM or volume key, store a new volume
 //      on the storage role. A refused precondition or failed step undoes
 //      the steps before it and reports the command without relaying it.
-//   4. Relay. Audit, then the slot goes to the mailbox unmodified.
+//   4. Relay. Audit, record the sequence number in the sealed store
+//      (cold-start Requirement 6.3; RouterConfig::sequence_recorder), then
+//      the slot goes to the mailbox unmodified.
 //   5. Commit or compensate. On ok or accepted, the command's destructive
 //      steps happen now, only after hull verified the controller's
 //      signature: release functions, destroy or rewrap keys, erase or
@@ -372,11 +374,35 @@ public:
     virtual auto report(proto::ReportBody body) -> void = 0;
 };
 
+// Keeps the last sequence number helm relayed across power loss
+// (.kiro/specs/cold-start/ Requirement 6.3): the next boot's provisioning
+// file passes it to hull as its floor, so a command captured before the
+// power cycle is refused after it. Implemented over the sealed store by
+// StoreSequenceRecorder (helm/boot_state.hpp).
+class SequenceRecorder {
+public:
+    SequenceRecorder() = default;
+    SequenceRecorder(const SequenceRecorder&) = delete;
+    auto operator=(const SequenceRecorder&) -> SequenceRecorder& = delete;
+    SequenceRecorder(SequenceRecorder&&) = delete;
+    auto operator=(SequenceRecorder&&) -> SequenceRecorder& = delete;
+    virtual ~SequenceRecorder() = default;
+
+    // Durably records `seq` as relayed; false if it could not.
+    [[nodiscard]] virtual auto record(std::uint64_t seq) -> bool = 0;
+};
+
 struct RouterConfig {
     using Clock = std::chrono::steady_clock;
 
     // Highest sequence number already delivered (hull's floor, if known).
     std::uint64_t last_seq{0};
+    // If set, every command's sequence number is recorded here before it
+    // is relayed, and a command whose number cannot be recorded is
+    // refused (internal_error) rather than relayed: a relayed command
+    // missing from the record could be replayed after a power cycle. Not
+    // owned; must outlive the router.
+    SequenceRecorder* sequence_recorder{nullptr};
     std::chrono::milliseconds command_timeout{std::chrono::seconds{30}};
     // How long a released function may wait for DEVICE_RELEASED.
     std::chrono::milliseconds release_timeout{std::chrono::seconds{60}};
@@ -408,6 +434,7 @@ struct RouterStats {
     std::uint64_t duplicates{0};      // retries answered from history or ignored
     std::uint64_t stray_messages{0};  // undecodable, unexpected or late hull messages
     std::uint64_t audit_failures{0};
+    std::uint64_t sequence_record_failures{0};  // refused: the relayed sequence could not be kept
     std::uint64_t inconsistencies{0};        // hull confirmed something helm's state disagrees with
     std::uint64_t key_delivery_failures{0};  // ATTACH_VOLUME succeeded, the key did not arrive
     std::uint64_t storage_failures{0};       // a committed delete or rewrap failed on the media

@@ -338,6 +338,12 @@ auto CommandRouter::relay(std::uint64_t seq, const mailbox::Slot& slot, const ma
         refuse(seq, type, mailbox::Status::internal_error);
         return;
     }
+    if (_config.sequence_recorder != nullptr && !_config.sequence_recorder->record(seq)) {
+        ++_stats.sequence_record_failures;
+        compensate(seq, undo);
+        refuse(seq, type, mailbox::Status::internal_error);
+        return;
+    }
     if (!_host->post_command(slot)) {
         compensate(seq, undo);
         refuse(seq, type, mailbox::Status::internal_error);

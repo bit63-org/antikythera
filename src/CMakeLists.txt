@@ -99,6 +99,7 @@ add_library(ak_helm
   helm/power_sequencer.cpp
   helm/scoped_key.cpp
   helm/sealed_store.cpp
+  helm/boot_state.cpp
   helm/secure_element.cpp
   helm/sideband_binding.cpp
   helm/store_anchor.cpp

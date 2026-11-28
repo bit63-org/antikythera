@@ -372,6 +372,23 @@ auto server_id_from_text(std::string_view text) -> std::optional<mb::ServerId> {
     return v;
 }
 
+auto provisioning_from_file(std::span<const std::byte> bytes)
+    -> std::optional<proto::Provisioning> {
+    if (proto::is_provisioning_frame(bytes)) {
+        auto p = proto::decode_provisioning(bytes);
+        if (!p) {
+            return std::nullopt;
+        }
+        return *p;
+    }
+    const auto id = server_id_from_text(
+        std::string_view{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+    if (!id) {
+        return std::nullopt;
+    }
+    return proto::Provisioning{.server_id = *id, .boot_epoch = 0, .sequence_floor = 0};
+}
+
 auto server_id_from_cmdline(std::string_view cmdline) -> std::optional<mb::ServerId> {
     std::optional<std::string_view> last;
     for (const auto word :

@@ -83,7 +83,12 @@ auto PowerSequencer::boot() -> BootResult {
     _host_released = false;
 
     std::vector<SlotNumber> powered;
+    bool first = true;
     for (const auto slot : _config.slots) {
+        if (!first && _config.slot_stagger.count() > 0) {
+            _config.sleep(_config.slot_stagger);
+        }
+        first = false;
         if (_backplane->set_slot_power(slot, true)) {
             _health[slot] = SlotHealth::starting;
             powered.push_back(slot);

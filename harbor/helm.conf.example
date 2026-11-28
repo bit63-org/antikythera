@@ -21,5 +21,11 @@ slot 2 /run/antikythera/slot2-sideband.sock 0x08 0x12 8 18 /usr/local/bin/ak-boa
 # Released once the slots are up: harbor's L1 QEMU (harbor/l1/run.sh).
 host /usr/local/bin/harbor-l1 --server 7
 
+# After its own power returns helm holds the host for the power-on policy
+# (tier delay + slot x interval + jitter; 300 s with no stored policy).
+# `skip` releases it at once; keep `apply` to rehearse a cold start.
+power-on-policy skip
+# controller-keys 1:<64 hex digits>     # verifies stored power policies
+
 command-timeout-ms 30000
 link-timeout-ms 30000

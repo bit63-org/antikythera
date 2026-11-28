@@ -180,6 +180,21 @@ BOOST_AUTO_TEST_CASE(boot_releases_the_host_only_after_every_slot,
     BOOST_TEST(!r.seq.health(9).has_value());
 }
 
+// cold-start Requirement 3.3: at most one slot per slot_stagger.
+BOOST_AUTO_TEST_CASE(boot_staggers_slot_power, *boost::unit_test::timeout(unit_timeout_seconds)) {
+    Rig r;
+    const auto start = r.t;
+    const auto result = r.seq.boot();
+    BOOST_TEST(result.ready.size() == 3U);
+    const auto a = r.backplane.powered_at.at(slot_a);
+    const auto b = r.backplane.powered_at.at(slot_b);
+    const auto c = r.backplane.powered_at.at(slot_c);
+    BOOST_TEST((a == start));
+    BOOST_TEST((b - a == SequencerConfig{}.slot_stagger));
+    BOOST_TEST((c - b == SequencerConfig{}.slot_stagger));
+    BOOST_TEST(SequencerConfig{}.slot_stagger == milliseconds{500});
+}
+
 BOOST_AUTO_TEST_CASE(a_slot_without_link_faults_and_the_host_still_boots,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
     Rig r;

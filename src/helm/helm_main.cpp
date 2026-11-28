@@ -50,11 +50,14 @@
 #include "helm/helm_config.hpp"
 #include "helm/helm_daemon.hpp"
 #include "helm/key_store.hpp"
+#include "helm/power_on.hpp"
 #include "helm/power_sequencer.hpp"
 #include "helm/sealed_store.hpp"
 #include "helm/secure_element.hpp"
 #include "helm/sideband_binding.hpp"
 #include "helm/store_anchor.hpp"
+#include "hull/host_setup.hpp"
+#include "hull/signature_verifier.hpp"
 
 namespace {
 
@@ -85,6 +88,22 @@ auto fresh_boot_id() -> std::optional<std::uint64_t> {
     }
     return id;
 }
+
+// helm's RecordVerifier over hull's Ed25519 verifier and the configured
+// controller keys.
+class ControllerRecordVerifier final : public helm::RecordVerifier {
+public:
+    explicit ControllerRecordVerifier(ak::hull::SignatureVerifier verifier) noexcept
+        : _verifier{std::move(verifier)} {}
+    [[nodiscard]] auto verify(std::span<const std::byte> message,
+                              std::span<const std::byte, ak::proto::ed25519_signature_size> sig,
+                              std::uint16_t key_id) const -> bool override {
+        return _verifier.verify(message, sig, key_id).has_value();
+    }
+
+private:
+    ak::hull::SignatureVerifier _verifier;
+};
 
 // Stands in for the MailboxDevice (helm task 8) until it exists.
 class DetachedHostPort final : public helm::HostPort {
@@ -212,6 +231,49 @@ auto run(const helm::HelmConfig& cfg) -> int {
         daemon_config.router.sequence_recorder = &*recorder;
     }
 
+    // The power-on policy (cold-start Requirement 3): the newest verified
+    // record, or the defaults.
+    std::unique_ptr<ControllerRecordVerifier> verifier;
+    if (!cfg.controller_keys.empty()) {
+        const auto controller_keys = ak::hull::parse_controller_keys(cfg.controller_keys);
+        if (!controller_keys) {
+            std::println(stderr, "{}: controller-keys: {}", log_name,
+                         controller_keys.error().reason);
+            return exit_usage;
+        }
+        auto v = ak::hull::SignatureVerifier::create(*controller_keys);
+        if (!v) {
+            std::println(stderr, "{}: controller-keys: {}", log_name,
+                         ak::hull::to_string(v.error()));
+            return exit_usage;
+        }
+        verifier = std::make_unique<ControllerRecordVerifier>(std::move(*v));
+    } else {
+        std::println(stderr, "{}: no controller-keys: power policies are refused", log_name);
+    }
+    helm::PowerPolicyKeeper power_policy{cfg.server_id, store ? &*store : nullptr, verifier.get()};
+    const auto loaded = power_policy.load();
+    if (loaded != helm::PolicyVerdict::kept && loaded != helm::PolicyVerdict::none) {
+        std::println(stderr, "{}: stored power policy: {}", log_name, helm::to_string(loaded));
+    }
+    daemon_config.power_policy = &power_policy;
+    daemon_config.on_boot = [](const helm::BootResult& booted) {
+        std::println(stderr, "{}: boot: {} slot(s) ready, {} faulted, host {}", log_name,
+                     booted.ready.size(), booted.faulted.size(),
+                     booted.host_released ? "released" : "held");
+    };
+    auto returned = helm::helm_power_returned(cfg.power_marker);
+    if (!returned) {
+        // Waiting when helm only restarted is the safe mistake.
+        std::println(stderr, "{}: power marker {}: errno {}; assuming power returned", log_name,
+                     cfg.power_marker.string(), returned.error());
+    }
+    const auto& policy = power_policy.current();
+    const auto plan =
+        // `power-on-policy skip` counts as a restart: no wait.
+        helm::plan_power_on(policy, cfg.apply_power_policy && returned.value_or(true),
+                            helm::HostPowerOverride::none, helm::draw_jitter(policy.max_jitter_ms));
+
     DetachedHostPort host;
     std::println(stderr, "{}: no mailbox device yet (helm task 8): commands are refused", log_name);
 
@@ -279,10 +341,12 @@ auto run(const helm::HelmConfig& cfg) -> int {
         }
     }};
 
-    const auto booted = daemon.boot();
-    std::println(stderr, "{}: boot {:#x}: {} slot(s) ready, {} faulted, host {}", log_name,
-                 *boot_id, booted.ready.size(), booted.faulted.size(),
-                 booted.host_released ? "released" : "held");
+    // The host stays in reset for the policy's wait; the loop keeps the
+    // controller link served meanwhile and boots when it has passed.
+    std::println(stderr, "{}: boot {:#x}: tier {} slot {}{}, host released in {} ms", log_name,
+                 *boot_id, policy.tier, policy.slot,
+                 power_policy.from_record() ? "" : " (default policy)", plan.wait.count());
+    daemon.schedule_boot(std::chrono::steady_clock::now() + plan.wait);
 
     std::jthread link_runner{[&link](const std::stop_token& st) { link->run(st); }};
     daemon.run(stop.get_token());

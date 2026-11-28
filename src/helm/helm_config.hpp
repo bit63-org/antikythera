@@ -27,6 +27,18 @@
 //                               with store. With a store, helm records each
 //                               relayed command's sequence number there
 //                               (cold-start Requirement 6.3)
+//   controller-keys ID:HEX;...  the controller's Ed25519 public keys, as hull's
+//                               AK_HULL_CONTROLLER_KEYS; helm verifies signed
+//                               records it acts on alone (power_policy) with
+//                               them. Optional: without, every such record is
+//                               refused and the defaults apply
+//   power-marker PATH           a file in a tmpfs whose absence means helm's
+//                               own power returned (default
+//                               /run/ak-helm/powered; cold-start Requirement 3.6)
+//   power-on-policy apply|skip  `apply` (default) waits out the power-on
+//                               policy after helm's power returns; `skip`
+//                               releases the host at once (a harbor run that
+//                               is not testing cold start)
 //   slot N SOCKET ADDR PEER_ADDR EID PEER_EID ARGV...
 //                               a data-plane slot: the board process to
 //                               launch (ARGV, argv[0] an absolute path), the
@@ -80,6 +92,9 @@ struct HelmConfig {
     std::optional<std::filesystem::path> store;       // nullopt: no sealed store
     std::uint64_t store_size{std::uint64_t{1} << 20};
     std::optional<std::filesystem::path> store_anchor;  // nullopt: ephemeral
+    std::string controller_keys;                        // empty: none
+    std::filesystem::path power_marker{"/run/ak-helm/powered"};
+    bool apply_power_policy{true};
     std::map<SlotNumber, SlotEntry> slots;
     std::vector<std::string> host_argv;  // empty: no host process
 

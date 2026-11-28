@@ -181,6 +181,7 @@ ak_add_test(harbor_controller_test SOURCES harbor_controller_test.cpp LIBS ak::h
 ak_add_test(key_store_test     SOURCES key_store_test.cpp     LIBS ak::helm)
 ak_add_test(sealed_store_test SOURCES sealed_store_test.cpp LIBS ak::helm)
 ak_add_test(boot_state_test SOURCES boot_state_test.cpp LIBS ak::helm)
+ak_add_test(power_on_test SOURCES power_on_test.cpp LIBS ak::helm)
 ak_add_test(hpke_test          SOURCES hpke_test.cpp          LIBS ak::helm)
 ak_add_test(virtqueue_test    SOURCES virtqueue_test.cpp    LIBS ak::oar_virtio)
 ak_add_test(virtio_pci_test   SOURCES virtio_pci_test.cpp   LIBS ak::oar_virtio)

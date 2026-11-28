@@ -131,6 +131,26 @@ BOOST_AUTO_TEST_CASE(store_directives_parse_and_go_together) {
                         "store-size must be"));
 }
 
+// cold-start Requirement 3: power-on directives.
+BOOST_AUTO_TEST_CASE(power_on_directives_parse) {
+    auto plain = helm::parse_helm_config(base);
+    BOOST_REQUIRE(plain.has_value());
+    BOOST_TEST(plain->apply_power_policy);
+    BOOST_TEST(plain->power_marker.string() == "/run/ak-helm/powered");
+    BOOST_TEST(plain->controller_keys.empty());
+
+    auto c = helm::parse_helm_config(base +
+                                     "power-on-policy skip\npower-marker /run/x/m\n"
+                                     "controller-keys 1:abcd\n");
+    BOOST_REQUIRE_MESSAGE(c.has_value(), (c ? std::string{} : c.error()));
+    BOOST_TEST(!c->apply_power_policy);
+    BOOST_TEST(c->power_marker.string() == "/run/x/m");
+    BOOST_TEST(c->controller_keys == "1:abcd");  // checked by ak-helm with hull's parser
+
+    BOOST_TEST(contains(error_of(base + "power-on-policy maybe\n"), "apply or skip"));
+    BOOST_TEST(contains(error_of(base + "power-marker relative\n"), "absolute path"));
+}
+
 BOOST_AUTO_TEST_CASE(ipv6_controllers_use_brackets) {
     std::string text = base;
     text.replace(text.find("10.0.0.1:7443"), std::string_view{"10.0.0.1:7443"}.size(),

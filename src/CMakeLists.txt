@@ -100,6 +100,7 @@ add_library(ak_helm
   helm/scoped_key.cpp
   helm/sealed_store.cpp
   helm/boot_state.cpp
+  helm/power_on.cpp
   helm/secure_element.cpp
   helm/sideband_binding.cpp
   helm/store_anchor.cpp
@@ -113,7 +114,7 @@ target_link_libraries(ak_helm
 # ak-helm: the helm daemon as harbor runs it (board processes, socket
 # sidebands, the ControllerLink).
 add_executable(ak-helm helm/helm_main.cpp)
-target_link_libraries(ak-helm PRIVATE ak::helm ak::warnings ak::hardening)
+target_link_libraries(ak-helm PRIVATE ak::helm ak::hull ak::warnings ak::hardening)
 install(TARGETS ak-helm RUNTIME DESTINATION bin)
 
 # hull: host-agent command authentication (Ed25519 signatures and sequence

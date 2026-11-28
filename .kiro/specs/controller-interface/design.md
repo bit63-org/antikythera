@@ -375,8 +375,11 @@ CREATE_VOLUME is about to create, `.kiro/specs/oar-blk-data-plane/` task 15),
 `vpc_config` (type 14, a VpcConfig frame), `group_members` (type 15,
 a GroupMembers frame), `instance_metadata` (type 16, an
 InstanceMetadata frame), and from fleet-scale-networking `vtep_credential`
-(type 30), `credential_revocations` (type 31) and `rotate_vtep_key` (type
-35); 19-29 and 32-34 are reserved by other specs and refused until built. Helm to controller: `hello` (`server_id u64 |
+(type 30), `credential_revocations` (type 31), `frame_notice` (type 33:
+`server_id u64` then a 56-byte FrameNotice, `src/proto/frame_notice.hpp`,
+unsigned since the fetched frame is checked against its digest and its own
+signature) and `rotate_vtep_key` (type 35); 19-29, 32 and 34 are reserved
+by other specs and refused until built. Helm to controller: `hello` (`server_id u64 |
 boot_id u64`, the first record on every connection) and `report`. Report sequence
 numbers restart when helm reboots, so the controller keys them by the
 connection's boot ID and drops any `(boot_id, report_seq)` it has already

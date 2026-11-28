@@ -331,6 +331,17 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
             _sink->on_credential_revocations(*list, rec.payload);
             return {};
         }
+        case proto::RecordType::frame_notice: {
+            auto notice = proto::decode_frame_notice_record(rec.payload);
+            if (!notice) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (notice->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_frame_notice(notice->notice);
+            return {};
+        }
         case proto::RecordType::rotate_vtep_key: {
             auto request = proto::decode_rotate_vtep_key(rec.payload);
             if (!request) {

@@ -112,6 +112,8 @@ struct RecordingSink final : helm::ControllerSink {
     auto on_rotate_vtep_key(const proto::RotateVtepKey& k) -> void override {
         rotations.push_back(k);
     }
+    std::vector<proto::FrameNotice> notices;
+    auto on_frame_notice(const proto::FrameNotice& n) -> void override { notices.push_back(n); }
     std::vector<std::pair<proto::VtepCredential, std::vector<std::byte>>> credentials;
     auto on_vtep_credential(const proto::VtepCredential& c, std::span<const std::byte> frame)
         -> void override {
@@ -388,6 +390,17 @@ auto rotate_record(std::uint64_t to) -> std::vector<std::byte> {
     return framed(RecordType::rotate_vtep_key, *b);
 }
 
+auto notice_record(std::uint64_t to) -> std::vector<std::byte> {
+    auto b = proto::encode_frame_notice_record({.server_id = to,
+                                                .notice = {.kind = proto::FrameKind::vpc_stream,
+                                                           .vni_or_scope = 0xAB0001,
+                                                           .sequence_or_version = 9,
+                                                           .size = 100,
+                                                           .sha256 = {}}});
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::frame_notice, *b);
+}
+
 auto credential_record(std::uint64_t to) -> std::vector<std::byte> {
     proto::VtepCredential c{.key_id = 3,
                             .server_id = to,
@@ -615,6 +628,28 @@ BOOST_FIXTURE_TEST_CASE(key_rotations_reach_the_sink_for_this_server_only, Fixtu
     BOOST_REQUIRE(!res.has_value());
     BOOST_TEST((res.error() == SessionError::wrong_server));
     BOOST_TEST(sink.rotations.size() == 1U);
+}
+
+// fleet-scale-networking task 11.
+BOOST_FIXTURE_TEST_CASE(frame_notices_reach_the_sink_for_this_server_only, Fixture) {
+    session.on_connected();
+    BOOST_REQUIRE(session.on_bytes(notice_record(server)).has_value());
+    BOOST_REQUIRE(sink.notices.size() == 1U);
+    BOOST_TEST(sink.notices[0].sequence_or_version == 9U);
+    BOOST_TEST(sink.notices[0].vni_or_scope == 0xAB0001U);
+    session.on_disconnected();
+    session.on_connected();
+    auto res = session.on_bytes(notice_record(other_server));
+    BOOST_REQUIRE(!res.has_value());
+    BOOST_TEST((res.error() == SessionError::wrong_server));
+    session.on_disconnected();
+    session.on_connected();
+    auto bad = notice_record(server);
+    bad[proto::record_header_size + 8] = std::byte{9};  // an unknown kind
+    res = session.on_bytes(bad);
+    BOOST_REQUIRE(!res.has_value());
+    BOOST_TEST((res.error() == SessionError::bad_record));
+    BOOST_TEST(sink.notices.size() == 1U);
 }
 
 // fleet-scale-networking task 2: a credential for this server and any

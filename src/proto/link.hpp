@@ -61,6 +61,10 @@
 //   credential_revocations controller -> helm a CredentialRevocations
 //                                      (vtep_credential.hpp): the revoked
 //                                      credentials of one cell
+//   frame_notice  controller -> helm   server_id u64 | FrameNotice (frame_notice.hpp):
+//                                      a signed frame waiting in a frame
+//                                      store, for the network roles to
+//                                      fetch over their bulk channel
 //   rotate_vtep_key controller -> helm server_id u64 | slot u8 | rsvd [3]
 //                                      | key_epoch u32: derive a new tunnel
 //                                      key for the network role in that slot
@@ -150,6 +154,7 @@
 #include "proto/volume_layout.hpp"
 #include "proto/volume_op.hpp"
 #include "proto/vpc_config.hpp"
+#include "proto/frame_notice.hpp"
 #include "proto/vtep_credential.hpp"
 
 namespace ak::proto {
@@ -187,7 +192,8 @@ inline constexpr std::size_t max_record_payload =
               power_policy_size,
               rotate_vtep_key_size,
               vtep_credential_size,
-              max_credential_revocations_size});
+              max_credential_revocations_size,
+              frame_notice_record_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class RecordType : std::uint16_t {
@@ -213,6 +219,7 @@ enum class RecordType : std::uint16_t {
     power_policy = 24,
     vtep_credential = 30,
     credential_revocations = 31,
+    frame_notice = 33,
     rotate_vtep_key = 35,
 };
 
@@ -274,7 +281,7 @@ namespace detail {
     return (t >= RecordType::envelope && t <= RecordType::self_test) ||
            t == RecordType::standing_set || t == RecordType::power_policy ||
            t == RecordType::vtep_credential || t == RecordType::credential_revocations ||
-           t == RecordType::rotate_vtep_key;
+           t == RecordType::frame_notice || t == RecordType::rotate_vtep_key;
 }
 
 }  // namespace detail

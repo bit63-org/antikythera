@@ -131,6 +131,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
@@ -152,6 +153,7 @@
 #include "oar/net/virtio_net.hpp"
 #include "oar/net/vswitch.hpp"
 #include "oar/net/vtep.hpp"
+#include "proto/frame_notice.hpp"
 
 namespace ak::oar::net {
 
@@ -244,6 +246,12 @@ struct RoleCounters {
     // VTEP credentials and revocation lists the CredentialStore refused
     // (fleet-scale-networking task 2; its counters say why).
     std::uint64_t credentials_refused{0};
+    // Frame notices (fleet-scale-networking task 11): kept for the bulk
+    // channel, refused when they do not decode, and dropped (oldest
+    // first) past max_pending_notices.
+    std::uint64_t frame_notices{0};
+    std::uint64_t frame_notices_refused{0};
+    std::uint64_t frame_notices_dropped{0};
     // GroupPolicy frames (task 13), counted like map_updates.
     std::uint64_t group_applied{0};
     std::uint64_t group_redelivered{0};
@@ -303,6 +311,13 @@ public:
     auto tunnel_peers(std::span<const std::byte> frame) -> helm::oar::Status override;
     auto vtep_credential(std::span<const std::byte> frame) -> helm::oar::Status override;
     auto credential_revocations(std::span<const std::byte> frame) -> helm::oar::Status override;
+    // A frame to fetch over the bulk channel: decoded and kept, in arrival
+    // order, until the bulk fetcher (task 12) takes it.
+    auto frame_notice(std::span<const std::byte> notice) -> helm::oar::Status override;
+    static constexpr std::size_t max_pending_notices = 1024;
+    [[nodiscard]] auto pending_notices() const noexcept -> const std::deque<proto::FrameNotice>& {
+        return _notices;
+    }
 
     // Enrollment (fleet-scale-networking task 10): the role certificate its
     // bulk channel presents to frame stores. Without set_enrollment the
@@ -398,6 +413,7 @@ private:
     std::unique_ptr<TunnelPeerSet> _peer_set;
     std::unique_ptr<CredentialStore> _credentials;
     helm::RoleEnrollment* _enrollment{nullptr};
+    std::deque<proto::FrameNotice> _notices;
     std::optional<tls::Config> _bulk_tls;
     std::unique_ptr<Vtep> _vtep;
     std::unique_ptr<VSwitch> _vswitch;

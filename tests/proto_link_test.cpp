@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "proto/link.hpp"
@@ -228,9 +229,99 @@ BOOST_AUTO_TEST_CASE(credential_records_are_framed) {
     BOOST_REQUIRE(back.size() == 1U);
     BOOST_TEST((back[0].type == RecordType::credential_revocations));
     BOOST_TEST(back[0].payload.size() == full.size());
-    for (const std::uint16_t t : {std::uint16_t{29}, std::uint16_t{32}, std::uint16_t{33}}) {
+    for (const std::uint16_t t : {std::uint16_t{29}, std::uint16_t{32}, std::uint16_t{34}}) {
         BOOST_TEST(!proto::encode_record(static_cast<RecordType>(t), {}).has_value());
     }
+}
+
+// fleet-scale-networking task 11: link record 33 and the 56-byte notice
+// helm passes to its network roles (vendor type 0x33).
+BOOST_AUTO_TEST_CASE(frame_notices_round_trip_and_are_strict) {
+    BOOST_TEST(static_cast<std::uint16_t>(RecordType::frame_notice) == 33U);
+    BOOST_TEST(proto::max_record_payload >= proto::frame_notice_record_size);
+    proto::FrameNotice n{.kind = proto::FrameKind::vpc_stream,
+                         .vni_or_scope = 0xAB0001,
+                         .sequence_or_version = 0x0102'0304'0506'0708,
+                         .size = 0x0002'0000,
+                         .sha256 = {}};
+    for (std::size_t i = 0; i < n.sha256.size(); ++i) {
+        n.sha256[i] = static_cast<std::byte>(0xA0 + i);
+    }
+    const auto b = proto::encode_frame_notice(n);
+    BOOST_REQUIRE(b.has_value());
+    BOOST_REQUIRE(b->size() == proto::frame_notice_size);
+    const auto head = ak::test::bytes_of(0x01, 0, 0, 0, 0x01, 0x00, 0xAB, 0, 0x08, 0x07, 0x06, 0x05,
+                                         0x04, 0x03, 0x02, 0x01, 0, 0, 0x02, 0, 0, 0, 0, 0);
+    BOOST_TEST(std::ranges::equal(std::span{*b}.first(head.size()), head));
+    BOOST_TEST(std::to_integer<int>((*b)[0x18]) == 0xA0);
+    BOOST_TEST(std::to_integer<int>((*b)[0x37]) == 0xA0 + 31);
+    BOOST_TEST((proto::decode_frame_notice(*b).value() == n));
+    for (std::size_t len = 0; len < b->size(); ++len) {
+        BOOST_TEST((proto::decode_frame_notice(std::span{*b}.first(len)).error() ==
+                    DecodeError::truncated));
+    }
+    auto longer = *b;
+    longer.push_back(std::byte{0});
+    BOOST_TEST((proto::decode_frame_notice(longer).error() == DecodeError::trailing_bytes));
+    for (const std::size_t off : {1U, 2U, 3U, 0x14U, 0x15U, 0x16U, 0x17U}) {
+        auto bad = *b;
+        bad[off] = std::byte{1};
+        BOOST_TEST((proto::decode_frame_notice(bad).error() == DecodeError::reserved_not_zero));
+    }
+    const auto refused = [](proto::FrameNotice m) {
+        const auto e = proto::encode_frame_notice(m);
+        return e ? std::optional<DecodeError>{} : std::optional<DecodeError>{e.error()};
+    };
+    auto m = n;
+    m.kind = static_cast<proto::FrameKind>(4);
+    BOOST_TEST((refused(m) == DecodeError::unknown_value));
+    m = n;
+    m.kind = static_cast<proto::FrameKind>(0);
+    BOOST_TEST((refused(m) == DecodeError::unknown_value));
+    m = n;
+    m.vni_or_scope = 0;
+    BOOST_TEST((refused(m) == DecodeError::bad_vni));
+    m.vni_or_scope = proto::max_notice_vni + 1;
+    BOOST_TEST((refused(m) == DecodeError::bad_vni));
+    m.kind = proto::FrameKind::security_policy;  // a scope, not a VNI: any value
+    BOOST_TEST(!refused(m).has_value());
+    m = n;
+    m.sequence_or_version = 0;
+    BOOST_TEST((refused(m) == DecodeError::bad_id));
+    m = n;
+    m.size = 0;
+    BOOST_TEST((refused(m) == DecodeError::bad_frame_size));
+    m.size = proto::max_notice_frame_size + 1;
+    BOOST_TEST((refused(m) == DecodeError::bad_frame_size));
+    m.size = proto::max_notice_frame_size;
+    BOOST_TEST(!refused(m).has_value());
+    // The decoder refuses what the encoder would: a zero size on the wire.
+    auto zero = *b;
+    zero[0x12] = std::byte{0};
+    BOOST_TEST((proto::decode_frame_notice(zero).error() == DecodeError::bad_frame_size));
+
+    // The record: the server, then the notice.
+    const proto::FrameNoticeRecord rec{.server_id = 7, .notice = n};
+    const auto rb = proto::encode_frame_notice_record(rec);
+    BOOST_REQUIRE(rb.has_value());
+    BOOST_REQUIRE(rb->size() == proto::frame_notice_record_size);
+    BOOST_TEST(std::to_integer<int>((*rb)[0]) == 7);
+    BOOST_TEST(std::ranges::equal(std::span{*rb}.subspan(8), *b));
+    BOOST_TEST((proto::decode_frame_notice_record(*rb).value() == rec));
+    BOOST_TEST((proto::encode_frame_notice_record({.server_id = 0, .notice = n}).error() ==
+                DecodeError::bad_server_id));
+    auto no_server = *rb;
+    no_server[0] = std::byte{0};
+    BOOST_TEST(
+        (proto::decode_frame_notice_record(no_server).error() == DecodeError::bad_server_id));
+    BOOST_TEST((proto::decode_frame_notice_record(std::span{*rb}.first(60)).error() ==
+                DecodeError::truncated));
+    auto rlonger = *rb;
+    rlonger.push_back(std::byte{0});
+    BOOST_TEST((proto::decode_frame_notice_record(rlonger).error() == DecodeError::trailing_bytes));
+    BOOST_TEST(proto::encode_record(RecordType::frame_notice, *rb).has_value());
+    BOOST_TEST(std::string_view{proto::to_string(DecodeError::bad_frame_size)} ==
+               "frame notice size is zero or too large");
 }
 
 BOOST_AUTO_TEST_CASE(encode_refuses_what_decode_would) {

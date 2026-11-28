@@ -17,11 +17,13 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -123,6 +125,7 @@ public:
     ak::helm::VolumeId key_volume{0};
     std::vector<std::vector<std::byte>> frames;
     std::vector<std::vector<std::byte>> peer_frames;
+    std::vector<std::vector<std::byte>> notices;
     std::optional<ak::helm::VolumeId> created;
     std::uint64_t created_sectors{0};
     std::vector<std::byte> created_key;
@@ -130,6 +133,10 @@ public:
     ak::helm::VmId rewrapped_owner{0};
     std::vector<std::byte> rewrapped_key;
 
+    auto frame_notice(std::span<const std::byte> n) -> oar::Status override {
+        notices.emplace_back(n.begin(), n.end());
+        return status;
+    }
     auto create_volume(const oar::CreateVolume& r) -> oar::Status override {
         created = r.volume_id;
         created_sectors = r.capacity_sectors;
@@ -615,6 +622,114 @@ BOOST_AUTO_TEST_CASE(map_apply_failure_is_reported) {
     auto r = link.map_update(pattern(multi_chunk_frame));
     BOOST_TEST((r.error().code == LinkErrc::refused));
     BOOST_TEST((r.error().status == oar::Status::failed));
+}
+
+// fleet-scale-networking task 11: a frame notice is one message, passed
+// through undecoded; the wrong size never reaches the wire, and the role's
+// endpoint refuses one that arrives anyway.
+BOOST_AUTO_TEST_CASE(frame_notices_cross_whole) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    FakeOar fake;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config(long_timeout)};
+    const auto notice = pattern(oar::frame_notice_body);
+    {
+        const Server server{endpoint, fake};
+        BOOST_TEST(link.frame_notice(notice).has_value());
+        BOOST_TEST((link.frame_notice(pattern(oar::frame_notice_body + 1)).error().code ==
+                    LinkErrc::bad_request));
+        BOOST_TEST((link.frame_notice({}).error().code == LinkErrc::bad_request));
+    }
+    BOOST_REQUIRE(fake.notices.size() == 1U);
+    BOOST_TEST((fake.notices[0] == notice));
+    BOOST_TEST(static_cast<int>(mctp::VendorType::frame_notice) == 0x33);
+
+    const auto short_body = pattern(oar::frame_notice_body - 1);
+    send_raw_request(*helm_b, mctp::VendorType::frame_notice, short_body, 0);
+    serve_request(endpoint, fake);
+    BOOST_TEST((read_raw_status(*helm_b) == oar::Status::bad_request));
+    BOOST_TEST(fake.notices.size() == 1U);
+}
+
+// fleet-scale-networking task 11: a multi-chunk frame is bulk, sent a
+// chunk per pump_bulk, and control requests and single-chunk frames of
+// other types cross between its chunks without disturbing the transfer.
+BOOST_AUTO_TEST_CASE(bulk_frames_yield_to_control_between_chunks) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    FakeOar fake;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config(long_timeout)};
+    const auto big = pattern(multi_chunk_frame);
+    auto small_peers = pattern(oar::max_map_chunk);
+    small_peers[0] = std::byte{0xEE};
+    auto small_map = pattern(64);
+    small_map[0] = std::byte{0x55};
+    const oar::PrepareFunction prep{.fn = sample_fn,
+                                    .type = FunctionType::blk_fn,
+                                    .vm_id = sample_vm,
+                                    .config = oar::BlkConfig{.volume_id = sample_volume}};
+    std::vector<std::string> done;
+    const auto note = [&done](std::string what) {
+        return [&done, what = std::move(what)](const std::expected<void, ak::helm::LinkError>& r) {
+            done.push_back(what + (r ? ":ok" : ":failed"));
+        };
+    };
+    {
+        const Server server{endpoint, fake};
+        link.send_frame(mctp::VendorType::map_update, big, note("big"));
+        BOOST_TEST(link.bulk_pending());
+        BOOST_TEST(done.empty());
+        BOOST_TEST(link.pump_bulk());
+        // Control, and a whole frame of another type, cross at once.
+        BOOST_TEST(link.prepare_function(prep).has_value());
+        link.send_frame(mctp::VendorType::tunnel_peers, small_peers, note("peers"));
+        BOOST_REQUIRE(done.size() == 1U);
+        BOOST_TEST(done[0] == "peers:ok");
+        // A frame of the type in transfer waits its turn behind it.
+        link.send_frame(mctp::VendorType::map_update, small_map, note("small"));
+        BOOST_TEST(done.size() == 1U);
+        // A frame outside its type's limits never queues.
+        link.send_frame(mctp::VendorType::map_update, {}, note("empty"));
+        link.send_frame(mctp::VendorType::health, small_map, note("not a frame"));
+        BOOST_REQUIRE(done.size() == 3U);
+        BOOST_TEST(done[1] == "empty:failed");
+        BOOST_TEST(done[2] == "not a frame:failed");
+        while (link.pump_bulk()) {
+        }
+        BOOST_TEST(!link.bulk_pending());
+        BOOST_REQUIRE(done.size() == 5U);
+        BOOST_TEST(done[3] == "big:ok");
+        BOOST_TEST(done[4] == "small:ok");
+        // Three chunks of the big frame, one of the small one behind it.
+        BOOST_TEST(link.bulk_chunks() == 4U);
+    }
+    BOOST_TEST((fake.prepared == prep));
+    BOOST_REQUIRE(fake.frames.size() == 2U);
+    BOOST_TEST((fake.frames[0] == big));
+    BOOST_TEST((fake.frames[1] == small_map));
+    BOOST_REQUIRE(fake.peer_frames.size() == 1U);
+    BOOST_TEST((fake.peer_frames[0] == small_peers));
+}
+
+BOOST_AUTO_TEST_CASE(a_refused_bulk_frame_reports_the_refusal) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    FakeOar fake;
+    fake.status = oar::Status::failed;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config(long_timeout)};
+    const Server server{endpoint, fake};
+    std::optional<ak::helm::LinkError> error;
+    link.send_frame(mctp::VendorType::map_update, pattern(multi_chunk_frame),
+                    [&error](const std::expected<void, ak::helm::LinkError>& r) {
+                        if (!r) {
+                            error = r.error();
+                        }
+                    });
+    while (link.pump_bulk()) {
+    }
+    BOOST_REQUIRE(error.has_value());
+    BOOST_TEST((error->code == LinkErrc::refused));
+    BOOST_TEST((error->status == oar::Status::failed));
 }
 
 BOOST_AUTO_TEST_CASE(peer_gone_is_disconnected) {

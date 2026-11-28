@@ -313,6 +313,11 @@ struct DaemonStats {
     std::uint64_t credential_revocations{0};          // lists kept: newer for their cell
     std::uint64_t credential_revocations_stale{0};    // not newer: dropped
     std::uint64_t credential_revocations_refused{0};  // a network role refused one
+    // OarLink scheduling (fleet-scale-networking task 11): chunks of bulk
+    // transfers sent, one per link per pass.
+    std::uint64_t bulk_chunks{0};
+    std::uint64_t frame_notices{0};          // forwarded to every network role
+    std::uint64_t frame_notices_refused{0};  // a network role refused one
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -367,6 +372,9 @@ public:
     // The health a network role last reported (loop thread); empty for
     // other roles, or before the first answer.
     [[nodiscard]] auto role_health(SlotNumber slot) const -> std::optional<oar::Health>;
+    // Whether any link still has a bulk transfer queued; run_once does not
+    // wait for the inbox while one does.
+    [[nodiscard]] auto bulk_pending() const -> bool;
     [[nodiscard]] auto group_usage() const noexcept -> const GroupUsageStats& {
         return _groups.stats();
     }
@@ -401,6 +409,7 @@ public:
     auto on_power_policy(const proto::PowerPolicy& policy, std::span<const std::byte> frame)
         -> void override;
     auto on_rotate_vtep_key(const proto::RotateVtepKey& request) -> void override;
+    auto on_frame_notice(const proto::FrameNotice& notice) -> void override;
     auto on_vtep_credential(const proto::VtepCredential& credential,
                             std::span<const std::byte> frame) -> void override;
     auto on_credential_revocations(const proto::CredentialRevocations& list,
@@ -483,7 +492,7 @@ private:
                               proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
                               ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame, MetadataFrame,
                               LayoutFrame, proto::SelfTest, PowerPolicyFrame, proto::RotateVtepKey,
-                              CredentialFrame, RevocationsFrame>;
+                              CredentialFrame, RevocationsFrame, proto::FrameNotice>;
     // Where a NIC with a kept record is plugged: its network role's slot
     // and function.
     struct MetadataHome {
@@ -561,6 +570,8 @@ private:
     auto enqueue(Item item) -> void;
     auto handle(Item& item) -> void;
     auto apply_map(MapFrame& map) -> void;
+    // One chunk of each link's oldest bulk transfer.
+    auto pump_bulk() -> void;
     // VPC configs: kept per VNI, to every attached net role (with or
     // without a VTEP).
     [[nodiscard]] static auto is_net_role(const SlotState& slot) -> bool;
@@ -604,6 +615,8 @@ private:
     auto poll_credential(SlotState& slot) -> void;
     auto keep_credential(CredentialFrame& credential) -> void;
     auto keep_revocations(RevocationsFrame& list) -> void;
+    // Frame notices go to every network role at once, as control traffic.
+    auto forward_notice(const proto::FrameNotice& notice) -> void;
     auto send_credentials(SlotState& slot) -> void;
     auto poll_health(SlotState& slot) -> void;
     // Opens the sideband, reads the inventory, registers with the router.

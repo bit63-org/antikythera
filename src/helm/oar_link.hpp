@@ -37,7 +37,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <span>
 #include <vector>
@@ -137,6 +139,11 @@ public:
     // chunks like tunnel_peers (fleet-scale-networking task 2).
     auto vtep_credential(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
     auto credential_revocations(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
+    // Tells a network role about a frame waiting in a frame store
+    // (fleet-scale-networking task 11): one proto::FrameNotice, passed
+    // through undecoded in one message; fails without sending unless it is
+    // oar::frame_notice_body bytes.
+    auto frame_notice(std::span<const std::byte> notice) -> std::expected<void, LinkError>;
     auto health() -> std::expected<oar::Health, LinkError>;
     // Forwards one controller GroupPolicy frame to a network role in
     // chunks, like map_update; fails without sending unless it is
@@ -209,9 +216,44 @@ public:
     // back as a capacity report through hold_reports.
     auto self_test() -> std::expected<void, LinkError>;
 
+    // Scheduling classes (fleet-scale-networking Requirement 6.4, task 11).
+    // Everything above is control or status: one request, answered before
+    // the call returns. A controller frame that takes more than one chunk
+    // is bulk: send_frame queues it and pump_bulk sends one chunk per call,
+    // so the caller can serve control and status work between chunks and a
+    // lease or a key never waits behind a whole transfer. A frame that fits
+    // one chunk goes at once, unless a transfer of the same type is queued,
+    // when it waits its turn behind it so a role sees each type's frames in
+    // the order helm sent them. The role's endpoint keeps a transfer in
+    // progress across single-chunk frames of any type.
+    //
+    // `done` runs once with the frame's outcome: before send_frame returns
+    // for a frame sent at once or refused (bad_request: a type that is not
+    // a controller frame, or a size outside that type's limits), otherwise
+    // from the pump_bulk call that ends the transfer. A chunk that fails
+    // ends its transfer with that error; the role discards its partial
+    // frame when the next transfer starts. Transfers still queued when the
+    // link is destroyed never complete and their `done` never runs.
+    using FrameDone = std::function<void(const std::expected<void, LinkError>&)>;
+    auto send_frame(mctp::VendorType type, std::span<const std::byte> frame, FrameDone done)
+        -> void;
+    // Sends the next chunk of the oldest queued transfer; true while any
+    // transfer is still queued.
+    auto pump_bulk() -> bool;
+    [[nodiscard]] auto bulk_pending() const noexcept -> bool { return !_bulk.empty(); }
+    // Bulk chunks sent, and transfers ended (whatever the outcome).
+    [[nodiscard]] auto bulk_chunks() const noexcept -> std::uint64_t { return _bulk_chunks; }
+
     [[nodiscard]] auto stats() const noexcept -> const LinkStats& { return _stats; }
 
 private:
+    struct BulkTransfer {
+        mctp::VendorType type{mctp::VendorType::map_update};
+        std::vector<std::byte> frame;
+        std::size_t offset{0};
+        FrameDone done;
+    };
+
     // Sends one request and waits for its response; returns the response
     // body after an ok head. `secret` wipes every buffer that held the body.
     auto transact(mctp::VendorType type, std::vector<std::byte>& body, bool secret = false)
@@ -224,13 +266,19 @@ private:
     // tunnel_peers, role_certificate).
     auto send_chunked(mctp::VendorType type, std::span<const std::byte> frame)
         -> std::expected<void, LinkError>;
+    // One chunk of `frame` at `offset`, of at most oar::max_map_chunk bytes;
+    // returns the chunk's length.
+    auto send_chunk(mctp::VendorType type, std::span<const std::byte> frame, std::size_t offset)
+        -> std::expected<std::size_t, LinkError>;
 
     Binding* _binding;
     LinkConfig _config;
     mctp::Assembler _assembler;
     std::uint8_t _next_tag{0};
     LinkStats _stats;
-    std::uint64_t _report_ack{0};  // the last hold report read whole
+    std::uint64_t _report_ack{0};    // the last hold report read whole
+    std::deque<BulkTransfer> _bulk;  // oldest first; the front is in progress
+    std::uint64_t _bulk_chunks{0};
 };
 
 // What a data-plane role implements to answer OarLink. Each call returns the
@@ -293,6 +341,10 @@ public:
         return oar::Status::unsupported;
     }
     virtual auto credential_revocations(std::span<const std::byte> /*frame*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    // A FrameNotice (oar::frame_notice_body bytes), not yet decoded.
+    virtual auto frame_notice(std::span<const std::byte> /*notice*/) -> oar::Status {
         return oar::Status::unsupported;
     }
     virtual auto tunnel_peers(std::span<const std::byte> /*frame*/) -> oar::Status {
@@ -394,6 +446,9 @@ private:
     auto frame_chunk(OarHandler& handler, mctp::VendorType type, std::span<const std::byte> body)
         -> oar::Status;
     auto reset_frame() noexcept -> void;
+    // Hands a whole frame of `type` to its handler.
+    static auto deliver_frame(OarHandler& handler, mctp::VendorType type,
+                              std::span<const std::byte> frame) -> oar::Status;
 
     Binding* _binding;
     LinkConfig _config;

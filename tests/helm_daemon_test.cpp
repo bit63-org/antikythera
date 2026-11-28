@@ -204,6 +204,17 @@ public:
         const std::scoped_lock lock{_mutex};
         return _revocation_lists;
     }
+    // fleet-scale-networking task 11: frame notices, exactly as sent.
+    std::atomic<oar::Status> notice_status{oar::Status::ok};
+    [[nodiscard]] auto notices() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _notices;
+    }
+    auto frame_notice(std::span<const std::byte> notice) -> oar::Status override {
+        const std::scoped_lock lock{_mutex};
+        _notices.emplace_back(notice.begin(), notice.end());
+        return notice_status.load();
+    }
     auto vtep_credential(std::span<const std::byte> frame) -> oar::Status override {
         if (!tunnel) {
             return oar::Status::unsupported;
@@ -439,6 +450,7 @@ private:
     std::vector<std::vector<std::byte>> _tunnel_keys;
     std::vector<std::vector<std::byte>> _peer_sets;
     std::vector<std::vector<std::byte>> _credentials;
+    std::vector<std::vector<std::byte>> _notices;
     std::vector<std::vector<std::byte>> _revocation_lists;
     std::vector<oar::PrepareFunction> _prepared;
     std::vector<std::vector<std::byte>> _frames;
@@ -686,6 +698,15 @@ struct Rig {
                 std::chrono::seconds{static_cast<std::int64_t>(wall_now.load())}};
         };
         return c;
+    }
+
+    // Runs passes until no bulk transfer is queued: a multi-chunk frame
+    // goes one chunk per pass (fleet-scale-networking task 11).
+    auto drain() -> void {
+        for (int i = 0; i < 10000 && daemon.bulk_pending(); ++i) {
+            daemon.run_once(0ms);
+        }
+        BOOST_REQUIRE(!daemon.bulk_pending());
     }
 
     template<typename T> [[nodiscard]] auto count() const -> std::size_t {
@@ -946,6 +967,8 @@ BOOST_AUTO_TEST_CASE(vpc_configs_reach_net_roles_and_follow_a_restart) {
     BOOST_REQUIRE(frame3.size() > 2 * oar::max_body_size);
     r.daemon.on_vpc_config(v3, frame3);
     r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().vpc_configs_refused == 0U);  // one chunk per pass
+    r.drain();
     BOOST_TEST(r.daemon.stats().vpc_configs_refused == 1U);
     BOOST_TEST((r.net.role.vpc_configs().back() == frame3));
     r.net.role.vpc_status = oar::Status::ok;
@@ -1805,6 +1828,70 @@ auto revocations_frame(std::uint32_t cell, std::uint64_t version, std::size_t en
     return {.list = std::move(l), .frame = std::move(*bytes)};
 }
 
+// fleet-scale-networking task 11: a frame notice goes to every network
+// role at once (control traffic, even mid-transfer), and to no other role.
+BOOST_AUTO_TEST_CASE(frame_notices_reach_network_roles_only) {
+    Rig r;
+    r.net.role.tunnel = true;
+    (void)r.daemon.boot();
+    const proto::FrameNotice n{.kind = proto::FrameKind::vpc_stream,
+                               .vni_or_scope = 0xAB0001,
+                               .sequence_or_version = 4,
+                               .size = 200'000,
+                               .sha256 = {std::byte{0x11}}};
+    const auto big = revocations_frame(1, 1, 8192);
+    r.daemon.on_credential_revocations(big.list, big.frame);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.daemon.bulk_pending());
+    r.daemon.on_frame_notice(n);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.role.notices().size() == 1U);
+    BOOST_TEST((r.net.role.notices()[0] == proto::encode_frame_notice(n).value()));
+    BOOST_TEST(r.blk.role.notices().empty());
+    BOOST_TEST(r.daemon.bulk_pending());  // the list is still crossing
+    BOOST_TEST(r.daemon.stats().frame_notices == 1U);
+    BOOST_TEST(r.daemon.stats().frame_notices_refused == 0U);
+    r.net.role.notice_status = oar::Status::failed;
+    r.daemon.on_frame_notice(n);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().frame_notices == 2U);
+    BOOST_TEST(r.daemon.stats().frame_notices_refused == 1U);
+    r.drain();
+}
+
+// fleet-scale-networking task 11 (Requirement 6.4): a lease grant reaches
+// its role while a 131 KiB revocation list is still crossing to the
+// network role a chunk per pass, rather than after it.
+BOOST_AUTO_TEST_CASE(a_lease_grant_never_waits_behind_a_bulk_transfer) {
+    Rig r{link_timeout, nullptr, true};
+    r.net.role.tunnel = true;
+    (void)r.daemon.boot();
+    const auto [c2, f2] = hold_config(2);
+    r.daemon.on_replica_config(c2, f2);
+    r.daemon.run_once(0ms);
+    const auto big = revocations_frame(1, 1, 8192);
+    BOOST_REQUIRE(big.frame.size() > 128U * 1024U);
+    r.daemon.on_credential_revocations(big.list, big.frame);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.bulk_pending());
+    BOOST_TEST(r.daemon.stats().bulk_chunks == 1U);
+
+    // The grant arrives mid-transfer and goes out on the next pass.
+    r.daemon.on_lease_grant({.server_id = server, .volume_id = 0x100, .epoch = 2});
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.hold.role.grants().size() == 1U);
+    BOOST_TEST(r.net.role.revocation_lists().empty());
+    BOOST_TEST(r.daemon.bulk_pending());
+    BOOST_TEST(r.daemon.stats().bulk_chunks == 2U);
+
+    // The list still arrives whole, over many passes.
+    r.drain();
+    BOOST_REQUIRE(r.net.role.revocation_lists().size() == 1U);
+    BOOST_TEST((r.net.role.revocation_lists()[0] == big.frame));
+    BOOST_TEST(r.daemon.stats().bulk_chunks >= big.frame.size() / oar::max_map_chunk);
+    BOOST_TEST(r.daemon.stats().credential_revocations_refused == 0U);
+}
+
 BOOST_AUTO_TEST_CASE(net_roles_get_credentials_for_their_current_key) {
     constexpr std::uint64_t life = 86'400;
     const std::uint64_t t0 = wall_now.load();
@@ -1851,6 +1938,10 @@ BOOST_AUTO_TEST_CASE(net_roles_get_credentials_for_their_current_key) {
     r.daemon.on_credential_revocations(old_list.list, old_list.frame);
     r.daemon.on_credential_revocations(other_cell.list, other_cell.frame);
     r.daemon.run_once(0ms);
+    // The large list goes a chunk a pass, and the small one waits behind
+    // it: lists reach the role in the order helm took them.
+    BOOST_TEST(r.net.role.revocation_lists().empty());
+    r.drain();
     BOOST_REQUIRE(r.net.role.revocation_lists().size() == 2U);
     BOOST_TEST((r.net.role.revocation_lists()[0] == big.frame));
     BOOST_TEST((r.net.role.revocation_lists()[1] == other_cell.frame));

@@ -1618,6 +1618,7 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::vtep_credential:
         case proto::RecordType::credential_revocations:
         case proto::RecordType::rotate_vtep_key:
+        case proto::RecordType::frame_notice:
             break;
     }
     return std::unexpected("helm sent a controller-only record");

@@ -92,6 +92,7 @@ constexpr auto known_vendor_type(std::uint8_t raw) noexcept -> bool {
         case VendorType::self_test:
         case VendorType::vtep_credential:
         case VendorType::credential_revocations:
+        case VendorType::frame_notice:
             return true;
     }
     return false;

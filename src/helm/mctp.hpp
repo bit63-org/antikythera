@@ -270,6 +270,7 @@ enum class VendorType : std::uint8_t {
     // internet gateways). fleet-scale-networking owns 0x30-0x35.
     vtep_credential = 0x31,
     credential_revocations = 0x32,
+    frame_notice = 0x33,
 };
 
 struct VendorHeader {

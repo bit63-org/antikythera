@@ -27,8 +27,10 @@
 //           0x10 body_len u16 | 0x12 key_id u16 | 0x14 reserved (4 bytes, zero)
 //           0x18 server_id u64
 //   0x20  body   (up to 160 bytes; body_len says how much is meaningful)
-//   0xC0  Ed25519 signature (64 bytes) over bytes [0x00, 0xC0) -- commands only
+//   0xC0  Ed25519 signature (64 bytes) over bytes [0x00, 0xC0) -- controller
+//         commands only; zero in helm's own commands (is_helm_command)
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -106,6 +108,10 @@ enum class Type : std::uint16_t {
     create_network = 0x0030,   // VPC
     delete_network = 0x0031,
     gpu_vf_config = 0x0040,  // reserved: GPU support is designed, not yet built
+    // helm's own commands (cold-start Requirement 4.4): unsigned, see
+    // is_helm_command.
+    standing_chunk = 0x0050,  // part of the standing set
+    standing_start = 0x0051,  // start one instance of that set
 
     // Responses (host agent -> control plane).
     response = 0x0100,
@@ -118,6 +124,16 @@ enum class Type : std::uint16_t {
 };
 
 [[nodiscard]] auto is_command(Type t) noexcept -> bool;
+
+// helm's own commands: STANDING_CHUNK and STANDING_START
+// (.kiro/specs/cold-start/ Requirement 4.4-4.5). They carry no controller
+// signature of their own: key_id is no_key_id and the signature bytes are
+// zero. They still name the server. What makes hull act on them is the
+// controller signature over the whole standing set they carry, which hull
+// verifies itself once the set is complete. They never consume or check
+// a command sequence number. hull takes them only at the start of a boot,
+// before the first signed command is accepted.
+[[nodiscard]] auto is_helm_command(Type t) noexcept -> bool;
 
 struct Header {
     std::uint32_t magic{mailbox::magic};
@@ -398,6 +414,44 @@ struct DeleteNetwork {
 
 // GPU_VF_CONFIG has no body yet: decoding it fails with reserved_type.
 
+// STANDING_CHUNK: total u32 | offset u32 | len u16 | rsvd u16 | bytes [len]
+// (12 + len bytes). One piece of a standing set (proto/standing_set.hpp,
+// up to max_standing_transfer bytes), in the chunk rules helm's OarLink
+// transfers use: offset 0 starts a new transfer, every later chunk
+// continues exactly where the last ended with the same total, and anything
+// else aborts the transfer. 1 <= len <= max_standing_chunk,
+// offset + len <= total, 1 <= total <= max_standing_transfer. The answer
+// to the chunk that completes the set says whether hull accepted it
+// (signature, server); earlier chunks are answered ok.
+inline constexpr std::size_t standing_chunk_fixed_size = 12;
+inline constexpr std::size_t max_standing_chunk = max_body - standing_chunk_fixed_size;  // 148
+// proto::max_standing_set_size; hull/standing_starts.cpp pins them equal.
+inline constexpr std::uint32_t max_standing_transfer = 384U * 1024U;
+
+struct StandingChunk {
+    std::uint32_t total{0};
+    std::uint32_t offset{0};
+    std::uint16_t len{0};
+    std::array<std::byte, max_standing_chunk> bytes{};
+
+    [[nodiscard]] auto chunk_bytes() const noexcept -> std::span<const std::byte> {
+        return std::span{bytes}.first(std::min<std::size_t>(len, max_standing_chunk));
+    }
+    friend auto operator==(const StandingChunk&, const StandingChunk&) -> bool = default;
+};
+
+// STANDING_START: generation u64 | index u16 | rsvd [6]  (16 bytes)
+// Starts entry `index` of the standing set hull holds, which must be the
+// set at `generation` (non-zero). index < max_standing_index.
+// proto::max_standing_instances; hull/standing_starts.cpp pins them equal.
+inline constexpr std::uint16_t max_standing_index = 16;
+
+struct StandingStart {
+    std::uint64_t generation{0};
+    std::uint16_t index{0};
+    friend auto operator==(const StandingStart&, const StandingStart&) -> bool = default;
+};
+
 // ---- Response body --------------------------------------------------------
 
 // Values are part of the wire protocol: never renumber.
@@ -558,10 +612,11 @@ struct ScrubDone {
 
 // ---- Any body -------------------------------------------------------------
 
-using Body = std::variant<ListVms, VmStatus, CreateVm, DestroyVm, AttachDevice, DetachDevice,
-                          CreateVolume, DeleteVolume, AttachVolume, DetachVolume, RewrapVolume,
-                          WithdrawDetach, CreateNetwork, DeleteNetwork, Response, VmExited,
-                          DeviceReleased, HostFault, ScrubDone, ConvertVolume>;
+using Body =
+    std::variant<ListVms, VmStatus, CreateVm, DestroyVm, AttachDevice, DetachDevice, CreateVolume,
+                 DeleteVolume, AttachVolume, DetachVolume, RewrapVolume, WithdrawDetach,
+                 CreateNetwork, DeleteNetwork, Response, VmExited, DeviceReleased, HostFault,
+                 ScrubDone, ConvertVolume, StandingChunk, StandingStart>;
 
 // Decodes and validates the body of any message according to its type.
 [[nodiscard]] auto decode_body(const Message& msg) noexcept -> std::expected<Body, BodyError>;

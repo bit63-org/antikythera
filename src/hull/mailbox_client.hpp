@@ -15,7 +15,10 @@
 //      command it took (a spurious or repeated interrupt);
 //   2. copies CMD_SLOT out once, with 64 32-bit reads, into a local Slot
 //      (3.4) -- nothing is ever parsed in place in device memory;
-//   3. authenticates the copy (decode, signature, sequence; command_auth.hpp);
+//   3. authenticates the copy (decode, signature, sequence; command_auth.hpp),
+//      or, for helm's own STANDING_CHUNK and STANDING_START, decodes it and
+//      checks the server it names (StandingStarts verifies the controller's
+//      signature over the set they carry);
 //   4. decodes and validates the body;
 //   5. hands the command to the CommandHandler, and
 //   6. writes exactly one response into RSP_SLOT with 32-bit writes, then
@@ -43,6 +46,8 @@
 #include "hull/signature_verifier.hpp"
 
 namespace ak::hull {
+
+class StandingStarts;
 
 // Aligned 32-bit MMIO into the mailbox's BAR0. Offsets are byte offsets
 // that are multiples of four and inside helm::mailbox::reg::bar0_size.
@@ -113,6 +118,11 @@ public:
           _sequence{&sequence},
           _handler{&handler} {}
 
+    // Where helm's STANDING_CHUNK and STANDING_START go (not owned). With
+    // none they are answered `unsupported`. The first signed command
+    // accepted closes it (StandingStarts::close).
+    auto set_standing_starts(StandingStarts* standing) noexcept -> void { _standing = standing; }
+
     // Checks MAGIC and VERSION and takes the doorbell baseline.
     [[nodiscard]] auto attach() -> std::expected<void, AttachError>;
 
@@ -129,6 +139,7 @@ public:
 
 private:
     auto copy_command_slot() -> helm::mailbox::Slot;
+    auto service_helm_command(const helm::mailbox::Message& msg) -> void;
     auto respond(std::uint64_t in_reply_to, helm::mailbox::Type command,
                  const CommandOutcome& outcome) -> void;
     auto write_slot(std::size_t base, std::size_t doorbell, const helm::mailbox::Body& body)
@@ -139,6 +150,7 @@ private:
     const SignatureVerifier* _verifier;
     SequenceTracker* _sequence;
     CommandHandler* _handler;
+    StandingStarts* _standing{nullptr};
     std::uint32_t _last_doorbell{0};
     std::uint64_t _next_seq{1};  // header seq of hull's responses and events
     MailboxClientStats _stats;

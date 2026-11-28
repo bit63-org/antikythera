@@ -54,6 +54,7 @@
 #include "hull/mailbox_client.hpp"
 #include "hull/resource_allocator.hpp"
 #include "hull/sequence_tracker.hpp"
+#include "hull/standing_starts.hpp"
 #include "hull/signature_verifier.hpp"
 #include "hull/vfio_mailbox.hpp"
 #include "hull/vm_cgroup.hpp"
@@ -244,6 +245,20 @@ auto main(int argc, char** argv) -> int {
     // a replay of one), so it is refused (cold-start Requirement 6.2).
     SequenceTracker sequence{opt.sequence_floor};
     MailboxClient client{**mailbox, opt.server_id, *verifier, sequence, handler};
+    // Standing starts (cold-start Requirement 4.5) are for the first run
+    // of the agent in a boot only. The run directory is a tmpfs that a
+    // boot clears, so a marker left there says this run is a restart and
+    // the controller may already be talking to the server.
+    StandingStarts standing{opt.server_id, *verifier};
+    // "x" creates the marker only if it is absent: an existing marker, or
+    // one that cannot be made (so a restart cannot be told from a first
+    // run), closes standing starts.
+    if (FILE* f = std::fopen((opt.run_dir / "agent-started").c_str(), "wx"); f != nullptr) {
+        std::fclose(f);
+    } else {
+        standing.close();
+    }
+    client.set_standing_starts(&standing);
     if (auto a = client.attach(); !a) {
         die(std::string{"mailbox attach: "} + to_string(a.error()));
     }

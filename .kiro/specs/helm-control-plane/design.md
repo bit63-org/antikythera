@@ -241,7 +241,15 @@ corrupt file stops helm rather than bringing back a retired key. A
 controller `rotate_vtep_key` raises a slot's epoch (`TunnelKeyring::rotate`)
 and `deliver_rotation` sends the new key in the 40-byte `set_tunnel_key`
 form with a grace period (`DaemonConfig::tunnel_key_grace`, 10 minutes),
-falling back to the plain form for a role that refuses it. `TunnelKeyring::provision`
+falling back to the plain form for a role that refuses it. VTEP
+credentials (fleet-scale-networking task 2): on each check HelmDaemon
+reports a `credential_request` for a keyed network role that holds no
+credential for its current key, or whose credential has under a third of
+its life left (by `DaemonConfig::wall_clock`), at most once per
+`identity_retry` per key; it keeps the controller's newest credential per
+VTEP and the highest revocation list per cell, forwards them unmodified
+(OarLink `vtep_credential` and chunked `credential_revocations`), and
+sends both again right after a role's key when its sideband reopens. `TunnelKeyring::provision`
 sends a role its private key (`set_tunnel_key`) and then the newest
 controller peer set for its VTEP, on every attach, so a restarted role
 gets both back. `fill` puts the public keys in the inventory. Peer sets

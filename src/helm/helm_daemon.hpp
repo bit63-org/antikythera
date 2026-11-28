@@ -65,6 +65,19 @@
 // next publish. A rotation whose epoch cannot be saved changes nothing
 // and is counted; the controller sends it again.
 //
+// VTEP credentials (fleet-scale-networking Requirement 2, task 2). On
+// every check helm looks at each keyed network role: if it holds no
+// credential for the VTEP's current public key, or the one it holds has
+// less than a third of its life left, it reports a credential_request
+// (slot, key epoch, VTEP, public key), again after identity_retry if no
+// answer came, and at once after a rotation (the key changed). The
+// controller's vtep_credential is kept per VTEP (the newest: later
+// not_after, then higher serial) and forwarded unmodified to the VTEP's
+// role when it certifies the key that role holds; the role verifies it.
+// credential_revocations lists are kept per cell (highest list_version)
+// and forwarded to every network role. A role whose sideband (re)opens
+// gets its credential and every list right after its key.
+//
 // Network health (oar-net Requirement 6, task 11). Every check helm asks
 // each network role for its health; a degraded role (a peer VTEP down, a
 // path that does not carry full-size frames, an unkeyed tunnel: the
@@ -220,6 +233,8 @@ struct DaemonConfig {
     // rotation (Requirement 1.3: 10 minutes).
     KeyEpochs key_epochs;
     std::chrono::seconds tunnel_key_grace{std::chrono::minutes{10}};
+    // Credential validity is in Unix seconds. Empty: system_clock::now.
+    std::function<std::chrono::system_clock::time_point()> wall_clock;
     // How often network roles are asked whether their snooped joins
     // changed (one small message each when they did not).
     std::chrono::milliseconds membership_interval{std::chrono::seconds{1}};
@@ -287,6 +302,14 @@ struct DaemonStats {
     std::uint64_t tunnel_rotations{0};         // epochs raised by the controller
     std::uint64_t tunnel_rotations_stale{0};   // at or below the epoch held: ignored
     std::uint64_t tunnel_rotations_failed{0};  // not saved, not derived, or not delivered
+    // VTEP credentials.
+    std::uint64_t credential_requests{0};             // credential_request reports sent
+    std::uint64_t vtep_credentials{0};                // kept: newer than the one held
+    std::uint64_t vtep_credentials_stale{0};          // not newer: dropped
+    std::uint64_t vtep_credentials_refused{0};        // the VTEP's role refused it
+    std::uint64_t credential_revocations{0};          // lists kept: newer for their cell
+    std::uint64_t credential_revocations_stale{0};    // not newer: dropped
+    std::uint64_t credential_revocations_refused{0};  // a network role refused one
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -375,6 +398,10 @@ public:
     auto on_power_policy(const proto::PowerPolicy& policy, std::span<const std::byte> frame)
         -> void override;
     auto on_rotate_vtep_key(const proto::RotateVtepKey& request) -> void override;
+    auto on_vtep_credential(const proto::VtepCredential& credential,
+                            std::span<const std::byte> frame) -> void override;
+    auto on_credential_revocations(const proto::CredentialRevocations& list,
+                                   std::span<const std::byte> frame) -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
     // The newest published snapshot (ControllerSession's InventorySource).
@@ -429,6 +456,15 @@ private:
         std::uint64_t metadata_version{0};
         std::vector<std::byte> frame;
     };
+    struct CredentialFrame {
+        proto::VtepCredential credential;
+        std::vector<std::byte> frame;
+    };
+    struct RevocationsFrame {
+        std::uint32_t cell_id{0};
+        std::uint64_t list_version{0};
+        std::vector<std::byte> frame;
+    };
     struct LayoutFrame {
         std::uint64_t volume_id{0};
         std::uint64_t epoch{0};
@@ -443,7 +479,8 @@ private:
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
                               proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
                               ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame, MetadataFrame,
-                              LayoutFrame, proto::SelfTest, PowerPolicyFrame, proto::RotateVtepKey>;
+                              LayoutFrame, proto::SelfTest, PowerPolicyFrame, proto::RotateVtepKey,
+                              CredentialFrame, RevocationsFrame>;
     // Where a NIC with a kept record is plugged: its network role's slot
     // and function.
     struct MetadataHome {
@@ -505,6 +542,9 @@ private:
         // A network role not yet given its tunnel key: retried on check.
         bool keys_pending{false};
         std::optional<oar::Health> health;  // network roles: the last answer
+        // The public key last asked to be certified for this slot, and when.
+        proto::TunnelPublicKey credential_asked{};
+        Clock::time_point credential_asked_at{};
         SlotPort port;
 
         SlotState(SlotNumber n, LinkConfig c, HelmDaemon& daemon)
@@ -553,6 +593,12 @@ private:
     auto provision_tunnel(SlotState& slot) -> void;
     auto forward_peers(const PeersFrame& peers) -> void;
     auto rotate_tunnel_key(const proto::RotateVtepKey& request) -> void;
+    // VTEP credentials: requests, and the kept frames forwarded and replayed.
+    [[nodiscard]] auto now_unix() const -> std::uint64_t;
+    auto poll_credential(SlotState& slot) -> void;
+    auto keep_credential(CredentialFrame& credential) -> void;
+    auto keep_revocations(RevocationsFrame& list) -> void;
+    auto send_credentials(SlotState& slot) -> void;
     auto poll_health(SlotState& slot) -> void;
     // Opens the sideband, reads the inventory, registers with the router.
     auto attach(SlotState& slot) -> bool;
@@ -578,9 +624,11 @@ private:
     std::map<std::uint64_t, ConfigFrame> _volume_configs;  // the newest, by volume
     std::map<std::uint64_t, LayoutFrame> _layouts;         // the newest khold layout, by volume
     TunnelKeyring _keyring;
-    std::map<std::uint32_t, VpcFrame> _vpc_configs;         // the newest, by VNI
-    std::map<std::uint64_t, MetadataFrame> _metadata;       // the newest, by NIC ID
-    std::map<std::uint64_t, MetadataHome> _metadata_homes;  // by NIC ID
+    std::map<std::uint32_t, VpcFrame> _vpc_configs;          // the newest, by VNI
+    std::map<oar::Vtep, CredentialFrame> _credentials;       // the newest, by VTEP
+    std::map<std::uint32_t, RevocationsFrame> _revocations;  // the newest, by cell
+    std::map<std::uint64_t, MetadataFrame> _metadata;        // the newest, by NIC ID
+    std::map<std::uint64_t, MetadataHome> _metadata_homes;   // by NIC ID
     GroupUsageReporter _groups;
 
     mutable std::mutex _inbox_mutex;

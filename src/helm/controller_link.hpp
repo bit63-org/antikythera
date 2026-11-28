@@ -163,6 +163,13 @@ public:
                                  std::span<const std::byte> /*frame*/) -> void {}
     // Move one network role's tunnel key to a new epoch
     // (fleet-scale-networking Requirement 1).
+    // A network role's VTEP credential, and a cell's revocation list
+    // (fleet-scale-networking Requirement 2); `frame` is the exact
+    // encoding, which the network role verifies.
+    virtual auto on_vtep_credential(const proto::VtepCredential& /*credential*/,
+                                    std::span<const std::byte> /*frame*/) -> void {}
+    virtual auto on_credential_revocations(const proto::CredentialRevocations& /*list*/,
+                                           std::span<const std::byte> /*frame*/) -> void {}
     virtual auto on_rotate_vtep_key(const proto::RotateVtepKey& /*request*/) -> void {}
 };
 

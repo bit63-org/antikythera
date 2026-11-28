@@ -116,21 +116,53 @@ VtepCredential {              // controller -> helm -> network role, signed;
 }
 CredentialRevocations {       // per cell, signed, full list (it is small)
   0x00 magic 'AKCR', version (1), key_id, 0x08 cell_id u32, rsvd u32,
-  0x10 list_version u64, 0x18 count u32 (<= 65,536), rsvd u32,
-  0x20 entries x count { serial u64 | not_after u64 }, ascending by serial,
-  signature [64]
+  0x10 list_version u64 (from 1), 0x18 count u32 (<= 16,384), rsvd u32,
+  0x20 entries x count { serial u64 | not_after u64 }, serials non-zero
+  and strictly ascending,
+  signature [64]              // Ed25519 over every byte before it
 }
 ```
 
-helm asks for a credential with a `credential_request` report (kind 31:
-`slot u8 | rsvd [3] | key_epoch u32 | public_key [32]`), on every
-connection, at key rotation, and when the current credential has less
-than a third of its life left. The controller answers with link record
-30 (`vtep_credential`) and keeps the cell's revocation list current with
-link record 31 (`credential_revocations`); helm forwards both to the role
-(vendor types 0x31 and 0x32). An entry leaves the list once its
-`not_after` has passed, so with 24-hour credentials the list holds at most
-a day of revocations.
+Both decoders are strict (truncation, trailing bytes, reserved bytes,
+zero ids, unknown mode bits, an empty validity window and an
+out-of-order list are refused) and verify nothing: the network role
+verifies the signature under `key_id`. The list's cap is 16,384 entries,
+not the first estimate of 65,536, so that a full list (262 KiB) fits one
+controller link record; with 24-hour credentials that is 16,384
+revocations a day per cell.
+
+helm asks for a credential with a `credential_request` report (kind 31,
+56 bytes: `slot u8 | rsvd [3] | key_epoch u32 (1-65535) | vtep [16] |
+public_key [32]`). The VTEP is carried because the inventory maps VTEPs
+to public keys but not slots to VTEPs, and the controller signs it into
+the credential. helm asks when the role holds no credential for its
+current public key (after its first keying, a helm restart, or a
+rotation), when the held one has less than a third of its life left, and
+again after `identity_retry` (10 minutes) if no answer came. The
+controller answers with link record 30 (`vtep_credential`) and keeps the
+cell's revocation list current with link record 31
+(`credential_revocations`). helm keeps the newest credential per VTEP
+(later `not_after`, then higher serial; one for another key replaces it)
+and the highest `list_version` per cell, and forwards both unmodified to
+the role (vendor types 0x31, exactly 160 bytes, and 0x32, chunked like a
+map update); a role whose sideband reopens gets them again after its key.
+
+The role's `CredentialStore` (`src/oar/net/credentials.hpp`) takes its
+own credential only if it names this server and VTEP, carries the role's
+current public key and verifies; it presents it only inside its
+validity window (with the skew allowance), and stops presenting it once
+the key rotates. It keeps each cell's newest list, and an entry revokes
+its serial until the entry's `not_after` plus the skew. Task 3's
+handshake verifies peers' credentials through the same store. An entry
+leaves the list once its `not_after` has passed, so with 24-hour
+credentials the list holds at most a day of revocations.
+
+`ak-test-controller` issues both: the script verb `issue-credential
+[LIFETIME_S [CELL]]` waits for helm's `credential_request`, signs a
+credential for it with the controller key and sends record 30, and
+`credential-revocations CELL VERSION [SERIAL,NOT_AFTER...]` signs and
+sends record 31. Signing vectors 17 and 18 in `src/proto/test_vectors.hpp`
+pin both encodings for kythira's controller.
 
 ## Certified handshake
 

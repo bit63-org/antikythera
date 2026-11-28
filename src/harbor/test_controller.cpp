@@ -195,6 +195,34 @@ auto Signer::tunnel_peers(const proto::TunnelPeers& peers) const
     return *frame;
 }
 
+auto Signer::vtep_credential(const proto::VtepCredential& credential) const
+    -> std::optional<std::vector<std::byte>> {
+    auto frame = proto::encode_vtep_credential(credential);
+    if (!frame) {
+        return std::nullopt;
+    }
+    const auto sig = sign(proto::credential_signed_bytes(*frame));
+    if (!sig) {
+        return std::nullopt;
+    }
+    proto::set_credential_signature(*frame, *sig);
+    return *frame;
+}
+
+auto Signer::credential_revocations(const proto::CredentialRevocations& list) const
+    -> std::optional<std::vector<std::byte>> {
+    auto frame = proto::encode_credential_revocations(list);
+    if (!frame) {
+        return std::nullopt;
+    }
+    const auto sig = sign(proto::credential_signed_bytes(*frame));
+    if (!sig) {
+        return std::nullopt;
+    }
+    proto::set_credential_signature(*frame, *sig);
+    return *frame;
+}
+
 // ---- Script ---------------------------------------------------------------
 
 namespace {
@@ -912,6 +940,7 @@ constexpr std::array kind_names{
     std::pair{"conversion_progress", proto::ReportKind::conversion_progress},
     std::pair{"cold_start", proto::ReportKind::cold_start},
     std::pair{"boot_cache", proto::ReportKind::boot_cache},
+    std::pair{"credential_request", proto::ReportKind::credential_request},
 };
 
 template<typename T, std::size_t N>
@@ -1284,6 +1313,60 @@ auto parse_line(std::string_view line) -> std::expected<std::optional<Action>, s
         }
         return std::optional<Action>{std::move(*c)};
     }
+    if (verb == "issue-credential") {
+        if (args.size() > 2) {
+            return std::unexpected("issue-credential: want [LIFETIME_S [CELL]]");
+        }
+        IssueCredential a;
+        if (!args.empty()) {
+            auto lifetime = number<std::uint64_t>(args[0], "lifetime");
+            if (!lifetime || *lifetime == 0) {
+                return std::unexpected(lifetime ? "issue-credential: lifetime must be non-zero"
+                                                : lifetime.error());
+            }
+            a.lifetime_s = *lifetime;
+        }
+        if (args.size() == 2) {
+            auto cell = number<std::uint32_t>(args[1], "cell");
+            if (!cell) {
+                return std::unexpected(cell.error());
+            }
+            a.cell_id = *cell;
+        }
+        return std::optional<Action>{a};
+    }
+    if (verb == "credential-revocations") {
+        if (args.size() < 2) {
+            return std::unexpected(
+                "credential-revocations: want CELL VERSION [SERIAL,NOT_AFTER ...]");
+        }
+        auto cell = number<std::uint32_t>(args[0], "cell");
+        auto version = number<std::uint64_t>(args[1], "list version");
+        if (!cell) {
+            return std::unexpected(cell.error());
+        }
+        if (!version) {
+            return std::unexpected(version.error());
+        }
+        SendRevocations a{.cell_id = *cell, .list_version = *version, .entries = {}};
+        for (const auto e : args.subspan(2)) {
+            const auto comma = e.find(',');
+            if (comma == std::string_view::npos) {
+                return std::unexpected("credential-revocations: entries are SERIAL,NOT_AFTER");
+            }
+            auto serial = number<std::uint64_t>(e.substr(0, comma), "serial");
+            auto not_after = number<std::uint64_t>(e.substr(comma + 1), "not_after");
+            if (!serial) {
+                return std::unexpected(serial.error());
+            }
+            if (!not_after) {
+                return std::unexpected(not_after.error());
+            }
+            a.entries.push_back({.serial = *serial, .not_after = *not_after});
+        }
+        std::ranges::sort(a.entries, {}, &proto::Revocation::serial);
+        return std::optional<Action>{std::move(a)};
+    }
     if (verb == "tunnel-peers") {
         if (args.size() < 2) {
             return std::unexpected("tunnel-peers: want VTEP VERSION [PEER_VTEP,KEY ...]");
@@ -1380,6 +1463,8 @@ auto to_string(const proto::Report& report) -> std::string {
                    << " status=" << static_cast<int>(b.status) << " detail=" << b.detail;
             } else if constexpr (std::is_same_v<T, proto::Enrollment>) {
                 os << " kem=0x" << std::hex << b.kem << std::dec;
+            } else if constexpr (std::is_same_v<T, proto::CredentialRequest>) {
+                os << " slot=" << int{b.slot} << " key_epoch=" << b.key_epoch;
             } else if constexpr (std::is_same_v<T, proto::CertRequest>) {
                 os << " slot=" << int{b.slot} << " role=" << static_cast<int>(b.role)
                    << " csr=" << b.csr.size();
@@ -1530,6 +1615,8 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::self_test:
         case proto::RecordType::standing_set:
         case proto::RecordType::power_policy:
+        case proto::RecordType::vtep_credential:
+        case proto::RecordType::credential_revocations:
         case proto::RecordType::rotate_vtep_key:
             break;
     }
@@ -1694,6 +1781,48 @@ auto TestController::run(const Action& action) -> std::expected<void, std::strin
                     return std::unexpected("could not encode or sign the tunnel peer set");
                 }
                 return send(proto::RecordType::tunnel_peers, *frame);
+            } else if constexpr (std::is_same_v<T, IssueCredential>) {
+                auto r = pump([](const proto::Report& rep) {
+                    return std::holds_alternative<proto::CredentialRequest>(rep.body);
+                });
+                if (!r) {
+                    return std::unexpected("issue-credential: " + r.error());
+                }
+                const auto& req = std::get<proto::CredentialRequest>(r->body);
+                const auto now = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count());
+                const proto::VtepCredential c{
+                    .key_id = _options.key_id,
+                    .server_id = _options.server_id,
+                    .cell_id = a.cell_id,
+                    .modes = proto::tunnel_mode_bit(proto::TunnelMode::wireguard),
+                    .slot = req.slot,
+                    .key_epoch = static_cast<std::uint16_t>(req.key_epoch),
+                    .vtep = req.vtep,
+                    .public_key = req.public_key,
+                    .not_before = now,
+                    .not_after = now + a.lifetime_s,
+                    .serial = _next_serial,
+                    .signature = {}};
+                auto frame = _signer.vtep_credential(c);
+                if (!frame) {
+                    return std::unexpected("could not encode or sign the VTEP credential");
+                }
+                ++_next_serial;
+                return send(proto::RecordType::vtep_credential, *frame);
+            } else if constexpr (std::is_same_v<T, SendRevocations>) {
+                const proto::CredentialRevocations l{.key_id = _options.key_id,
+                                                     .cell_id = a.cell_id,
+                                                     .list_version = a.list_version,
+                                                     .entries = a.entries,
+                                                     .signature = {}};
+                auto frame = _signer.credential_revocations(l);
+                if (!frame) {
+                    return std::unexpected("could not encode or sign the revocation list");
+                }
+                return send(proto::RecordType::credential_revocations, *frame);
             } else if constexpr (std::is_same_v<T, ExpectOutcome>) {
                 if (_last_command_seq == 0) {
                     return std::unexpected("expect: no command sent yet");

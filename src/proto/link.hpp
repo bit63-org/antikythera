@@ -55,6 +55,12 @@
 //   power_policy  controller -> helm   a PowerPolicy (power_policy.hpp): when
 //                                      helm releases the host after power
 //                                      returns, and which image to keep
+//   vtep_credential controller -> helm a VtepCredential (vtep_credential.hpp)
+//                                      for one of this server's network
+//                                      roles, answering its credential_request
+//   credential_revocations controller -> helm a CredentialRevocations
+//                                      (vtep_credential.hpp): the revoked
+//                                      credentials of one cell
 //   rotate_vtep_key controller -> helm server_id u64 | slot u8 | rsvd [3]
 //                                      | key_epoch u32: derive a new tunnel
 //                                      key for the network role in that slot
@@ -144,6 +150,7 @@
 #include "proto/volume_layout.hpp"
 #include "proto/volume_op.hpp"
 #include "proto/vpc_config.hpp"
+#include "proto/vtep_credential.hpp"
 
 namespace ak::proto {
 
@@ -178,7 +185,9 @@ inline constexpr std::size_t max_record_payload =
               self_test_size,
               max_standing_set_size,
               power_policy_size,
-              rotate_vtep_key_size});
+              rotate_vtep_key_size,
+              vtep_credential_size,
+              max_credential_revocations_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class RecordType : std::uint16_t {
@@ -202,6 +211,8 @@ enum class RecordType : std::uint16_t {
     self_test = 18,
     standing_set = 23,
     power_policy = 24,
+    vtep_credential = 30,
+    credential_revocations = 31,
     rotate_vtep_key = 35,
 };
 
@@ -262,6 +273,7 @@ namespace detail {
 [[nodiscard]] constexpr auto known(RecordType t) noexcept -> bool {
     return (t >= RecordType::envelope && t <= RecordType::self_test) ||
            t == RecordType::standing_set || t == RecordType::power_policy ||
+           t == RecordType::vtep_credential || t == RecordType::credential_revocations ||
            t == RecordType::rotate_vtep_key;
 }
 

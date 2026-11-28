@@ -1,6 +1,6 @@
 # Implementation Plan — Network control at fleet scale
 
-## Status: 1/18 tasks complete
+## Status: 2/18 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -25,7 +25,7 @@ tasks 14-15. Phases A, B and C can run in parallel.
   10-minute two-key grace in the role; tests that a helm restart keeps
   the key and a rotation keeps sessions until the grace ends.
   _Requirements: 1.1-1.4_ (cloud)
-- [ ] 2. `VtepCredential` and `CredentialRevocations` codecs
+- [x] 2. `VtepCredential` and `CredentialRevocations` codecs
   (`src/proto/`), link records 30 and 31, vendor types 0x31 and 0x32,
   report kind 31 `credential_request`, signing vectors, fuzz targets,
   `ak-test-controller` issuing credentials and revocations.

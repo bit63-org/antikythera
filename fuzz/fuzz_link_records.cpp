@@ -64,6 +64,22 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
                     }
                 }
             }
+            if ((*r)->type == ak::proto::RecordType::vtep_credential) {
+                if (auto c = ak::proto::decode_vtep_credential((*r)->payload); c) {
+                    auto again = ak::proto::encode_vtep_credential(*c);
+                    if (!again || *again != (*r)->payload) {
+                        std::abort();
+                    }
+                }
+            }
+            if ((*r)->type == ak::proto::RecordType::credential_revocations) {
+                if (auto l = ak::proto::decode_credential_revocations((*r)->payload); l) {
+                    auto again = ak::proto::encode_credential_revocations(*l);
+                    if (!again || *again != (*r)->payload) {
+                        std::abort();
+                    }
+                }
+            }
             if ((*r)->type == ak::proto::RecordType::role_certificate) {
                 if (auto c = ak::proto::decode_role_certificate((*r)->payload); c) {
                     auto again = ak::proto::encode_role_certificate(*c);

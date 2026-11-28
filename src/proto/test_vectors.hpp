@@ -295,4 +295,35 @@ inline constexpr std::string_view report_boot_cache16 =
     "abababababababababababababababababababab000000000000000000000000000000000000000000000000"
     "00000000000000000500000000000000040000000000000000000040000000000000008000000000";
 
+// Vector 17: a VtepCredential (format v1, .kiro/specs/fleet-scale-networking/)
+// signed with key 1 (key_id 1): server 7, cell 3, modes WireGuard, slot 1,
+// key_epoch 2, VTEP fd00::1, public key RFC 7748 section 6.1 Alice's
+// (8520f009...), not_before 1800000000, not_after 1800086400, serial 0x10.
+inline constexpr std::uint64_t credential17_server_id = 7;
+inline constexpr std::uint16_t credential17_key_id = 1;
+inline constexpr std::uint64_t credential17_not_before = 1'800'000'000;
+inline constexpr std::string_view credential17_public_key =
+    "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+inline constexpr std::string_view credential17 =
+    "414b56430100010007000000000000000300000001010200fd0000000000000000000000000000018520f009"
+    "8930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a00d2496b0000000080234b6b00000000"
+    "1000000000000000ba98a97e5de850b1e7360bfb376ded30e80753f2ee12ca7f6b1938232677de660c69500b"
+    "b275fdc138714a1792be1120dd571da1cb1acd1364f1a8c466b63705";
+inline constexpr std::string_view credential17_signature =
+    "ba98a97e5de850b1e7360bfb376ded30e80753f2ee12ca7f6b1938232677de660c69500bb275fdc138714a17"
+    "92be1120dd571da1cb1acd1364f1a8c466b63705";
+
+// Vector 18: a CredentialRevocations list (format v1) for cell 3, signed
+// with key 2 (key_id 2), list_version 4, two entries: serial 0x0C until
+// 1800086400 and serial 0x0F until 1800043200.
+inline constexpr std::uint16_t revocations18_key_id = 2;
+inline constexpr std::uint32_t revocations18_cell_id = 3;
+inline constexpr std::uint64_t revocations18_list_version = 4;
+inline constexpr std::string_view revocations18 =
+    "414b4352010002000300000000000000040000000000000002000000000000000c0000000000000080234b6b"
+    "000000000f00000000000000c07a4a6b0000000078f2faf25db9394c6fe5f44f5130977619f34e5c592c1919"
+    "a05010ba82f9d6b75688646d37ee33f63f7d76f41734aee5501a8ac920ffeb9ce4249df93137600c";
+inline constexpr std::string_view revocations18_signature =
+    "78f2faf25db9394c6fe5f44f5130977619f34e5c592c1919a05010ba82f9d6b75688646d37ee33f63f7d76f4"
+    "1734aee5501a8ac920ffeb9ce4249df93137600c";
 }  // namespace ak::proto::vectors

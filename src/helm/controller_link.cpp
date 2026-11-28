@@ -311,6 +311,26 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
             _sink->on_power_policy(*policy, rec.payload);
             return {};
         }
+        case proto::RecordType::vtep_credential: {
+            auto credential = proto::decode_vtep_credential(rec.payload);
+            if (!credential) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (credential->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_vtep_credential(*credential, rec.payload);
+            return {};
+        }
+        case proto::RecordType::credential_revocations: {
+            // Per cell, not per server: every server of the cell gets it.
+            auto list = proto::decode_credential_revocations(rec.payload);
+            if (!list) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            _sink->on_credential_revocations(*list, rec.payload);
+            return {};
+        }
         case proto::RecordType::rotate_vtep_key: {
             auto request = proto::decode_rotate_vtep_key(rec.payload);
             if (!request) {

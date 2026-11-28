@@ -296,6 +296,19 @@ distributed through the controller (Requirement 8):
    in which the role keeps sessions made under the old key and answers
    handshakes still addressed to it, and reports the new public key, after
    which the controller sends the VTEP's peers new peer sets.
+
+   The controller also certifies each key (fleet-scale-networking
+   Requirement 2): helm reports a `credential_request` (report kind 31:
+   slot, key epoch, VTEP, public key) whenever a network role holds no
+   credential for its current key or the one it holds has a third of its
+   life left, and the controller answers with a signed `vtep_credential`
+   (link record 30, `src/proto/vtep_credential.hpp`, 160 bytes) binding
+   the key to the server, slot, epoch, VTEP and cell for a validity
+   window. `credential_revocations` (link record 31) is the cell's signed
+   list of credentials revoked before they expire, a full snapshot by
+   `list_version`. helm forwards both unmodified; the role verifies them.
+   Peers exchange credentials before a handshake (task 3), so peer sets
+   become optional at fleet scale.
 2. The controller keeps every VTEP's public key and, for each VTEP, the set
    of VTEPs it shares a VNI with. Whenever that set or a key in it changes
    (a NIC attach that adds a VTEP to a VPC, a key rotation), it sends the
@@ -355,8 +368,10 @@ block volume records `replica_config`, `volume_op`, `volume_key`, `lease_grant` 
 `image_key` (type 13, an encrypted image's key for the image volume a
 CREATE_VOLUME is about to create, `.kiro/specs/oar-blk-data-plane/` task 15),
 `vpc_config` (type 14, a VpcConfig frame), `group_members` (type 15,
-a GroupMembers frame) and `instance_metadata` (type 16, an
-InstanceMetadata frame). Helm to controller: `hello` (`server_id u64 |
+a GroupMembers frame), `instance_metadata` (type 16, an
+InstanceMetadata frame), and from fleet-scale-networking `vtep_credential`
+(type 30), `credential_revocations` (type 31) and `rotate_vtep_key` (type
+35); 19-29 and 32-34 are reserved by other specs and refused until built. Helm to controller: `hello` (`server_id u64 |
 boot_id u64`, the first record on every connection) and `report`. Report sequence
 numbers restart when helm reboots, so the controller keys them by the
 connection's boot ID and drops any `(boot_id, report_seq)` it has already

@@ -93,6 +93,8 @@ enum class DecodeError : std::uint8_t {
     bad_generation,           // standing set generation or power policy version 0
     bad_standing_entry,  // a standing instance's commands, volumes, NICs or secrets break the rules
     bad_power_policy,    // a power-on policy tier or delay outside its rules
+    bad_validity,        // a credential's not_before is not before its not_after
+    bad_list_version,    // revocation list version 0 (versions start at 1)
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -221,6 +223,10 @@ enum class DecodeError : std::uint8_t {
             return "standing instance entry breaks its rules";
         case DecodeError::bad_power_policy:
             return "power-on policy field outside its rules";
+        case DecodeError::bad_validity:
+            return "credential validity window is empty";
+        case DecodeError::bad_list_version:
+            return "revocation list version is zero";
     }
     return "unknown";
 }

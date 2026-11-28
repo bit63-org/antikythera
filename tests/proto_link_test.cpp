@@ -204,10 +204,33 @@ BOOST_AUTO_TEST_CASE(rotate_vtep_key_round_trips_and_is_strict) {
     BOOST_TEST(
         (proto::encode_rotate_vtep_key({.server_id = 0, .slot = 0, .key_epoch = 1}).error() ==
          DecodeError::bad_server_id));
-    // The record framing knows it although 19-34 are not yet defined.
+    // The record framing knows it although 19-29 and 32-34 are not yet
+    // defined.
     BOOST_TEST(proto::encode_record(RecordType::rotate_vtep_key, *b).has_value());
     BOOST_TEST(!proto::encode_record(static_cast<RecordType>(34), {}).has_value());
     BOOST_TEST(!proto::encode_record(static_cast<RecordType>(36), {}).has_value());
+}
+
+// fleet-scale-networking task 2: the records are numbered by the spec, a
+// full revocation list fits one record, and the gaps stay unknown.
+BOOST_AUTO_TEST_CASE(credential_records_are_framed) {
+    BOOST_TEST(static_cast<std::uint16_t>(RecordType::vtep_credential) == 30U);
+    BOOST_TEST(static_cast<std::uint16_t>(RecordType::credential_revocations) == 31U);
+    BOOST_TEST(proto::max_record_payload >= proto::max_credential_revocations_size);
+    const std::vector<std::byte> credential(proto::vtep_credential_size);
+    BOOST_TEST(proto::encode_record(RecordType::vtep_credential, credential).has_value());
+    const std::vector<std::byte> full(proto::max_credential_revocations_size);
+    auto rec = proto::encode_record(RecordType::credential_revocations, full);
+    BOOST_REQUIRE(rec.has_value());
+    proto::RecordDecoder d;
+    d.feed(*rec);
+    const auto back = drain(d);
+    BOOST_REQUIRE(back.size() == 1U);
+    BOOST_TEST((back[0].type == RecordType::credential_revocations));
+    BOOST_TEST(back[0].payload.size() == full.size());
+    for (const std::uint16_t t : {std::uint16_t{29}, std::uint16_t{32}, std::uint16_t{33}}) {
+        BOOST_TEST(!proto::encode_record(static_cast<RecordType>(t), {}).has_value());
+    }
 }
 
 BOOST_AUTO_TEST_CASE(encode_refuses_what_decode_would) {

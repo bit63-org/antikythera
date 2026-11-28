@@ -112,6 +112,16 @@ struct RecordingSink final : helm::ControllerSink {
     auto on_rotate_vtep_key(const proto::RotateVtepKey& k) -> void override {
         rotations.push_back(k);
     }
+    std::vector<std::pair<proto::VtepCredential, std::vector<std::byte>>> credentials;
+    auto on_vtep_credential(const proto::VtepCredential& c, std::span<const std::byte> frame)
+        -> void override {
+        credentials.emplace_back(c, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
+    std::vector<std::pair<proto::CredentialRevocations, std::vector<std::byte>>> revocations;
+    auto on_credential_revocations(const proto::CredentialRevocations& l,
+                                   std::span<const std::byte> frame) -> void override {
+        revocations.emplace_back(l, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
     std::vector<proto::RoleCertificate> certificates;
     auto on_role_certificate(const proto::RoleCertificate& c) -> void override {
         certificates.push_back(c);
@@ -378,6 +388,37 @@ auto rotate_record(std::uint64_t to) -> std::vector<std::byte> {
     return framed(RecordType::rotate_vtep_key, *b);
 }
 
+auto credential_record(std::uint64_t to) -> std::vector<std::byte> {
+    proto::VtepCredential c{.key_id = 3,
+                            .server_id = to,
+                            .cell_id = 7,
+                            .modes = proto::tunnel_mode_bit(proto::TunnelMode::wireguard),
+                            .slot = 2,
+                            .key_epoch = 1,
+                            .vtep = {},
+                            .public_key = {},
+                            .not_before = 10,
+                            .not_after = 20,
+                            .serial = 5,
+                            .signature = {}};
+    c.vtep[0] = std::byte{0xFD};
+    c.vtep[15] = std::byte{1};
+    c.public_key.fill(std::byte{0x11});
+    auto b = proto::encode_vtep_credential(c);
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::vtep_credential, *b);
+}
+
+auto revocations_record() -> std::vector<std::byte> {
+    auto b = proto::encode_credential_revocations({.key_id = 3,
+                                                   .cell_id = 7,
+                                                   .list_version = 2,
+                                                   .entries = {{.serial = 4, .not_after = 9}},
+                                                   .signature = {}});
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::credential_revocations, *b);
+}
+
 auto tunnel_peers_record(std::uint64_t to) -> std::vector<std::byte> {
     proto::TunnelPeers t{
         .server_id = to,
@@ -574,6 +615,36 @@ BOOST_FIXTURE_TEST_CASE(key_rotations_reach_the_sink_for_this_server_only, Fixtu
     BOOST_REQUIRE(!res.has_value());
     BOOST_TEST((res.error() == SessionError::wrong_server));
     BOOST_TEST(sink.rotations.size() == 1U);
+}
+
+// fleet-scale-networking task 2: a credential for this server and any
+// cell's revocation list reach the sink with their exact bytes.
+BOOST_FIXTURE_TEST_CASE(credential_records_reach_the_sink_unmodified, Fixture) {
+    session.on_connected();
+    const auto cred = credential_record(server);
+    const auto list = revocations_record();
+    BOOST_REQUIRE(session.on_bytes(cred).has_value());
+    BOOST_REQUIRE(session.on_bytes(list).has_value());
+    BOOST_REQUIRE(sink.credentials.size() == 1U);
+    BOOST_TEST(sink.credentials[0].first.serial == 5U);
+    BOOST_TEST(std::ranges::equal(sink.credentials[0].second,
+                                  std::span{cred}.subspan(proto::record_header_size)));
+    BOOST_REQUIRE(sink.revocations.size() == 1U);
+    BOOST_TEST(sink.revocations[0].first.list_version == 2U);
+    BOOST_TEST(std::ranges::equal(sink.revocations[0].second,
+                                  std::span{list}.subspan(proto::record_header_size)));
+    // Another server's credential is refused; an undecodable one too.
+    auto res = session.on_bytes(credential_record(other_server));
+    BOOST_REQUIRE(!res.has_value());
+    BOOST_TEST((res.error() == SessionError::wrong_server));
+    session.on_disconnected();
+    session.on_connected();
+    auto bad = credential_record(server);
+    bad[proto::record_header_size] = std::byte{0};  // magic
+    res = session.on_bytes(bad);
+    BOOST_REQUIRE(!res.has_value());
+    BOOST_TEST((res.error() == SessionError::bad_record));
+    BOOST_TEST(sink.credentials.size() == 1U);
 }
 
 // kythira khold-block-service task 17.

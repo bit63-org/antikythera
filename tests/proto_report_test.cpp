@@ -327,6 +327,10 @@ auto der_seq(std::size_t n, std::uint8_t fill = 0x02) -> std::vector<std::byte> 
     return out;
 }
 
+auto sample_credential_request() -> proto::CredentialRequest {
+    return {.slot = 2, .key_epoch = 0x1234, .vtep = vtep(1), .public_key = tunnel_key(0x33)};
+}
+
 auto sample_cert_request() -> proto::CertRequest {
     return {.slot = 3, .role = proto::StorageRole::hold, .csr = der_seq(300)};
 }
@@ -451,6 +455,7 @@ auto every_body() -> std::vector<proto::ReportBody> {
                                                .state = proto::ConversionState::failed,
                                                .failure = proto::ConversionFailure::lost,
                                                .slot = 0});
+    all.emplace_back(sample_credential_request());
     return all;
 }
 
@@ -1373,6 +1378,53 @@ BOOST_AUTO_TEST_CASE(khold_rules_are_enforced_both_ways) {
     b[body + 2] = std::byte{0xFF};
     b[body + 3] = std::byte{0xFF};
     BOOST_TEST((proto::decode_report(b).error() == DecodeError::too_many_entries));
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// fleet-scale-networking task 2.
+BOOST_AUTO_TEST_SUITE(credential_requests, *boost::unit_test::timeout(unit_timeout_seconds))
+
+BOOST_AUTO_TEST_CASE(credential_request_layout) {
+    BOOST_TEST(static_cast<std::uint16_t>(proto::report_kind(sample_credential_request())) == 31U);
+    const auto b = encoded(make_report(sample_credential_request()));
+    BOOST_TEST(b.size() == body + proto::credential_request_size);
+    BOOST_TEST(proto::credential_request_size == 56U);
+    BOOST_TEST(std::to_integer<int>(b[off_kind]) == 31);
+    BOOST_TEST(std::to_integer<int>(b[body]) == 2);  // slot
+    for (std::size_t i = 1; i < 4; ++i) {
+        BOOST_TEST(std::to_integer<int>(b[body + i]) == 0);  // reserved
+    }
+    BOOST_TEST(std::to_integer<int>(b[body + 4]) == 0x34);
+    BOOST_TEST(std::to_integer<int>(b[body + 5]) == 0x12);
+    BOOST_TEST(std::to_integer<int>(b[body + 8]) == ula_prefix);
+    BOOST_TEST(std::to_integer<int>(b[body + 8 + last]) == 1);
+    BOOST_TEST(std::to_integer<int>(b[body + 24]) == 0x33);
+    BOOST_TEST(std::to_integer<int>(b[body + 55]) == 0x33);
+}
+
+BOOST_AUTO_TEST_CASE(credential_request_rules_are_enforced_both_ways) {
+    const auto good = encoded(make_report(sample_credential_request()));
+    auto reserved = good;
+    reserved[body + 1] = std::byte{1};
+    BOOST_TEST((decode_error(reserved) == DecodeError::reserved_not_zero));
+    for (const std::uint32_t epoch : {0U, 0x1'0000U}) {
+        auto bad = good;
+        set_le32(bad, body + 4, epoch);
+        BOOST_TEST((decode_error(bad) == DecodeError::bad_id));
+        auto c = sample_credential_request();
+        c.key_epoch = epoch;
+        BOOST_TEST((encode_error(make_report(c)) == DecodeError::bad_id));
+    }
+    auto multicast = good;
+    multicast[body + 8] = std::byte{0xFF};
+    BOOST_TEST((decode_error(multicast) == DecodeError::bad_vtep));
+    auto c = sample_credential_request();
+    c.vtep = {};
+    BOOST_TEST((encode_error(make_report(c)) == DecodeError::bad_vtep));
+    c = sample_credential_request();
+    c.public_key = {};
+    BOOST_TEST((encode_error(make_report(c)) == DecodeError::bad_public_key));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

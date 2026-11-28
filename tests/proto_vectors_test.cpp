@@ -23,6 +23,7 @@
 #include "hull/signature_verifier.hpp"
 #include "proto/envelope.hpp"
 #include "proto/map_update.hpp"
+#include "proto/host_image.hpp"
 #include "proto/host_lifecycle.hpp"
 #include "proto/power_policy.hpp"
 #include "proto/replica_config.hpp"
@@ -447,6 +448,22 @@ BOOST_AUTO_TEST_CASE(decommission18_reproduces_and_verifies) {
         [](std::span<std::byte> b, const auto& sig) {
             proto::set_host_lifecycle_signature(b, sig);
         });
+}
+
+BOOST_AUTO_TEST_CASE(host_image21_reproduces_and_verifies) {
+    proto::HostImage fields{.key_id = vec::host_image21_key_id,
+                            .image_version = vec::host_image21_version,
+                            .size = vec::host_image21_size,
+                            .kind = proto::HostImageKind::hull,
+                            .digest = {},
+                            .signature = {}};
+    fields.digest.fill(std::byte{0xC4});
+    check_signed_vector(
+        vec::host_image21, vec::host_image21_signature, fields, TestSigner{vec::key1_secret},
+        [](const proto::HostImage& h) { return proto::encode_host_image(h); },
+        [](std::span<const std::byte> b) { return proto::decode_host_image(b); },
+        [](std::span<const std::byte> b) { return proto::host_image_signed_bytes(b); },
+        [](std::span<std::byte> b, const auto& sig) { proto::set_host_image_signature(b, sig); });
 }
 
 BOOST_AUTO_TEST_CASE(standing14_reproduces_and_verifies) {

@@ -1,0 +1,20 @@
+// Copyright (c) 2026 Clark Rawlins
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+// The image signing public keys compiled into ak-helm
+// (.kiro/specs/cold-start/ Requirement 2.5). CMake writes this header from
+// src/helm/image_keys.hpp.in and the cache variable AK_HELM_IMAGE_KEYS;
+// edit the template, not the generated copy. Same text format as hull's
+// controller keys (parse_controller_keys()).
+
+#include <string_view>
+
+namespace ak::helm {
+
+// A function rather than a variable so an empty list (the default) is not
+// a "redundant" empty-string initializer to clang-tidy.
+constexpr auto compiled_image_keys() noexcept -> std::string_view { return "@AK_HELM_IMAGE_KEYS@"; }
+
+}  // namespace ak::helm

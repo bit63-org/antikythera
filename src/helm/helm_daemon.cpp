@@ -553,8 +553,24 @@ auto HelmDaemon::handle(Item& item) -> void {
         if (kept && _config.time_floor != nullptr) {
             (void)_config.time_floor->observe(power->policy.time_floor);
         }
+        // keep_image promotes an image helm holds to LKG (Requirement
+        // 2.3); the controller sends it only after the server booted that
+        // image and passed its checks. Re-sending the LKG's digest is a
+        // no-op, so every later policy may carry it.
+        std::optional<bool> promoted;
+        if (kept && _config.images != nullptr &&
+            !proto::detail::all_zero(power->policy.keep_image)) {
+            auto p = _config.images->promote(power->policy.keep_image);
+            promoted = p.has_value();
+            if (p && !*p) {
+                promoted.reset();
+            }
+        }
         const std::scoped_lock lock{_inbox_mutex};
         ++(kept ? _stats.power_policies : _stats.power_policies_refused);
+        if (promoted) {
+            ++(*promoted ? _stats.images_promoted : _stats.image_promotions_failed);
+        }
     } else if (const auto* standing = std::get_if<StandingSetFrame>(&item)) {
         // Verified, kept and anchored for the next time helm's power
         // returns (cold-start Requirement 4.2); it starts nothing now.

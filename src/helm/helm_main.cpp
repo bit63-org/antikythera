@@ -50,6 +50,8 @@
 #include "helm/flash.hpp"
 #include "helm/helm_config.hpp"
 #include "helm/helm_daemon.hpp"
+#include "helm/image_cache.hpp"
+#include "helm/image_keys.hpp"
 #include "helm/key_store.hpp"
 #include "helm/power_on.hpp"
 #include "helm/standing_frames.hpp"
@@ -255,6 +257,42 @@ auto run(const helm::HelmConfig& cfg) -> int {
     } else {
         std::println(stderr, "{}: no controller-keys: power policies are refused", log_name);
     }
+    // The hull images in the sealed store (cold-start Requirement 2):
+    // verified under the image signing keys, compiled in or configured.
+    std::unique_ptr<ControllerRecordVerifier> image_verifier;
+    std::string_view image_keys = ak::helm::compiled_image_keys();
+    if (!image_keys.empty() && !cfg.image_keys.empty()) {
+        std::println(stderr, "{}: image-keys: this build has its image keys compiled in", log_name);
+        return exit_usage;
+    }
+    if (image_keys.empty()) {
+        image_keys = cfg.image_keys;
+    }
+    if (!image_keys.empty()) {
+        const auto parsed = ak::hull::parse_controller_keys(image_keys);
+        if (!parsed) {
+            std::println(stderr, "{}: image-keys: {}", log_name, parsed.error().reason);
+            return exit_usage;
+        }
+        auto v = ak::hull::SignatureVerifier::create(*parsed);
+        if (!v) {
+            std::println(stderr, "{}: image-keys: {}", log_name, ak::hull::to_string(v.error()));
+            return exit_usage;
+        }
+        image_verifier = std::make_unique<ControllerRecordVerifier>(std::move(*v));
+    }
+    std::optional<helm::ImageCache> images;
+    if (store) {
+        images.emplace(*store, image_verifier.get());
+        if (auto ok = images->load(); !ok) {
+            std::println(stderr, "{}: image cache: {}", log_name, helm::to_string(ok.error()));
+            images.reset();
+        } else if (images->faults() != 0) {
+            std::println(stderr, "{}: image cache: {} slot(s) discarded", log_name,
+                         images->faults());
+        }
+    }
+    daemon_config.images = images ? &*images : nullptr;
     helm::PowerPolicyKeeper power_policy{cfg.server_id, store ? &*store : nullptr, verifier.get()};
     const auto loaded = power_policy.load();
     if (loaded != helm::PolicyVerdict::kept && loaded != helm::PolicyVerdict::none) {
@@ -312,9 +350,14 @@ auto run(const helm::HelmConfig& cfg) -> int {
                             helm::HostPowerOverride::none, helm::draw_jitter(policy.max_jitter_ms));
 
     // The boot cache's state behind every inventory (cold-start Requirement
-    // 8.2). The LKG and previous images (task 4) are none.
-    daemon_config.boot_cache = [&power_policy, &standing_set, &store] {
-        return helm::make_boot_cache({}, standing_set.generation(), power_policy,
+    // 8.2).
+    daemon_config.boot_cache = [&power_policy, &standing_set, &store, &images] {
+        helm::BootImages held;
+        if (images) {
+            held.lkg = images->digest(helm::ImageSlot::lkg);
+            held.previous = images->digest(helm::ImageSlot::previous);
+        }
+        return helm::make_boot_cache(held, standing_set.generation(), power_policy,
                                      store ? &*store : nullptr);
     };
     // After the power-on wait: one cold_start report per power return

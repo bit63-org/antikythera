@@ -75,6 +75,23 @@ replayed power or decommission record is refused like a replayed
 command. helm verifies their signatures itself (unlike a MapUpdate,
 which it forwards unchecked), because helm is the one that acts.
 
+### Host images
+
+Every host image travels with a signed `HostImage` descriptor
+(`src/proto/host_image.hpp`, fixed 0x80 bytes: key ID, release number,
+size, kind, SHA-256): signed by an image signing key, not the controller
+key, so a compromised controller still cannot put an image of its own on
+a server. helm's image keys are compiled in (`AK_HELM_IMAGE_KEYS`) in a
+production build, or configured (`image-keys`) in harbor. The boot layer
+serves an image and its descriptor at `v1/images/<hex digest>/data` and
+`/descriptor`, so an image is fetched by what it is.
+
+helm keeps up to three images in its sealed store (`src/helm/
+image_cache.hpp`): `staged` (assigned and fetched, not yet trusted),
+`lkg` and `previous`, as 1 MiB chunks named by digest so releases share
+what they have in common. Each is checked when stored and again, from
+the chunks read back, before it is booted.
+
 ### Decommission order
 
 Keys first: once the master key is gone every volume is unreadable, so

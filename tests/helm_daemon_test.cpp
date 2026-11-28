@@ -35,6 +35,12 @@
 #include "helm/audit_log.hpp"
 #include "helm/controller_link.hpp"
 #include "helm/helm_daemon.hpp"
+#include <openssl/sha.h>
+#include "proto/host_image.hpp"
+#include "helm/store_anchor.hpp"
+#include "helm/sealed_store.hpp"
+#include "helm/flash.hpp"
+#include "helm/image_cache.hpp"
 #include "helm/key_store.hpp"
 #include "helm/mailbox.hpp"
 #include "helm/oar_link.hpp"
@@ -617,9 +623,10 @@ struct Rig {
                  helm::TimeFloor* time_floor = nullptr,
                  std::function<proto::BootCache()> boot_cache = {},
                  helm::StandingSetKeeper* standing_set = nullptr,
-                 helm::StandingFrames* standing_frames = nullptr)
+                 helm::StandingFrames* standing_frames = nullptr,
+                 helm::ImageCache* images = nullptr)
         : daemon{config(slot_link_timeout, with_hold, with_khold, power_policy, time_floor,
-                        std::move(boot_cache), standing_set, standing_frames),
+                        std::move(boot_cache), standing_set, standing_frames, images),
                  keys,
                  audit,
                  host_port != nullptr ? *host_port : host,
@@ -643,8 +650,10 @@ struct Rig {
                        helm::TimeFloor* time_floor = nullptr,
                        std::function<proto::BootCache()> boot_cache = {},
                        helm::StandingSetKeeper* standing_set = nullptr,
-                       helm::StandingFrames* standing_frames = nullptr) -> helm::DaemonConfig {
+                       helm::StandingFrames* standing_frames = nullptr,
+                       helm::ImageCache* images = nullptr) -> helm::DaemonConfig {
         helm::DaemonConfig c;
+        c.images = images;
         c.power_policy = power_policy;
         c.standing_set = standing_set;
         c.standing_frames = standing_frames;
@@ -2240,6 +2249,66 @@ BOOST_AUTO_TEST_CASE(power_policy_records_reach_the_keeper) {
     // Only the kept record's floor counts (cold-start Requirement 7.1),
     // not the forged one's higher floor.
     BOOST_TEST(time_floor.floor() == 1'795'000'002U);
+}
+
+// Requirement 2.3: a kept power policy's keep_image promotes a held image
+// to LKG; one that names no held image, or comes in a refused policy,
+// promotes nothing.
+BOOST_AUTO_TEST_CASE(keep_image_promotes_a_held_image) {
+    struct AcceptAll final : helm::RecordVerifier {
+        [[nodiscard]] auto verify(std::span<const std::byte> /*message*/,
+                                  std::span<const std::byte, proto::ed25519_signature_size> sig,
+                                  std::uint16_t /*key_id*/) const -> bool override {
+            return sig[0] == std::byte{1};
+        }
+    } verifier;
+    helm::MemoryFlash flash{std::uint64_t{1} << 20};
+    auto anchor = helm::SoftwareStoreAnchor::ephemeral();
+    BOOST_REQUIRE(anchor.has_value());
+    auto store = helm::SealedStore::open(flash, **anchor);
+    BOOST_REQUIRE(store.has_value());
+    helm::ImageCache images{*store, &verifier};
+    const std::vector<std::byte> uki(3000, std::byte{0x42});
+    proto::HostImage d{.key_id = 1,
+                       .image_version = 1,
+                       .size = uki.size(),
+                       .kind = proto::HostImageKind::hull,
+                       .digest = {},
+                       .signature = {}};
+    SHA256(reinterpret_cast<const unsigned char*>(uki.data()), uki.size(),
+           reinterpret_cast<unsigned char*>(d.digest.data()));
+    d.signature.fill(std::byte{1});
+    BOOST_REQUIRE(images.stage(*proto::encode_host_image(d), uki).has_value());
+
+    helm::PowerPolicyKeeper keeper{server, nullptr, &verifier};
+    Rig r{link_timeout, nullptr, false, false, &keeper, nullptr, {}, nullptr, nullptr, &images};
+    const auto frame = [](std::uint64_t version, const proto::ImageDigest& keep, std::uint8_t sig) {
+        proto::PowerPolicy p = proto::default_power_policy(server);
+        p.key_id = 1;
+        p.policy_version = version;
+        p.keep_image = keep;
+        p.signature.fill(std::byte{sig});
+        auto bytes = proto::encode_power_policy(p);
+        BOOST_REQUIRE(bytes.has_value());
+        return std::pair{p, *bytes};
+    };
+    proto::ImageDigest unknown{};
+    unknown.fill(std::byte{9});
+    const auto [forged, forged_bytes] = frame(1, d.digest, 0);
+    const auto [miss, miss_bytes] = frame(2, unknown, 1);
+    const auto [keep, keep_bytes] = frame(3, d.digest, 1);
+    const auto [again, again_bytes] = frame(4, d.digest, 1);
+    r.daemon.on_power_policy(forged, forged_bytes);
+    r.daemon.on_power_policy(miss, miss_bytes);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(!images.slot(helm::ImageSlot::lkg).has_value());
+    BOOST_TEST(r.daemon.stats().image_promotions_failed == 1U);
+    r.daemon.on_power_policy(keep, keep_bytes);
+    r.daemon.on_power_policy(again, again_bytes);  // the LKG already: no-op
+    r.daemon.run_once(0ms);
+    BOOST_TEST((images.digest(helm::ImageSlot::lkg) == d.digest));
+    BOOST_TEST(r.daemon.stats().images_promoted == 1U);
+    BOOST_TEST(r.daemon.stats().image_promotions_failed == 1U);
 }
 
 BOOST_AUTO_TEST_CASE(the_boot_cache_is_read_before_each_publish) {

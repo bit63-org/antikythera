@@ -90,6 +90,7 @@ add_library(ak_helm
   helm/helm_config.cpp
   helm/helm_daemon.cpp
   helm/hpke.cpp
+  helm/image_cache.cpp
   helm/key_store.cpp
   helm/mailbox.cpp
   helm/mailbox_device.cpp
@@ -117,7 +118,16 @@ target_link_libraries(ak_helm
 
 # ak-helm: the helm daemon as harbor runs it (board processes, socket
 # sidebands, the ControllerLink).
+# The image signing public keys compiled into ak-helm (cold-start
+# Requirement 2.5), in AK_HULL_CONTROLLER_KEYS' format. A production build
+# sets them, and the configuration's image-keys is then refused; empty
+# (the default, for harbor and development) lets image-keys supply them.
+set(AK_HELM_IMAGE_KEYS "" CACHE STRING
+  "ak-helm's image signing public keys: <id>:<hex>;<id>:<hex>...")
+configure_file(helm/image_keys.hpp.in
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/helm/image_keys.hpp @ONLY)
 add_executable(ak-helm helm/helm_main.cpp)
+target_include_directories(ak-helm PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(ak-helm PRIVATE ak::helm ak::hull ak::warnings ak::hardening)
 install(TARGETS ak-helm RUNTIME DESTINATION bin)
 

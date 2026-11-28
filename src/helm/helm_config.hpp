@@ -32,6 +32,12 @@
 //                               records it acts on alone (power_policy) with
 //                               them. Optional: without, every such record is
 //                               refused and the defaults apply
+//   image-keys ID:HEX;...       image signing public keys (same format) that
+//                               hull images in the sealed store must verify
+//                               under (cold-start Requirement 2.5); refused
+//                               when ak-helm was built with
+//                               AK_HELM_IMAGE_KEYS. Optional: without either,
+//                               no image is stored or promoted
 //   power-marker PATH           a file in a tmpfs whose absence means helm's
 //                               own power returned (default
 //                               /run/ak-helm/powered; cold-start Requirement 3.6)
@@ -93,6 +99,7 @@ struct HelmConfig {
     std::uint64_t store_size{std::uint64_t{1} << 20};
     std::optional<std::filesystem::path> store_anchor;  // nullopt: ephemeral
     std::string controller_keys;                        // empty: none
+    std::string image_keys;                             // empty: none
     std::filesystem::path power_marker{"/run/ak-helm/powered"};
     bool apply_power_policy{true};
     std::map<SlotNumber, SlotEntry> slots;

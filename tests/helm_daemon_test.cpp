@@ -204,6 +204,17 @@ public:
         const std::scoped_lock lock{_mutex};
         return _revocation_lists;
     }
+    // fleet-scale-networking task 11: frame notices, exactly as sent.
+    std::atomic<oar::Status> notice_status{oar::Status::ok};
+    [[nodiscard]] auto notices() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _notices;
+    }
+    auto frame_notice(std::span<const std::byte> notice) -> oar::Status override {
+        const std::scoped_lock lock{_mutex};
+        _notices.emplace_back(notice.begin(), notice.end());
+        return notice_status.load();
+    }
     auto vtep_credential(std::span<const std::byte> frame) -> oar::Status override {
         if (!tunnel) {
             return oar::Status::unsupported;
@@ -439,6 +450,7 @@ private:
     std::vector<std::vector<std::byte>> _tunnel_keys;
     std::vector<std::vector<std::byte>> _peer_sets;
     std::vector<std::vector<std::byte>> _credentials;
+    std::vector<std::vector<std::byte>> _notices;
     std::vector<std::vector<std::byte>> _revocation_lists;
     std::vector<oar::PrepareFunction> _prepared;
     std::vector<std::vector<std::byte>> _frames;
@@ -1814,6 +1826,37 @@ auto revocations_frame(std::uint32_t cell, std::uint64_t version, std::size_t en
     auto bytes = proto::encode_credential_revocations(l);
     BOOST_REQUIRE(bytes.has_value());
     return {.list = std::move(l), .frame = std::move(*bytes)};
+}
+
+// fleet-scale-networking task 11: a frame notice goes to every network
+// role at once (control traffic, even mid-transfer), and to no other role.
+BOOST_AUTO_TEST_CASE(frame_notices_reach_network_roles_only) {
+    Rig r;
+    r.net.role.tunnel = true;
+    (void)r.daemon.boot();
+    const proto::FrameNotice n{.kind = proto::FrameKind::vpc_stream,
+                               .vni_or_scope = 0xAB0001,
+                               .sequence_or_version = 4,
+                               .size = 200'000,
+                               .sha256 = {std::byte{0x11}}};
+    const auto big = revocations_frame(1, 1, 8192);
+    r.daemon.on_credential_revocations(big.list, big.frame);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.daemon.bulk_pending());
+    r.daemon.on_frame_notice(n);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.role.notices().size() == 1U);
+    BOOST_TEST((r.net.role.notices()[0] == proto::encode_frame_notice(n).value()));
+    BOOST_TEST(r.blk.role.notices().empty());
+    BOOST_TEST(r.daemon.bulk_pending());  // the list is still crossing
+    BOOST_TEST(r.daemon.stats().frame_notices == 1U);
+    BOOST_TEST(r.daemon.stats().frame_notices_refused == 0U);
+    r.net.role.notice_status = oar::Status::failed;
+    r.daemon.on_frame_notice(n);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().frame_notices == 2U);
+    BOOST_TEST(r.daemon.stats().frame_notices_refused == 1U);
+    r.drain();
 }
 
 // fleet-scale-networking task 11 (Requirement 6.4): a lease grant reaches

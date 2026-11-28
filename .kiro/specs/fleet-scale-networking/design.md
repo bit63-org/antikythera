@@ -367,12 +367,37 @@ FrameNotice {                 // controller link record 33 / vendor type 0x33
   own decoder and signature check. Retries with backoff across the
   listed endpoints; after a configured failure count it asks helm to
   fall back to OarLink chunks for that notice.
+- **Notice format.** `src/proto/frame_notice.hpp`. Kinds 1 `vpc_stream`
+  (the scope is a VNI, 1 to 2^24-1), 2 `edge_mapping`, 3
+  `security_policy` (the scope is the kind's own). The sequence or
+  version is never 0, and the size is 1 byte to `max_notice_frame_size`
+  (64 MiB, room for a full stream snapshot). The decoder is strict:
+  reserved bytes, unknown kinds, a zero or oversized size, and trailing
+  bytes are all refused. Link record 33 puts `server_id u64` ahead of
+  the 56-byte notice. The struct above has no server ID, but every
+  other per-server record names its server, so a record routed to the
+  wrong session is refused the same way. helm strips it and sends the
+  notice to every network role as one OarLink message, not kept for
+  replay: a role that missed one asks for a snapshot through
+  `stream_status`. The role keeps up to 1,024 pending notices (the
+  oldest goes first) for the fetcher in task 12. Frame-store addresses
+  are the fetcher's configuration (task 12), not part of the notice.
 - **OarLink scheduling.** helm's per-link queue gets three classes:
   control (keys, commands, credentials, revocations, lease traffic,
   notices), status polls, and bulk chunks. A bulk transfer sends one
   chunk per turn and always lets a waiting control message go first, so
   one 128 KiB frame never holds a lease renewal for seconds. Frames above
   16 KiB go by notice whenever the role reports the bulk channel up.
+  As built (task 11): the classes are the order of a `run_once` pass
+  rather than three queues. The inbox is control and goes out first;
+  status polls come next; then `OarLink::pump_bulk` sends one chunk per
+  link. A frame is bulk when it takes more than one chunk. A
+  single-chunk frame goes at once, except behind a queued transfer of
+  its own type, so a role sees each type in order. The role's endpoint
+  keeps a multi-chunk transfer across single-chunk frames of any type.
+  Replays to a reopened sideband stay synchronous, so a restarted role
+  holds its VPC configs, metadata, layouts and revocation lists before
+  the router prepares a NIC on it.
 
 ## Lookups for very large VPCs
 

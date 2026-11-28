@@ -470,6 +470,10 @@ auto HelmDaemon::on_rotate_vtep_key(const proto::RotateVtepKey& request) -> void
     enqueue(request);
 }
 
+auto HelmDaemon::on_frame_notice(const proto::FrameNotice& notice) -> void {
+    enqueue(notice);
+}
+
 auto HelmDaemon::on_vtep_credential(const proto::VtepCredential& credential,
                                     std::span<const std::byte> frame) -> void {
     enqueue(CredentialFrame{.credential = credential, .frame = {frame.begin(), frame.end()}});
@@ -577,6 +581,8 @@ auto HelmDaemon::handle(Item& item) -> void {
         keep_credential(*credential);
     } else if (auto* list = std::get_if<RevocationsFrame>(&item)) {
         keep_revocations(*list);
+    } else if (const auto* notice = std::get_if<proto::FrameNotice>(&item)) {
+        forward_notice(*notice);
     }
 }
 
@@ -840,6 +846,22 @@ auto HelmDaemon::keep_revocations(RevocationsFrame& list) -> void {
                                    });
         }
     }
+}
+
+auto HelmDaemon::forward_notice(const proto::FrameNotice& notice) -> void {
+    // Not kept for a role whose sideband reopens: a role that missed a
+    // stream notice asks for a snapshot through its stream_status
+    // (design "VPC streams").
+    const auto body = proto::encode_frame_notice(notice);
+    std::uint64_t refused = 0;
+    for (auto& [n, slot] : _slots) {
+        if (is_net_role(*slot) && (!body || !slot->link->frame_notice(*body))) {
+            ++refused;
+        }
+    }
+    const std::scoped_lock lock{_inbox_mutex};
+    ++_stats.frame_notices;
+    _stats.frame_notices_refused += refused;
 }
 
 auto HelmDaemon::send_credentials(SlotState& slot) -> void {

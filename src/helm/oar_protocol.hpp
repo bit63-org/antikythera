@@ -73,6 +73,10 @@
 //   credential_revocations 0  total u32 | 4  offset u32 | 8  chunk (as map_update):
 //                          one controller proto::CredentialRevocations (signed;
 //                          at most max_credential_revocations_frame bytes)
+//   frame_notice        0  one proto::FrameNotice (frame_notice_body bytes, unsigned):
+//                          a frame to fetch over the bulk channel
+//                          (fleet-scale-networking task 11); a single
+//                          message, never chunked, so it is control traffic
 //   group_membership    0  cursor u16 | 2  flags u16 (bit 0: `since` is set)
 //                       4  since u32 (the generation helm last read whole)
 //   copy_volume         0  op u8 (CopyOp) | 1  direction u8 (CopyDirection) | 2  reserved u16
@@ -310,6 +314,8 @@ inline constexpr std::size_t max_tunnel_peers_frame = 0x30 + (2048 * 0x38) + 64;
 // header, 16,384 entries of 16 bytes, signature), mirrored like the above
 // (fleet-scale-networking task 2).
 inline constexpr std::size_t vtep_credential_frame = 160;
+// A FrameNotice (proto::frame_notice_size), mirrored the same way.
+inline constexpr std::size_t frame_notice_body = 56;
 inline constexpr std::size_t max_credential_revocations_frame = 0x20 + (16384 * 0x10) + 64;
 static_assert(max_tunnel_peers_frame <= max_map_frame);
 

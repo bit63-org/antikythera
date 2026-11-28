@@ -64,6 +64,20 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
                     }
                 }
             }
+            if ((*r)->type == ak::proto::RecordType::frame_notice) {
+                if (auto n = ak::proto::decode_frame_notice_record((*r)->payload); n) {
+                    auto again = ak::proto::encode_frame_notice_record(*n);
+                    if (!again || *again != (*r)->payload) {
+                        std::abort();
+                    }
+                    // The notice alone, as helm passes it to the role.
+                    auto body = ak::proto::encode_frame_notice(n->notice);
+                    if (!body || !std::ranges::equal(*body, std::span{(*r)->payload}.subspan(8)) ||
+                        ak::proto::decode_frame_notice(*body) != n->notice) {
+                        std::abort();
+                    }
+                }
+            }
             if ((*r)->type == ak::proto::RecordType::vtep_credential) {
                 if (auto c = ak::proto::decode_vtep_credential((*r)->payload); c) {
                     auto again = ak::proto::encode_vtep_credential(*c);

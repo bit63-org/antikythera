@@ -139,6 +139,11 @@ public:
     // chunks like tunnel_peers (fleet-scale-networking task 2).
     auto vtep_credential(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
     auto credential_revocations(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
+    // Tells a network role about a frame waiting in a frame store
+    // (fleet-scale-networking task 11): one proto::FrameNotice, passed
+    // through undecoded in one message; fails without sending unless it is
+    // oar::frame_notice_body bytes.
+    auto frame_notice(std::span<const std::byte> notice) -> std::expected<void, LinkError>;
     auto health() -> std::expected<oar::Health, LinkError>;
     // Forwards one controller GroupPolicy frame to a network role in
     // chunks, like map_update; fails without sending unless it is
@@ -336,6 +341,10 @@ public:
         return oar::Status::unsupported;
     }
     virtual auto credential_revocations(std::span<const std::byte> /*frame*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    // A FrameNotice (oar::frame_notice_body bytes), not yet decoded.
+    virtual auto frame_notice(std::span<const std::byte> /*notice*/) -> oar::Status {
         return oar::Status::unsupported;
     }
     virtual auto tunnel_peers(std::span<const std::byte> /*frame*/) -> oar::Status {

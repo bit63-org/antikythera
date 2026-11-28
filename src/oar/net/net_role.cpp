@@ -773,6 +773,21 @@ auto NetRole::vtep_credential(std::span<const std::byte> frame) -> oar::Status {
     return oar::Status::ok;
 }
 
+auto NetRole::frame_notice(std::span<const std::byte> notice) -> oar::Status {
+    const auto n = proto::decode_frame_notice(notice);
+    if (!n) {
+        ++_counters.frame_notices_refused;
+        return oar::Status::bad_request;
+    }
+    if (_notices.size() >= max_pending_notices) {
+        _notices.pop_front();
+        ++_counters.frame_notices_dropped;
+    }
+    _notices.push_back(*n);
+    ++_counters.frame_notices;
+    return oar::Status::ok;
+}
+
 auto NetRole::cert_request() -> std::expected<oar::CertAnswer, oar::Status> {
     if (_enrollment == nullptr) {
         return std::unexpected(oar::Status::unsupported);

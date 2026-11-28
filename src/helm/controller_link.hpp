@@ -171,6 +171,9 @@ public:
     virtual auto on_credential_revocations(const proto::CredentialRevocations& /*list*/,
                                            std::span<const std::byte> /*frame*/) -> void {}
     virtual auto on_rotate_vtep_key(const proto::RotateVtepKey& /*request*/) -> void {}
+    // A frame waiting in a frame store for the network roles to fetch
+    // over their bulk channel (fleet-scale-networking task 11).
+    virtual auto on_frame_notice(const proto::FrameNotice& /*notice*/) -> void {}
 };
 
 enum class SessionError : std::uint8_t {

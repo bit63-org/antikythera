@@ -125,6 +125,7 @@ public:
     ak::helm::VolumeId key_volume{0};
     std::vector<std::vector<std::byte>> frames;
     std::vector<std::vector<std::byte>> peer_frames;
+    std::vector<std::vector<std::byte>> notices;
     std::optional<ak::helm::VolumeId> created;
     std::uint64_t created_sectors{0};
     std::vector<std::byte> created_key;
@@ -132,6 +133,10 @@ public:
     ak::helm::VmId rewrapped_owner{0};
     std::vector<std::byte> rewrapped_key;
 
+    auto frame_notice(std::span<const std::byte> n) -> oar::Status override {
+        notices.emplace_back(n.begin(), n.end());
+        return status;
+    }
     auto create_volume(const oar::CreateVolume& r) -> oar::Status override {
         created = r.volume_id;
         created_sectors = r.capacity_sectors;
@@ -617,6 +622,33 @@ BOOST_AUTO_TEST_CASE(map_apply_failure_is_reported) {
     auto r = link.map_update(pattern(multi_chunk_frame));
     BOOST_TEST((r.error().code == LinkErrc::refused));
     BOOST_TEST((r.error().status == oar::Status::failed));
+}
+
+// fleet-scale-networking task 11: a frame notice is one message, passed
+// through undecoded; the wrong size never reaches the wire, and the role's
+// endpoint refuses one that arrives anyway.
+BOOST_AUTO_TEST_CASE(frame_notices_cross_whole) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    FakeOar fake;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config(long_timeout)};
+    const auto notice = pattern(oar::frame_notice_body);
+    {
+        const Server server{endpoint, fake};
+        BOOST_TEST(link.frame_notice(notice).has_value());
+        BOOST_TEST((link.frame_notice(pattern(oar::frame_notice_body + 1)).error().code ==
+                    LinkErrc::bad_request));
+        BOOST_TEST((link.frame_notice({}).error().code == LinkErrc::bad_request));
+    }
+    BOOST_REQUIRE(fake.notices.size() == 1U);
+    BOOST_TEST((fake.notices[0] == notice));
+    BOOST_TEST(static_cast<int>(mctp::VendorType::frame_notice) == 0x33);
+
+    const auto short_body = pattern(oar::frame_notice_body - 1);
+    send_raw_request(*helm_b, mctp::VendorType::frame_notice, short_body, 0);
+    serve_request(endpoint, fake);
+    BOOST_TEST((read_raw_status(*helm_b) == oar::Status::bad_request));
+    BOOST_TEST(fake.notices.size() == 1U);
 }
 
 // fleet-scale-networking task 11: a multi-chunk frame is bulk, sent a

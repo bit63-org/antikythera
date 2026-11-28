@@ -1963,3 +1963,31 @@ BOOST_AUTO_TEST_CASE(a_network_role_enrolls_for_its_bulk_channel,
     std::error_code ec;
     fs::remove_all(dir, ec);
 }
+
+// fleet-scale-networking task 11: notices are decoded and kept in arrival
+// order for the bulk channel, a bounded number of them.
+BOOST_AUTO_TEST_CASE(frame_notices_are_kept_for_the_bulk_channel,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    One b;
+    proto::FrameNotice n{.kind = proto::FrameKind::vpc_stream,
+                         .vni_or_scope = 0xAB0001,
+                         .sequence_or_version = 1,
+                         .size = 4096,
+                         .sha256 = {}};
+    BOOST_TEST((b.role->frame_notice(proto::encode_frame_notice(n).value()) == oar::Status::ok));
+    auto bad = proto::encode_frame_notice(n).value();
+    bad[1] = std::byte{1};  // reserved
+    BOOST_TEST((b.role->frame_notice(bad) == oar::Status::bad_request));
+    BOOST_TEST(b.role->counters().frame_notices == 1U);
+    BOOST_TEST(b.role->counters().frame_notices_refused == 1U);
+    for (std::uint64_t s = 2; s <= net::NetRole::max_pending_notices + 1; ++s) {
+        n.sequence_or_version = s;
+        BOOST_TEST(
+            (b.role->frame_notice(proto::encode_frame_notice(n).value()) == oar::Status::ok));
+    }
+    const auto& kept = b.role->pending_notices();
+    BOOST_REQUIRE(kept.size() == net::NetRole::max_pending_notices);
+    BOOST_TEST(kept.front().sequence_or_version == 2U);  // the oldest went first
+    BOOST_TEST(kept.back().sequence_or_version == net::NetRole::max_pending_notices + 1);
+    BOOST_TEST(b.role->counters().frame_notices_dropped == 1U);
+}

@@ -1,6 +1,6 @@
 # Implementation Plan — Network control at fleet scale
 
-## Status: 5/18 tasks complete
+## Status: 6/18 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -71,7 +71,7 @@ tasks 14-15. Phases A, B and C can run in parallel.
 - [x] 10. Network role certificates: role kind `net` in `cert_request`,
   the role's control address as an IP SAN, `tls::RoleIdentity` reused.
   _Requirements: 6.1_ (cloud)
-- [ ] 11. `FrameNotice` codec (link record 33, vendor type 0x33) and
+- [x] 11. `FrameNotice` codec (link record 33, vendor type 0x33) and
   OarLink scheduling classes in helm (control, status, bulk; one bulk
   chunk per turn); a test that a lease renewal never waits behind a
   131 KiB transfer. _Requirements: 6.2, 6.4_ (cloud)

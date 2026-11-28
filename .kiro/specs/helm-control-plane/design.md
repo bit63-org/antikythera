@@ -249,7 +249,22 @@ its life left (by `DaemonConfig::wall_clock`), at most once per
 `identity_retry` per key; it keeps the controller's newest credential per
 VTEP and the highest revocation list per cell, forwards them unmodified
 (OarLink `vtep_credential` and chunked `credential_revocations`), and
-sends both again right after a role's key when its sideband reopens. `TunnelKeyring::provision`
+sends both again right after a role's key when its sideband reopens.
+OarLink scheduling (fleet-scale-networking task 11): a controller frame
+that takes more than one chunk is bulk. `OarLink::send_frame` queues it,
+and each `run_once` pass serves the inbox (control), then status polls,
+then one chunk of each link's oldest transfer (`pump_bulk`), so a lease
+grant or a key never waits behind a 131 KiB frame. A single-chunk frame
+goes at once unless a transfer of its type is queued, in which case it
+waits behind it to keep each type in order. The role's endpoint hands a
+whole single-chunk frame to its handler without disturbing a transfer in
+progress. Forwarded map updates, VPC configs, metadata, layouts,
+revocation lists and peer sets use it, and their outcome is counted when
+the last role answers. Replays on a new sideband stay synchronous, so a
+restarted role holds its configuration before its first prepare. A
+controller `frame_notice` goes to every network role at once as one
+OarLink message (vendor type 0x33) and is not kept for replay.
+`TunnelKeyring::provision`
 sends a role its private key (`set_tunnel_key`) and then the newest
 controller peer set for its VTEP, on every attach, so a restarted role
 gets both back. `fill` puts the public keys in the inventory. Peer sets

@@ -272,6 +272,14 @@ auto OarLink::credential_revocations(std::span<const std::byte> frame)
     return send_chunked(mctp::VendorType::credential_revocations, frame);
 }
 
+auto OarLink::frame_notice(std::span<const std::byte> notice) -> std::expected<void, LinkError> {
+    if (notice.size() != oar::frame_notice_body) {
+        return std::unexpected(bad_request());
+    }
+    std::vector<std::byte> body{notice.begin(), notice.end()};
+    return expect_empty(transact(mctp::VendorType::frame_notice, body));
+}
+
 auto OarLink::group_members(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
     if (frame.empty() || frame.size() > oar::max_group_members_frame) {
         return std::unexpected(bad_request());
@@ -865,6 +873,9 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
             auto req = oar::decode_remove_tunnel_peer(body);
             return status_only(req ? handler.remove_tunnel_peer(*req) : oar::Status::bad_request);
         }
+        case mctp::VendorType::frame_notice:
+            return status_only(body.size() == oar::frame_notice_body ? handler.frame_notice(body)
+                                                                     : oar::Status::bad_request);
         case mctp::VendorType::map_update:
         case mctp::VendorType::tunnel_peers:
         case mctp::VendorType::vtep_credential:

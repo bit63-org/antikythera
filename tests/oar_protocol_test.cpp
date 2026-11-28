@@ -99,6 +99,7 @@ BOOST_AUTO_TEST_CASE(map_frame_limit_matches_proto) {
     BOOST_TEST(oar::max_map_frame == ak::proto::max_map_update_size);
     BOOST_TEST(oar::max_tunnel_peers_frame == ak::proto::max_tunnel_peers_size);
     BOOST_TEST(oar::vtep_credential_frame == ak::proto::vtep_credential_size);
+    BOOST_TEST(oar::frame_notice_body == ak::proto::frame_notice_size);
     BOOST_TEST(oar::max_credential_revocations_frame == ak::proto::max_credential_revocations_size);
     BOOST_TEST(oar::max_map_chunk + oar::map_chunk_head_size + ak::helm::mctp::vendor_header_size ==
                ak::helm::mctp::max_message_size);

@@ -95,6 +95,7 @@ enum class DecodeError : std::uint8_t {
     bad_power_policy,    // a power-on policy tier or delay outside its rules
     bad_validity,        // a credential's not_before is not before its not_after
     bad_list_version,    // revocation list version 0 (versions start at 1)
+    bad_frame_size,      // a frame notice's size is 0 or over max_notice_frame_size
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -227,6 +228,8 @@ enum class DecodeError : std::uint8_t {
             return "credential validity window is empty";
         case DecodeError::bad_list_version:
             return "revocation list version is zero";
+        case DecodeError::bad_frame_size:
+            return "frame notice size is zero or too large";
     }
     return "unknown";
 }

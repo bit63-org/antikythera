@@ -179,6 +179,7 @@ ak_add_test(controller_session_test SOURCES controller_session_test.cpp LIBS ak:
 ak_add_test(controller_link_test    SOURCES controller_link_test.cpp    LIBS ak::helm OpenSSL::Crypto)
 ak_add_test(harbor_controller_test SOURCES harbor_controller_test.cpp LIBS ak::harbor_controller ak::hull OpenSSL::Crypto)
 ak_add_test(key_store_test     SOURCES key_store_test.cpp     LIBS ak::helm)
+ak_add_test(sealed_store_test SOURCES sealed_store_test.cpp LIBS ak::helm)
 ak_add_test(hpke_test          SOURCES hpke_test.cpp          LIBS ak::helm)
 ak_add_test(virtqueue_test    SOURCES virtqueue_test.cpp    LIBS ak::oar_virtio)
 ak_add_test(virtio_pci_test   SOURCES virtio_pci_test.cpp   LIBS ak::oar_virtio)

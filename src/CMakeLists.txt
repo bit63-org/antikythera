@@ -86,6 +86,7 @@ add_library(ak_helm
   helm/group_usage.cpp
   helm/controller_link.cpp
   helm/device_pool.cpp
+  helm/flash.cpp
   helm/helm_config.cpp
   helm/helm_daemon.cpp
   helm/hpke.cpp
@@ -97,8 +98,10 @@ add_library(ak_helm
   helm/oar_protocol.cpp
   helm/power_sequencer.cpp
   helm/scoped_key.cpp
+  helm/sealed_store.cpp
   helm/secure_element.cpp
   helm/sideband_binding.cpp
+  helm/store_anchor.cpp
   helm/tunnel_keyring.cpp
   helm/volume_key_seal.cpp)
 add_library(ak::helm ALIAS ak_helm)

@@ -47,7 +47,7 @@ and 16 there). Each task is one PR unless noted.
     would. Left: the agent releasing the function (a mailbox command, with
     helm's mailbox device) and booting the UKI under OVMF (task 7).
 
-- [ ] 5. Decommission
+- [x] 5. Decommission
   - Key destruction, `sanitize` MCTP request to storage roles, identity
     clearing, persisted resume
   - _Requirements: 5.1-5.5_
@@ -65,11 +65,16 @@ and 16 there). Each task is one PR unless noted.
     TLS key, certificate and master key file, erases the sealed store
     and stops. The host is held from the first step to the end. A power
     loss resumes at the step it reached, before the power-on wait.
-  - Left: the storage roles running NVMe Sanitize (crypto erase, else
-    block erase) behind `OarHandler::sanitize`. Until then every role
-    answers unsupported and its drives are reported failed. helm's
-    server ID stays in its configuration file until enrollment states
-    (task 2) give helm an unenrolled state of its own.
+  - Built (roles): ak-hold and ak-khold take `--drive-device
+    SERIAL:PATH` and answer `sanitize` through `MediaSanitizer`
+    (`src/helm/media_sanitize.hpp`), with one worker per drive. Each
+    drive gets NVMe Sanitize: crypto erase if SANICAP has it, else (or
+    when it fails) block erase, then the Sanitize Status log is polled
+    until the operation ends. A drive named with `--drive-serial` but
+    given no device is reported failed.
+  - Left: helm's server ID stays in its configuration file until
+    enrollment states (task 2) give helm an unenrolled state of its own.
+    The harbor run with emulated NVMe is task 7.
 
 - [x] 6. Hardware identity report
   - _Requirements: 6.1-6.2_

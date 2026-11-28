@@ -38,11 +38,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
 
 #include "helm/mctp.hpp"
+#include "helm/media_sanitize.hpp"
 #include "helm/oar_protocol.hpp"
 #include "helm/scoped_key.hpp"
 #include "helm/sideband_binding.hpp"
@@ -268,10 +270,16 @@ public:
     auto set_identity(oar::RoleIdentity identity) -> void { _identity = std::move(identity); }
     // Media sanitize at decommission: a storage role starts it (once; a
     // start while one runs or after it finished reports that one) or
-    // reports how it stands. Every other role answers unsupported.
-    virtual auto sanitize(oar::SanitizeOp /*op*/)
-        -> std::expected<oar::SanitizeStatus, oar::Status> {
-        return std::unexpected(oar::Status::unsupported);
+    // reports how it stands, through the sanitizer set_sanitizer() gave
+    // (a role process's --drive-device options). Without one: unsupported.
+    virtual auto sanitize(oar::SanitizeOp op) -> std::expected<oar::SanitizeStatus, oar::Status> {
+        if (!_sanitizer) {
+            return std::unexpected(oar::Status::unsupported);
+        }
+        return op == oar::SanitizeOp::start ? _sanitizer->start() : _sanitizer->status();
+    }
+    auto set_sanitizer(std::shared_ptr<MediaSanitizer> sanitizer) -> void {
+        _sanitizer = std::move(sanitizer);
     }
     // The volume store, which only the storage role keeps; every other
     // role answers unsupported. request.wrapped_key is valid only during
@@ -390,6 +398,7 @@ public:
 
 private:
     std::optional<oar::RoleIdentity> _identity;
+    std::shared_ptr<MediaSanitizer> _sanitizer;
 };
 
 class OarEndpoint {

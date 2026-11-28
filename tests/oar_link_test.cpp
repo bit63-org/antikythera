@@ -964,6 +964,20 @@ BOOST_AUTO_TEST_CASE(sanitize_is_started_and_queried) {
     const auto refused = other_link.sanitize(oar::SanitizeOp::start);
     BOOST_REQUIRE(!refused.has_value());
     BOOST_TEST((refused.error().status == oar::Status::unsupported));
+
+    // A role given a sanitizer (--drive-device) answers through it.
+    fake.set_sanitizer(std::make_shared<ak::helm::MediaSanitizer>(
+        std::vector<ak::helm::SanitizeTarget>{
+            {.serial = ak::proto::identity_text("D-9"), .device = {}}},
+        [](const std::filesystem::path&, const std::stop_token&) {
+            return ak::proto::SanitizeResult::sanitized_crypto;
+        }));
+    const auto started = other_link.sanitize(oar::SanitizeOp::start);
+    BOOST_REQUIRE(started.has_value());
+    BOOST_TEST((started->state == oar::SanitizeState::done));  // no device: failed at once
+    BOOST_REQUIRE(started->drives.size() == 1U);
+    BOOST_TEST((started->drives[0].result == ak::proto::SanitizeResult::failed));
+    BOOST_TEST((other_link.sanitize(oar::SanitizeOp::query).value() == *started));
 }
 
 BOOST_AUTO_TEST_CASE(instance_metadata_is_forwarded_in_chunks) {

@@ -93,6 +93,7 @@ add_library(ak_helm
   helm/host_boot.cpp
   helm/hardware_identity.cpp
   helm/decommission.cpp
+  helm/media_sanitize.cpp
   helm/hpke.cpp
   helm/image_cache.cpp
   helm/key_store.cpp

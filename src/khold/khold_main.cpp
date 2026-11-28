@@ -101,6 +101,7 @@ struct Options {
     std::vector<std::string> node;
     ak::helm::oar::RoleIdentity identity;  // --serial, --firmware, --drive-serial
     bool has_identity{false};
+    std::vector<ak::helm::SanitizeTarget> devices;  // --drive-device
 };
 
 constexpr std::uint64_t max_bus_addr = 0x7F;
@@ -118,6 +119,7 @@ auto usage() -> int {
         "                --drive N:DIR [--drive N:DIR ...]\n"
         "                [--link-if IF | --link-mbps M]\n"
         "                [--serial TEXT [--firmware TEXT] [--drive-serial SERIAL:BYTES ...]]\n"
+        "                [--drive-device SERIAL:PATH ...]\n"
         "                -- NODE [NODE-ARGS ...]");
     return 2;
 }
@@ -262,6 +264,10 @@ auto parse(int argc, char** argv) -> std::optional<Options> {
                 return std::nullopt;
             }
             o.has_identity = true;
+        } else if (const auto device = ak::helm::parse_sanitize_option(flag, value, o.devices)) {
+            if (!*device) {
+                return std::nullopt;
+            }
         } else {
             return std::nullopt;
         }
@@ -394,6 +400,12 @@ auto main(int argc, char** argv) -> int {
         random_seq(), [test] { return ak::khold::run_self_test(test); }};
     if (opts->has_identity) {
         role.set_identity(opts->identity);
+    }
+    // Media sanitize at decommission: every drive given a device, and
+    // every drive named without one (reported failed).
+    if (auto targets = ak::helm::sanitize_targets(opts->identity, opts->devices);
+        !targets.empty()) {
+        role.set_sanitizer(std::make_shared<ak::helm::MediaSanitizer>(std::move(targets)));
     }
     ak::helm::RoleEnrollment enrollment{identity, ak::helm::oar::Role::khold, ak::tls::Role::server,
                                         [&node](const ak::tls::Config& /*cfg*/) {

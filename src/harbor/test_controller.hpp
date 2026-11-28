@@ -91,6 +91,16 @@
 //   tunnel-peers VTEP VERSION [PEER_VTEP,KEY ...]
 //                        the WireGuard peers of this server's VTEP; KEY is the
 //                        peer's X25519 public key as 64 hex digits
+//   issue-credential [LIFETIME_S [CELL]]
+//                        waits for helm's next credential_request and
+//                        answers it with a signed VtepCredential for that
+//                        slot, VTEP, key and epoch, valid from now for
+//                        LIFETIME_S (default 86400) in CELL (default 0);
+//                        serials count up from 1 (fleet-scale-networking
+//                        task 2)
+//   credential-revocations CELL VERSION [SERIAL,NOT_AFTER ...]
+//                        a cell's signed revocation list; NOT_AFTER is the
+//                        revoked credential's, in Unix seconds
 //   expect STATUS        the last command's outcome must be STATUS
 //                        (ok, accepted, bad_signature, stale_sequence, wrong_server,
 //                        busy, ...)
@@ -126,6 +136,7 @@
 #include "proto/group_members.hpp"
 #include "proto/instance_metadata.hpp"
 #include "proto/vpc_config.hpp"
+#include "proto/vtep_credential.hpp"
 #include "tls/tls.hpp"
 
 namespace ak::harbor {
@@ -170,6 +181,11 @@ public:
         -> std::optional<std::vector<std::byte>>;
     // `peers` encoded and signed (its signature field is ignored).
     [[nodiscard]] auto tunnel_peers(const proto::TunnelPeers& peers) const
+        -> std::optional<std::vector<std::byte>>;
+    // `credential` / `list` encoded and signed (the signature field is ignored).
+    [[nodiscard]] auto vtep_credential(const proto::VtepCredential& credential) const
+        -> std::optional<std::vector<std::byte>>;
+    [[nodiscard]] auto credential_revocations(const proto::CredentialRevocations& list) const
         -> std::optional<std::vector<std::byte>>;
 
 private:
@@ -222,6 +238,15 @@ struct SendGroupMembers {
 struct SendInstanceMetadata {
     proto::InstanceMetadata metadata;
 };
+struct IssueCredential {
+    std::uint64_t lifetime_s{86400};
+    std::uint32_t cell_id{0};
+};
+struct SendRevocations {
+    std::uint32_t cell_id{0};
+    std::uint64_t list_version{0};
+    std::vector<proto::Revocation> entries;
+};
 struct ExpectOutcome {
     proto::CommandStatus status{proto::CommandStatus::ok};
 };
@@ -229,9 +254,9 @@ struct WaitReport {
     proto::ReportKind kind{proto::ReportKind::inventory};
 };
 
-using Action =
-    std::variant<SendCommand, SendMapUpdate, SendGroupPolicy, SendTunnelPeers, SendVpcConfig,
-                 SendGroupMembers, SendInstanceMetadata, ExpectOutcome, WaitReport>;
+using Action = std::variant<SendCommand, SendMapUpdate, SendGroupPolicy, SendTunnelPeers,
+                            SendVpcConfig, SendGroupMembers, SendInstanceMetadata, IssueCredential,
+                            SendRevocations, ExpectOutcome, WaitReport>;
 
 // One script line: an action, nothing (blank or comment), or a message
 // saying what is wrong with it.
@@ -291,6 +316,7 @@ private:
     std::uint64_t _last_command_seq{0};
     std::optional<proto::Inventory> _inventory;
     std::vector<proto::Report> _backlog;  // reports read but not yet waited for
+    std::uint64_t _next_serial{1};        // the next VtepCredential serial
 };
 
 }  // namespace ak::harbor

@@ -266,6 +266,10 @@ enum class VendorType : std::uint8_t {
     copy_volume = 0x1C,
     volume_layout = 0x1D,
     self_test = 0x1E,
+    // 0x1F-0x2F: claimed by specs still being built (security groups,
+    // internet gateways). fleet-scale-networking owns 0x30-0x35.
+    vtep_credential = 0x31,
+    credential_revocations = 0x32,
 };
 
 struct VendorHeader {

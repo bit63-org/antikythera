@@ -145,6 +145,7 @@
 #include "oar/net/metadata_tap.hpp"
 #include "oar/net/mtu.hpp"
 #include "oar/net/tunnel.hpp"
+#include "oar/net/credentials.hpp"
 #include "oar/net/tunnel_peers.hpp"
 #include "oar/net/udp_endpoint.hpp"
 #include "oar/net/virtio_net.hpp"
@@ -239,6 +240,9 @@ struct RoleCounters {
     // (vpc-subnets-routing Requirement 2.6); counted once per rebuild.
     std::uint64_t map_addr_outside_subnet{0};
     std::uint64_t tunnel_keys_refused{0};  // set_tunnel_key / set_tunnel_peer the Tunnel refused
+    // VTEP credentials and revocation lists the CredentialStore refused
+    // (fleet-scale-networking task 2; its counters say why).
+    std::uint64_t credentials_refused{0};
     // GroupPolicy frames (task 13), counted like map_updates.
     std::uint64_t group_applied{0};
     std::uint64_t group_redelivered{0};
@@ -296,6 +300,8 @@ public:
     auto remove_tunnel_peer(const helm::oar::RemoveTunnelPeer& request)
         -> helm::oar::Status override;
     auto tunnel_peers(std::span<const std::byte> frame) -> helm::oar::Status override;
+    auto vtep_credential(std::span<const std::byte> frame) -> helm::oar::Status override;
+    auto credential_revocations(std::span<const std::byte> frame) -> helm::oar::Status override;
 
     // One datagram from the underlay, from `outer_src` at `now`: through
     // the tunnel if there is one, then the Vtep and the VSwitch. True if a
@@ -332,6 +338,8 @@ public:
     // Null without a tunnel.
     [[nodiscard]] auto tunnel() -> Tunnel* { return _tunnel.get(); }
     [[nodiscard]] auto peer_set() -> TunnelPeerSet* { return _peer_set.get(); }
+    // Null without a tunnel.
+    [[nodiscard]] auto credentials() -> CredentialStore* { return _credentials.get(); }
     [[nodiscard]] auto counters() const noexcept -> const RoleCounters& { return _counters; }
     // The NICs' instance metadata records (one per function at most).
     [[nodiscard]] auto metadata() const noexcept -> const MetadataStore& { return *_metadata; }
@@ -372,6 +380,7 @@ private:
     MappingTable _mappings;
     std::unique_ptr<Tunnel> _tunnel;
     std::unique_ptr<TunnelPeerSet> _peer_set;
+    std::unique_ptr<CredentialStore> _credentials;
     std::unique_ptr<Vtep> _vtep;
     std::unique_ptr<VSwitch> _vswitch;
     std::map<std::uint32_t, std::uint64_t> _vpc_versions;      // applied config version, by VNI

@@ -34,6 +34,7 @@ add_library(ak_oar_net
   oar/net/route_trie.cpp
   oar/net/tunnel.cpp
   oar/net/tunnel_peers.cpp
+  oar/net/credentials.cpp
   oar/net/udp_endpoint.cpp
   oar/net/virtio_net.cpp
   oar/net/vswitch.cpp

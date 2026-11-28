@@ -3,7 +3,8 @@
 
 // .kiro/specs/controller-interface/ Requirements 1.1 and 5.2 and
 // .kiro/specs/block-volume-service/ Requirement 13.4 (and kythira's khold
-// Requirement 11.5 for the volume layout): the signing test
+// Requirement 11.5 for the volume layout, and fleet-scale-networking
+// Requirements 2 and 3 for VTEP credentials): the signing test
 // vectors in src/proto/test_vectors.hpp. For each vector this checks
 // that encoding the listed fields and signing with the listed RFC 8032 key
 // reproduces the bytes exactly, that the frame decodes back to the fields,
@@ -29,6 +30,7 @@
 #include "proto/test_vectors.hpp"
 #include "proto/volume_layout.hpp"
 #include "proto/volume_op.hpp"
+#include "proto/vtep_credential.hpp"
 #include "proto/vpc_config.hpp"
 #include "test_support.hpp"
 
@@ -443,6 +445,48 @@ BOOST_AUTO_TEST_CASE(standing14_reproduces_and_verifies) {
         [](std::span<const std::byte> b) { return proto::decode_standing_set(b); },
         [](std::span<const std::byte> b) { return proto::standing_set_signed_bytes(b); },
         [](std::span<std::byte> b, const auto& sig) { proto::set_standing_set_signature(b, sig); });
+}
+
+BOOST_AUTO_TEST_CASE(credential17_reproduces_and_verifies) {
+    proto::VtepCredential fields{.key_id = vec::credential17_key_id,
+                                 .server_id = vec::credential17_server_id,
+                                 .cell_id = 3,
+                                 .modes = proto::tunnel_mode_bit(proto::TunnelMode::wireguard),
+                                 .slot = 1,
+                                 .key_epoch = 2,
+                                 .vtep = {},
+                                 .public_key = {},
+                                 .not_before = vec::credential17_not_before,
+                                 .not_after = vec::credential17_not_before + 86'400,
+                                 .serial = 0x10,
+                                 .signature = {}};
+    fields.vtep[0] = std::byte{ula_prefix};
+    fields.vtep[last] = std::byte{1};
+    std::ranges::copy(from_hex(vec::credential17_public_key), fields.public_key.begin());
+    check_signed_vector(
+        vec::credential17, vec::credential17_signature, fields, TestSigner{vec::key1_secret},
+        [](const proto::VtepCredential& c) { return proto::encode_vtep_credential(c); },
+        [](std::span<const std::byte> b) { return proto::decode_vtep_credential(b); },
+        [](std::span<const std::byte> b) { return proto::credential_signed_bytes(b); },
+        [](std::span<std::byte> b, const auto& sig) { proto::set_credential_signature(b, sig); });
+}
+
+BOOST_AUTO_TEST_CASE(revocations18_reproduces_and_verifies) {
+    const proto::CredentialRevocations fields{
+        .key_id = vec::revocations18_key_id,
+        .cell_id = vec::revocations18_cell_id,
+        .list_version = vec::revocations18_list_version,
+        .entries = {{.serial = 0x0C, .not_after = vec::credential17_not_before + 86'400},
+                    {.serial = 0x0F, .not_after = vec::credential17_not_before + 43'200}},
+        .signature = {}};
+    check_signed_vector(
+        vec::revocations18, vec::revocations18_signature, fields, TestSigner{vec::key2_secret},
+        [](const proto::CredentialRevocations& l) {
+            return proto::encode_credential_revocations(l);
+        },
+        [](std::span<const std::byte> b) { return proto::decode_credential_revocations(b); },
+        [](std::span<const std::byte> b) { return proto::credential_signed_bytes(b); },
+        [](std::span<std::byte> b, const auto& sig) { proto::set_credential_signature(b, sig); });
 }
 
 BOOST_AUTO_TEST_SUITE_END()

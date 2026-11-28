@@ -67,6 +67,12 @@
 //                          attaching khold volumes (kythira khold-block-service
 //                          Requirement 11.5) or a khold role serving them
 //   self_test           (empty)
+//   vtep_credential     0  total u32 | 4  offset u32 | 8  chunk (as map_update): one
+//                          controller proto::VtepCredential (signed,
+//                          vtep_credential_frame bytes) for this role's VTEP
+//   credential_revocations 0  total u32 | 4  offset u32 | 8  chunk (as map_update):
+//                          one controller proto::CredentialRevocations (signed;
+//                          at most max_credential_revocations_frame bytes)
 //   group_membership    0  cursor u16 | 2  flags u16 (bit 0: `since` is set)
 //                       4  since u32 (the generation helm last read whole)
 //   copy_volume         0  op u8 (CopyOp) | 1  direction u8 (CopyDirection) | 2  reserved u16
@@ -297,6 +303,12 @@ inline constexpr std::size_t max_map_frame =
 // Largest TunnelPeers frame (proto::max_tunnel_peers_size: 48-byte header,
 // 2048 peers of 56 bytes, 64-byte signature), pinned the same way.
 inline constexpr std::size_t max_tunnel_peers_frame = 0x30 + (2048 * 0x38) + 64;
+// A VtepCredential (proto::vtep_credential_size) and the largest
+// CredentialRevocations (proto::max_credential_revocations_size: 32-byte
+// header, 16,384 entries of 16 bytes, signature), mirrored like the above
+// (fleet-scale-networking task 2).
+inline constexpr std::size_t vtep_credential_frame = 160;
+inline constexpr std::size_t max_credential_revocations_frame = 0x20 + (16384 * 0x10) + 64;
 static_assert(max_tunnel_peers_frame <= max_map_frame);
 
 inline constexpr std::size_t response_head_size = 2;

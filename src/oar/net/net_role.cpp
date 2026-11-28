@@ -203,6 +203,14 @@ auto NetRole::create(NetRoleConfig config, const std::vector<NetTransport*>& tra
     if (role->_config.tunnel) {
         auto tc = *role->_config.tunnel;
         tc.peer_port = role->_config.vtep_config.peer_port;
+        // Credentials (fleet-scale-networking task 2) are checked against the
+        // same wall clock the tunnel stamps handshakes with.
+        role->_credentials =
+            std::make_unique<CredentialStore>(CredentialConfig{.server_id = role->_config.server_id,
+                                                               .vtep = role->_config.vtep,
+                                                               .skew = std::chrono::minutes{5},
+                                                               .wall_clock = tc.wall_clock},
+                                              role->_verifier);
         auto tunnel = Tunnel::create(sender, std::move(tc));
         if (!tunnel) {
             return std::unexpected(std::format("tunnel: {}", to_string(tunnel.error())));
@@ -743,6 +751,33 @@ auto NetRole::tunnel_peers(std::span<const std::byte> frame) -> oar::Status {
         return oar::Status::ok;
     }
     return r == PeersResult::unsupported ? oar::Status::unsupported : oar::Status::failed;
+}
+
+auto NetRole::vtep_credential(std::span<const std::byte> frame) -> oar::Status {
+    if (!_credentials) {
+        return oar::Status::unsupported;
+    }
+    const auto key = _tunnel->public_key();
+    if (!key) {
+        ++_counters.credentials_refused;
+        return oar::Status::failed;  // no key yet: nothing to certify
+    }
+    if (!accepted(_credentials->install_own(frame, *key))) {
+        ++_counters.credentials_refused;
+        return oar::Status::failed;
+    }
+    return oar::Status::ok;
+}
+
+auto NetRole::credential_revocations(std::span<const std::byte> frame) -> oar::Status {
+    if (!_credentials) {
+        return oar::Status::unsupported;
+    }
+    if (!accepted(_credentials->install_revocations(frame))) {
+        ++_counters.credentials_refused;
+        return oar::Status::failed;
+    }
+    return oar::Status::ok;
 }
 
 auto NetRole::receive(std::span<const std::byte> datagram, const Ipv6Address& outer_src,

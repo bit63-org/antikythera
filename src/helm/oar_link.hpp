@@ -133,6 +133,10 @@ public:
     // Sends one controller TunnelPeers frame the same way; fails without
     // sending if it is empty or larger than oar::max_tunnel_peers_frame.
     auto tunnel_peers(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
+    // Sends the role its VTEP credential, or a cell's revocation list, in
+    // chunks like tunnel_peers (fleet-scale-networking task 2).
+    auto vtep_credential(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
+    auto credential_revocations(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
     auto health() -> std::expected<oar::Health, LinkError>;
     // Forwards one controller GroupPolicy frame to a network role in
     // chunks, like map_update; fails without sending unless it is
@@ -285,6 +289,12 @@ public:
         return std::unexpected(oar::Status::unsupported);
     }
     // A whole, reassembled TunnelPeers frame, not yet decoded or verified.
+    virtual auto vtep_credential(std::span<const std::byte> /*frame*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    virtual auto credential_revocations(std::span<const std::byte> /*frame*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
     virtual auto tunnel_peers(std::span<const std::byte> /*frame*/) -> oar::Status {
         return oar::Status::unsupported;
     }

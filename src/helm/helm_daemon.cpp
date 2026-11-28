@@ -445,6 +445,18 @@ auto HelmDaemon::on_rotate_vtep_key(const proto::RotateVtepKey& request) -> void
     enqueue(request);
 }
 
+auto HelmDaemon::on_vtep_credential(const proto::VtepCredential& credential,
+                                    std::span<const std::byte> frame) -> void {
+    enqueue(CredentialFrame{.credential = credential, .frame = {frame.begin(), frame.end()}});
+}
+
+auto HelmDaemon::on_credential_revocations(const proto::CredentialRevocations& list,
+                                           std::span<const std::byte> frame) -> void {
+    enqueue(RevocationsFrame{.cell_id = list.cell_id,
+                             .list_version = list.list_version,
+                             .frame = {frame.begin(), frame.end()}});
+}
+
 auto HelmDaemon::post_host_slot(const mailbox::Slot& slot) -> void {
     enqueue(slot);
 }
@@ -536,6 +548,10 @@ auto HelmDaemon::handle(Item& item) -> void {
         ++(kept ? _stats.power_policies : _stats.power_policies_refused);
     } else if (const auto* rotation = std::get_if<proto::RotateVtepKey>(&item)) {
         rotate_tunnel_key(*rotation);
+    } else if (auto* credential = std::get_if<CredentialFrame>(&item)) {
+        keep_credential(*credential);
+    } else if (auto* list = std::get_if<RevocationsFrame>(&item)) {
+        keep_revocations(*list);
     }
 }
 
@@ -676,8 +692,136 @@ auto HelmDaemon::provision_tunnel(SlotState& slot) -> void {
         return;
     }
     slot.keys_pending = !done;
+    if (done) {
+        send_credentials(slot);
+    }
     const std::scoped_lock lock{_inbox_mutex};
     ++(done ? _stats.tunnel_provisioned : _stats.tunnel_provision_failed);
+}
+
+auto HelmDaemon::now_unix() const -> std::uint64_t {
+    const auto t = _config.wall_clock ? _config.wall_clock() : std::chrono::system_clock::now();
+    const auto secs =
+        std::chrono::duration_cast<std::chrono::seconds>(t.time_since_epoch()).count();
+    return secs < 0 ? 0 : static_cast<std::uint64_t>(secs);
+}
+
+auto HelmDaemon::poll_credential(SlotState& slot) -> void {
+    if (!is_net(slot) || slot.keys_pending) {
+        return;
+    }
+    const auto& vtep = slot.inventory->vtep;
+    const auto key = _keyring.public_key(vtep);
+    if (!key) {
+        return;  // a role without a tunnel
+    }
+    if (const auto it = _credentials.find(vtep); it != _credentials.end()) {
+        const auto& c = it->second.credential;
+        // Renew with a third of the life left (Requirement 2.2).
+        const auto renew_at = c.not_after - ((c.not_after - c.not_before) / 3);
+        if (c.public_key == *key && now_unix() < renew_at) {
+            return;
+        }
+    }
+    if (slot.credential_asked == *key &&
+        now() < slot.credential_asked_at + _config.identity_retry) {
+        return;  // already with the controller
+    }
+    proto::CredentialRequest request{.slot = slot.number,
+                                     .key_epoch = _keyring.key_epoch(slot.number),
+                                     .vtep = {},
+                                     .public_key = *key};
+    std::ranges::copy(vtep, request.vtep.begin());
+    slot.credential_asked = *key;
+    slot.credential_asked_at = now();
+    {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.credential_requests;
+    }
+    report(request);
+}
+
+auto HelmDaemon::keep_credential(CredentialFrame& credential) -> void {
+    const auto& c = credential.credential;
+    oar::Vtep vtep{};
+    std::ranges::copy(c.vtep, vtep.begin());
+    auto it = _credentials.find(vtep);
+    if (it != _credentials.end()) {
+        const auto& held = it->second.credential;
+        // A credential for another key replaces the held one (a rotation);
+        // for the same key only a newer one does.
+        const bool newer = held.public_key != c.public_key || c.not_after > held.not_after ||
+                           (c.not_after == held.not_after && c.serial > held.serial);
+        if (!newer) {
+            const std::scoped_lock lock{_inbox_mutex};
+            ++_stats.vtep_credentials_stale;
+            return;
+        }
+        it->second = std::move(credential);
+    } else {
+        it = _credentials.emplace(vtep, std::move(credential)).first;
+    }
+    bool refused = false;
+    for (auto& [n, slot] : _slots) {
+        if (!is_net(*slot) || slot->keys_pending || slot->inventory->vtep != vtep ||
+            _keyring.public_key(vtep) != it->second.credential.public_key) {
+            continue;  // held: the role gets it when keyed, if it still fits
+        }
+        // Answered: the renewal at two thirds of this credential's life is
+        // a new request, not a retry of this one.
+        slot->credential_asked = {};
+        refused = !slot->link->vtep_credential(it->second.frame) || refused;
+    }
+    const std::scoped_lock lock{_inbox_mutex};
+    ++_stats.vtep_credentials;
+    if (refused) {
+        ++_stats.vtep_credentials_refused;
+    }
+}
+
+auto HelmDaemon::keep_revocations(RevocationsFrame& list) -> void {
+    auto& held = _revocations[list.cell_id];
+    if (list.list_version <= held.list_version) {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.credential_revocations_stale;
+        return;
+    }
+    held = std::move(list);
+    bool refused = false;
+    for (auto& [n, slot] : _slots) {
+        if (is_net(*slot) && !slot->keys_pending) {
+            refused = !slot->link->credential_revocations(held.frame) || refused;
+        }
+    }
+    const std::scoped_lock lock{_inbox_mutex};
+    ++_stats.credential_revocations;
+    if (refused) {
+        ++_stats.credential_revocations_refused;
+    }
+}
+
+auto HelmDaemon::send_credentials(SlotState& slot) -> void {
+    if (!is_net(slot)) {
+        return;
+    }
+    std::uint64_t credential_refused = 0;
+    std::uint64_t lists_refused = 0;
+    const auto& vtep = slot.inventory->vtep;
+    if (const auto it = _credentials.find(vtep);
+        it != _credentials.end() && _keyring.public_key(vtep) == it->second.credential.public_key &&
+        !slot.link->vtep_credential(it->second.frame)) {
+        ++credential_refused;
+    }
+    for (const auto& [cell, list] : _revocations) {
+        if (!slot.link->credential_revocations(list.frame)) {
+            ++lists_refused;
+        }
+    }
+    if (credential_refused != 0 || lists_refused != 0) {
+        const std::scoped_lock lock{_inbox_mutex};
+        _stats.vtep_credentials_refused += credential_refused;
+        _stats.credential_revocations_refused += lists_refused;
+    }
 }
 
 auto HelmDaemon::forward_peers(const PeersFrame& peers) -> void {
@@ -1129,6 +1273,7 @@ auto HelmDaemon::check() -> void {
             provision_tunnel(*slot);
         }
         poll_health(*slot);
+        poll_credential(*slot);
     }
 }
 

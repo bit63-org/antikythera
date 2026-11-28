@@ -159,6 +159,15 @@
 //     slot u8 | role u8 (StorageRole) | csr_len u16 | rsvd u32
 //     csr [csr_len] (a DER PKCS#10 request, 1..max_csr_size bytes)
 //
+// VTEP credentials (.kiro/specs/fleet-scale-networking/ Requirement 2,
+// task 2), from helm for one of its network roles:
+//   credential_request  -- kind 31: certify the VTEP's current tunnel key
+//     slot u8 | rsvd [3] | key_epoch u32 (1..65535) | vtep [16] (unicast)
+//     public_key [32] (never all zero)
+//   The controller answers with a vtep_credential link record. Kinds 21-26,
+//   29 and 30 belong to specs still being built (30 is this spec's
+//   stream_status); report_kind() maps each body to its kind.
+//
 // The controller seals every VolumeKey for this server to the newest
 // transport key it holds. A cert_request's CSR is the role's own key pair
 // (the private key never leaves the role); its outer framing is checked
@@ -292,6 +301,7 @@ inline constexpr std::uint8_t cold_start_rollback = 0x01;
 inline constexpr std::uint8_t cold_start_rtc_below_floor = 0x02;
 inline constexpr std::uint8_t known_cold_start_flags =
     cold_start_rollback | cold_start_rtc_below_floor;
+inline constexpr std::size_t credential_request_size = 8 + vtep_address_size + tunnel_key_size;
 
 inline constexpr std::size_t max_report_size =
     report_header_size + std::max({max_inventory_size, max_group_usage_size,
@@ -321,6 +331,7 @@ enum class ReportKind : std::uint16_t {
     conversion_progress = 20,
     cold_start = 27,
     boot_cache = 28,
+    credential_request = 31,
 };
 
 // Where helm booted hull from after power returned (cold_start).
@@ -821,6 +832,14 @@ struct BootCache {
     friend auto operator==(const BootCache&, const BootCache&) -> bool = default;
 };
 
+struct CredentialRequest {
+    std::uint8_t slot{0};
+    std::uint32_t key_epoch{0};
+    VtepAddress vtep{};
+    TunnelPublicKey public_key{};
+    friend auto operator==(const CredentialRequest&, const CredentialRequest&) -> bool = default;
+};
+
 struct CertRequest {
     std::uint8_t slot{0};
     StorageRole role{StorageRole::hold};
@@ -828,11 +847,12 @@ struct CertRequest {
     friend auto operator==(const CertRequest&, const CertRequest&) -> bool = default;
 };
 
-using ReportBody = std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport,
-                                MapApplied, HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault,
-                                AttachmentStatus, DemotionConfirmed, OpOutcome, SnapshotProgress,
-                                Enrollment, CertRequest, GroupMembership, GroupStatus, Capacity,
-                                GroupFault, ConversionProgress, ColdStart, BootCache>;
+using ReportBody =
+    std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport, MapApplied,
+                 HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault, AttachmentStatus,
+                 DemotionConfirmed, OpOutcome, SnapshotProgress, Enrollment, CertRequest,
+                 GroupMembership, GroupStatus, Capacity, GroupFault, ConversionProgress, ColdStart,
+                 BootCache, CredentialRequest>;
 
 struct Report {
     std::uint64_t server_id{0};
@@ -843,8 +863,8 @@ struct Report {
 
 // The variant's alternatives are in ReportKind order: kinds 1-20 are
 // alternatives 0-19, and the later kinds follow in order.
-inline constexpr std::array report_kinds_after_contiguous{ReportKind::cold_start,
-                                                          ReportKind::boot_cache};
+inline constexpr std::array report_kinds_after_contiguous{
+    ReportKind::cold_start, ReportKind::boot_cache, ReportKind::credential_request};
 [[nodiscard]] inline auto report_kind(const ReportBody& body) noexcept -> ReportKind {
     constexpr auto contiguous = static_cast<std::size_t>(ReportKind::conversion_progress);
     if (body.index() < contiguous) {
@@ -1282,6 +1302,21 @@ namespace detail {
         return std::unexpected(DecodeError::unknown_value);
     }
     if (all_zero(e.transport_key)) {
+        return std::unexpected(DecodeError::bad_public_key);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const CredentialRequest& c) noexcept
+    -> std::expected<void, DecodeError> {
+    constexpr std::uint32_t max_epoch = 0xFFFF;
+    if (c.key_epoch == 0 || c.key_epoch > max_epoch) {
+        return std::unexpected(DecodeError::bad_id);
+    }
+    if (all_zero(c.vtep) || std::to_integer<std::uint8_t>(c.vtep[0]) == ipv6_multicast_prefix) {
+        return std::unexpected(DecodeError::bad_vtep);
+    }
+    if (all_zero(c.public_key)) {
         return std::unexpected(DecodeError::bad_public_key);
     }
     return {};
@@ -1953,6 +1988,30 @@ inline auto write_volume_event(wire::Writer& w, const ConversionProgress& b) -> 
     return out;
 }
 
+[[nodiscard]] inline auto decode_credential_request(std::span<const std::byte> body)
+    -> std::expected<CredentialRequest, DecodeError> {
+    if (body.size() < credential_request_size) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (body.size() > credential_request_size) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    BodyReader in{.r = wire::Reader{body}};
+    CredentialRequest out;
+    out.slot = in.u8();
+    const bool zero = in.zeros(3);
+    out.key_epoch = in.le32();
+    in.bytes(out.vtep);
+    in.bytes(out.public_key);
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (auto ok = check_body(out); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return out;
+}
+
 [[nodiscard]] inline auto decode_cert_request(std::span<const std::byte> body)
     -> std::expected<CertRequest, DecodeError> {
     wire::Reader r{body};
@@ -2354,6 +2413,12 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
                 w.le16(b.kem);
                 w.bytes(std::array<std::byte, 6>{});
                 w.bytes(b.transport_key);
+            } else if constexpr (std::is_same_v<T, CredentialRequest>) {
+                w.u8(b.slot);
+                w.bytes(std::array<std::byte, 3>{});
+                w.le32(b.key_epoch);
+                w.bytes(b.vtep);
+                w.bytes(b.public_key);
             } else if constexpr (std::is_same_v<T, CertRequest>) {
                 w.u8(b.slot);
                 w.u8(static_cast<std::uint8_t>(b.role));
@@ -2464,6 +2529,8 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
             return wrap(detail::decode_cold_start(body));
         case ReportKind::boot_cache:
             return wrap(detail::decode_boot_cache(body));
+        case ReportKind::credential_request:
+            return wrap(detail::decode_credential_request(body));
     }
     return std::unexpected(DecodeError::unknown_value);
 }

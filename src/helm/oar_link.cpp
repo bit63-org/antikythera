@@ -35,6 +35,10 @@ constexpr auto frame_limit(mctp::VendorType type) noexcept -> std::size_t {
             return oar::max_map_frame;
         case mctp::VendorType::tunnel_peers:
             return oar::max_tunnel_peers_frame;
+        case mctp::VendorType::vtep_credential:
+            return oar::vtep_credential_frame;
+        case mctp::VendorType::credential_revocations:
+            return oar::max_credential_revocations_frame;
         case mctp::VendorType::group_members:
             return oar::max_group_members_frame;
         case mctp::VendorType::instance_metadata:
@@ -251,6 +255,21 @@ auto OarLink::tunnel_peers(std::span<const std::byte> frame) -> std::expected<vo
         return std::unexpected(bad_request());
     }
     return send_chunked(mctp::VendorType::tunnel_peers, frame);
+}
+
+auto OarLink::vtep_credential(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
+    if (frame.size() != oar::vtep_credential_frame) {
+        return std::unexpected(bad_request());
+    }
+    return send_chunked(mctp::VendorType::vtep_credential, frame);
+}
+
+auto OarLink::credential_revocations(std::span<const std::byte> frame)
+    -> std::expected<void, LinkError> {
+    if (frame.empty() || frame.size() > oar::max_credential_revocations_frame) {
+        return std::unexpected(bad_request());
+    }
+    return send_chunked(mctp::VendorType::credential_revocations, frame);
 }
 
 auto OarLink::group_members(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
@@ -761,6 +780,8 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
         }
         case mctp::VendorType::map_update:
         case mctp::VendorType::tunnel_peers:
+        case mctp::VendorType::vtep_credential:
+        case mctp::VendorType::credential_revocations:
         case mctp::VendorType::group_members:
         case mctp::VendorType::instance_metadata:
         case mctp::VendorType::volume_layout:
@@ -901,6 +922,12 @@ auto OarEndpoint::frame_chunk(OarHandler& handler, mctp::VendorType type,
             break;
         case mctp::VendorType::tunnel_peers:
             status = handler.tunnel_peers(_frame);
+            break;
+        case mctp::VendorType::vtep_credential:
+            status = handler.vtep_credential(_frame);
+            break;
+        case mctp::VendorType::credential_revocations:
+            status = handler.credential_revocations(_frame);
             break;
         case mctp::VendorType::group_members:
             status = handler.group_members(_frame);

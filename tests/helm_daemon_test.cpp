@@ -45,6 +45,7 @@
 #include "proto/group_policy.hpp"
 #include "proto/test_vectors.hpp"
 #include "proto/tunnel_peers.hpp"
+#include "proto/vtep_credential.hpp"
 #include "proto/instance_metadata.hpp"
 #include "proto/volume_layout.hpp"
 #include "proto/vpc_config.hpp"
@@ -92,6 +93,8 @@ constexpr auto sideband_timeout = 2s;
 constexpr auto link_timeout = 2s;
 constexpr auto short_link_timeout = 50ms;
 constexpr auto settle = 1ms;
+// helm's wall clock in every Rig (Unix seconds), for credential lifetimes.
+std::atomic<std::uint64_t> wall_now{1'800'000'000};
 const std::string loopback = "127.0.0.1";
 
 struct IgnoreSigpipe {
@@ -190,6 +193,32 @@ public:
             key_grace = r.grace_seconds;
         }
         return key_status.load();
+    }
+    // fleet-scale-networking task 2: the credentials and revocation lists
+    // helm forwards, exactly as sent.
+    [[nodiscard]] auto credentials() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _credentials;
+    }
+    [[nodiscard]] auto revocation_lists() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _revocation_lists;
+    }
+    auto vtep_credential(std::span<const std::byte> frame) -> oar::Status override {
+        if (!tunnel) {
+            return oar::Status::unsupported;
+        }
+        const std::scoped_lock lock{_mutex};
+        _credentials.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
+    }
+    auto credential_revocations(std::span<const std::byte> frame) -> oar::Status override {
+        if (!tunnel) {
+            return oar::Status::unsupported;
+        }
+        const std::scoped_lock lock{_mutex};
+        _revocation_lists.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
     }
     auto tunnel_peers(std::span<const std::byte> frame) -> oar::Status override {
         if (!tunnel) {
@@ -409,6 +438,8 @@ private:
     oar::Health _health{};
     std::vector<std::vector<std::byte>> _tunnel_keys;
     std::vector<std::vector<std::byte>> _peer_sets;
+    std::vector<std::vector<std::byte>> _credentials;
+    std::vector<std::vector<std::byte>> _revocation_lists;
     std::vector<oar::PrepareFunction> _prepared;
     std::vector<std::vector<std::byte>> _frames;
     std::vector<std::vector<std::byte>> _vpc_configs;
@@ -650,6 +681,10 @@ struct Rig {
         // the tests never wait out an interval.
         c.group_usage_interval = 1h;
         c.membership_interval = 0ms;  // every pass asks for joins
+        c.wall_clock = [] {
+            return std::chrono::system_clock::time_point{
+                std::chrono::seconds{static_cast<std::int64_t>(wall_now.load())}};
+        };
         return c;
     }
 
@@ -1701,6 +1736,138 @@ BOOST_AUTO_TEST_CASE(tunnel_keys_are_derived_and_rotated_by_the_controller) {
     BOOST_REQUIRE(again.size() == 3U);
     BOOST_TEST((again[2] == rotated[1]));
     BOOST_TEST(r.net.role.key_grace.load() == 0U);
+}
+
+// fleet-scale-networking task 2: helm asks for a credential for the
+// role's key, forwards the controller's newest one and every cell's newest
+// revocation list, and asks again on renewal and after a rotation.
+struct CredentialFrame {
+    proto::VtepCredential credential;
+    std::vector<std::byte> frame;
+};
+
+auto credential_frame(const proto::TunnelPublicKey& key, std::uint64_t not_before,
+                      std::uint64_t not_after, std::uint64_t serial) -> CredentialFrame {
+    proto::VtepCredential c{.key_id = 1,
+                            .server_id = server,
+                            .cell_id = 0,
+                            .modes = proto::tunnel_mode_bit(proto::TunnelMode::wireguard),
+                            .slot = net_slot,
+                            .key_epoch = 1,
+                            .vtep = net_vtep(),
+                            .public_key = key,
+                            .not_before = not_before,
+                            .not_after = not_after,
+                            .serial = serial,
+                            .signature = {}};
+    c.signature.fill(std::byte{sig_fill});
+    auto bytes = proto::encode_vtep_credential(c);
+    BOOST_REQUIRE(bytes.has_value());
+    return {.credential = c, .frame = std::move(*bytes)};
+}
+
+struct RevocationsFrame {
+    proto::CredentialRevocations list;
+    std::vector<std::byte> frame;
+};
+
+auto revocations_frame(std::uint32_t cell, std::uint64_t version, std::size_t entries)
+    -> RevocationsFrame {
+    proto::CredentialRevocations l{
+        .key_id = 1, .cell_id = cell, .list_version = version, .entries = {}, .signature = {}};
+    for (std::uint64_t i = 1; i <= entries; ++i) {
+        l.entries.push_back({.serial = i, .not_after = wall_now.load() + 100});
+    }
+    l.signature.fill(std::byte{sig_fill});
+    auto bytes = proto::encode_credential_revocations(l);
+    BOOST_REQUIRE(bytes.has_value());
+    return {.list = std::move(l), .frame = std::move(*bytes)};
+}
+
+BOOST_AUTO_TEST_CASE(net_roles_get_credentials_for_their_current_key) {
+    constexpr std::uint64_t life = 86'400;
+    const std::uint64_t t0 = wall_now.load();
+    Rig r;
+    r.net.role.tunnel = true;
+    (void)r.daemon.boot();
+    r.daemon.run_once(0ms);
+    const auto pub = r.daemon.keyring().public_key(net_vtep()).value();
+
+    // One request for the role's key; no repeat while it is outstanding.
+    BOOST_REQUIRE(r.count<proto::CredentialRequest>() == 1U);
+    const auto request = r.last<proto::CredentialRequest>();
+    BOOST_TEST(request.slot == net_slot);
+    BOOST_TEST(request.key_epoch == 1U);
+    BOOST_TEST((request.vtep == net_vtep()));
+    BOOST_TEST((request.public_key == pub));
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.count<proto::CredentialRequest>() == 1U);
+    BOOST_TEST(r.daemon.stats().credential_requests == 1U);
+
+    // The answer goes to the role unmodified; an older one is dropped.
+    const auto c1 = credential_frame(pub, t0, t0 + life, 2);
+    std::thread{[&] { r.daemon.on_vtep_credential(c1.credential, c1.frame); }}.join();
+    r.daemon.run_once(0ms);
+    const auto older = credential_frame(pub, t0, t0 + life, 1);
+    r.daemon.on_vtep_credential(older.credential, older.frame);
+    r.daemon.on_vtep_credential(c1.credential, c1.frame);  // a duplicate
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.role.credentials().size() == 1U);
+    BOOST_TEST((r.net.role.credentials()[0] == c1.frame));
+    BOOST_TEST(r.daemon.stats().vtep_credentials == 1U);
+    BOOST_TEST(r.daemon.stats().vtep_credentials_stale == 2U);
+    BOOST_TEST(r.count<proto::CredentialRequest>() == 1U);
+
+    // Revocation lists: the newest per cell reaches the role, a large one
+    // in chunks.
+    const auto big = revocations_frame(1, 2, 500);
+    const auto old_list = revocations_frame(1, 1, 0);
+    const auto other_cell = revocations_frame(2, 1, 1);
+    r.daemon.on_credential_revocations(big.list, big.frame);
+    r.daemon.on_credential_revocations(old_list.list, old_list.frame);
+    r.daemon.on_credential_revocations(other_cell.list, other_cell.frame);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.role.revocation_lists().size() == 2U);
+    BOOST_TEST((r.net.role.revocation_lists()[0] == big.frame));
+    BOOST_TEST((r.net.role.revocation_lists()[1] == other_cell.frame));
+    BOOST_TEST(r.daemon.stats().credential_revocations == 2U);
+    BOOST_TEST(r.daemon.stats().credential_revocations_stale == 1U);
+    BOOST_TEST(r.blk.role.revocation_lists().empty());
+
+    // A restarted role gets its key, credential and lists back.
+    r.daemon.on_slot_recovered(net_slot);
+    BOOST_REQUIRE(r.net.role.credentials().size() == 2U);
+    BOOST_TEST((r.net.role.credentials()[1] == c1.frame));
+    BOOST_TEST(r.net.role.revocation_lists().size() == 4U);
+
+    // With a third of its life left helm asks for a renewal.
+    wall_now = t0 + (2 * life / 3) - 1;
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.count<proto::CredentialRequest>() == 1U);
+    wall_now = t0 + (2 * life / 3) + 1;
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.count<proto::CredentialRequest>() == 2U);
+
+    // After a rotation helm asks at once for the new key, and the held
+    // credential (for the old key) is not sent to the role again.
+    r.daemon.on_rotate_vtep_key({.server_id = server, .slot = net_slot, .key_epoch = 3});
+    r.daemon.run_once(0ms);
+    const auto new_pub = r.daemon.keyring().public_key(net_vtep()).value();
+    BOOST_REQUIRE(r.count<proto::CredentialRequest>() == 3U);
+    BOOST_TEST((r.last<proto::CredentialRequest>().public_key == new_pub));
+    BOOST_TEST(r.last<proto::CredentialRequest>().key_epoch == 3U);
+    r.daemon.on_slot_recovered(net_slot);
+    BOOST_TEST(r.net.role.credentials().size() == 2U);
+    // A credential for the new key replaces the old one, even with an
+    // earlier window.
+    const auto c2 = credential_frame(new_pub, t0, t0 + life - 1, 3);
+    r.daemon.on_vtep_credential(c2.credential, c2.frame);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.role.credentials().size() == 3U);
+    BOOST_TEST((r.net.role.credentials()[2] == c2.frame));
+    BOOST_TEST(r.daemon.stats().vtep_credentials_refused == 0U);
+    BOOST_TEST(r.daemon.stats().credential_revocations_refused == 0U);
+    wall_now = t0;
 }
 
 BOOST_AUTO_TEST_CASE(an_unkeyed_net_role_is_retried_and_one_without_a_tunnel_left_alone) {

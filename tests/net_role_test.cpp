@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -31,8 +32,11 @@
 #include <thread>
 #include <vector>
 
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include <openssl/evp.h>
 
 #include "ed25519_test_support.hpp"
 #include "helm/oar_link.hpp"
@@ -1990,4 +1994,134 @@ BOOST_AUTO_TEST_CASE(frame_notices_are_kept_for_the_bulk_channel,
     BOOST_TEST(kept.front().sequence_or_version == 2U);  // the oldest went first
     BOOST_TEST(kept.back().sequence_or_version == net::NetRole::max_pending_notices + 1);
     BOOST_TEST(b.role->counters().frame_notices_dropped == 1U);
+}
+
+namespace {
+
+// A frame source that serves frames it holds, by digest, and fails for
+// any other (fleet-scale-networking task 12).
+class HeldFrames final : public net::FrameSource {
+public:
+    std::map<std::string, std::vector<std::byte>, std::less<>> frames;
+
+    auto get(const net::FrameEndpoint& /*endpoint*/, std::string_view digest,
+             std::uint32_t /*size*/, ak::tls::Clock::time_point /*deadline*/)
+        -> std::expected<std::vector<std::byte>, net::FetchFailure> override {
+        const auto it = frames.find(digest);
+        if (it == frames.end()) {
+            return std::unexpected(net::FetchFailure::http_status);
+        }
+        return it->second;
+    }
+};
+
+auto notice_of(std::span<const std::byte> frame, std::uint64_t seq) -> proto::FrameNotice {
+    proto::FrameNotice n{.kind = proto::FrameKind::vpc_stream,
+                         .vni_or_scope = 0xAB0001,
+                         .sequence_or_version = seq,
+                         .size = static_cast<std::uint32_t>(frame.size()),
+                         .sha256 = {}};
+    unsigned len = 0;
+    BOOST_REQUIRE(EVP_Digest(frame.data(), frame.size(),
+                             reinterpret_cast<unsigned char*>(n.sha256.data()), &len, EVP_sha256(),
+                             nullptr) == 1);
+    return n;
+}
+
+}  // namespace
+
+// fleet-scale-networking task 12: with a bulk channel, notices go to the
+// worker (those already pending at once), fetched frames wait for the
+// stream applier, and notices the fetcher gives up on are kept for
+// OarLink delivery.
+BOOST_AUTO_TEST_CASE(a_bulk_channel_takes_notices_and_hands_back_failures,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    One b;
+    const std::vector<std::byte> held(3000, std::byte{0x5A});
+    const std::vector<std::byte> missing(10, std::byte{0x01});
+    const auto early = notice_of(held, 1);
+    BOOST_TEST(
+        (b.role->frame_notice(proto::encode_frame_notice(early).value()) == oar::Status::ok));
+    BOOST_TEST(b.role->pending_notices().size() == 1U);  // no channel yet
+
+    auto source = std::make_unique<HeldFrames>();
+    source->frames.emplace(net::digest_hex(early.sha256), held);
+    net::BulkFetchConfig c;
+    c.endpoints = {{.host = "store", .port = 443}};
+    c.fallback_after = 2;
+    c.sleep = [](std::chrono::milliseconds /*d*/) {};
+    auto worker = net::BulkWorker::create(std::move(source), c);
+    BOOST_REQUIRE(worker.has_value());
+    b.role->set_bulk_worker(std::move(*worker));
+    BOOST_TEST(b.role->pending_notices().empty());  // submitted at once
+    std::vector<pollfd> fds;
+    b.role->bulk_poll_fds(fds);
+    BOOST_REQUIRE(fds.size() == 1U);
+
+    const auto late = notice_of(missing, 2);
+    BOOST_TEST((b.role->frame_notice(proto::encode_frame_notice(late).value()) == oar::Status::ok));
+
+    std::vector<net::FetchResult> fetched;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{20};
+    while ((fetched.empty() || b.role->pending_notices().empty()) &&
+           std::chrono::steady_clock::now() < deadline) {
+        static_cast<void>(::poll(fds.data(), fds.size(), 100));
+        static_cast<void>(b.role->poll());
+        for (auto& r : b.role->take_fetched()) {
+            fetched.push_back(std::move(r));
+        }
+    }
+    BOOST_REQUIRE(fetched.size() == 1U);
+    BOOST_TEST((fetched[0].frame == held));
+    BOOST_TEST((fetched[0].notice == early));
+    BOOST_REQUIRE(b.role->pending_notices().size() == 1U);
+    BOOST_TEST((b.role->pending_notices().front() == late));
+    BOOST_TEST(b.role->counters().bulk_fetched == 1U);
+    BOOST_TEST(b.role->counters().bulk_fallbacks == 1U);
+    BOOST_TEST(b.role->bulk_worker()->counters().attempts == 3U);
+    BOOST_TEST(b.role->take_fetched().empty());
+
+    // A role with a channel configuration but no certificate yet keeps
+    // its notices; a certificate that is not a client's starts nothing.
+    One other;
+    net::BulkFetchConfig cfg;
+    cfg.endpoints = {{.host = "127.0.0.1", .port = 1}};
+    other.role->set_bulk_channel(cfg);
+    BOOST_TEST(other.role->bulk_worker() == nullptr);
+    other.role->set_bulk_tls({.role = ak::tls::Role::server,
+                              .ca_pem = {},
+                              .cert_pem = {},
+                              .key_pem = {},
+                              .peer_name = {}});
+    BOOST_TEST(other.role->bulk_worker() == nullptr);
+    BOOST_TEST(other.role->counters().bulk_setup_failed == 1U);
+}
+
+// The channel starts once both its configuration and a role certificate
+// are present, whichever comes first, and a renewal reuses it.
+BOOST_AUTO_TEST_CASE(the_bulk_channel_starts_with_a_certificate,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    ak::test::TestCa ca{"role CA"};
+    const auto leaf = ca.issue("oar-net", "IP:127.0.0.1");
+    const ak::tls::Config client{.role = ak::tls::Role::client,
+                                 .ca_pem = ca.cert_pem(),
+                                 .cert_pem = leaf.cert,
+                                 .key_pem = leaf.key,
+                                 .peer_name = {}};
+    net::BulkFetchConfig cfg;
+    cfg.endpoints = {{.host = "127.0.0.1", .port = 1}};
+
+    One b;
+    b.role->set_bulk_tls(client);
+    BOOST_TEST(b.role->bulk_worker() == nullptr);
+    b.role->set_bulk_channel(cfg);
+    auto* started = b.role->bulk_worker();
+    BOOST_REQUIRE(started != nullptr);
+    b.role->set_bulk_tls(client);  // renewal: same worker
+    BOOST_TEST(b.role->bulk_worker() == started);
+    auto broken = client;
+    broken.key_pem = ca.issue("other", "IP:127.0.0.1").key;  // does not match the cert
+    b.role->set_bulk_tls(broken);
+    BOOST_TEST(b.role->bulk_worker() == started);
+    BOOST_TEST(b.role->counters().bulk_setup_failed == 1U);
 }

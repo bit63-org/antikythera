@@ -11,7 +11,8 @@
 //              --sideband PATH --addr A --helm-addr A --eid E --helm-eid E
 //              --function SOCKET [--function SOCKET ...]
 //              [--port P] [--source-ports N] [--scope IFINDEX] [--metadata TUN]
-//              [--control-addr ADDR --role-ca FILE --role-cert FILE --role-key FILE]
+//              [--control-addr ADDR --role-ca FILE --role-cert FILE --role-key FILE
+//               [--frame-store HOST:PORT ...]]
 //
 // --control-addr and the --role-* files are the role's identity for its
 // bulk channel (fleet-scale-networking Requirement 6.1, task 10), all of
@@ -24,6 +25,11 @@
 // the certificate, and --role-ca the CA it checks the chain against. A
 // --role-cert that already passes is used at once. Without them the role
 // answers cert_request unsupported and never uses the bulk channel.
+//
+// Each --frame-store is a frame store the bulk channel fetches announced
+// frames from (task 12; HOST an address or name, [ADDR]:PORT for IPv6),
+// tried in turn with backoff; a frame that every attempt fails to fetch
+// is kept for OarLink delivery. It needs the identity options above.
 //
 // --metadata serves the instance metadata service (oar-net Requirement 13,
 // metadata_tap.hpp): it makes the TUN device of that name (usually akmd0)
@@ -362,6 +368,7 @@ constexpr std::string_view arg_control_addr = "--control-addr";
 constexpr std::string_view arg_role_ca = "--role-ca";
 constexpr std::string_view arg_role_cert = "--role-cert";
 constexpr std::string_view arg_role_key = "--role-key";
+constexpr std::string_view arg_frame_store = "--frame-store";
 constexpr std::string_view role_log = "ak-oar-net";
 constexpr std::uint64_t max_bus_addr = 0x7F;
 constexpr std::uint64_t max_eid = 0xFE;
@@ -374,13 +381,14 @@ auto role_usage() -> int {
     std::println(stderr,
                  "usage: {} {} ADDR {} N {} N [{} N] {} ID:HEX [...] {} PATH {} A {} A {} E {} E "
                  "{} SOCKET [...] [{} P] [{} N] [{} IFINDEX] [{} TUN]\n"
-                 "          [{} ADDR {} FILE {} FILE {} FILE]\n"
+                 "          [{} ADDR {} FILE {} FILE {} FILE [{} HOST:PORT ...]]\n"
                  "   or: {} {} PATH {} ID {} MAC ({} N | {} N [{} N]) [{} IFNAME]",
                  role_log, arg_vtep, arg_server_id, arg_underlay_mtu, arg_tunnel_overhead,
                  arg_controller_key, arg_sideband, arg_addr, arg_helm_addr, arg_eid, arg_helm_eid,
                  arg_function, arg_port, arg_source_ports, arg_scope, arg_metadata,
-                 arg_control_addr, arg_role_ca, arg_role_cert, arg_role_key, role_log, arg_socket,
-                 arg_nic_id, arg_mac, arg_mtu, arg_underlay_mtu, arg_tunnel_overhead, arg_tap);
+                 arg_control_addr, arg_role_ca, arg_role_cert, arg_role_key, arg_frame_store,
+                 role_log, arg_socket, arg_nic_id, arg_mac, arg_mtu, arg_underlay_mtu,
+                 arg_tunnel_overhead, arg_tap);
     return exit_usage;
 }
 
@@ -424,6 +432,28 @@ auto parse_controller_key(std::string_view s) -> std::optional<ak::hull::Control
     return key;
 }
 
+// HOST:PORT, or [ADDR]:PORT for an IPv6 address.
+auto parse_endpoint(std::string_view s) -> std::optional<net::FrameEndpoint> {
+    const auto colon = s.rfind(':');
+    if (colon == std::string_view::npos || colon == 0) {
+        return std::nullopt;
+    }
+    auto host = s.substr(0, colon);
+    if (host.front() == '[') {
+        if (host.size() < 3 || host.back() != ']') {
+            return std::nullopt;
+        }
+        host = host.substr(1, host.size() - 2);
+    } else if (host.find(':') != std::string_view::npos) {
+        return std::nullopt;  // an IPv6 address needs its brackets
+    }
+    auto port = parse_bounded(s.substr(colon + 1), UINT16_MAX);
+    if (!port || *port == 0) {
+        return std::nullopt;
+    }
+    return net::FrameEndpoint{.host = std::string{host}, .port = static_cast<std::uint16_t>(*port)};
+}
+
 // Parses `s` into `out` if it is a number no larger than `max`.
 auto assign(std::uint64_t& out, std::string_view s, std::uint64_t max) -> bool {
     auto v = parse_bounded(s, max);
@@ -455,6 +485,7 @@ struct RoleOptions {
     std::string role_ca;
     std::string role_cert;
     std::string role_key;
+    std::vector<net::FrameEndpoint> frame_stores;  // the bulk channel's (task 12)
 };
 
 auto read_text(const std::string& path) -> std::optional<std::string> {
@@ -530,6 +561,12 @@ auto parse_role(int argc, char** argv) -> std::optional<RoleOptions> {
             o.role_cert = value;
         } else if (arg == arg_role_key) {
             o.role_key = value;
+        } else if (arg == arg_frame_store) {
+            auto e = parse_endpoint(value);
+            if (!e) {
+                return std::nullopt;
+            }
+            o.frame_stores.push_back(std::move(*e));
         } else {
             return std::nullopt;
         }
@@ -538,7 +575,7 @@ auto parse_role(int argc, char** argv) -> std::optional<RoleOptions> {
         o.control_addr || !o.role_ca.empty() || !o.role_cert.empty() || !o.role_key.empty();
     const bool all_identity =
         o.control_addr && !o.role_ca.empty() && !o.role_cert.empty() && !o.role_key.empty();
-    if (any_identity && !all_identity) {
+    if ((any_identity && !all_identity) || (!o.frame_stores.empty() && !all_identity)) {
         return std::nullopt;
     }
     if (!o.vtep || !o.server_id || *o.server_id == 0 || !o.underlay_mtu || o.keys.empty() ||
@@ -699,6 +736,13 @@ auto run_role(const RoleOptions& opts) -> int {
                                return true;
                            });
         (*role)->set_enrollment(*enrollment);
+        if (!opts.frame_stores.empty()) {
+            net::BulkFetchConfig bulk;
+            bulk.endpoints = opts.frame_stores;
+            (*role)->set_bulk_channel(std::move(bulk));
+            std::println(stderr, "{}: bulk channel: {} frame store(s)", role_log,
+                         opts.frame_stores.size());
+        }
     }
 
     remove_stale_socket(opts.sideband);
@@ -737,6 +781,7 @@ auto run_role(const RoleOptions& opts) -> int {
                 .fd = transports[i]->binding().poll_fd(), .events = POLLIN, .revents = 0};
         }
         (*role)->metadata_poll_fds(fds);  // after the rest: served by poll() below
+        (*role)->bulk_poll_fds(fds);
         const auto wait =
             std::chrono::ceil<std::chrono::milliseconds>(next_tick - net::VtepClock::now());
         const int timeout =

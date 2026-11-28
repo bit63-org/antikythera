@@ -75,11 +75,22 @@ tasks 14-15. Phases A, B and C can run in parallel.
   OarLink scheduling classes in helm (control, status, bulk; one bulk
   chunk per turn); a test that a lease renewal never waits behind a
   131 KiB transfer. _Requirements: 6.2, 6.4_ (cloud)
-- [ ] 12. `BulkFetcher` (TLS 1.3 client, digest then signature, retries
+- [x] 12. `BulkFetcher` (TLS 1.3 client, digest then signature, retries
   over endpoints, fallback to OarLink chunks) and a frame store in
-  `ak-test-controller`; a network-namespace test moving from SMBus-only
-  to the bulk channel and back, with the channel cut mid-transfer.
-  _Requirements: 6.1-6.3, 6.5, 6.6, 10.3_ (cloud)
+  `ak-test-controller`. As built: `BulkWorker` off the data-plane
+  thread, `NetRole` wiring and `--frame-store`, harbor's `FrameStore`
+  with fault injection and `fuzz_frame_request`, and loopback mutual
+  TLS tests (a transfer cut midway and retried, a corrupted body moved
+  to the next store, wrong statuses and an untrusted store falling back,
+  a verify refusal dropped). The namespace test moved to 12a, since no
+  frame kind has a consumer and helm cannot resend a fallback until
+  `stream_status` exists. _Requirements: 6.1, 6.2, 6.5_ (cloud)
+- [ ] 12a. Bulk fallback end to end: the role reports fallback notices
+  and its bulk counters in `stream_status`, helm resends those frames
+  in OarLink chunks, frames of 16 KiB or less always go by chunks; a
+  network-namespace test moving from SMBus-only to the bulk channel and
+  back, with the channel cut mid-transfer. Needs tasks 6 and 9.
+  _Requirements: 6.3, 6.6, 10.3_ (cloud)
 
 ### Phase D: lookups
 

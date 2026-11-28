@@ -12,6 +12,11 @@
 //       --signing-key controller-ed25519.pem --key-id 1 --server-id 7
 //       --script phase3.txt
 //
+// --frame-store HOST:PORT also serves frames to network roles' bulk
+// channels (fleet-scale-networking task 12): every frame-notice line puts
+// its frame there before announcing it. The store presents --cert and
+// checks role certificates against --store-ca (default --ca).
+//
 // Exit status: 0 when every action succeeded, 1 when one failed (the
 // message names the script line), 2 for a usage or setup error.
 
@@ -21,6 +26,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -37,7 +43,8 @@ constexpr int exit_usage = 2;
 constexpr std::string_view usage =
     "usage: ak-test-controller --listen HOST:PORT --ca PEM --cert PEM --key PEM\n"
     "                          --signing-key PEM --key-id N --server-id N\n"
-    "                          [--client-name NAME] [--timeout SECONDS] [--script FILE|-]\n";
+    "                          [--client-name NAME] [--timeout SECONDS] [--script FILE|-]\n"
+    "                          [--frame-store HOST:PORT [--store-ca PEM]]\n";
 
 auto read_file(const std::string& path) -> std::optional<std::string> {
     std::ifstream in{path, std::ios::binary};
@@ -75,6 +82,8 @@ auto main(int argc, char** argv) -> int {
     std::optional<std::uint64_t> key_id;
     std::optional<std::uint64_t> server_id;
     std::uint64_t timeout_s = 30;
+    std::string frame_store;
+    std::string store_ca;
 
     const std::vector<std::string> args(argv + 1, argv + argc);
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -106,6 +115,10 @@ auto main(int argc, char** argv) -> int {
             key_id = parse_u64(value);
         } else if (flag == "--server-id") {
             server_id = parse_u64(value);
+        } else if (flag == "--frame-store") {
+            frame_store = value;
+        } else if (flag == "--store-ca") {
+            store_ca = value;
         } else if (flag == "--timeout") {
             timeout_s = parse_u64(value).value_or(0);
         } else {
@@ -185,6 +198,40 @@ auto main(int argc, char** argv) -> int {
     if (!controller) {
         std::cerr << controller.error() << "\n";
         return exit_usage;
+    }
+    std::unique_ptr<ak::harbor::FrameStore> store;
+    if (!frame_store.empty()) {
+        const auto store_colon = frame_store.rfind(':');
+        const auto store_port = store_colon == std::string::npos
+                                    ? std::nullopt
+                                    : parse_u64(frame_store.substr(store_colon + 1));
+        if (!store_port || *store_port > UINT16_MAX) {
+            std::cerr << usage;
+            return exit_usage;
+        }
+        auto store_host = frame_store.substr(0, store_colon);
+        if (store_host.size() >= 2 && store_host.front() == '[' && store_host.back() == ']') {
+            store_host = store_host.substr(1, store_host.size() - 2);
+        }
+        const auto role_ca = store_ca.empty() ? ca_pem : read_file(store_ca);
+        if (!role_ca) {
+            std::cerr << "cannot read " << store_ca << "\n";
+            return exit_usage;
+        }
+        auto made =
+            ak::harbor::FrameStore::create({.role = ak::tls::Role::server,
+                                            .ca_pem = *role_ca,
+                                            .cert_pem = *cert_pem,
+                                            .key_pem = *key_pem,
+                                            .peer_name = {}},
+                                           store_host, static_cast<std::uint16_t>(*store_port));
+        if (!made) {
+            std::cerr << made.error() << "\n";
+            return exit_usage;
+        }
+        store = std::move(*made);
+        controller->set_frame_store(store.get());
+        std::cerr << "frame store on " << store_host << ":" << store->port() << "\n";
     }
     auto listener = ak::tls::Listener::bind(host, static_cast<std::uint16_t>(*port));
     if (!listener) {

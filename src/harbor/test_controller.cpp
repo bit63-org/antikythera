@@ -16,6 +16,7 @@
 #include <charconv>
 #include <climits>
 #include <cstring>
+#include <fstream>
 #include <sstream>
 #include <utility>
 
@@ -1335,6 +1336,36 @@ auto parse_line(std::string_view line) -> std::expected<std::optional<Action>, s
         }
         return std::optional<Action>{a};
     }
+    if (verb == "frame-notice") {
+        if (args.size() != 4) {
+            return std::unexpected("frame-notice: want KIND SCOPE SEQUENCE FILE");
+        }
+        SendFrameNotice a;
+        if (args[0] == "vpc_stream") {
+            a.kind = proto::FrameKind::vpc_stream;
+        } else if (args[0] == "edge_mapping") {
+            a.kind = proto::FrameKind::edge_mapping;
+        } else if (args[0] == "security_policy") {
+            a.kind = proto::FrameKind::security_policy;
+        } else {
+            return std::unexpected(
+                "frame-notice: KIND is vpc_stream, edge_mapping or "
+                "security_policy");
+        }
+        auto scope = number<std::uint32_t>(args[1], "scope");
+        auto sequence = number<std::uint64_t>(args[2], "sequence");
+        if (!scope) {
+            return std::unexpected(scope.error());
+        }
+        if (!sequence || *sequence == 0) {
+            return std::unexpected(sequence ? "frame-notice: sequence must be non-zero"
+                                            : sequence.error());
+        }
+        a.scope = *scope;
+        a.sequence = *sequence;
+        a.path = std::string{args[3]};
+        return std::optional<Action>{std::move(a)};
+    }
     if (verb == "credential-revocations") {
         if (args.size() < 2) {
             return std::unexpected(
@@ -1824,6 +1855,37 @@ auto TestController::run(const Action& action) -> std::expected<void, std::strin
                     return std::unexpected("could not encode or sign the revocation list");
                 }
                 return send(proto::RecordType::credential_revocations, *frame);
+            } else if constexpr (std::is_same_v<T, SendFrameNotice>) {
+                std::ifstream in{a.path, std::ios::binary};
+                if (!in) {
+                    return std::unexpected("frame-notice: cannot read " + a.path);
+                }
+                std::vector<std::byte> frame;
+                for (char c = 0; in.get(c);) {
+                    frame.push_back(static_cast<std::byte>(c));
+                }
+                proto::FrameNoticeRecord rec{
+                    .server_id = _options.server_id,
+                    .notice = {.kind = a.kind,
+                               .vni_or_scope = a.scope,
+                               .sequence_or_version = a.sequence,
+                               .size = static_cast<std::uint32_t>(
+                                   std::min<std::size_t>(frame.size(), UINT32_MAX)),
+                               .sha256 = {}}};
+                unsigned len = 0;
+                static_cast<void>(
+                    EVP_Digest(frame.data(), frame.size(),
+                               reinterpret_cast<unsigned char*>(rec.notice.sha256.data()), &len,
+                               EVP_sha256(), nullptr));
+                auto payload = proto::encode_frame_notice_record(rec);
+                if (!payload) {
+                    return std::unexpected(std::string{"frame-notice: "} +
+                                           proto::to_string(payload.error()));
+                }
+                if (_frame_store != nullptr) {
+                    static_cast<void>(_frame_store->put(std::move(frame)));
+                }
+                return send(proto::RecordType::frame_notice, *payload);
             } else if constexpr (std::is_same_v<T, ExpectOutcome>) {
                 if (_last_command_seq == 0) {
                     return std::unexpected("expect: no command sent yet");

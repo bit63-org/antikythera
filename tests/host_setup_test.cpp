@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -287,6 +288,31 @@ BOOST_AUTO_TEST_CASE(from_a_provisioning_file) {
     BOOST_TEST(!server_id_from_text(" 12").has_value());
     BOOST_TEST(!server_id_from_text("").has_value());
     BOOST_TEST(!server_id_from_text("0\n").has_value());
+}
+
+BOOST_AUTO_TEST_CASE(provisioning_frame_or_decimal_server_id) {
+    const auto as_bytes = [](std::string_view s) {
+        return std::as_bytes(std::span{s.data(), s.size()});
+    };
+    // The older file: the ID alone, with no epoch and no floor.
+    const auto old = provisioning_from_file(as_bytes("12\n"));
+    BOOST_TEST_REQUIRE(old.has_value());
+    BOOST_TEST(old->server_id == 12U);
+    BOOST_TEST(old->boot_epoch == 0U);
+    BOOST_TEST(old->sequence_floor == 0U);
+    BOOST_TEST(!provisioning_from_file(as_bytes("0\n")).has_value());
+    BOOST_TEST(!provisioning_from_file({}).has_value());
+
+    const ak::proto::Provisioning want{.server_id = 9, .boot_epoch = 3, .sequence_floor = 700};
+    const auto frame = ak::proto::encode_provisioning(want);
+    BOOST_TEST_REQUIRE(frame.has_value());
+    BOOST_TEST((provisioning_from_file(*frame) == std::optional{want}));
+    // Starts with the magic, so it must decode: a truncated or extended
+    // frame is refused, never read as a decimal ID.
+    BOOST_TEST(!provisioning_from_file(std::span{*frame}.first(0x1F)).has_value());
+    auto longer = *frame;
+    longer.push_back(std::byte{'\n'});
+    BOOST_TEST(!provisioning_from_file(longer).has_value());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
@@ -594,7 +620,47 @@ BOOST_AUTO_TEST_CASE(writes_the_inventory_and_execs_the_agent) {
                "0000:02:00.0 7 bus\n");
     BOOST_TEST(slurp(dir / "args") == "--mailbox\n0000:00:1f.0\n--inventory\n" +
                                           (dir / "run/inventory").string() +
-                                          "\n--server-id\n77\n--vmm-stderr\n");
+                                          "\n--server-id\n77\n--boot-epoch\n0\n"
+                                          "--sequence-floor\n0\n--vmm-stderr\n");
+}
+
+// cold-start Requirement 6.1-6.2: helm's provisioning frame gives the
+// agent its boot epoch and the sequence floor it refuses at or below.
+BOOST_AUTO_TEST_CASE(passes_the_boot_epoch_and_sequence_floor_to_the_agent) {
+    FakeSysfs sys;
+    sys.standard_host();
+    const auto file = sys.root() / "provisioning";
+    const auto frame =
+        ak::proto::encode_provisioning({.server_id = 77, .boot_epoch = 5, .sequence_floor = 4242});
+    BOOST_TEST_REQUIRE(frame.has_value());
+    {
+        std::ofstream out{file, std::ios::binary};
+        out.write(reinterpret_cast<const char*>(frame->data()),
+                  static_cast<std::streamsize>(frame->size()));
+    }
+    std::string config{good_config};
+    config.replace(config.find("server-id cmdline"), 17, "server-id file " + file.string());
+    BOOST_TEST_REQUIRE(run_init(sys, config, "ro\n") == 0);
+    const auto dir = sys.root() / "init";
+    BOOST_TEST(slurp(dir / "args") == "--mailbox\n0000:00:1f.0\n--inventory\n" +
+                                          (dir / "run/inventory").string() +
+                                          "\n--server-id\n77\n--boot-epoch\n5\n"
+                                          "--sequence-floor\n4242\n--vmm-stderr\n");
+
+    // A frame that does not decode is not a server ID: init fails closed.
+    auto bad = *frame;
+    bad.at(0x10) = std::byte{0};  // boot epoch 0
+    for (std::size_t i = 0x11; i < 0x18; ++i) {
+        bad.at(i) = std::byte{0};
+    }
+    {
+        std::ofstream out{file, std::ios::binary | std::ios::trunc};
+        out.write(reinterpret_cast<const char*>(bad.data()),
+                  static_cast<std::streamsize>(bad.size()));
+    }
+    fs::remove(dir / "args");
+    BOOST_TEST(run_init(sys, config, "ro\n") == 1);
+    BOOST_TEST(!fs::exists(dir / "args"));
 }
 
 BOOST_AUTO_TEST_CASE(creates_vfs_before_looking_for_them) {

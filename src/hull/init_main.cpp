@@ -34,6 +34,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -192,12 +194,22 @@ auto main(int argc, char** argv) -> int {
         die(g.error().detail);
     }
 
-    const auto server_id = config->server_id_source == ServerIdSource::cmdline
-                               ? server_id_from_cmdline(slurp(opt.cmdline))
-                               : server_id_from_text(slurp(config->server_id_file));
-    if (!server_id) {
+    // The server ID, and with helm's provisioning frame the boot epoch and
+    // the sequence floor (.kiro/specs/cold-start/ Requirement 6). A server
+    // ID from the command line comes with neither.
+    std::optional<ak::proto::Provisioning> provisioning;
+    if (config->server_id_source == ServerIdSource::cmdline) {
+        if (const auto id = server_id_from_cmdline(slurp(opt.cmdline))) {
+            provisioning = ak::proto::Provisioning{.server_id = *id};
+        }
+    } else {
+        const auto text = slurp(config->server_id_file);
+        provisioning = provisioning_from_file(std::as_bytes(std::span{text}));
+    }
+    if (!provisioning) {
         die("no valid server ID");
     }
+    const auto server_id = provisioning->server_id;
 
     std::error_code ec;
     fs::create_directories(opt.run_dir, ec);
@@ -210,13 +222,26 @@ auto main(int argc, char** argv) -> int {
             die("cannot write " + inventory.string());
         }
     }
-    std::printf("hull-init: mailbox %s, %zu function(s), server %llu\n", found->mailbox_bdf.c_str(),
-                found->functions.size(), static_cast<unsigned long long>(*server_id));
+    std::printf(
+        "hull-init: mailbox %s, %zu function(s), server %llu, boot epoch %llu, "
+        "sequence floor %llu\n",
+        found->mailbox_bdf.c_str(), found->functions.size(),
+        static_cast<unsigned long long>(server_id),
+        static_cast<unsigned long long>(provisioning->boot_epoch),
+        static_cast<unsigned long long>(provisioning->sequence_floor));
     std::fflush(stdout);
 
-    std::vector<std::string> args{
-        opt.agent.string(), "--mailbox",   found->mailbox_bdf,        "--inventory",
-        inventory.string(), "--server-id", std::to_string(*server_id)};
+    std::vector<std::string> args{opt.agent.string(),
+                                  "--mailbox",
+                                  found->mailbox_bdf,
+                                  "--inventory",
+                                  inventory.string(),
+                                  "--server-id",
+                                  std::to_string(server_id),
+                                  "--boot-epoch",
+                                  std::to_string(provisioning->boot_epoch),
+                                  "--sequence-floor",
+                                  std::to_string(provisioning->sequence_floor)};
     args.insert(args.end(), opt.agent_args.begin(), opt.agent_args.end());
     std::vector<char*> cargs;
     for (auto& a : args) {

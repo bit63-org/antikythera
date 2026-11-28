@@ -101,6 +101,22 @@ struct FakeHost final : helm::HostPort {
     }
 };
 
+struct FakeRecorder final : helm::SequenceRecorder {
+    std::vector<std::uint64_t> recorded;
+    // What the host had been posted when each number was recorded.
+    std::vector<std::size_t> posted_before;
+    const FakeHost* host{nullptr};
+    bool fail{false};
+    auto record(std::uint64_t seq) -> bool override {
+        if (fail) {
+            return false;
+        }
+        recorded.push_back(seq);
+        posted_before.push_back(host != nullptr ? host->posted.size() : 0);
+        return true;
+    }
+};
+
 struct FakeOar final : helm::OarPort {
     std::vector<oar::PrepareFunction> prepared;
     std::vector<oar::CleanFunction> cleaned;
@@ -404,8 +420,10 @@ struct Helm {
     std::uint64_t seq{0};
     helm::CommandRouter router;
 
-    explicit Helm(std::size_t max_queued = helm::RouterConfig{}.max_queued, bool with_blk = true)
+    explicit Helm(std::size_t max_queued = helm::RouterConfig{}.max_queued, bool with_blk = true,
+                  helm::SequenceRecorder* recorder = nullptr)
         : router{helm::RouterConfig{.last_seq = 0,
+                                    .sequence_recorder = recorder,
                                     .command_timeout = command_timeout,
                                     .release_timeout = release_timeout,
                                     .clean_timeout = clean_timeout,
@@ -552,6 +570,40 @@ BOOST_AUTO_TEST_CASE(stale_sequences_are_dropped_and_retries_are_idempotent,
     h.router.on_envelope(envelope(0, net));
     BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::stale_sequence));
     BOOST_TEST(h.host.posted.size() == 2U);
+}
+
+// cold-start Requirement 6.3: each relayed sequence number is recorded
+// before the command reaches the mailbox, and a command whose number
+// cannot be recorded is not relayed at all.
+BOOST_AUTO_TEST_CASE(sequence_numbers_are_recorded_before_each_relay,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    FakeRecorder recorder;
+    Helm h{helm::RouterConfig{}.max_queued, true, &recorder};
+    recorder.host = &h.host;
+    const mb::CreateNetwork a{.vni = vni};
+    const mb::CreateNetwork b{.vni = vni + 1};
+    const auto first = h.run(a);
+    const auto second = h.run(b);
+    BOOST_TEST(recorder.recorded == (std::vector<std::uint64_t>{first, second}));
+    BOOST_TEST(recorder.posted_before == (std::vector<std::size_t>{0, 1}));
+    BOOST_TEST(h.host.posted.size() == 2U);
+
+    recorder.fail = true;
+    const mb::CreateVm create{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib};
+    const auto s = h.send(create);
+    BOOST_TEST(h.host.posted.size() == 2U);
+    BOOST_TEST(!h.router.busy());
+    BOOST_TEST(h.reports.last_outcome().in_reply_to == s);
+    BOOST_TEST((status_of(h.reports.last_outcome()) == mb::Status::internal_error));
+    BOOST_TEST(h.router.stats().sequence_record_failures == 1U);
+    // Its prepare step (the VM key) was undone.
+    BOOST_TEST(!h.keys.find_vm_key(vm_one).has_value());
+
+    // Recording works again: the next command is relayed.
+    recorder.fail = false;
+    const auto next = h.run(create);
+    BOOST_TEST(recorder.recorded.back() == next);
+    BOOST_TEST(h.host.posted.size() == 3U);
 }
 
 BOOST_AUTO_TEST_CASE(the_queue_is_bounded, *boost::unit_test::timeout(unit_timeout_seconds)) {

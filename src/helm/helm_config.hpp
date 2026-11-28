@@ -17,6 +17,16 @@
 //   master-key PATH|ephemeral   software secure element master key file
 //                               (created 0600); `ephemeral` keeps a random
 //                               key in memory only (throwaway harbor runs)
+//   store PATH                  sealed store flash partition (a file here,
+//                               created 0600; .kiro/specs/cold-start/
+//                               Requirement 1); optional
+//   store-size N                its size in bytes (default 1 MiB; a multiple
+//                               of 4096, at least 16 KiB)
+//   store-anchor PATH|ephemeral the software secure element's store key and
+//                               monotonic counters (created 0600); required
+//                               with store. With a store, helm records each
+//                               relayed command's sequence number there
+//                               (cold-start Requirement 6.3)
 //   slot N SOCKET ADDR PEER_ADDR EID PEER_EID ARGV...
 //                               a data-plane slot: the board process to
 //                               launch (ARGV, argv[0] an absolute path), the
@@ -67,6 +77,9 @@ struct HelmConfig {
     std::filesystem::path key;
     std::filesystem::path audit_log;
     std::optional<std::filesystem::path> master_key;  // nullopt: ephemeral
+    std::optional<std::filesystem::path> store;       // nullopt: no sealed store
+    std::uint64_t store_size{std::uint64_t{1} << 20};
+    std::optional<std::filesystem::path> store_anchor;  // nullopt: ephemeral
     std::map<SlotNumber, SlotEntry> slots;
     std::vector<std::string> host_argv;  // empty: no host process
 

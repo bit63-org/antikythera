@@ -70,6 +70,11 @@ struct Options {
     std::string mailbox;
     fs::path inventory;
     mb::ServerId server_id{mb::no_server_id};
+    // From helm's provisioning file (.kiro/specs/cold-start/ Requirement 6):
+    // this boot's number and the last sequence number helm relayed before
+    // it, below which every command is a replay.
+    std::uint64_t boot_epoch{0};
+    std::uint64_t sequence_floor{0};
     fs::path cloud_hypervisor{"/usr/bin/cloud-hypervisor"};
     BootPayload payload;
     fs::path run_dir{"/run/hull"};
@@ -111,6 +116,10 @@ auto parse_args(int argc, char** argv) -> Options {
             o.inventory = value();
         } else if (a == "--server-id") {
             o.server_id = number<mb::ServerId>(value(), "--server-id");
+        } else if (a == "--boot-epoch") {
+            o.boot_epoch = number<std::uint64_t>(value(), "--boot-epoch");
+        } else if (a == "--sequence-floor") {
+            o.sequence_floor = number<std::uint64_t>(value(), "--sequence-floor");
         } else if (a == "--cloud-hypervisor") {
             o.cloud_hypervisor = value();
         } else if (a == "--firmware") {
@@ -231,7 +240,9 @@ auto main(int argc, char** argv) -> int {
     SysfsFunctionResetter resetter{opt.sysfs};
     VmSupervisor supervisor{allocator, launcher, resetter, inventory, opt.payload};
     AgentHandler handler{supervisor};
-    SequenceTracker sequence;
+    // A command at or below the floor was relayed before this boot (or is
+    // a replay of one), so it is refused (cold-start Requirement 6.2).
+    SequenceTracker sequence{opt.sequence_floor};
     MailboxClient client{**mailbox, opt.server_id, *verifier, sequence, handler};
     if (auto a = client.attach(); !a) {
         die(std::string{"mailbox attach: "} + to_string(a.error()));
@@ -241,9 +252,13 @@ auto main(int argc, char** argv) -> int {
         die(std::string{"dropping capabilities: "} + std::strerror(d.error()));
     }
 
-    std::printf("hull-agent: server %llu, %zu function(s), %zu guest core(s), %u page(s)\n",
-                static_cast<unsigned long long>(opt.server_id), inventory.entries().size(),
-                allocator.guest_cores(), allocator.total_hugepages());
+    std::printf(
+        "hull-agent: server %llu, boot epoch %llu, sequence floor %llu, %zu function(s), "
+        "%zu guest core(s), %u page(s)\n",
+        static_cast<unsigned long long>(opt.server_id),
+        static_cast<unsigned long long>(opt.boot_epoch),
+        static_cast<unsigned long long>(opt.sequence_floor), inventory.entries().size(),
+        allocator.guest_cores(), allocator.total_hugepages());
     std::fflush(stdout);
     // helm cannot know what a previous run of the agent left behind.
     (void)client.send_event(

@@ -28,7 +28,10 @@
 //   server-id cmdline | server-id file <absolute path>
 //       where the agent's server ID comes from: the kernel command line's
 //       hull.server_id= (part of the signed UKI), or a provisioning file
-//       (a measured one in production).
+//       (a measured one in production): helm's Provisioning frame
+//       (proto/provisioning.hpp), which also carries the boot epoch and
+//       the command sequence floor (.kiro/specs/cold-start/ Requirement
+//       6), or the older file holding only the server ID in decimal.
 //
 // `#` starts a comment; blank lines are ignored; anything else is an
 // error. The parser is strict and fuzzed (fuzz/fuzz_host_config.cpp).
@@ -51,11 +54,13 @@
 #include <expected>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "helm/mailbox.hpp"
+#include "proto/provisioning.hpp"
 #include "hull/device_inventory.hpp"
 #include "hull/signature_verifier.hpp"
 
@@ -116,6 +121,13 @@ inline constexpr std::size_t max_config_bytes = 64U * 1024U;
     -> std::optional<helm::mailbox::ServerId>;
 [[nodiscard]] auto server_id_from_text(std::string_view text)
     -> std::optional<helm::mailbox::ServerId>;
+
+// A provisioning file's contents: a Provisioning frame if it starts with
+// that frame's magic (and then it must decode, or the result is nullopt),
+// else the older decimal server ID, with boot_epoch and sequence_floor 0
+// (no floor: any first sequence number is accepted).
+[[nodiscard]] auto provisioning_from_file(std::span<const std::byte> bytes)
+    -> std::optional<proto::Provisioning>;
 
 // --- Discovery and binding over sysfs -----------------------------------------
 

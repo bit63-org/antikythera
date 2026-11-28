@@ -92,6 +92,7 @@ add_library(ak_helm
   helm/helm_daemon.cpp
   helm/host_boot.cpp
   helm/hardware_identity.cpp
+  helm/decommission.cpp
   helm/hpke.cpp
   helm/image_cache.cpp
   helm/key_store.cpp

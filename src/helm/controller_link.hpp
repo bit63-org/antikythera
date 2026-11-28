@@ -270,6 +270,7 @@ struct ControllerLinkStats {
     std::uint64_t connects{0};  // completed handshakes
     std::uint64_t failures{0};  // failed connects and broken connections
     std::uint64_t protocol_errors{0};
+    std::size_t pending_reports{0};  // queued or sent, not yet acknowledged
 };
 
 class ControllerLink {

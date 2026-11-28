@@ -550,6 +550,19 @@ auto OarLink::role_identity() -> std::expected<oar::RoleIdentity, LinkError> {
     return *id;
 }
 
+auto OarLink::sanitize(oar::SanitizeOp op) -> std::expected<oar::SanitizeStatus, LinkError> {
+    auto body = oar::encode_sanitize_request(op);
+    auto response = transact(mctp::VendorType::sanitize, body);
+    if (!response) {
+        return std::unexpected(response.error());
+    }
+    auto st = oar::decode_sanitize_status(*response);
+    if (!st) {
+        return std::unexpected(bad_response());
+    }
+    return *st;
+}
+
 auto OarLink::health() -> std::expected<oar::Health, LinkError> {
     std::vector<std::byte> body;
     auto response = transact(mctp::VendorType::health, body);
@@ -819,6 +832,18 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
                                                                  : id.error());
             }
             return with_body(oar::encode_role_identity(*id));
+        }
+        case mctp::VendorType::sanitize: {
+            const auto op = oar::decode_sanitize_request(body);
+            if (!op) {
+                return status_only(oar::Status::bad_request);
+            }
+            auto st = handler.sanitize(*op);
+            if (!st) {
+                return status_only(st.error() == oar::Status::ok ? oar::Status::failed
+                                                                 : st.error());
+            }
+            return with_body(oar::encode_sanitize_status(*st));
         }
         case mctp::VendorType::cert_request: {
             if (!oar::decode_empty(body)) {

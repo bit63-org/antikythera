@@ -162,6 +162,7 @@
 #include "helm/audit_log.hpp"
 #include "helm/command_router.hpp"
 #include "helm/controller_link.hpp"
+#include "helm/decommission.hpp"
 #include "helm/device_pool.hpp"
 #include "helm/group_usage.hpp"
 #include "helm/key_store.hpp"
@@ -174,6 +175,7 @@
 #include "helm/standing_frames.hpp"
 #include "helm/standing_set_keeper.hpp"
 #include "helm/power_sequencer.hpp"
+#include "helm/sealed_store.hpp"
 #include "helm/sideband_binding.hpp"
 #include "helm/time_floor.hpp"
 #include "helm/tunnel_keyring.hpp"
@@ -267,6 +269,20 @@ struct DaemonConfig {
     // thread at construction and before every publish; boot_cache() hands
     // the newest to other threads. Empty: no boot_cache reports.
     std::function<proto::BootCache()> boot_cache;
+    // Keeps a decommission in progress (server-provisioning Requirement
+    // 5.5) so the next boot resumes it (load_decommission). Null: a power
+    // loss part-way leaves it to the controller to send again. Not owned.
+    SealedStore* store{nullptr};
+    // How long the storage roles have, from the start of the media step,
+    // to answer for their drives; a drive not answered for by then is
+    // reported failed (to be destroyed) and the decommission goes on.
+    std::chrono::milliseconds sanitize_timeout{std::chrono::hours{12}};
+    // Called on the loop thread once a decommission has reported
+    // identity_cleared: the caller removes helm's TLS keys and stored
+    // server ID, destroys the sealed store, closes the link and stops
+    // (Requirement 5.4). Empty: the decommission record is removed from
+    // the store and the daemon stays decommissioned.
+    std::function<void()> on_decommissioned;
     // Empty: steady_clock::now.
     std::function<Clock::time_point()> clock;
 };
@@ -344,6 +360,13 @@ struct DaemonStats {
     std::uint64_t identity_reports{0};   // hardware_identity reports sent
     std::uint64_t hardware_changes{0};   // reports that differed from the baseline
     std::uint64_t identity_failures{0};  // a role's identity could not be read (not unsupported)
+    // Decommission (server-provisioning Requirement 5).
+    std::uint64_t decommissions{0};          // accepted (or resumed)
+    std::uint64_t decommissions_refused{0};  // unsigned, stale, or something still on the server
+    std::uint64_t decommission_retries{0};   // a step failed and is retried on the next pass
+    std::uint64_t drives_sanitized{0};       // drives a storage role sanitized
+    std::uint64_t drives_failed{0};          // drives reported failed (to be destroyed)
+    std::uint64_t decommission_dropped{0};   // envelopes and host_power dropped meanwhile
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -455,6 +478,17 @@ public:
         -> void override;
     auto on_host_power(const proto::HostPower& order, std::span<const std::byte> frame)
         -> void override;
+    auto on_decommission(const proto::Decommission& order, std::span<const std::byte> frame)
+        -> void override;
+    // Reads a decommission a power loss interrupted (Requirement 5.5),
+    // checking its signature again. Call once, before boot(): when it
+    // returns true the daemon resumes it before anything else, and the
+    // host is never released.
+    auto load_decommission() -> bool;
+    [[nodiscard]] auto decommissioning() const noexcept -> bool {
+        return _decommission.has_value();
+    }
+    [[nodiscard]] auto decommissioned() const noexcept -> bool { return _decommissioned; }
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
     // The newest published snapshot (ControllerSession's InventorySource).
@@ -534,11 +568,28 @@ private:
         proto::HostPower order;
         std::vector<std::byte> frame;
     };
+    struct DecommissionFrame {
+        proto::Decommission order;
+        std::vector<std::byte> frame;
+    };
+    // How one slot's media sanitize stands.
+    enum class SanitizeStep : std::uint8_t {
+        pending,
+        running,
+        done
+    };
+    struct DecommissionRun {
+        DecommissionPhase phase{DecommissionPhase::keys};
+        std::vector<std::byte> frame;
+        std::map<SlotNumber, SanitizeStep> slots;
+        std::optional<Clock::time_point> media_deadline;
+        Clock::time_point next_media{};
+    };
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
                               proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
                               ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame, MetadataFrame,
                               LayoutFrame, proto::SelfTest, PowerPolicyFrame, StandingSetFrame,
-                              BootImageFrame, HostPowerFrame>;
+                              BootImageFrame, HostPowerFrame, DecommissionFrame>;
     // Where a NIC with a kept record is plugged: its network role's slot
     // and function.
     struct MetadataHome {
@@ -658,6 +709,24 @@ private:
     // host_power on: boots, or releases a held host onto a filled boot
     // function.
     auto power_host_on() -> proto::CommandStatus;
+    // A decommission record: verified, sequenced, refused while anything
+    // is still on the server, else kept and begun.
+    auto apply_decommission(const proto::Decommission& order, std::span<const std::byte> frame)
+        -> proto::CommandStatus;
+    // Something a decommission must wait for (Requirement 5.1): a VM, a
+    // network volume attachment, or a storage replica of this server.
+    [[nodiscard]] auto server_in_use() const -> bool;
+    // Holds the host for good: a decommissioning server boots nothing.
+    auto hold_host_for_decommission() -> void;
+    auto save_decommission() -> void;
+    // One pass of the decommission in progress.
+    auto step_decommission() -> void;
+    // The media step for one slot; true once the slot is done.
+    auto sanitize_slot(SlotState& slot, SanitizeStep& step, bool overdue) -> bool;
+    // Reports every drive helm knows on `slot` as failed (a role that
+    // cannot sanitize, or did not answer in time).
+    auto report_failed_drives(SlotNumber slot) -> void;
+    auto finish_decommission() -> void;
     [[nodiscard]] static auto is_storage(const SlotState& slot) -> bool;
     auto poll_identity(SlotState& slot) -> void;
     auto deliver_certificate(const proto::RoleCertificate& certificate) -> void;
@@ -698,6 +767,8 @@ private:
     bool _fallback_used{false};
     HostPowerOverride _host_override{HostPowerOverride::none};
     bool _booted{false};
+    std::optional<DecommissionRun> _decommission;
+    bool _decommissioned{false};
     std::map<SlotNumber, std::unique_ptr<SlotState>> _slots;
     Clock::time_point _next_check;
     Clock::time_point _next_reports;

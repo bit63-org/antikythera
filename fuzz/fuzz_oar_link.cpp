@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <optional>
 #include <span>
 
 #include "helm/oar_link.hpp"
@@ -81,6 +82,12 @@ auto decoders(std::span<const std::byte> body) -> void {
     }
     if (auto id = oar::decode_role_identity(body)) {
         same(body, oar::encode_role_identity(*id));
+    }
+    if (auto op = oar::decode_sanitize_request(body)) {
+        same(body, std::optional{oar::encode_sanitize_request(*op)});
+    }
+    if (auto st = oar::decode_sanitize_status(body)) {
+        same(body, oar::encode_sanitize_status(*st));
     }
     if (auto c = oar::decode_usage_request(body)) {
         same(body, oar::encode_usage_request(*c));

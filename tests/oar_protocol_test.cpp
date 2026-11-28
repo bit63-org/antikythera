@@ -1376,6 +1376,70 @@ BOOST_AUTO_TEST_CASE(role_identity_round_trip_and_rules) {
         (oar::decode_role_identity(std::span(*body).first(5)).error() == BodyError::truncated));
 }
 
+BOOST_AUTO_TEST_CASE(sanitize_round_trip_and_rules) {
+    // The request.
+    for (const auto op : {oar::SanitizeOp::start, oar::SanitizeOp::query}) {
+        const auto body = oar::encode_sanitize_request(op);
+        BOOST_TEST(body.size() == oar::sanitize_request_size);
+        BOOST_TEST((oar::decode_sanitize_request(body).value() == op));
+    }
+    auto req = oar::encode_sanitize_request(oar::SanitizeOp::start);
+    req[0] = std::byte{3};
+    BOOST_TEST((oar::decode_sanitize_request(req).error() == BodyError::unknown_enum));
+    req[0] = std::byte{1};
+    req[7] = std::byte{1};
+    BOOST_TEST((oar::decode_sanitize_request(req).error() == BodyError::reserved_not_zero));
+    req.pop_back();
+    BOOST_TEST((oar::decode_sanitize_request(req).error() == BodyError::truncated));
+
+    // The answer.
+    const oar::SanitizeStatus running{.state = oar::SanitizeState::running, .drives = {}};
+    const auto r = oar::encode_sanitize_status(running);
+    BOOST_REQUIRE(r.has_value());
+    BOOST_TEST(r->size() == oar::sanitize_fixed_size);
+    BOOST_TEST((oar::decode_sanitize_status(*r).value() == running));
+    oar::SanitizeStatus done{.state = oar::SanitizeState::done, .drives = {}};
+    done.drives.push_back({.serial = ak::proto::identity_text("D-A"),
+                           .result = ak::proto::SanitizeResult::sanitized_crypto});
+    done.drives.push_back(
+        {.serial = ak::proto::identity_text("D-B"), .result = ak::proto::SanitizeResult::failed});
+    const auto body = oar::encode_sanitize_status(done);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::sanitize_fixed_size + (2 * oar::sanitize_drive_size));
+    BOOST_TEST((oar::decode_sanitize_status(*body).value() == done));
+
+    auto bad = done;
+    bad.state = oar::SanitizeState::running;  // results only once done
+    BOOST_TEST((oar::encode_sanitize_status(bad).error() == BodyError::too_many_entries));
+    bad = done;
+    std::swap(bad.drives[0], bad.drives[1]);
+    BOOST_TEST((oar::encode_sanitize_status(bad).error() == BodyError::not_increasing));
+    bad = done;
+    bad.drives[0].serial = {};
+    BOOST_TEST((oar::encode_sanitize_status(bad).error() == BodyError::bad_text));
+    bad = done;
+    bad.drives[0].result = static_cast<ak::proto::SanitizeResult>(9);
+    BOOST_TEST((oar::encode_sanitize_status(bad).error() == BodyError::unknown_enum));
+
+    auto f = *body;
+    f[0] = std::byte{7};  // state
+    BOOST_TEST((oar::decode_sanitize_status(f).error() == BodyError::unknown_enum));
+    f = *body;
+    f[1] = std::byte{1};
+    BOOST_TEST((oar::decode_sanitize_status(f).error() == BodyError::reserved_not_zero));
+    f = *body;
+    f[oar::sanitize_fixed_size + oar::sanitize_drive_size - 1] = std::byte{1};  // a drive's pad
+    BOOST_TEST((oar::decode_sanitize_status(f).error() == BodyError::reserved_not_zero));
+    f = *body;
+    f.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_sanitize_status(f).error() == BodyError::trailing_bytes));
+    f = *body;
+    f[2] = std::byte{3};
+    BOOST_TEST((oar::decode_sanitize_status(f).error() == BodyError::truncated));
+    BOOST_TEST(
+        (oar::decode_sanitize_status(std::span(*body).first(4)).error() == BodyError::truncated));
+}
+
 BOOST_AUTO_TEST_CASE(identity_options_build_a_role_identity) {
     oar::RoleIdentity id;
     BOOST_TEST(!oar::parse_identity_option("--sideband", "x", id).has_value());

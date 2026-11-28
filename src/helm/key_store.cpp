@@ -387,4 +387,18 @@ auto KeyStore::volumes_of(VmId vm) const -> std::vector<VolumeId> {
     return out;
 }
 
+auto KeyStore::destroy_all() -> std::expected<void, KeyError> {
+    // VM keys first, as DESTROY_VM would: each takes its volumes' keys.
+    while (!_vm_keys.empty()) {
+        (void)destroy_vm_key(_vm_keys.begin()->first);
+    }
+    _volume_keys.clear();
+    _attachment_keys.clear();
+    _image_keys.clear();
+    if (!_se->destroy_master_key()) {
+        return std::unexpected(KeyError::secure_element);
+    }
+    return {};
+}
+
 }  // namespace ak::helm

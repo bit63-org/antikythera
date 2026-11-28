@@ -385,7 +385,38 @@ auto SoftwareSecureElement::open(const std::filesystem::path& path)
     if (!master) {
         return std::unexpected(master.error());
     }
-    return SoftwareSecureElement{std::move(*master)};
+    return SoftwareSecureElement{std::move(*master), path};
+}
+
+auto SoftwareSecureElement::destroy_master_key() -> std::expected<void, SeError> {
+    SecretBytes<master_key_size> fresh;
+    if (auto r = random_fill(fresh.span()); !r) {
+        return std::unexpected(r.error());
+    }
+    if (_path) {
+        auto tmp = *_path;
+        tmp += ".new";
+        (void)::unlink(tmp.c_str());
+        {
+            Fd fd{::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                         master_key_mode)};
+            if (!fd.valid() || !write_all(fd.get(), fresh.span()) || ::fsync(fd.get()) != 0) {
+                (void)::unlink(tmp.c_str());
+                return std::unexpected(SeError::master_key_io);
+            }
+        }
+        if (::rename(tmp.c_str(), _path->c_str()) != 0) {
+            (void)::unlink(tmp.c_str());
+            return std::unexpected(SeError::master_key_io);
+        }
+        const auto dir = _path->has_parent_path() ? _path->parent_path() : ".";
+        const Fd dfd{::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+        if (!dfd.valid() || ::fsync(dfd.get()) != 0) {
+            return std::unexpected(SeError::master_key_io);
+        }
+    }
+    _master = std::move(fresh);
+    return {};
 }
 
 auto SoftwareSecureElement::transport_key() const -> std::expected<hpke::KeyPair, SeError> {

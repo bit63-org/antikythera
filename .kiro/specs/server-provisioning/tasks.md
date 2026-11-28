@@ -51,6 +51,25 @@ and 16 there). Each task is one PR unless noted.
   - Key destruction, `sanitize` MCTP request to storage roles, identity
     clearing, persisted resume
   - _Requirements: 5.1-5.5_
+  - Built (helm): the signed `decommission` record is refused while a
+    VM, a network volume attachment or a replica (hold config or khold
+    layout naming this server) remains; otherwise it is kept in the
+    sealed store (`helm.decommission`, `src/helm/decommission.hpp`) and
+    run in order. First every VM key and the secure element's master key
+    are destroyed (`KeyStore::destroy_all`,
+    `SecureElement::destroy_master_key`). Then each hold and khold role
+    is asked to sanitize over the sideband (`sanitize`, oar vendor type
+    0x21, start then query). A role that refuses, or does not answer
+    within `sanitize_timeout` (12 h), has its known drives reported
+    failed. Last comes identity_cleared, after which ak-helm removes its
+    TLS key, certificate and master key file, erases the sealed store
+    and stops. The host is held from the first step to the end. A power
+    loss resumes at the step it reached, before the power-on wait.
+  - Left: the storage roles running NVMe Sanitize (crypto erase, else
+    block erase) behind `OarHandler::sanitize`. Until then every role
+    answers unsupported and its drives are reported failed. helm's
+    server ID stays in its configuration file until enrollment states
+    (task 2) give helm an unenrolled state of its own.
 
 - [x] 6. Hardware identity report
   - _Requirements: 6.1-6.2_

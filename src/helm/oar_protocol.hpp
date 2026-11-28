@@ -67,6 +67,7 @@
 //                          Requirement 11.5) or a khold role serving them
 //   self_test           (empty)
 //   role_identity       (empty)
+//   sanitize            0  op u8 (SanitizeOp) | 1  reserved [7]
 //   instance_secrets    0  total u32 | 4  offset u32 | 8  chunk (as map_update): one
 //                          InstanceSecrets frame (below), for the net role
 //   group_membership    0  cursor u16 | 2  flags u16 (bit 0: `since` is set)
@@ -222,6 +223,11 @@
 //                          printable ASCII, zero-padded; serial non-empty)
 //                       72 count x { serial [32] (non-empty) | size_bytes u64 (non-zero) },
 //                          at most max_role_drives, strictly increasing serial
+//   sanitize            2  state u8 (SanitizeState) | 3  reserved u8 | 4  count u16
+//                       6  reserved u16 | 8  count x { serial [32] (non-empty) |
+//                          result u8 (proto::SanitizeResult) | reserved [7] },
+//                          at most max_role_drives, strictly increasing serial;
+//                          count is 0 while running
 //   copy_volume         2  state u8 (CopyVolumeState) | 3  failure u8 (CopyVolumeFailure)
 //                       4  reserved [6] | 10 total_bytes u64 | 18 done_bytes u64
 //                       26 written_bytes u64 (done, written <= total)
@@ -1073,6 +1079,46 @@ struct RoleIdentity {
 // An identity a role can answer with: a serial, valid text, drives in
 // serial order (what parse_identity_option builds once --serial is given).
 [[nodiscard]] auto valid_role_identity(const RoleIdentity& identity) -> bool;
+
+// Media sanitize (.kiro/specs/server-provisioning/ Requirement 5.3): helm
+// asks each storage role to sanitize every drive it serves (NVMe Sanitize
+// with crypto erase, else block erase) at decommission. A sanitize runs
+// for minutes to hours, so `start` begins it (or reports the one already
+// running or finished) and `query` asks how it stands; both answer with
+// the state, and once done with every drive's result by serial, drives
+// that could not be sanitized included.
+enum class SanitizeOp : std::uint8_t {
+    start = 1,
+    query = 2,
+};
+enum class SanitizeState : std::uint8_t {
+    running = 1,
+    done = 2,
+};
+
+inline constexpr std::size_t sanitize_request_size = 8;
+inline constexpr std::size_t sanitize_fixed_size = 6;
+inline constexpr std::size_t sanitize_drive_size = proto::identity_text_size + 8;
+
+struct DriveSanitize {
+    proto::IdentityText serial{};
+    proto::SanitizeResult result{proto::SanitizeResult::failed};
+    friend auto operator==(const DriveSanitize&, const DriveSanitize&) -> bool = default;
+};
+
+struct SanitizeStatus {
+    SanitizeState state{SanitizeState::running};
+    std::vector<DriveSanitize> drives;  // empty while running; strictly increasing serial
+    friend auto operator==(const SanitizeStatus&, const SanitizeStatus&) -> bool = default;
+};
+
+[[nodiscard]] auto encode_sanitize_request(SanitizeOp op) -> std::vector<std::byte>;
+[[nodiscard]] auto decode_sanitize_request(std::span<const std::byte> body)
+    -> std::expected<SanitizeOp, BodyError>;
+[[nodiscard]] auto encode_sanitize_status(const SanitizeStatus& status)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_sanitize_status(std::span<const std::byte> body)
+    -> std::expected<SanitizeStatus, BodyError>;
 
 [[nodiscard]] auto encode_health(const Health& h)
     -> std::expected<std::vector<std::byte>, BodyError>;

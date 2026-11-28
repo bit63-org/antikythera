@@ -341,6 +341,48 @@ BOOST_AUTO_TEST_CASE(reopened_master_key_unwraps,
     BOOST_TEST((stranger.unwrap_volume_key(vol_a, vm_one).error() == KeyError::corrupt_key));
 }
 
+// server-provisioning Requirement 5.2: decommission destroys every VM key
+// and then the master key; wrapped keys saved anywhere, and the master key
+// file's old contents, open nothing afterwards.
+BOOST_AUTO_TEST_CASE(destroy_all_crypto_erases_everything,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    TempDir dir;
+    const auto path = dir.path / master_key_name;
+    auto se = SoftwareSecureElement::open(path);
+    BOOST_REQUIRE(se.has_value());
+    KeyStore store{*se};
+    BOOST_REQUIRE(store.create_vm_key(vm_one).has_value());
+    BOOST_REQUIRE(store.create_vm_key(vm_two).has_value());
+    BOOST_REQUIRE(store.create_volume_key(vol_a, vm_one).has_value());
+    const auto vm = store.find_vm_key(vm_one);
+    const auto vol = store.find_volume_key(vol_a);
+    const auto transport = se->transport_public_key();
+    BOOST_REQUIRE((vm && vol && transport));
+
+    BOOST_REQUIRE(store.destroy_all().has_value());
+    BOOST_TEST(store.vm_count() == 0U);
+    BOOST_TEST(store.volume_count() == 0U);
+    // The transport key was derived from the master key: gone too.
+    BOOST_TEST((se->transport_public_key().value() != *transport));
+    // The saved wrapped keys open nothing, now or after a restart.
+    BOOST_REQUIRE(store.import_vm_key(*vm).has_value());
+    BOOST_REQUIRE(store.import_volume_key(*vol).has_value());
+    BOOST_TEST((store.unwrap_volume_key(vol_a, vm_one).error() == KeyError::corrupt_key));
+    auto reopened = SoftwareSecureElement::open(path);
+    BOOST_REQUIRE(reopened.has_value());
+    KeyStore after{*reopened};
+    BOOST_REQUIRE(after.import_vm_key(*vm).has_value());
+    BOOST_REQUIRE(after.import_volume_key(*vol).has_value());
+    BOOST_TEST((after.unwrap_volume_key(vol_a, vm_one).error() == KeyError::corrupt_key));
+    // The replacement file passes the same checks, and no temporary is left.
+    struct stat st{};
+    BOOST_REQUIRE(::stat(path.c_str(), &st) == 0);
+    BOOST_TEST((st.st_mode & 0777) == 0600);
+    BOOST_TEST(!std::filesystem::exists(path.string() + ".new"));
+    // Again (a resumed decommission): it finishes the job.
+    BOOST_TEST(store.destroy_all().has_value());
+}
+
 BOOST_AUTO_TEST_CASE(refuses_group_readable_file,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
     TempDir dir;

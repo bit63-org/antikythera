@@ -220,6 +220,8 @@ private:
                 return fail("power-marker must be an absolute path");
             }
             _config.power_marker = value;
+        } else if (name == "key-epochs") {
+            _config.key_epochs = std::filesystem::path{value};
         } else if (name == "command-timeout-ms") {
             return millis(value, _config.command_timeout);
         } else if (name == "release-timeout-ms") {

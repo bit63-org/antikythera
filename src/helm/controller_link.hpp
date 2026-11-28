@@ -161,6 +161,9 @@ public:
                                  std::span<const std::byte> /*frame*/) -> void {}
     virtual auto on_power_policy(const proto::PowerPolicy& /*policy*/,
                                  std::span<const std::byte> /*frame*/) -> void {}
+    // Move one network role's tunnel key to a new epoch
+    // (fleet-scale-networking Requirement 1).
+    virtual auto on_rotate_vtep_key(const proto::RotateVtepKey& /*request*/) -> void {}
 };
 
 enum class SessionError : std::uint8_t {

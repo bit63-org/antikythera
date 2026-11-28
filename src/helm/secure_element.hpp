@@ -45,6 +45,15 @@
 // Its transport key is derived from the master key (HPKE DeriveKeyPair over
 // HMAC-SHA256(master, "antikythera se transport key v1")), so it is stable
 // across restarts and dies with the master key.
+//
+// VTEP tunnel keys (.kiro/specs/fleet-scale-networking/ Requirement 1) are
+// derived the same way, so a helm or board restart gives each network role
+// its key back: seed = HMAC-SHA256(master, "antikythera vtep key v1" |
+// server_id u64 | slot u8 | key_epoch u32), clamped as an X25519 private
+// key. Unlike the transport key this one does leave the secure element: it
+// is the network role's WireGuard static key, delivered over the sideband
+// (controller-interface Requirement 8). A new epoch (a controller
+// rotation) or a new master key (re-provisioning) gives a new key.
 
 #include <array>
 #include <cstddef>
@@ -66,6 +75,7 @@ using VolumeId = std::uint64_t;
 
 inline constexpr std::size_t master_key_size = 32;
 inline constexpr std::size_t vm_key_size = 32;
+inline constexpr std::size_t vtep_key_size = 32;
 
 // Values are stored in wrapped keys: never renumber.
 enum class KeyKind : std::uint8_t {
@@ -201,6 +211,12 @@ public:
         std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
         -> std::expected<WrappedVolumeKey, SeError> = 0;
 
+    // The X25519 private key of the VTEP in `slot` at `key_epoch` (see the
+    // file comment), written to `out`. Deterministic for one master key.
+    virtual auto derive_vtep_key(std::uint64_t server_id, std::uint8_t slot,
+                                 std::uint32_t key_epoch, std::span<std::byte, vtep_key_size> out)
+        -> std::expected<void, SeError> = 0;
+
     // Draws a fresh random volume key that is never wrapped or stored: an
     // image volume's attachment key (oar-blk Requirement 8.6), gone once
     // delivered. The default draws it from OpenSSL's RNG.
@@ -255,6 +271,9 @@ public:
                           std::span<const std::byte, hpke::enc_size> enc,
                           std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
         -> std::expected<WrappedVolumeKey, SeError> override;
+    auto derive_vtep_key(std::uint64_t server_id, std::uint8_t slot, std::uint32_t key_epoch,
+                         std::span<std::byte, vtep_key_size> out)
+        -> std::expected<void, SeError> override;
 
 private:
     explicit SoftwareSecureElement(SecretBytes<master_key_size> master) noexcept

@@ -166,6 +166,50 @@ BOOST_AUTO_TEST_CASE(self_test_round_trips_and_is_strict) {
              .error() == DecodeError::reserved_not_zero));
 }
 
+// fleet-scale-networking task 1.
+BOOST_AUTO_TEST_CASE(rotate_vtep_key_round_trips_and_is_strict) {
+    BOOST_TEST(static_cast<std::uint16_t>(RecordType::rotate_vtep_key) == 35U);
+    const proto::RotateVtepKey k{
+        .server_id = 0x0102'0304'0506'0708, .slot = 3, .key_epoch = 0x1234};
+    auto b = proto::encode_rotate_vtep_key(k);
+    BOOST_REQUIRE(b.has_value());
+    BOOST_TEST(b->size() == proto::rotate_vtep_key_size);
+    const auto want = ak::test::bytes_of(0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x03, 0, 0,
+                                         0, 0x34, 0x12, 0, 0);
+    BOOST_TEST((*b == want));
+    auto back = proto::decode_rotate_vtep_key(*b);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST((*back == k));
+    for (std::size_t n = 0; n < b->size(); ++n) {
+        BOOST_TEST((proto::decode_rotate_vtep_key(std::span{*b}.first(n)).error() ==
+                    DecodeError::truncated));
+    }
+    auto longer = *b;
+    longer.push_back(std::byte{0});
+    BOOST_TEST((proto::decode_rotate_vtep_key(longer).error() == DecodeError::trailing_bytes));
+    for (std::size_t off = 9; off < 12; ++off) {
+        auto reserved = *b;
+        reserved[off] = std::byte{1};
+        BOOST_TEST(
+            (proto::decode_rotate_vtep_key(reserved).error() == DecodeError::reserved_not_zero));
+    }
+    // Epoch 0 is never used, and an epoch must fit the credential's 16 bits.
+    for (const std::uint32_t epoch : {0U, proto::max_key_epoch + 1}) {
+        auto bad = *b;
+        for (std::size_t i = 0; i < 4; ++i) {
+            bad[12 + i] = static_cast<std::byte>((epoch >> (8U * i)) & 0xFFU);
+        }
+        BOOST_TEST((proto::decode_rotate_vtep_key(bad).error() == DecodeError::unknown_value));
+    }
+    BOOST_TEST(
+        (proto::encode_rotate_vtep_key({.server_id = 0, .slot = 0, .key_epoch = 1}).error() ==
+         DecodeError::bad_server_id));
+    // The record framing knows it although 19-34 are not yet defined.
+    BOOST_TEST(proto::encode_record(RecordType::rotate_vtep_key, *b).has_value());
+    BOOST_TEST(!proto::encode_record(static_cast<RecordType>(34), {}).has_value());
+    BOOST_TEST(!proto::encode_record(static_cast<RecordType>(36), {}).has_value());
+}
+
 BOOST_AUTO_TEST_CASE(encode_refuses_what_decode_would) {
     auto bad_type = proto::encode_record(static_cast<RecordType>(19), {});
     BOOST_REQUIRE(!bad_type.has_value());

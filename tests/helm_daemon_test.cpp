@@ -171,6 +171,7 @@ public:
     // `tunnel` is set; then the keys and peer sets helm sends.
     std::atomic<bool> tunnel{false};
     std::atomic<oar::Status> key_status{oar::Status::ok};
+    std::atomic<std::uint32_t> key_grace{0};  // the last key's grace_seconds
     [[nodiscard]] auto tunnel_keys() const -> std::vector<std::vector<std::byte>> {
         const std::scoped_lock lock{_mutex};
         return _tunnel_keys;
@@ -186,6 +187,7 @@ public:
         const std::scoped_lock lock{_mutex};
         if (key_status.load() == oar::Status::ok) {
             _tunnel_keys.emplace_back(r.private_key.begin(), r.private_key.end());
+            key_grace = r.grace_seconds;
         }
         return key_status.load();
     }
@@ -629,6 +631,7 @@ struct Rig {
         if (with_khold) {
             slots.push_back(khold_slot);
         }
+        c.router.server_id = server;
         c.report_interval = 0ms;  // every pass takes hold reports
         for (const auto s : slots) {
             c.slots.push_back({.slot = s,
@@ -1647,6 +1650,57 @@ BOOST_AUTO_TEST_CASE(net_roles_get_their_tunnel_key_and_peer_sets) {
     BOOST_TEST((again[1] == keys[0]));
     BOOST_REQUIRE(r.net.role.peer_sets().size() == 2U);
     BOOST_TEST((r.net.role.peer_sets()[1] == v2.frame));
+}
+
+// fleet-scale-networking task 1: keys derived from the secure element, and
+// controller rotations.
+BOOST_AUTO_TEST_CASE(tunnel_keys_are_derived_and_rotated_by_the_controller) {
+    Rig r;
+    r.net.role.tunnel = true;
+    (void)r.daemon.boot();
+    const auto keys = r.net.role.tunnel_keys();
+    BOOST_REQUIRE(keys.size() == 1U);
+    // The key is the secure element's for this server, slot and epoch 1.
+    std::array<std::byte, helm::vtep_key_size> want{};
+    BOOST_REQUIRE(r.se.derive_vtep_key(server, net_slot, 1, want).has_value());
+    BOOST_TEST(std::ranges::equal(keys[0], want));
+    BOOST_TEST(r.net.role.key_grace.load() == 0U);
+    const auto old_pub = r.daemon.keyring().public_key(net_vtep()).value();
+    const auto inventories = r.count<proto::Inventory>();
+
+    // A rotation: the new epoch's key, delivered with the grace.
+    std::thread{[&] {
+        r.daemon.on_rotate_vtep_key({.server_id = server, .slot = net_slot, .key_epoch = 3});
+    }}.join();
+    r.daemon.run_once(0ms);
+    const auto rotated = r.net.role.tunnel_keys();
+    BOOST_REQUIRE(rotated.size() == 2U);
+    BOOST_REQUIRE(r.se.derive_vtep_key(server, net_slot, 3, want).has_value());
+    BOOST_TEST(std::ranges::equal(rotated[1], want));
+    BOOST_TEST(r.net.role.key_grace.load() == 600U);
+    BOOST_TEST(r.daemon.keyring().key_epoch(net_slot) == 3U);
+    // The controller hears the new public key at once.
+    const auto new_pub = r.daemon.keyring().public_key(net_vtep()).value();
+    BOOST_TEST((new_pub != old_pub));
+    BOOST_REQUIRE(r.count<proto::Inventory>() > inventories);
+    BOOST_TEST((r.last<proto::Inventory>().tunnels.at(0).public_key == new_pub));
+
+    // Repeats are ignored; a slot with no network role only moves its epoch.
+    r.daemon.on_rotate_vtep_key({.server_id = server, .slot = net_slot, .key_epoch = 3});
+    r.daemon.on_rotate_vtep_key({.server_id = server, .slot = blk_slot, .key_epoch = 2});
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.net.role.tunnel_keys().size() == 2U);
+    const auto stats = r.daemon.stats();
+    BOOST_TEST(stats.tunnel_rotations == 2U);
+    BOOST_TEST(stats.tunnel_rotations_stale == 1U);
+    BOOST_TEST(stats.tunnel_rotations_failed == 0U);
+
+    // A restarted role gets the rotated key back, without a grace.
+    r.daemon.on_slot_recovered(net_slot);
+    const auto again = r.net.role.tunnel_keys();
+    BOOST_REQUIRE(again.size() == 3U);
+    BOOST_TEST((again[2] == rotated[1]));
+    BOOST_TEST(r.net.role.key_grace.load() == 0U);
 }
 
 BOOST_AUTO_TEST_CASE(an_unkeyed_net_role_is_retried_and_one_without_a_tunnel_left_alone) {

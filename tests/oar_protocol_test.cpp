@@ -462,6 +462,28 @@ BOOST_AUTO_TEST_CASE(tunnel_keys_round_trip_and_rejects) {
     auto b = *body;
     b.push_back(std::byte{0});
     BOOST_TEST((oar::decode_set_tunnel_key(b).error() == BodyError::trailing_bytes));
+    BOOST_TEST(key->grace_seconds == 0U);
+
+    // A rotation (fleet-scale-networking Requirement 1.3): key, grace, reserved.
+    auto rot = oar::encode_set_tunnel_key({.private_key = priv, .grace_seconds = 600});
+    BOOST_REQUIRE(rot.has_value());
+    BOOST_TEST(rot->size() == oar::rotate_tunnel_key_size);
+    BOOST_TEST(rot->capacity() == oar::rotate_tunnel_key_size);
+    BOOST_TEST(((*rot)[32] == std::byte{0x58} && (*rot)[33] == std::byte{0x02}));
+    auto rkey = oar::decode_set_tunnel_key(*rot);
+    BOOST_REQUIRE(rkey.has_value());
+    BOOST_TEST(rkey->grace_seconds == 600U);
+    BOOST_TEST(rkey->private_key.data() == rot->data());
+    auto rb = *rot;
+    rb[36] = std::byte{1};
+    BOOST_TEST((oar::decode_set_tunnel_key(rb).error() == BodyError::reserved_not_zero));
+    rb = *rot;
+    std::fill(rb.begin() + 32, rb.begin() + 36, std::byte{0});
+    BOOST_TEST((oar::decode_set_tunnel_key(rb).error() == BodyError::unknown_enum));
+    for (const std::size_t n : {33U, 39U, 41U}) {
+        std::vector<std::byte> odd(n, std::byte{key_fill});
+        BOOST_TEST(!oar::decode_set_tunnel_key(odd).has_value());
+    }
 
     oar::Vtep vtep{};
     vtep[0] = std::byte{0xfd};

@@ -405,6 +405,36 @@ auto SoftwareSecureElement::transport_key() const -> std::expected<hpke::KeyPair
     return std::move(*pair);
 }
 
+auto SoftwareSecureElement::derive_vtep_key(std::uint64_t server_id, std::uint8_t slot,
+                                            std::uint32_t key_epoch,
+                                            std::span<std::byte, vtep_key_size> out)
+    -> std::expected<void, SeError> {
+    static constexpr std::string_view label = "antikythera vtep key v1";
+    std::vector<std::byte> input;
+    input.reserve(label.size() + sizeof(server_id) + sizeof(slot) + sizeof(key_epoch));
+    wire::Writer w{input};
+    w.bytes(std::as_bytes(std::span{label.data(), label.size()}));
+    w.le64(server_id);
+    w.u8(slot);
+    w.le32(key_epoch);
+    unsigned int len = 0;
+    if (HMAC(EVP_sha256(), as_uchar(_master.span()), static_cast<int>(master_key_size),
+             as_uchar(input), input.size(), as_uchar_mut(out), &len) == nullptr ||
+        len != vtep_key_size) {
+        ERR_clear_error();
+        secure_zero(out);
+        return std::unexpected(SeError::crypto_failure);
+    }
+    // X25519 clamping (RFC 7748 section 5), so the stored key is the one used.
+    constexpr auto low_bits = std::byte{0xF8};
+    constexpr auto high_bit = std::byte{0x7F};
+    constexpr auto second_bit = std::byte{0x40};
+    out[0] &= low_bits;
+    out[vtep_key_size - 1] &= high_bit;
+    out[vtep_key_size - 1] |= second_bit;
+    return {};
+}
+
 auto SoftwareSecureElement::transport_public_key() -> std::expected<hpke::PublicKey, SeError> {
     auto pair = transport_key();
     if (!pair) {

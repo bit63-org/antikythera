@@ -281,14 +281,24 @@ oar-net carries VTEP-to-VTEP traffic inside WireGuard (oar-net
 Requirement 5), and WireGuard needs each peer's public key. The keys are
 distributed through the controller (Requirement 8):
 
-1. helm generates an X25519 key pair for each VTEP when its network role
-   attaches (`src/helm/tunnel_keyring.*`), hands the private key to that
+1. helm derives an X25519 key pair for each VTEP when its network role
+   attaches (`src/helm/tunnel_keyring.*`), from its secure element, the
+   server ID, the role's slot and the slot's key epoch
+   (fleet-scale-networking Requirement 1), hands the private key to that
    role (`set_tunnel_key`), and reports the public key in the inventory.
-   Key pairs live as long as the helm process; nothing secret is
-   persisted, and a new helm boot reports new keys.
+   Only the epochs are persisted (helm's `key-epochs` state file), so a
+   helm reboot reports the same keys and the controller re-signs nothing.
+   The controller changes a key with a `rotate_vtep_key` link record
+   (number 35: `server_id u64 | slot u8 | rsvd [3] | key_epoch u32`,
+   unsigned, on the authenticated link; an epoch at or below the one held
+   is ignored). helm saves the new epoch, derives the new key, delivers it
+   with a grace period (the 40-byte `set_tunnel_key`, default 10 minutes)
+   in which the role keeps sessions made under the old key and answers
+   handshakes still addressed to it, and reports the new public key, after
+   which the controller sends the VTEP's peers new peer sets.
 2. The controller keeps every VTEP's public key and, for each VTEP, the set
    of VTEPs it shares a VNI with. Whenever that set or a key in it changes
-   (a NIC attach that adds a VTEP to a VPC, a helm reboot), it sends the
+   (a NIC attach that adds a VTEP to a VPC, a key rotation), it sends the
    VTEP a `TunnelPeers` frame (`src/proto/tunnel_peers.hpp`):
 
    ```

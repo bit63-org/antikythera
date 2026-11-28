@@ -438,21 +438,45 @@ auto encode_set_tunnel_key(const SetTunnelKey& k)
         return std::unexpected(BodyError::zero_key);
     }
     std::vector<std::byte> out;
-    out.reserve(set_tunnel_key_size);  // no reallocation, no stray copy
+    // No reallocation, no stray copy of the key.
+    out.reserve(k.grace_seconds != 0 ? rotate_tunnel_key_size : set_tunnel_key_size);
     wire::Writer w{out};
     w.bytes(k.private_key);
+    if (k.grace_seconds != 0) {
+        w.le32(k.grace_seconds);
+        w.le32(0);
+    }
     return out;
 }
 
 auto decode_set_tunnel_key(std::span<const std::byte> body) noexcept
     -> std::expected<SetTunnelKey, BodyError> {
-    if (auto ok = check_size(body, set_tunnel_key_size); !ok) {
-        return std::unexpected(ok.error());
+    if (body.size() != rotate_tunnel_key_size) {
+        if (auto ok = check_size(body, set_tunnel_key_size); !ok) {
+            return std::unexpected(ok.error());
+        }
     }
-    if (all_zero(body)) {
+    const auto key = body.first<tunnel_key_size>();
+    if (all_zero(key)) {
         return std::unexpected(BodyError::zero_key);
     }
-    return SetTunnelKey{.private_key = body.first<tunnel_key_size>()};
+    SetTunnelKey out{.private_key = key};
+    if (body.size() == rotate_tunnel_key_size) {
+        wire::Reader r{body.subspan(tunnel_key_size)};
+        const auto grace = r.le32();
+        const auto reserved = r.le32();
+        if (!grace || !reserved) {
+            return std::unexpected(BodyError::truncated);
+        }
+        if (*reserved != 0) {
+            return std::unexpected(BodyError::reserved_not_zero);
+        }
+        if (*grace == 0) {
+            return std::unexpected(BodyError::unknown_enum);  // a rotation has a grace
+        }
+        out.grace_seconds = *grace;
+    }
+    return out;
 }
 
 auto encode_set_tunnel_peer(const SetTunnelPeer& p)

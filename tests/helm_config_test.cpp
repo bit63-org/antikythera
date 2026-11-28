@@ -61,6 +61,7 @@ BOOST_AUTO_TEST_CASE(minimal_file_parses) {
     BOOST_TEST(c->controller_name == "10.0.0.1");  // defaults to the host
     BOOST_TEST(c->key.string() == "/etc/ak/helm-key.pem");
     BOOST_TEST(!c->master_key.has_value());
+    BOOST_TEST(!c->key_epochs.has_value());
     BOOST_TEST(c->host_argv.empty());
     BOOST_REQUIRE(c->slots.size() == 1U);
     const auto& slot = c->slots.at(1);
@@ -80,6 +81,7 @@ BOOST_AUTO_TEST_CASE(optional_directives_parse) {
     auto c = helm::parse_helm_config(text + R"(
 controller-name controller.example
 master-key /var/lib/helm/master.key
+key-epochs /var/lib/helm/key-epochs
 host /usr/bin/qemu-system-x86_64 -m 4096
 slot 2 /run/harbor/slot2.sock 0x08 0x11 8 10 /usr/bin/ak-board --slot 2
 command-timeout-ms 5000
@@ -93,6 +95,8 @@ check-interval-ms 250
     BOOST_TEST(c->controller_name == "controller.example");
     BOOST_REQUIRE(c->master_key.has_value());
     BOOST_TEST(c->master_key->string() == "/var/lib/helm/master.key");
+    BOOST_REQUIRE(c->key_epochs.has_value());
+    BOOST_TEST(c->key_epochs->string() == "/var/lib/helm/key-epochs");
     BOOST_TEST(c->host_argv.size() == 3U);
     BOOST_TEST(c->slots.size() == 2U);
     BOOST_TEST((c->command_timeout == 5000ms));

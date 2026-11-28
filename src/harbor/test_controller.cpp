@@ -1530,6 +1530,7 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::self_test:
         case proto::RecordType::standing_set:
         case proto::RecordType::power_policy:
+        case proto::RecordType::rotate_vtep_key:
             break;
     }
     return std::unexpected("helm sent a controller-only record");

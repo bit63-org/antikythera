@@ -28,6 +28,16 @@
 // refused and counted (tx_no_peer). Changing the private key or a peer's
 // keys drops every session it affects; new ones are negotiated on demand.
 //
+// Key rotation (.kiro/specs/fleet-scale-networking/ Requirement 1.3).
+// rotate_private_key() replaces the static key without dropping sessions:
+// the old key is kept for a grace period, during which sessions made under
+// it keep sending and receiving, and an initiation whose mac1 names the old
+// public key (a peer that has not yet been told the new one) is still
+// answered under the old key. In-flight initiations of our own are
+// abandoned, since their responses would be keyed to the old static key;
+// the next send starts one under the new key. When the grace ends, every
+// session made under the old key is dropped and the old key wiped.
+//
 // Protocol: WireGuard's handshake and timers (wireguard.hpp for formats),
 // with these simplifications, none of which changes what goes on the wire:
 //
@@ -149,6 +159,9 @@ struct TunnelCounters {
     std::uint64_t responses_rx{0};        // accepted
     std::uint64_t handshake_timeouts{0};  // gave up after rekey_attempt_time
     std::uint64_t sessions_established{0};
+    std::uint64_t key_rotations{0};        // rotate_private_key with a new key
+    std::uint64_t retiring_handshakes{0};  // initiations answered under the old key
+    std::uint64_t retired_sessions{0};     // old-key sessions dropped when the grace ended
 };
 
 struct TunnelPeerStatus {
@@ -185,7 +198,13 @@ public:
     auto set_private_key(std::span<const std::byte, wg::key_size> private_key)
         -> std::expected<void, TunnelKeyError>;
     auto clear_private_key() -> void;
+    // Replaces the private key, keeping the old one for `grace` (above
+    // zero) as described above. Without a key yet it is set_private_key().
+    auto rotate_private_key(std::span<const std::byte, wg::key_size> private_key,
+                            std::chrono::milliseconds grace) -> std::expected<void, TunnelKeyError>;
     [[nodiscard]] auto public_key() const -> std::optional<wg::Key>;
+    // The old public key while a rotation's grace runs.
+    [[nodiscard]] auto retiring_public_key() const -> std::optional<wg::Key>;
 
     // Adds the peer VTEP at `vtep`, or replaces its keys (dropping its
     // sessions if they changed). An all-zero `psk` means none, as in
@@ -238,6 +257,9 @@ private:
     auto clear_sessions(Peer& peer) -> void;
     auto refresh_peer_secret(Peer& peer) -> void;
     [[nodiscard]] auto usable(const Keypair& kp, VtepClock::time_point now) const -> bool;
+    // Forgets the rotated-out key and every session made under it.
+    auto retire(bool count) -> void;
+    auto cancel_handshake(Peer& peer) -> void;
 
     DatagramSender* _underlay;
     TunnelConfig _config;
@@ -246,6 +268,17 @@ private:
     wg::Hash _initial_chain{};  // HASH(CONSTRUCTION)
     wg::Hash _initial_hash{};   // HASH(_initial_chain || IDENTIFIER)
     wg::Hash _mac1_key{};       // HASH("mac1----" || _public): checks incoming mac1
+    // Raised on every key change; each session records the one it was
+    // made under.
+    std::uint32_t _key_generation{0};
+    struct Retiring {
+        wg::SecretKey private_key;
+        wg::Key public_key{};
+        wg::Hash mac1_key{};
+        std::uint32_t generation{0};
+        VtepClock::time_point until;
+    };
+    std::optional<Retiring> _retiring;  // the old key during a rotation's grace
     std::map<Ipv6Address, std::unique_ptr<Peer>> _peers;
     std::map<wg::Key, Peer*> _by_key;
     std::unordered_map<std::uint32_t, Peer*> _by_index;

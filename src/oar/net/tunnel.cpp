@@ -78,14 +78,16 @@ struct Tunnel::Keypair {
     std::uint64_t send_counter{0};
     wg::ReplayWindow window;
     bool initiator{false};
+    std::uint32_t key_generation{0};  // Tunnel::_key_generation it was made under
 };
 
 struct Tunnel::Peer {
     Ipv6Address vtep{};
     Key public_key{};
     SecretKey psk;
-    Hash mac1_key{};                     // HASH("mac1----" || public_key)
-    std::optional<SecretKey> static_dh;  // DH(own private, public_key)
+    Hash mac1_key{};                       // HASH("mac1----" || public_key)
+    std::optional<SecretKey> static_dh;    // DH(own private, public_key)
+    std::optional<SecretKey> retiring_dh;  // DH(rotated-out private, public_key)
     std::optional<wg::Timestamp> last_timestamp;
     std::optional<VtepClock::time_point> last_initiation_rx;
     std::unique_ptr<Keypair> current;
@@ -222,9 +224,11 @@ auto Tunnel::set_private_key(std::span<const std::byte, wg::key_size> private_ke
     if (_by_key.contains(*pub)) {
         return std::unexpected(TunnelKeyError::own_key);
     }
+    retire(false);
     _private.emplace(private_key);
     _public = *pub;
     _mac1_key = wg::hash({text(label_mac1), _public});
+    ++_key_generation;
     for (auto& [vtep, peer] : _peers) {
         clear_sessions(*peer);
         refresh_peer_secret(*peer);
@@ -235,7 +239,83 @@ auto Tunnel::set_private_key(std::span<const std::byte, wg::key_size> private_ke
     return {};
 }
 
+auto Tunnel::rotate_private_key(std::span<const std::byte, wg::key_size> private_key,
+                                std::chrono::milliseconds grace)
+    -> std::expected<void, TunnelKeyError> {
+    if (!_private || grace <= std::chrono::milliseconds::zero()) {
+        return set_private_key(private_key);
+    }
+    if (is_zero(private_key)) {
+        return std::unexpected(TunnelKeyError::bad_key);
+    }
+    if (wg::equal(_private->span(), private_key)) {
+        return {};  // already in use: nothing to rotate
+    }
+    const auto pub = wg::public_key(private_key);
+    if (!pub) {
+        return std::unexpected(TunnelKeyError::bad_key);
+    }
+    if (_by_key.contains(*pub)) {
+        return std::unexpected(TunnelKeyError::own_key);
+    }
+    // A rotation during another's grace ends the older one now: only one
+    // old key is ever kept.
+    retire(true);
+    _retiring.emplace(Retiring{.private_key = std::move(*_private),
+                               .public_key = _public,
+                               .mac1_key = _mac1_key,
+                               .generation = _key_generation,
+                               .until = now() + grace});
+    _private.emplace(private_key);
+    _public = *pub;
+    _mac1_key = wg::hash({text(label_mac1), _public});
+    ++_key_generation;
+    for (auto& [vtep, peer] : _peers) {
+        cancel_handshake(*peer);
+        peer->retiring_dh = std::move(peer->static_dh);
+        refresh_peer_secret(*peer);
+    }
+    ++_counters.key_rotations;
+    return {};
+}
+
+auto Tunnel::retiring_public_key() const -> std::optional<wg::Key> {
+    if (!_retiring) {
+        return std::nullopt;
+    }
+    return _retiring->public_key;
+}
+
+auto Tunnel::retire(bool count) -> void {
+    if (!_retiring) {
+        return;
+    }
+    for (auto& [vtep, p] : _peers) {
+        Peer& peer = *p;
+        for (auto* slot : {&peer.current, &peer.previous, &peer.next}) {
+            if (*slot && (*slot)->key_generation != _key_generation) {
+                release(*slot);
+                if (count) {
+                    ++_counters.retired_sessions;
+                }
+            }
+        }
+        peer.retiring_dh.reset();
+    }
+    _retiring.reset();  // the Secret destructor wipes the old key
+}
+
+auto Tunnel::cancel_handshake(Peer& peer) -> void {
+    if (peer.handshaking) {
+        release_index(peer.hs_index);
+        peer.handshaking = false;
+    }
+    peer.hs_ephemeral.wipe();
+    peer.hs_chain.wipe();
+}
+
 auto Tunnel::clear_private_key() -> void {
+    retire(false);
     for (auto& [vtep, peer] : _peers) {
         clear_sessions(*peer);
         peer->static_dh.reset();
@@ -267,11 +347,15 @@ auto Tunnel::set_peer(const Ipv6Address& vtep, std::span<const std::byte, wg::ke
         return std::unexpected(TunnelKeyError::duplicate_key);
     }
     std::optional<SecretKey> static_dh;
+    std::optional<SecretKey> retiring_dh;
     if (_private) {
         static_dh = wg::dh(_private->span(), pub);
         if (!static_dh) {
             return std::unexpected(TunnelKeyError::bad_key);
         }
+    }
+    if (_retiring) {
+        retiring_dh = wg::dh(_retiring->private_key.span(), pub);
     }
     auto it = _peers.find(vtep);
     if (it != _peers.end()) {
@@ -292,6 +376,7 @@ auto Tunnel::set_peer(const Ipv6Address& vtep, std::span<const std::byte, wg::ke
     p.psk = SecretKey{psk};
     p.mac1_key = wg::hash({text(label_mac1), pub});
     p.static_dh = std::move(static_dh);
+    p.retiring_dh = std::move(retiring_dh);
     _by_key[pub] = &p;
     return {};
 }
@@ -436,15 +521,27 @@ auto Tunnel::handle_initiation(const wg::Initiation& m, const Ipv6Address& outer
     if (!_private) {
         return drop(TunnelDrop::no_private_key);
     }
+    // mac1 names the static key the initiator believes we have: the
+    // current one, or during a rotation's grace the old one.
+    const SecretKey* own_private = &*_private;
+    const Key* own_public = &_public;
+    std::uint32_t generation = _key_generation;
+    bool retiring = false;
     if (!wg::equal(wg::mac(_mac1_key, m.before_mac1), m.mac1)) {
-        return drop(TunnelDrop::bad_mac1);
+        if (!_retiring || !wg::equal(wg::mac(_retiring->mac1_key, m.before_mac1), m.mac1)) {
+            return drop(TunnelDrop::bad_mac1);
+        }
+        own_private = &_retiring->private_key;
+        own_public = &_retiring->public_key;
+        generation = _retiring->generation;
+        retiring = true;
     }
     Chain c{_initial_chain};
-    Hash h = wg::hash({_initial_hash, _public});
+    Hash h = wg::hash({_initial_hash, *own_public});
     mix_key(c, m.ephemeral);
     mix_hash(h, m.ephemeral);
 
-    const auto es = wg::dh(_private->span(), m.ephemeral);
+    const auto es = wg::dh(own_private->span(), m.ephemeral);
     if (!es) {
         return drop(TunnelDrop::bad_key);
     }
@@ -464,10 +561,11 @@ auto Tunnel::handle_initiation(const wg::Initiation& m, const Ipv6Address& outer
     if (peer.vtep != outer_src) {
         return drop(TunnelDrop::wrong_source);
     }
-    if (!peer.static_dh) {
+    const auto& static_dh = retiring ? peer.retiring_dh : peer.static_dh;
+    if (!static_dh) {
         return drop(TunnelDrop::bad_key);
     }
-    wg::kdf(c.span(), peer.static_dh->span(), {c.span(), k.span()});
+    wg::kdf(c.span(), static_dh->span(), {c.span(), k.span()});
     wg::Timestamp stamp{};
     if (!wg::open(k.span(), 0, m.encrypted_timestamp, h, stamp)) {
         return drop(TunnelDrop::decrypt_failed);
@@ -484,6 +582,9 @@ auto Tunnel::handle_initiation(const wg::Initiation& m, const Ipv6Address& outer
     peer.last_timestamp = stamp;
     peer.last_initiation_rx = t;
     ++_counters.initiations_rx;
+    if (retiring) {
+        ++_counters.retiring_handshakes;
+    }
 
     // The response.
     auto ephemeral = wg::generate_private_key();
@@ -534,7 +635,8 @@ auto Tunnel::handle_initiation(const wg::Initiation& m, const Ipv6Address& outer
                                                 .created = t,
                                                 .send_counter = 0,
                                                 .window = {},
-                                                .initiator = false});
+                                                .initiator = false,
+                                                .key_generation = generation});
     // Linux: the new session waits in `next` until the initiator uses it;
     // `previous` goes, `current` stays usable meanwhile.
     release(peer.next);
@@ -601,7 +703,8 @@ auto Tunnel::handle_response(const wg::Response& m, const Ipv6Address& outer_src
                                                 .created = t,
                                                 .send_counter = 0,
                                                 .window = {},
-                                                .initiator = true});
+                                                .initiator = true,
+                                                .key_generation = _key_generation});
     // The handshake's index now names the session.
     peer.handshaking = false;
     peer.hs_ephemeral.wipe();
@@ -767,6 +870,13 @@ auto Tunnel::receive(std::span<const std::byte> datagram, const Ipv6Address& out
 auto Tunnel::tick() -> VtepClock::time_point {
     const auto t = now();
     auto next = VtepClock::time_point::max();
+    if (_retiring) {
+        if (t >= _retiring->until) {
+            retire(true);
+        } else {
+            next = _retiring->until;
+        }
+    }
     for (auto& [vtep, p] : _peers) {
         Peer& peer = *p;
         if (peer.handshaking) {

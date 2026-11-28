@@ -119,8 +119,10 @@ public:
     // The network role's WireGuard keys (oar-net Requirement 5.2). Every
     // buffer that held a key is wiped once sent, success or not; the
     // caller wipes its own copies.
-    auto set_tunnel_key(std::span<const std::byte, oar::tunnel_key_size> private_key)
-        -> std::expected<void, LinkError>;
+    // A non-zero `grace_seconds` makes it a rotation: the role keeps the
+    // old key that long (fleet-scale-networking Requirement 1.3).
+    auto set_tunnel_key(std::span<const std::byte, oar::tunnel_key_size> private_key,
+                        std::uint32_t grace_seconds = 0) -> std::expected<void, LinkError>;
     auto set_tunnel_peer(const oar::SetTunnelPeer& request) -> std::expected<void, LinkError>;
     auto remove_tunnel_peer(const oar::RemoveTunnelPeer& request) -> std::expected<void, LinkError>;
     // Sends one controller MapUpdate frame, in chunks. Fails without sending

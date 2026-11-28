@@ -44,6 +44,7 @@
 //   rewrap_volume       0  volume_id u64 | 8  owner_vm u64 | 16 key_len u16
 //                       18 reserved u16 | 20 reserved u32 | 24 wrapped_key [key_len]
 //   set_tunnel_key      0  private_key [32]
+//                       32 grace_s u32 | 36 reserved u32, only for a rotation
 //   set_tunnel_peer     0  vtep [16] | 16 public_key [32] | 48 psk [32]
 //   remove_tunnel_peer  0  vtep [16]
 //   tunnel_peers        0  total u32 | 4  offset u32 | 8  chunk (as map_update)
@@ -77,7 +78,11 @@
 // The tunnel requests deliver the network role's WireGuard keys (oar-net
 // Requirement 5.2): its own static X25519 private key, and for each peer
 // VTEP that peer's public key and the pre-shared key for the pair (all
-// zero for none, as in WireGuard). set_tunnel_peer adds the peer or
+// zero for none, as in WireGuard). A 40-byte set_tunnel_key is a key
+// rotation (fleet-scale-networking Requirement 1.3): the role keeps its old
+// key for grace_s seconds (1 or more) for the sessions made under it and
+// for handshakes still addressed to it; the 32-byte form replaces the key
+// at once and drops every session. set_tunnel_peer adds the peer or
 // replaces its keys. Private and public keys and VTEP addresses are never
 // all zero. Only the network role implements them. The bodies carry
 // secrets, so both ends wipe every buffer that held one, as for
@@ -270,6 +275,7 @@ inline constexpr std::size_t delete_volume_size = 8;
 inline constexpr std::size_t rewrap_volume_head_size = 24;
 inline constexpr std::size_t tunnel_key_size = 32;  // X25519 keys and the WireGuard PSK
 inline constexpr std::size_t set_tunnel_key_size = tunnel_key_size;
+inline constexpr std::size_t rotate_tunnel_key_size = tunnel_key_size + 8;
 inline constexpr std::size_t set_tunnel_peer_size = vtep_size + (2 * tunnel_key_size);
 inline constexpr std::size_t remove_tunnel_peer_size = vtep_size;
 // Room for a later wrapped-key format; helm's format 1 is 95 bytes. Equal
@@ -569,6 +575,7 @@ struct RewrapVolume {
 // copies them during the call (OarEndpoint wipes the message after).
 struct SetTunnelKey {
     std::span<const std::byte, tunnel_key_size> private_key;
+    std::uint32_t grace_seconds{0};  // non-zero: a rotation keeping the old key this long
 };
 
 struct SetTunnelPeer {

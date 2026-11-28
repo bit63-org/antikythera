@@ -1,6 +1,6 @@
 # Implementation Plan — Network control at fleet scale
 
-## Status: 0/18 tasks complete
+## Status: 1/18 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -19,7 +19,7 @@ tasks 14-15. Phases A, B and C can run in parallel.
 
 ### Phase A: stable keys and certified peers
 
-- [ ] 1. Stable VTEP keys: `TunnelKeyring` derives each VTEP key from
+- [x] 1. Stable VTEP keys: `TunnelKeyring` derives each VTEP key from
   the secure element (`server_id`, slot, `key_epoch`), `key_epoch` kept
   in helm's state file, `rotate_vtep_key` link record (35) with a
   10-minute two-key grace in the role; tests that a helm restart keeps

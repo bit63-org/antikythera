@@ -108,6 +108,10 @@ struct RecordingSink final : helm::ControllerSink {
         -> void override {
         power_policies.emplace_back(p, std::vector<std::byte>{frame.begin(), frame.end()});
     }
+    std::vector<proto::RotateVtepKey> rotations;
+    auto on_rotate_vtep_key(const proto::RotateVtepKey& k) -> void override {
+        rotations.push_back(k);
+    }
     std::vector<proto::RoleCertificate> certificates;
     auto on_role_certificate(const proto::RoleCertificate& c) -> void override {
         certificates.push_back(c);
@@ -368,6 +372,12 @@ auto power_policy_record(std::uint64_t to) -> std::vector<std::byte> {
     return framed(RecordType::power_policy, *b);
 }
 
+auto rotate_record(std::uint64_t to) -> std::vector<std::byte> {
+    auto b = proto::encode_rotate_vtep_key({.server_id = to, .slot = 2, .key_epoch = 7});
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::rotate_vtep_key, *b);
+}
+
 auto tunnel_peers_record(std::uint64_t to) -> std::vector<std::byte> {
     proto::TunnelPeers t{
         .server_id = to,
@@ -549,6 +559,21 @@ BOOST_FIXTURE_TEST_CASE(block_volume_records_for_another_server_end_the_connecti
     BOOST_REQUIRE(!res.has_value());
     BOOST_TEST((res.error() == SessionError::bad_record));
     BOOST_TEST(sink.grants.empty());
+}
+
+// fleet-scale-networking task 1.
+BOOST_FIXTURE_TEST_CASE(key_rotations_reach_the_sink_for_this_server_only, Fixture) {
+    session.on_connected();
+    BOOST_REQUIRE(session.on_bytes(rotate_record(server)).has_value());
+    BOOST_REQUIRE(sink.rotations.size() == 1U);
+    BOOST_TEST((sink.rotations[0] ==
+                proto::RotateVtepKey{.server_id = server, .slot = 2, .key_epoch = 7}));
+    session.on_disconnected();
+    session.on_connected();
+    auto res = session.on_bytes(rotate_record(other_server));
+    BOOST_REQUIRE(!res.has_value());
+    BOOST_TEST((res.error() == SessionError::wrong_server));
+    BOOST_TEST(sink.rotations.size() == 1U);
 }
 
 // kythira khold-block-service task 17.

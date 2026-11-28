@@ -78,12 +78,28 @@ priv = X25519 clamp(seed[0..32])
 The secure element (or software secure element) does the derivation from
 its master key, as it already derives the transport key. `key_epoch`
 starts at 1 and is raised only by a controller `rotate_vtep_key` op (a
-small link record, below); helm keeps the epoch in its state file. During
+small link record, below); helm keeps the epoch in its state file
+(`key-epochs`, one `vtep-key-epoch SLOT EPOCH` line per rotated slot). An
+epoch is 1 to 65,535 so it fits the credential's 16-bit field. During
 a rotation the role holds both keys: new handshakes use the new key once
 its credential is installed, sessions on the old key run until their
 WireGuard rekey or the grace period (10 minutes) ends, whichever is
 first. A re-provisioned server has a new master key and therefore new
 keys at every epoch.
+
+Built in task 1: `SecureElement::derive_vtep_key`, `KeyEpochs` and
+`TunnelKeyring::rotate` in helm; the `rotate_vtep_key` record (35:
+`server_id u64 | slot u8 | rsvd [3] | key_epoch u32`, unsigned like
+`self_test`, since it carries no key and only moves an epoch forward);
+the 40-byte `set_tunnel_key` (`private_key [32] | grace_s u32 | rsvd
+u32`) rather than a new vendor type, so a role that predates it answers
+`bad_request` and helm falls back to the plain key; and
+`Tunnel::rotate_private_key` in the role. The role abandons its own
+in-flight initiations at a rotation (their responses would be keyed to
+the old static key) and answers initiations whose mac1 names the old key
+until the grace ends, when every session made under the old key is
+dropped (`retired_sessions`). Until task 3 installs credentials, new
+handshakes use the new key at once.
 
 ## VTEP credentials
 

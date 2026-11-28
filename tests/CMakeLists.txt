@@ -184,6 +184,8 @@ ak_add_test(harbor_controller_test SOURCES harbor_controller_test.cpp LIBS ak::h
 ak_add_test(key_store_test     SOURCES key_store_test.cpp     LIBS ak::helm)
 ak_add_test(sealed_store_test SOURCES sealed_store_test.cpp LIBS ak::helm)
 ak_add_test(image_cache_test SOURCES image_cache_test.cpp LIBS ak::helm OpenSSL::Crypto)
+ak_add_test(boot_function_test SOURCES boot_function_test.cpp LIBS ak::helm)
+ak_add_test(measured_boot_test SOURCES measured_boot_test.cpp LIBS ak::hull)
 ak_add_test(boot_state_test SOURCES boot_state_test.cpp LIBS ak::helm)
 ak_add_test(power_on_test SOURCES power_on_test.cpp LIBS ak::helm)
 ak_add_test(standing_set_keeper_test SOURCES standing_set_keeper_test.cpp LIBS ak::helm)

@@ -82,6 +82,7 @@ target_link_libraries(ak_tls
 # daemon that wires them (HelmDaemon, ak-helm's configuration).
 add_library(ak_helm
   helm/audit_log.cpp
+  helm/boot_function.cpp
   helm/command_router.cpp
   helm/group_usage.cpp
   helm/controller_link.cpp
@@ -146,6 +147,7 @@ add_library(ak_hull
   hull/jail.cpp
   hull/json.cpp
   hull/mailbox_client.cpp
+  hull/measured_boot.cpp
   hull/resource_allocator.cpp
   hull/sequence_tracker.cpp
   hull/signature_verifier.cpp

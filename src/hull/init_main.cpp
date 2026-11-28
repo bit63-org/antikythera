@@ -22,8 +22,9 @@
 // the kernel, so a host that cannot be set up safely does not run guests.
 //
 // For harbor and tests, --no-mount skips step 1 and the paths can be moved
-// with --sysfs, --config, --cmdline, --run-dir and --agent; arguments after
-// "--" go to the agent unchanged.
+// with --sysfs, --config, --cmdline, --dev (where the provisioning
+// partition's device node is), --tpm (the TPM, default /dev/tpmrm0),
+// --run-dir and --agent; arguments after "--" go to the agent unchanged.
 
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -42,6 +43,7 @@
 #include <vector>
 
 #include "hull/host_setup.hpp"
+#include "hull/measured_boot.hpp"
 
 namespace fs = std::filesystem;
 using namespace ak::hull;
@@ -53,6 +55,8 @@ struct Options {
     fs::path sysfs{"/sys"};
     fs::path config{"/etc/hull/hull.conf"};
     fs::path cmdline{"/proc/cmdline"};
+    fs::path dev{"/dev"};
+    fs::path tpm{"/dev/tpmrm0"};
     fs::path run_dir{"/run/hull"};
     fs::path agent{"/usr/bin/hull-agent"};
     std::vector<std::string> agent_args;
@@ -116,6 +120,10 @@ auto parse_args(int argc, char** argv) -> Options {
             o.config = value();
         } else if (a == "--cmdline") {
             o.cmdline = value();
+        } else if (a == "--dev") {
+            o.dev = value();
+        } else if (a == "--tpm") {
+            o.tpm = value();
         } else if (a == "--run-dir") {
             o.run_dir = value();
         } else if (a == "--agent") {
@@ -202,6 +210,16 @@ auto main(int argc, char** argv) -> int {
         if (const auto id = server_id_from_cmdline(slurp(opt.cmdline))) {
             provisioning = ak::proto::Provisioning{.server_id = *id};
         }
+    } else if (config->server_id_source == ServerIdSource::partition) {
+        // Measured into the TPM before it is read (server-provisioning
+        // Requirement 4); a frame that cannot be measured stops the boot.
+        auto p = read_measured_provisioning(opt.sysfs, opt.dev, opt.tpm);
+        if (!p) {
+            die(p.error().step + ": " + p.error().detail +
+                (p.error().sys_errno != 0 ? std::string{": "} + std::strerror(p.error().sys_errno)
+                                          : std::string{}));
+        }
+        provisioning = *p;
     } else {
         const auto text = slurp(config->server_id_file);
         provisioning = provisioning_from_file(std::as_bytes(std::span{text}));

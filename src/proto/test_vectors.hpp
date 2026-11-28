@@ -344,4 +344,18 @@ inline constexpr std::string_view report_decommission_progress20 =
     "414b525002001a0007000000000000000400000000000000280000000000000002010200000000004e564100"
     "00000000000000000000000000000000000000000000000000000000";
 
+// Vector 21: a HostImage descriptor (.kiro/specs/server-provisioning/)
+// for a hull UKI: image_version 12, 48 MiB, digest 0xC4 x 32, signed with
+// key 1 (key_id 1).
+inline constexpr std::uint16_t host_image21_key_id = 1;
+inline constexpr std::uint64_t host_image21_version = 12;
+inline constexpr std::uint64_t host_image21_size = std::uint64_t{48} << 20;
+inline constexpr std::string_view host_image21 =
+    "414b4849010001000c0000000000000000000003000000000100000000000000c4c4c4c4c4c4c4c4c4c4c4c4"
+    "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4505fd85ff32b1876af956e0a2aa0c85c0599bf59f74fe947"
+    "7fe4d5ebe16be58711fc5452a4bb37d9a7883bce19371599a7607d84a2bc7cece0edcd1e8bf52c0e";
+inline constexpr std::string_view host_image21_signature =
+    "505fd85ff32b1876af956e0a2aa0c85c0599bf59f74fe9477fe4d5ebe16be58711fc5452a4bb37d9a7883bce"
+    "19371599a7607d84a2bc7cece0edcd1e8bf52c0e";
+
 }  // namespace ak::proto::vectors

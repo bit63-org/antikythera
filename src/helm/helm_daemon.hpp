@@ -167,6 +167,7 @@
 #include "helm/key_store.hpp"
 #include "helm/mailbox.hpp"
 #include "helm/oar_link.hpp"
+#include "helm/image_cache.hpp"
 #include "helm/power_on.hpp"
 #include "helm/standing_frames.hpp"
 #include "helm/standing_set_keeper.hpp"
@@ -229,6 +230,10 @@ struct DaemonConfig {
     // Raised by the time_floor of every kept power policy and standing set
     // (cold-start Requirement 7.1). Null: not tracked. Not owned.
     TimeFloor* time_floor{nullptr};
+    // The hull images in the sealed store (cold-start Requirement 2): a
+    // kept power policy's keep_image promotes one to LKG (2.3). Null: no
+    // image is ever promoted. Not owned.
+    ImageCache* images{nullptr};
     // Called on the loop thread after a scheduled boot (schedule_boot).
     std::function<void(const BootResult&)> on_boot;
     // The boot cache's state (cold-start Requirement 8.2), read on the loop
@@ -287,7 +292,10 @@ struct DaemonStats {
     // Power-on policy (cold-start Requirement 3).
     std::uint64_t power_policies{0};          // verified, newer and kept
     std::uint64_t power_policies_refused{0};  // stale, another server's, unsigned or unstorable
-    std::uint64_t standing_sets{0};           // verified, newer and kept
+    std::uint64_t images_promoted{0};         // keep_image made a held image the LKG
+    std::uint64_t image_promotions_failed{
+        0};                          // keep_image named no held image, or the store failed
+    std::uint64_t standing_sets{0};  // verified, newer and kept
     std::uint64_t standing_sets_refused{0};
     std::uint64_t standing_frames{0};           // network frames kept for standing NICs
     std::uint64_t standing_frames_refused{0};   // for a standing NIC, but unsigned or unstorable

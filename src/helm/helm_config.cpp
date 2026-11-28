@@ -210,6 +210,8 @@ private:
             }
         } else if (name == "controller-keys") {
             _config.controller_keys = value;
+        } else if (name == "image-keys") {
+            _config.image_keys = value;
         } else if (name == "power-on-policy") {
             if (value != "apply" && value != "skip") {
                 return fail("power-on-policy must be apply or skip");

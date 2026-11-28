@@ -9,7 +9,7 @@ and `helm-control-plane`. Pairs with kythira's
     `boot_cache` (28); vectors and libFuzzer targets
   - _Requirements: 8.3_
 
-- [ ] 2. Sealed store
+- [x] 2. Sealed store
   - Log-structured store over a flash interface, AES-256-GCM under a
     secure-element key, atomic writes, rollback detection by monotonic
     counter, erase on decommission; file-backed flash with fault

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -692,6 +693,45 @@ BOOST_FIXTURE_TEST_CASE(enrollment_follows_the_inventory_on_every_connection, Fi
     BOOST_TEST(again.report_seq == 5U);
     BOOST_TEST((std::get<proto::Enrollment>(again.body) == enrollment(0x22)));
     BOOST_TEST(session.pending_reports() == 2U);
+}
+
+BOOST_FIXTURE_TEST_CASE(a_boot_cache_follows_every_inventory, Fixture) {
+    std::optional<proto::BootCache> cache;  // nothing to send yet
+    session.set_boot_cache_source([&cache] { return cache; });
+    session.on_connected();
+    auto recs = records(session.take_outbound());
+    BOOST_REQUIRE(recs.size() == 2U);  // hello, inventory
+    BOOST_TEST(std::holds_alternative<proto::Inventory>(as_report(recs[1]).body));
+
+    cache = proto::BootCache{.standing_generation = 3,
+                             .policy_version = 7,
+                             .store_free_bytes = 100,
+                             .store_total_bytes = 400};
+    // A later inventory (a change helm reports) brings the boot cache
+    // right behind it; other reports do not.
+    (void)session.report(exited(5));
+    proto::Inventory changed;
+    changed.boot_id = boot;
+    changed.cores_total = 8;
+    (void)session.report(changed);
+    recs = records(session.take_outbound());
+    BOOST_REQUIRE(recs.size() == 3U);
+    BOOST_TEST(std::holds_alternative<proto::Inventory>(as_report(recs[1]).body));
+    const auto b = as_report(recs[2]);
+    BOOST_TEST(b.report_seq == as_report(recs[1]).report_seq + 1);
+    BOOST_TEST((std::get<proto::BootCache>(b.body) == *cache));
+
+    // Nothing acknowledged: a reconnect replays the exit only, then a fresh
+    // inventory and boot cache.
+    cache->policy_version = 8;
+    session.on_disconnected();
+    session.on_connected();
+    recs = records(session.take_outbound());
+    BOOST_REQUIRE(recs.size() == 4U);
+    BOOST_TEST(std::holds_alternative<proto::VmExitedReport>(as_report(recs[1]).body));
+    BOOST_TEST(std::holds_alternative<proto::Inventory>(as_report(recs[2]).body));
+    BOOST_TEST(std::get<proto::BootCache>(as_report(recs[3]).body).policy_version == 8U);
+    BOOST_TEST(session.pending_reports() == 3U);
 }
 
 BOOST_FIXTURE_TEST_CASE(role_certificates_reach_the_sink, Fixture) {

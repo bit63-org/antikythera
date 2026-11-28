@@ -178,6 +178,10 @@ inline constexpr std::size_t max_pending_reports = 4096;
 class ControllerSession {
 public:
     using InventorySource = std::function<proto::Inventory()>;
+    // The boot cache's state (.kiro/specs/cold-start/ Requirement 8.2), or
+    // nothing to send yet. Called whenever an inventory is queued, with the
+    // link's lock held, so it must not block or call back into the link.
+    using BootCacheSource = std::function<std::optional<proto::BootCache>()>;
 
     // `boot_id` is fresh for every helm boot (non-zero). `inventory` is
     // called at every (re)connection for a fresh snapshot; the session
@@ -192,6 +196,10 @@ public:
     // helm's secure-element transport key (block volumes, enrollment):
     // sent after the inventory on every connection, and now if connected.
     auto set_enrollment(const proto::Enrollment& enrollment) -> void;
+    // Every inventory, at a connection or a later change, is followed by a
+    // boot_cache report from `source` (cold-start Requirement 8.2). Set it
+    // before the link runs.
+    auto set_boot_cache_source(BootCacheSource source) -> void { _boot_cache = std::move(source); }
     auto on_disconnected() noexcept -> void;
     [[nodiscard]] auto connected() const noexcept -> bool { return _connected; }
 
@@ -213,7 +221,7 @@ public:
 private:
     struct Pending {
         std::uint64_t seq;
-        bool inventory;
+        bool snapshot;  // an inventory or boot cache: restated at every connection
         bool enrollment;
         std::vector<std::byte> record;  // the framed report, ready to send
     };
@@ -224,6 +232,7 @@ private:
     std::uint64_t _server_id;
     std::uint64_t _boot_id;
     InventorySource _inventory;
+    BootCacheSource _boot_cache;
     ControllerSink* _sink;
     std::uint64_t _next_seq{1};
     std::uint64_t _acked{0};

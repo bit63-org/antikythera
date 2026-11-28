@@ -50,10 +50,12 @@ and `helm-control-plane`. Pairs with kythira's
 - [x] 8. Time floor in helm
   - _Requirements: 7.1, 7.2_
 
-- [ ] 9. Cold-start reports
+- [x] 9. Cold-start reports
   - `cold_start` on the first link after power returns; `boot_cache` on
     every inventory
   - _Requirements: 8.1, 8.2_
+  - Built: the LKG and previous images (task 4) and standing starts
+    (task 6) are reported as none until those tasks land
 
 - [ ] 10. Harbor AZ power-loss suite
   - Every component killed at once, controller absent, standing

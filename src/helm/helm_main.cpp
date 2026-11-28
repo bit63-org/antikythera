@@ -45,6 +45,7 @@
 
 #include "helm/audit_log.hpp"
 #include "helm/boot_state.hpp"
+#include "helm/cold_start_reports.hpp"
 #include "helm/controller_link.hpp"
 #include "helm/flash.hpp"
 #include "helm/helm_config.hpp"
@@ -268,16 +269,13 @@ auto run(const helm::HelmConfig& cfg) -> int {
     if (power_policy.from_record()) {
         (void)time_floor.observe(power_policy.current().time_floor);
     }
-    if (!time_floor.rtc_trusted(helm::TimeFloor::rtc_now())) {
+    const auto started_at = helm::TimeFloor::rtc_now();
+    const bool rtc_below_floor = !time_floor.rtc_trusted(started_at);
+    if (rtc_below_floor) {
         std::println(stderr, "{}: RTC reads {} s, below the time floor {} s: not trusted", log_name,
                      helm::TimeFloor::rtc_now(), time_floor.floor());
     }
     daemon_config.time_floor = &time_floor;
-    daemon_config.on_boot = [](const helm::BootResult& booted) {
-        std::println(stderr, "{}: boot: {} slot(s) ready, {} faulted, host {}", log_name,
-                     booted.ready.size(), booted.faulted.size(),
-                     booted.host_released ? "released" : "held");
-    };
     auto returned = helm::helm_power_returned(cfg.power_marker);
     if (!returned) {
         // Waiting when helm only restarted is the safe mistake.
@@ -290,10 +288,46 @@ auto run(const helm::HelmConfig& cfg) -> int {
         helm::plan_power_on(policy, cfg.apply_power_policy && returned.value_or(true),
                             helm::HostPowerOverride::none, helm::draw_jitter(policy.max_jitter_ms));
 
+    // The boot cache's state behind every inventory (cold-start Requirement
+    // 8.2). The standing set (task 6) does not exist yet, so its
+    // generation is the anchor's counter as it stands; the LKG and previous
+    // images (task 4) are none.
+    std::uint64_t standing_generation = 0;
+    if (anchor) {
+        if (auto g = anchor->counter(helm::Counter::standing_generation); g) {
+            standing_generation = *g;
+        }
+    }
+    daemon_config.boot_cache = [&power_policy, &store, standing_generation] {
+        return helm::make_boot_cache({}, standing_generation, power_policy,
+                                     store ? &*store : nullptr);
+    };
+    // After the power-on wait: one cold_start report per power return
+    // (Requirement 8.1), queued so it goes out on the first connection.
+    std::unique_ptr<helm::ControllerLink> link;
+    const bool power_returned = returned.value_or(true);
+    daemon_config.on_boot = [&link, &time_floor, &store, power_returned, started_at,
+                             rtc_below_floor, waited = plan.wait](const helm::BootResult& booted) {
+        std::println(stderr, "{}: boot: {} slot(s) ready, {} faulted, host {}", log_name,
+                     booted.ready.size(), booted.faulted.size(),
+                     booted.host_released ? "released" : "held");
+        if (!power_returned || !link) {
+            return;
+        }
+        // hull comes from the boot layer until the boot cache exists (task
+        // 4); standing starts arrive with the standing set (task 6).
+        (void)link->report(helm::make_cold_start({.power_return_time = started_at,
+                                                  .time_floor = time_floor.floor(),
+                                                  .waited = waited,
+                                                  .boot_source = ak::proto::BootSource::netboot,
+                                                  .rtc_below_floor = rtc_below_floor,
+                                                  .standing = {}},
+                                                 store ? &*store : nullptr));
+    };
+
     DetachedHostPort host;
     std::println(stderr, "{}: no mailbox device yet (helm task 8): commands are refused", log_name);
 
-    std::unique_ptr<helm::ControllerLink> link;
     helm::HelmDaemon daemon{
         std::move(daemon_config),
         keys,
@@ -316,6 +350,7 @@ auto run(const helm::HelmConfig& cfg) -> int {
 
     helm::ControllerSession session{cfg.server_id, *boot_id,
                                     [&daemon] { return daemon.inventory(); }, daemon};
+    session.set_boot_cache_source([&daemon] { return daemon.boot_cache(); });
     // Enrollment: the controller seals volume keys to this key.
     if (auto pk = se->transport_public_key(); pk) {
         ak::proto::Enrollment enrollment;

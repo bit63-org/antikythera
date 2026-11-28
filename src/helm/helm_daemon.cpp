@@ -228,6 +228,9 @@ HelmDaemon::HelmDaemon(DaemonConfig config, KeyStore& keys, AuditLog& audit, Hos
     _next_reports = now();
     _next_identity = now();
     _snapshot = _router.inventory();
+    if (_config.boot_cache) {
+        _boot_cache = _config.boot_cache();
+    }
 }
 
 HelmDaemon::~HelmDaemon() = default;
@@ -442,6 +445,11 @@ auto HelmDaemon::post_host_slot(const mailbox::Slot& slot) -> void {
 auto HelmDaemon::inventory() const -> proto::Inventory {
     const std::scoped_lock lock{_snapshot_mutex};
     return _snapshot;
+}
+
+auto HelmDaemon::boot_cache() const -> std::optional<proto::BootCache> {
+    const std::scoped_lock lock{_snapshot_mutex};
+    return _boot_cache;
 }
 
 // ---- loop thread --------------------------------------------------------------
@@ -1115,9 +1123,16 @@ auto HelmDaemon::publish() -> void {
         }
     }
     _keyring.fill(inv);
+    // Read before the inventory goes out: the session sends this reading
+    // right behind it.
+    std::optional<proto::BootCache> cache;
+    if (_config.boot_cache) {
+        cache = _config.boot_cache();
+    }
     bool changed = false;
     {
         const std::scoped_lock lock{_snapshot_mutex};
+        _boot_cache = cache;
         changed = inv.vteps != _snapshot.vteps || inv.tunnels != _snapshot.tunnels ||
                   inv.health != _snapshot.health;
         _snapshot = inv;

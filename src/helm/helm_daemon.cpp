@@ -522,6 +522,10 @@ auto HelmDaemon::handle(Item& item) -> void {
         const bool kept =
             _config.power_policy != nullptr &&
             _config.power_policy->offer(power->policy, power->frame) == PolicyVerdict::kept;
+        // Its time floor counts only once the record verified (Requirement 7.1).
+        if (kept && _config.time_floor != nullptr) {
+            (void)_config.time_floor->observe(power->policy.time_floor);
+        }
         const std::scoped_lock lock{_inbox_mutex};
         ++(kept ? _stats.power_policies : _stats.power_policies_refused);
     }

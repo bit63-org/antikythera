@@ -25,7 +25,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -45,6 +47,12 @@ struct Config {
     // Client: the server's expected DNS name or IP address (required).
     // Server: the client's expected name, or empty for any CA-issued cert.
     std::string peer_name;
+    // The time, in Unix seconds, at which the peer's certificates must be
+    // valid, asked for each handshake. Empty, or nullopt: the system clock.
+    // helm passes max(RTC, time floor) so a clock that reset to 1970 cannot
+    // make an expired certificate look current (.kiro/specs/cold-start/
+    // Requirement 7.2).
+    std::function<std::optional<std::int64_t>()> verification_time{};
 };
 
 enum class Error : std::uint8_t {

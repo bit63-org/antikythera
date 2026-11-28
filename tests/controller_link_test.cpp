@@ -257,6 +257,33 @@ BOOST_AUTO_TEST_CASE(server_can_pin_the_client_name) {
     BOOST_TEST(ok.server.has_value());
 }
 
+// cold-start Requirement 7.2: certificates are checked at the time the
+// configuration gives (helm: max(RTC, time floor)), not the system clock.
+// The test certificates are valid from a minute ago for an hour.
+BOOST_AUTO_TEST_CASE(certificates_are_checked_at_the_verification_time) {
+    const Pki pki;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    auto at = [](std::int64_t t) {
+        return std::function<std::optional<std::int64_t>()>{[t] { return std::optional{t}; }};
+    };
+    auto client = pki.helm_config();
+
+    client.verification_time = at(now);
+    BOOST_TEST(handshake(pki.controller_config(), client).client.has_value());
+    // nullopt: the system clock.
+    client.verification_time = [] { return std::optional<std::int64_t>{}; };
+    BOOST_TEST(handshake(pki.controller_config(), client).client.has_value());
+
+    // A floor past the server certificate's notAfter: expired.
+    client.verification_time = at(now + 7200);
+    BOOST_TEST(!handshake(pki.controller_config(), client).client.has_value());
+    // A clock in the past (what a floor prevents): not yet valid.
+    client.verification_time = at(now - 7200);
+    BOOST_TEST(!handshake(pki.controller_config(), client).client.has_value());
+}
+
 BOOST_AUTO_TEST_CASE(bad_configuration_is_refused) {
     const Pki pki;
     auto cfg = pki.helm_config();

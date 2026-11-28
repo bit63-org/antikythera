@@ -678,9 +678,9 @@ BOOST_AUTO_TEST_CASE(inventory_carries_vtep_tunnel_keys) {
     BOOST_TEST((b[entry1 + last] == std::byte{2}));
     BOOST_TEST((b[entry1 + 16] == std::byte{0x03}));  // wireguard and psp
     BOOST_TEST((b[entry1 + 24] == std::byte{0}));
-    // The reserved bytes after the modes must be zero.
+    // The reserved bytes after the modes and flags must be zero.
     auto bad = b;
-    bad[entry0 + 17] = std::byte{1};
+    bad[entry0 + 18] = std::byte{1};
     BOOST_TEST((decode_error(bad) == DecodeError::reserved_not_zero));
 
     // No keys at all encodes as zeros and decodes as empty again, so the
@@ -695,6 +695,29 @@ BOOST_AUTO_TEST_CASE(inventory_carries_vtep_tunnel_keys) {
     BOOST_REQUIRE(back.has_value());
     BOOST_TEST(std::get<proto::Inventory>(back->body).tunnels.empty());
     BOOST_TEST((back->body == proto::ReportBody{keyless}));
+}
+
+// fleet-scale-networking task 4: the certified flag, in the byte after
+// the modes.
+BOOST_AUTO_TEST_CASE(inventory_carries_the_certified_flag) {
+    auto inv = sample_inventory();
+    inv.tunnels[0].flags = proto::tunnel_flag_certified;
+    const auto b = encoded(make_report(inv));
+    const std::size_t entry0 = body + proto::inventory_fixed_size;
+    BOOST_TEST((b[entry0 + 17] == std::byte{0x01}));
+    auto back = proto::decode_report(b);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST((back->body == proto::ReportBody{inv}));
+    // Unknown flag bits, and certified without a key, are refused both ways.
+    auto unknown = b;
+    unknown[entry0 + 17] = std::byte{0x02};
+    BOOST_TEST((decode_error(unknown) == DecodeError::unknown_value));
+    auto keyless = inv;
+    keyless.tunnels[1].flags = proto::tunnel_flag_certified;
+    BOOST_TEST((encode_error(make_report(keyless)) == DecodeError::bad_public_key));
+    auto bad = b;
+    bad[entry0 + proto::inventory_vtep_size + 17] = std::byte{0x01};
+    BOOST_TEST((decode_error(bad) == DecodeError::bad_public_key));
 }
 
 BOOST_AUTO_TEST_CASE(inventory_reserved_bytes_must_be_zero) {

@@ -123,9 +123,14 @@ are helm's (`FunctionType`, `FunctionState`) and the mailbox's (`Status`,
 `ExitReason`, `FaultCode`), pinned by `tests/proto_report_test.cpp`.
 
 Report format 2 made each inventory VTEP entry 56 bytes: the address, the
-VTEP's supported tunnel modes (a bit set: WireGuard, PSP), seven reserved
-bytes, and its WireGuard public key (all zero until helm has a key pair
-for it; see "TunnelPeers"). Format 1 frames are refused.
+VTEP's supported tunnel modes (a bit set: WireGuard, PSP), a
+`tunnel_flags` byte, six reserved bytes, and its WireGuard public key
+(all zero until helm has a key pair for it; see "TunnelPeers"). Format 1
+frames are refused. `tunnel_flags` bit 0, `certified`, says the role
+holds an unexpired controller credential for that public key
+(fleet-scale-networking Requirement 3.5): the controller may stop
+listing the VTEP's peers once every VTEP of a VNI sets it. The byte was
+reserved and zero, so older helms send it clear.
 
 ## Multicast policy and usage
 

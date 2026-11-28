@@ -30,7 +30,8 @@
 //     0x18 pages_1g_total u32 | pages_1g_free u32
 //     0x20 function_count u16 | vm_count u16 | volume_count u16 | network_count u16
 //     0x28 vteps      vtep_count x 48:
-//                       address [16] (IPv6 underlay) | tunnel_modes u8 | rsvd [7]
+//                       address [16] (IPv6 underlay) | tunnel_modes u8
+//                       tunnel_flags u8 | rsvd [6]
 //                       tunnel_key [32]
 //          functions  function_count x 16:
 //                       slot u8 | type u8 | function u16 | state u8 | rsvd [3] | owner_vm u64
@@ -200,7 +201,12 @@
 // key of its WireGuard key pair, all zero until helm has one for it, and
 // non-zero only with the wireguard bit set. The controller sends the key
 // to the VTEP's peers. Format 2 added both; format 1 had 16-byte VTEP
-// entries.
+// entries. tunnel_flags (fleet-scale-networking Requirement 3.5, task 4,
+// in what was the first reserved byte, so format 2 is unchanged): bit 0
+// `certified`, the VTEP's role holds a current controller credential for
+// tunnel_key and admits certified peers; it needs the wireguard bit and a
+// key. The controller stops sending TunnelPeers to a VTEP only when it and
+// every VTEP it shares a VNI with set it.
 //
 // Enum values are shared with helm (FunctionType, FunctionState) and the
 // mailbox (Status, ExitReason, FaultCode); tests/proto_report_test.cpp
@@ -544,9 +550,13 @@ struct InventoryNetwork {
 
 // A VTEP's tunnel capabilities: the modes it supports and its WireGuard
 // public key (all zero until it has one).
+inline constexpr std::uint8_t tunnel_flag_certified = 0x01;
+inline constexpr std::uint8_t known_tunnel_flags = tunnel_flag_certified;
+
 struct VtepTunnel {
     TunnelModes modes{0};
     TunnelPublicKey public_key{};
+    std::uint8_t flags{0};  // tunnel_flag_* bits
     friend auto operator==(const VtepTunnel&, const VtepTunnel&) -> bool = default;
 };
 
@@ -980,6 +990,13 @@ namespace detail {
             return std::unexpected(DecodeError::unknown_value);
         }
         if (!all_zero(t.public_key) && (t.modes & tunnel_mode_bit(TunnelMode::wireguard)) == 0) {
+            return std::unexpected(DecodeError::bad_public_key);
+        }
+        if ((t.flags & ~known_tunnel_flags) != 0) {
+            return std::unexpected(DecodeError::unknown_value);
+        }
+        // Certified means a credential for the WireGuard key.
+        if ((t.flags & tunnel_flag_certified) != 0 && all_zero(t.public_key)) {
             return std::unexpected(DecodeError::bad_public_key);
         }
     }
@@ -1481,7 +1498,8 @@ private:
     for (std::size_t i = 0; i < vtep_count; ++i) {
         in.bytes(inv.vteps[i]);
         inv.tunnels[i].modes = in.u8();
-        zero = in.zeros(7) && zero;
+        inv.tunnels[i].flags = in.u8();
+        zero = in.zeros(6) && zero;
         in.bytes(inv.tunnels[i].public_key);
     }
     if (std::ranges::all_of(inv.tunnels, [](const VtepTunnel& t) { return t == VtepTunnel{}; })) {
@@ -1540,10 +1558,11 @@ inline auto write_inventory(wire::Writer& w, const Inventory& inv) -> void {
     w.le16(static_cast<std::uint16_t>(inv.volumes.size()));
     w.le16(static_cast<std::uint16_t>(inv.networks.size()));
     for (std::size_t i = 0; i < inv.vteps.size(); ++i) {
-        constexpr std::array<std::byte, 7> rsvd{};
+        constexpr std::array<std::byte, 6> rsvd{};
         const VtepTunnel t = inv.tunnels.empty() ? VtepTunnel{} : inv.tunnels[i];
         w.bytes(inv.vteps[i]);
         w.u8(t.modes);
+        w.u8(t.flags);
         w.bytes(rsvd);
         w.bytes(t.public_key);
     }

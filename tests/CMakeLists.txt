@@ -239,6 +239,12 @@ target_link_libraries(vpc_netns_role PRIVATE ak::oar_net_role ak::hull ak::warni
 add_test(NAME vpc_netns
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/vpc_netns.sh $<TARGET_FILE:vpc_netns_role>)
 set_tests_properties(vpc_netns PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+# Certified-VTEP coexistence (fleet-scale-networking task 4): three roles
+# move from peer lists to credentials and back under traffic. Root only,
+# like vpc_netns; CI runs tests/certified_netns.sh under sudo.
+add_test(NAME certified_netns
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/certified_netns.sh $<TARGET_FILE:vpc_netns_role>)
+set_tests_properties(certified_netns PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 
 # The guest's cooperative-detach helper, against a fake sysfs and procfs
 # (block-volume-service task 13, Requirement 3.4).

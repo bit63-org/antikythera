@@ -1815,6 +1815,9 @@ BOOST_AUTO_TEST_CASE(net_roles_get_credentials_for_their_current_key) {
     BOOST_REQUIRE(r.net.role.credentials().size() == 1U);
     BOOST_TEST((r.net.role.credentials()[0] == c1.frame));
     BOOST_TEST(r.daemon.stats().vtep_credentials == 1U);
+    // The role holds it: the inventory says certified (task 4).
+    BOOST_TEST(r.daemon.inventory().tunnels.at(0).flags == proto::tunnel_flag_certified);
+    BOOST_TEST(r.last<proto::Inventory>().tunnels.at(0).flags == proto::tunnel_flag_certified);
     BOOST_TEST(r.daemon.stats().vtep_credentials_stale == 2U);
     BOOST_TEST(r.count<proto::CredentialRequest>() == 1U);
 
@@ -1855,6 +1858,7 @@ BOOST_AUTO_TEST_CASE(net_roles_get_credentials_for_their_current_key) {
     const auto new_pub = r.daemon.keyring().public_key(net_vtep()).value();
     BOOST_REQUIRE(r.count<proto::CredentialRequest>() == 3U);
     BOOST_TEST((r.last<proto::CredentialRequest>().public_key == new_pub));
+    BOOST_TEST(r.daemon.inventory().tunnels.at(0).flags == 0U);  // not for the new key
     BOOST_TEST(r.last<proto::CredentialRequest>().key_epoch == 3U);
     r.daemon.on_slot_recovered(net_slot);
     BOOST_TEST(r.net.role.credentials().size() == 2U);
@@ -1865,6 +1869,11 @@ BOOST_AUTO_TEST_CASE(net_roles_get_credentials_for_their_current_key) {
     r.daemon.run_once(0ms);
     BOOST_REQUIRE(r.net.role.credentials().size() == 3U);
     BOOST_TEST((r.net.role.credentials()[2] == c2.frame));
+    BOOST_TEST(r.daemon.inventory().tunnels.at(0).flags == proto::tunnel_flag_certified);
+    // Expired: no longer certified.
+    wall_now = t0 + life;
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.inventory().tunnels.at(0).flags == 0U);
     BOOST_TEST(r.daemon.stats().vtep_credentials_refused == 0U);
     BOOST_TEST(r.daemon.stats().credential_revocations_refused == 0U);
     wall_now = t0;

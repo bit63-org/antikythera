@@ -76,7 +76,10 @@
 // role when it certifies the key that role holds; the role verifies it.
 // credential_revocations lists are kept per cell (highest list_version)
 // and forwarded to every network role. A role whose sideband (re)opens
-// gets its credential and every list right after its key.
+// gets its credential and every list right after its key. A VTEP whose
+// role accepted a credential for its current key, still unexpired, is
+// advertised `certified` in the inventory (task 4), which tells the
+// controller it may stop sending that VTEP TunnelPeers.
 //
 // Network health (oar-net Requirement 6, task 11). Every check helm asks
 // each network role for its health; a degraded role (a peer VTEP down, a
@@ -544,6 +547,9 @@ private:
         std::optional<oar::Health> health;  // network roles: the last answer
         // The public key last asked to be certified for this slot, and when.
         proto::TunnelPublicKey credential_asked{};
+        // The key whose credential the role last accepted (task 4: the
+        // inventory's certified flag).
+        std::optional<proto::TunnelPublicKey> credential_held;
         Clock::time_point credential_asked_at{};
         SlotPort port;
 

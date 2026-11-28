@@ -146,7 +146,7 @@ stops mattering.
    owns.
 5. Peers from `TunnelPeers` frames and peers set by hand SHALL keep
    working beside certified peers. The inventory SHALL advertise a
-   `certified` tunnel mode bit, and the controller SHALL stop sending
+   `certified` tunnel flag, and the controller SHALL stop sending
    `TunnelPeers` to a VTEP only when the VTEP and every VTEP it shares a
    VNI with advertise it.
 6. Sessions to certified peers SHALL be torn down when the peer's

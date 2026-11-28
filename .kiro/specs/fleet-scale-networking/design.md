@@ -227,10 +227,20 @@ initiator I                                   responder R
 - **Coexistence.** `TunnelPeerSet` and `set_tunnel_peer` peers are looked
   up first; a key found there is accepted without a credential, as today.
   A key with neither a list entry nor a valid credential is refused
-  (`handshake_drop_uncertified`). The inventory VTEP entry gains mode bit
-  2, `certified`, in one of its reserved bytes; the controller moves a
-  VNI's VTEPs off `TunnelPeers` only when all of them set it, and back by
-  sending `TunnelPeers` again.
+  (`handshake_drop_uncertified`). The inventory VTEP entry gains a
+  `tunnel_flags` byte at offset 17, the first of its former reserved
+  bytes, with bit 0 `certified` (`tunnel_flag_certified`). It is a flag
+  rather than a third mode bit because it says what helm holds, not what
+  the data plane can speak. helm sets it while the role has accepted a
+  credential for the VTEP's current public key that has not expired; a
+  rotation clears it until the new key's credential arrives. The decoder
+  refuses unknown flag bits and `certified` without a public key. The
+  controller moves a VNI's VTEPs off `TunnelPeers` only when all of them
+  set it, and back by sending `TunnelPeers` again: an empty list leaves
+  every peer to credentials, and a list naming a certified peer turns it
+  into a list peer with its sessions kept, so moving back loses nothing.
+  `tests/certified_netns.sh` moves a live three-role VPC across, one
+  VTEP at a time under ping, and back.
 - **Expiry and revocation.** On credential expiry or revocation the role
   drops the peer's sessions and cache entry (checked on every tick, at
   least once a second); the peer must present a new credential. Within

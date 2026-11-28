@@ -530,6 +530,45 @@ BOOST_AUTO_TEST_CASE(peer_lists_win_over_credentials) {
     BOOST_TEST(drops(*a.tunnel, TunnelDrop::credential_conflict) == 1U);
 }
 
+// Coexistence (task 4, tests/certified_netns.sh): VTEPs move from peer
+// lists to credentials one at a time and back, and traffic keeps flowing
+// with at most a handshake's delay at each step.
+BOOST_AUTO_TEST_CASE(peer_lists_give_way_to_credentials_one_vtep_at_a_time) {
+    Net n{2};
+    auto& a = n[0];
+    auto& b = n[1];
+    a.certify();
+    b.certify();
+    BOOST_REQUIRE(a.tunnel->set_peer(b.addr, b.pub, wg::Key{}).has_value());
+    BOOST_REQUIRE(b.tunnel->set_peer(a.addr, a.pub, wg::Key{}).has_value());
+    BOOST_REQUIRE(n.connect(a, b, 2));
+    BOOST_TEST(a.tunnel->counters().credentials_tx == 0U);
+    // a's peer list empties first while b still lists a: a reaches b with
+    // its credential, b answers as for any list peer.
+    BOOST_REQUIRE(a.tunnel->remove_peer(b.addr));
+    BOOST_REQUIRE(n.connect(a, b, 2));
+    BOOST_REQUIRE(n.connect(b, a, 2));
+    BOOST_TEST(a.peer(b.addr)->certified);
+    BOOST_TEST(!b.peer(a.addr)->certified);
+    // Then b's: b's old session with a is gone too, and comes back
+    // certified when b next sends.
+    BOOST_REQUIRE(b.tunnel->remove_peer(a.addr));
+    BOOST_REQUIRE(n.connect(b, a, 2));
+    BOOST_REQUIRE(n.connect(a, b, 2));
+    BOOST_TEST(a.peer(b.addr)->certified);
+    BOOST_TEST(b.peer(a.addr)->certified);
+    // Lists come back: the peers turn into list peers and keep their
+    // sessions, so nothing is lost.
+    BOOST_REQUIRE(a.tunnel->set_peer(b.addr, b.pub, wg::Key{}).has_value());
+    BOOST_REQUIRE(b.tunnel->set_peer(a.addr, a.pub, wg::Key{}).has_value());
+    BOOST_TEST(!a.peer(b.addr)->certified);
+    BOOST_TEST(!b.peer(a.addr)->certified);
+    const auto handshakes = a.tunnel->counters().initiations_tx;
+    BOOST_REQUIRE(n.connect(a, b, 1));
+    BOOST_REQUIRE(n.connect(b, a, 1));
+    BOOST_TEST(a.tunnel->counters().initiations_tx == handshakes);
+}
+
 BOOST_AUTO_TEST_CASE(a_peer_that_rotates_is_followed) {
     Net n{2};
     auto& a = n[0];

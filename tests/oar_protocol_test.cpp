@@ -1323,6 +1323,86 @@ BOOST_AUTO_TEST_CASE(instance_secrets_round_trip_and_rules) {
     BOOST_TEST(s.secrets.empty());
 }
 
+BOOST_AUTO_TEST_CASE(role_identity_round_trip_and_rules) {
+    oar::RoleIdentity id{.serial = ak::proto::identity_text("BOARD-7"),
+                         .firmware = ak::proto::identity_text("fw 3.1"),
+                         .drives = {}};
+    id.drives.push_back({.serial = ak::proto::identity_text("D-A"), .size_bytes = 1U << 30});
+    id.drives.push_back({.serial = ak::proto::identity_text("D-B"), .size_bytes = 2U << 30});
+    const auto body = oar::encode_role_identity(id);
+    BOOST_REQUIRE(body.has_value());
+    BOOST_TEST(body->size() == oar::role_identity_fixed_size + (2 * oar::role_drive_size));
+    BOOST_TEST((oar::decode_role_identity(*body).value() == id));
+    BOOST_TEST(oar::valid_role_identity(id));
+
+    // Encoder rules.
+    auto bad = id;
+    bad.serial = {};
+    BOOST_TEST((oar::encode_role_identity(bad).error() == BodyError::bad_text));
+    BOOST_TEST(!oar::valid_role_identity(bad));
+    bad = id;
+    bad.firmware[0] = '\x01';
+    BOOST_TEST((oar::encode_role_identity(bad).error() == BodyError::bad_text));
+    bad = id;
+    std::swap(bad.drives[0], bad.drives[1]);
+    BOOST_TEST((oar::encode_role_identity(bad).error() == BodyError::not_increasing));
+    bad = id;
+    bad.drives[1].serial = bad.drives[0].serial;
+    BOOST_TEST((oar::encode_role_identity(bad).error() == BodyError::not_increasing));
+    bad = id;
+    bad.drives[0].size_bytes = 0;
+    BOOST_TEST((oar::encode_role_identity(bad).error() == BodyError::bad_geometry));
+    bad = id;
+    bad.drives.resize(oar::max_role_drives + 1, id.drives[0]);
+    BOOST_TEST((oar::encode_role_identity(bad).error() == BodyError::too_many_entries));
+
+    // Decoder rules, from the good body.
+    auto f = *body;
+    f[0] = std::byte{1};  // reserved
+    BOOST_TEST((oar::decode_role_identity(f).error() == BodyError::reserved_not_zero));
+    f = *body;
+    f[2] = std::byte{3};  // count
+    BOOST_TEST((oar::decode_role_identity(f).error() == BodyError::truncated));
+    f = *body;
+    f[2] = std::byte{oar::max_role_drives + 1};
+    BOOST_TEST((oar::decode_role_identity(f).error() == BodyError::too_many_entries));
+    f = *body;
+    f.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_role_identity(f).error() == BodyError::trailing_bytes));
+    f = *body;
+    f[6] = std::byte{0};  // the serial's first byte: empty
+    BOOST_TEST((oar::decode_role_identity(f).error() == BodyError::bad_text));
+    BOOST_TEST(
+        (oar::decode_role_identity(std::span(*body).first(5)).error() == BodyError::truncated));
+}
+
+BOOST_AUTO_TEST_CASE(identity_options_build_a_role_identity) {
+    oar::RoleIdentity id;
+    BOOST_TEST(!oar::parse_identity_option("--sideband", "x", id).has_value());
+    BOOST_TEST(oar::parse_identity_option("--serial", "SN-1", id).value());
+    BOOST_TEST(oar::parse_identity_option("--firmware", "1.2", id).value());
+    BOOST_TEST(oar::parse_identity_option("--drive-serial", "Z9:4096", id).value());
+    BOOST_TEST(oar::parse_identity_option("--drive-serial", "A:1:8192", id).value());  // last colon
+    BOOST_REQUIRE(id.drives.size() == 2U);  // kept in serial order
+    BOOST_TEST(ak::proto::identity_text_view(id.drives[0].serial) == "A:1");
+    BOOST_TEST(id.drives[0].size_bytes == 8192U);
+    BOOST_TEST(oar::valid_role_identity(id));
+
+    BOOST_TEST(!oar::parse_identity_option("--serial", "", id).value());
+    BOOST_TEST(!oar::parse_identity_option("--serial", std::string(33, 'x'), id).value());
+    BOOST_TEST(!oar::parse_identity_option("--drive-serial", "Z9:4096", id).value());  // twice
+    BOOST_TEST(!oar::parse_identity_option("--drive-serial", "nosize", id).value());
+    BOOST_TEST(!oar::parse_identity_option("--drive-serial", "Q:0", id).value());
+    BOOST_TEST(!oar::parse_identity_option("--drive-serial", "Q:12x", id).value());
+    BOOST_TEST(!oar::parse_identity_option("--drive-serial", ":12", id).value());
+    BOOST_TEST(id.drives.size() == 2U);
+
+    // Drives alone are no identity: --serial is needed.
+    oar::RoleIdentity drives_only;
+    BOOST_TEST(oar::parse_identity_option("--drive-serial", "D:1", drives_only).value());
+    BOOST_TEST(!oar::valid_role_identity(drives_only));
+}
+
 BOOST_AUTO_TEST_CASE(names) {
     BOOST_TEST(std::string_view{oar::to_string(Status::busy)} == "busy");
     BOOST_TEST(std::string_view{oar::to_string(BodyError::bad_group)} == "bad_group");

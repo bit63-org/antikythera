@@ -126,7 +126,8 @@ auto usage() -> int {
     std::println(stderr,
                  "usage: {} {} DIR {} PATH {} A {} A {} E {} E {} SOCKET [{} SOCKET ...] [{} N]\n"
                  "       [{} DIR [{} N] {} ID=PATH ...]\n"
-                 "       [{} N {} ID:HEX [{} ID:HEX ...] {} FILE {} FILE {} FILE]",
+                 "       [{} N {} ID:HEX [{} ID:HEX ...] {} FILE {} FILE {} FILE]\n"
+                 "       [--serial TEXT [--firmware TEXT] [--drive-serial SERIAL:BYTES ...]]",
                  log_name, arg_volumes, arg_sideband, arg_addr, arg_helm_addr, arg_eid,
                  arg_helm_eid, arg_function, arg_function, arg_queues, arg_image_cache,
                  arg_image_cache_bytes, arg_image_store, arg_server_id, arg_controller_key,
@@ -235,6 +236,8 @@ struct Options {
     std::string storage_ca;
     std::string storage_cert;
     std::string storage_key;
+    ak::helm::oar::RoleIdentity identity;  // --serial, --firmware, --drive-serial
+    bool has_identity{false};
 };
 
 auto parse(int argc, char** argv) -> std::optional<Options> {
@@ -299,9 +302,19 @@ auto parse(int argc, char** argv) -> std::optional<Options> {
             o.storage_cert = value;
         } else if (arg == arg_storage_key) {
             o.storage_key = value;
+        } else if (const auto taken =
+                       ak::helm::oar::parse_identity_option(arg, value, o.identity)) {
+            if (!*taken) {
+                return std::nullopt;
+            }
+            o.has_identity = true;
         } else {
             return std::nullopt;
         }
+    }
+    // An identity needs at least --serial.
+    if (o.has_identity && !ak::helm::oar::valid_role_identity(o.identity)) {
+        return std::nullopt;
     }
     if (o.volumes.empty() || o.sideband.empty() || o.functions.empty() || !o.addr || !o.helm_addr ||
         !o.eid || !o.helm_eid || o.image_stores.empty() != o.image_cache.empty()) {
@@ -467,6 +480,9 @@ auto main(int argc, char** argv) -> int {
     if (!role) {
         std::println(stderr, "{}: {}", log_name, role.error());
         return EXIT_FAILURE;
+    }
+    if (opts->has_identity) {
+        (*role)->set_identity(opts->identity);
     }
     std::optional<helm::RoleEnrollment> enrollment;
     if (identity) {

@@ -49,6 +49,7 @@
 #include "helm/cold_start_reports.hpp"
 #include "helm/controller_link.hpp"
 #include "helm/flash.hpp"
+#include "helm/hardware_identity.hpp"
 #include "helm/helm_config.hpp"
 #include "helm/helm_daemon.hpp"
 #include "helm/host_boot.hpp"
@@ -341,6 +342,26 @@ auto run(const helm::HelmConfig& cfg) -> int {
     // host_power records (server-provisioning Requirement 3) under the
     // same controller keys.
     daemon_config.controller_keys = verifier.get();
+    // The hardware identity report (server-provisioning Requirement 6):
+    // the secure element's transport key stands for the EK until helm has
+    // a TPM-backed one (task 2), and each slot's board answers for itself.
+    std::optional<helm::HardwareIdentityTracker> identity;
+    if (!cfg.board_serial.empty()) {
+        const auto pk = se->transport_public_key();
+        const auto ek = pk ? helm::key_hash(*pk) : std::nullopt;
+        if (!ek) {
+            std::println(stderr, "{}: secure element key hash unavailable", log_name);
+            return exit_failed;
+        }
+        identity.emplace(
+            cfg.server_id,
+            helm::HelmIdentity{.ek_hash = *ek,
+                               .board_serial = ak::proto::identity_text(cfg.board_serial),
+                               .firmware = ak::proto::identity_text(cfg.board_firmware)},
+            store ? &*store : nullptr);
+        identity->load();
+        daemon_config.identity = &*identity;
+    }
     std::unique_ptr<ak::objstore::S3ObjectStore> boot_layer;
     std::string boot_layer_prefix;
     if (cfg.boot_layer) {

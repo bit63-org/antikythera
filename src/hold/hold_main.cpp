@@ -96,6 +96,8 @@ struct Options {
     std::optional<std::uint64_t> eid;
     std::optional<std::uint64_t> helm_eid;
     std::vector<ak::hull::ControllerKey> keys;
+    ak::helm::oar::RoleIdentity identity;  // --serial, --firmware, --drive-serial
+    bool has_identity{false};
 };
 
 constexpr std::uint64_t max_bus_addr = 0x7F;
@@ -104,12 +106,14 @@ constexpr std::size_t key_hex_digits = 2 * ak::hull::ed25519_public_key_size;
 constexpr int base_hex = 16;
 
 auto usage() -> int {
-    std::println(stderr,
-                 "usage: ak-hold --server-id N --listen HOST:PORT --data-dir DIR\n"
-                 "               --ca FILE --cert FILE --key FILE\n"
-                 "               ( --sideband PATH --addr A --helm-addr A --eid E --helm-eid E\n"
-                 "                 --controller-key ID:HEX [--controller-key ID:HEX ...]\n"
-                 "               | --configs DIR )");
+    std::println(
+        stderr,
+        "usage: ak-hold --server-id N --listen HOST:PORT --data-dir DIR\n"
+        "               --ca FILE --cert FILE --key FILE\n"
+        "               ( --sideband PATH --addr A --helm-addr A --eid E --helm-eid E\n"
+        "                 --controller-key ID:HEX [--controller-key ID:HEX ...]\n"
+        "               | --configs DIR )\n"
+        "               [--serial TEXT [--firmware TEXT] [--drive-serial SERIAL:BYTES ...]]");
     return 2;
 }
 
@@ -231,9 +235,19 @@ auto parse(int argc, char** argv) -> std::optional<Options> {
                 return std::nullopt;
             }
             o.keys.push_back(*key);
+        } else if (const auto taken =
+                       ak::helm::oar::parse_identity_option(flag, value, o.identity)) {
+            if (!*taken) {
+                return std::nullopt;
+            }
+            o.has_identity = true;
         } else {
             return std::nullopt;
         }
+    }
+    // An identity needs at least --serial.
+    if (o.has_identity && !ak::helm::oar::valid_role_identity(o.identity)) {
+        return std::nullopt;
     }
     if (o.server_id == 0 || o.host.empty() || o.data_dir.empty() || o.ca.empty() ||
         o.cert.empty() || o.key.empty()) {
@@ -473,6 +487,9 @@ auto main(int argc, char** argv) -> int {
         [verifier](std::span<const std::byte> msg, std::span<const std::byte, 64> sig,
                    std::uint16_t key_id) { return verifier->verify(msg, sig, key_id).has_value(); },
         random_seq()};
+    if (opts->has_identity) {
+        role.set_identity(opts->identity);
+    }
     ak::helm::RoleEnrollment enrollment{*identity, ak::helm::oar::Role::hold, ak::tls::Role::server,
                                         [&node](const ak::tls::Config& cfg) {
                                             if (!(*node)->set_tls(cfg)) {

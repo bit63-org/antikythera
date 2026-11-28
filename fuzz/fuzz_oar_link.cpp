@@ -79,6 +79,9 @@ auto decoders(std::span<const std::byte> body) -> void {
     if (auto h = oar::decode_health(body)) {
         same(body, oar::encode_health(*h));
     }
+    if (auto id = oar::decode_role_identity(body)) {
+        same(body, oar::encode_role_identity(*id));
+    }
     if (auto c = oar::decode_usage_request(body)) {
         same(body, oar::encode_usage_request(*c));
     }

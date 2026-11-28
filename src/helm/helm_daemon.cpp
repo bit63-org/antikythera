@@ -463,6 +463,7 @@ auto HelmDaemon::run_once(std::chrono::milliseconds wait) -> void {
     boot_if_due();
     _router.poll();
     check_host_start();
+    report_identity();
     if (now() >= _next_check) {
         check();
         _next_check = now() + _config.check_interval;
@@ -1356,6 +1357,54 @@ auto HelmDaemon::slot_state(SlotNumber slot) -> SlotState* {
     return it == _slots.end() ? nullptr : it->second.get();
 }
 
+auto HelmDaemon::read_identity(SlotState& slot) -> void {
+    if (_config.identity == nullptr) {
+        return;
+    }
+    auto id = slot.link->role_identity();
+    if (id) {
+        _config.identity->set_slot(slot.number, slot.inventory->role, *id);
+        slot.identity_read = true;
+        return;
+    }
+    const bool refused = id.error().code == LinkErrc::refused;
+    if (refused) {
+        slot.identity_read = true;  // no identity to give: settled all the same
+    }
+    // A role with no identity configured answers unsupported: it is left
+    // out of the report rather than counted as a failure. Anything else is
+    // a failure, and a slot that did not answer is asked again when its
+    // sideband next opens.
+    if (refused && id.error().status == oar::Status::unsupported) {
+        return;
+    }
+    const std::scoped_lock lock{_inbox_mutex};
+    ++_stats.identity_failures;
+}
+
+auto HelmDaemon::report_identity() -> void {
+    if (_config.identity == nullptr) {
+        return;
+    }
+    const bool settled =
+        std::ranges::all_of(_slots, [](const auto& entry) { return entry.second->identity_read; });
+    auto update = _config.identity->poll(settled);
+    if (!update) {
+        return;
+    }
+    report(std::move(update->report));
+    if (update->changed) {
+        // Requirement 6.2: the controller decides what a change means.
+        report(proto::HostFaultReport{
+            .code = proto::FaultCode::hardware_changed, .slot = 0xFF, .detail = 0});
+    }
+    const std::scoped_lock lock{_inbox_mutex};
+    ++_stats.identity_reports;
+    if (update->changed) {
+        ++_stats.hardware_changes;
+    }
+}
+
 auto HelmDaemon::attach(SlotState& slot) -> bool {
     detach(slot);
     auto binding = _connect ? _connect(slot.number) : std::unexpected(BindingError::disconnected);
@@ -1381,6 +1430,7 @@ auto HelmDaemon::attach(SlotState& slot) -> bool {
     }
     slot.pending = false;
     slot.inventory = *inv;
+    read_identity(slot);
     slot.reported_csr.clear();  // a restarted role's request is reported afresh
     slot.health.reset();
     provision_tunnel(slot);  // network roles: before any NIC is prepared on it

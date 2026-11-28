@@ -537,6 +537,19 @@ auto OarLink::self_test() -> std::expected<void, LinkError> {
     return expect_empty(transact(mctp::VendorType::self_test, body));
 }
 
+auto OarLink::role_identity() -> std::expected<oar::RoleIdentity, LinkError> {
+    std::vector<std::byte> body;
+    auto response = transact(mctp::VendorType::role_identity, body);
+    if (!response) {
+        return std::unexpected(response.error());
+    }
+    auto id = oar::decode_role_identity(*response);
+    if (!id) {
+        return std::unexpected(bad_response());
+    }
+    return *id;
+}
+
 auto OarLink::health() -> std::expected<oar::Health, LinkError> {
     std::vector<std::byte> body;
     auto response = transact(mctp::VendorType::health, body);
@@ -796,6 +809,17 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
         case mctp::VendorType::self_test:
             return status_only(oar::decode_empty(body) ? handler.self_test()
                                                        : oar::Status::bad_request);
+        case mctp::VendorType::role_identity: {
+            if (!oar::decode_empty(body)) {
+                return status_only(oar::Status::bad_request);
+            }
+            auto id = handler.role_identity();
+            if (!id) {
+                return status_only(id.error() == oar::Status::ok ? oar::Status::failed
+                                                                 : id.error());
+            }
+            return with_body(oar::encode_role_identity(*id));
+        }
         case mctp::VendorType::cert_request: {
             if (!oar::decode_empty(body)) {
                 return status_only(oar::Status::bad_request);

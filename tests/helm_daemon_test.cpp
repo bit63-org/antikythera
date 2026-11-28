@@ -34,6 +34,7 @@
 #include "harbor/test_controller.hpp"
 #include "helm/audit_log.hpp"
 #include "helm/controller_link.hpp"
+#include "helm/hardware_identity.hpp"
 #include "helm/helm_daemon.hpp"
 #include "helm/host_boot.hpp"
 #include "proto/boot_image.hpp"
@@ -2646,6 +2647,61 @@ BOOST_AUTO_TEST_CASE(host_power_on_ends_the_power_on_wait) {
     r.daemon.run_once(0ms);  // boots
     BOOST_TEST(r.daemon.booted());
     BOOST_TEST(r.backplane.host);
+}
+
+// server-provisioning Requirement 6: each slot's board answers
+// role_identity when its sideband opens, helm reports the identity, and
+// a later identity that differs from the baseline raises hardware_changed.
+BOOST_AUTO_TEST_CASE(the_hardware_identity_is_reported_and_a_swap_is_a_fault) {
+    BootRig b;  // for its sealed store
+    helm::HelmIdentity me;
+    me.ek_hash.fill(std::byte{0x22});
+    me.board_serial = proto::identity_text("HELM-7");
+    const auto rig_with = [](helm::HardwareIdentityTracker& t) {
+        return std::make_unique<Rig>(link_timeout, nullptr, false, false, nullptr, nullptr,
+                                     std::function<proto::BootCache()>{}, nullptr, nullptr, nullptr,
+                                     [&t](helm::DaemonConfig& c) { c.identity = &t; });
+    };
+    const auto board_named = [](std::string_view serial) {
+        return oar::RoleIdentity{.serial = proto::identity_text(serial),
+                                 .firmware = proto::identity_text("fw 1"),
+                                 .drives = {}};
+    };
+    {
+        helm::HardwareIdentityTracker t{server, me, b.store.get()};
+        t.load();
+        auto r = rig_with(t);
+        r->net.role.set_identity(board_named("NET-1"));  // blk has none: left out
+        (void)r->daemon.boot();
+        r->daemon.run_once(0ms);
+        BOOST_REQUIRE(r->count<proto::HardwareIdentity>() == 1U);
+        const auto id = r->last<proto::HardwareIdentity>();
+        BOOST_TEST(proto::identity_text_view(id.board_serial) == "HELM-7");
+        BOOST_REQUIRE(id.slots.size() == 1U);
+        BOOST_TEST(id.slots[0].slot == net_slot);
+        BOOST_TEST(proto::identity_text_view(id.slots[0].serial) == "NET-1");
+        BOOST_TEST(r->count<proto::HostFaultReport>() == 0U);
+        const auto st = r->daemon.stats();
+        BOOST_TEST(st.identity_reports == 1U);
+        BOOST_TEST(st.hardware_changes == 0U);
+        BOOST_TEST(st.identity_failures == 0U);
+        BOOST_TEST(t.baseline().has_value());
+        r->daemon.run_once(0ms);
+        BOOST_TEST(r->count<proto::HardwareIdentity>() == 1U);  // unchanged: not again
+    }
+    // helm restarts with the network board replaced.
+    helm::HardwareIdentityTracker t{server, me, b.store.get()};
+    t.load();
+    auto r = rig_with(t);
+    r->net.role.set_identity(board_named("NET-2"));
+    (void)r->daemon.boot();
+    r->daemon.run_once(0ms);
+    BOOST_REQUIRE(r->count<proto::HardwareIdentity>() == 1U);
+    BOOST_TEST(proto::identity_text_view(r->last<proto::HardwareIdentity>().slots[0].serial) ==
+               "NET-2");
+    const auto fault = r->last<proto::HostFaultReport>();
+    BOOST_TEST((fault.code == proto::FaultCode::hardware_changed));
+    BOOST_TEST(r->daemon.stats().hardware_changes == 1U);
 }
 
 BOOST_AUTO_TEST_CASE(the_boot_cache_is_read_before_each_publish) {

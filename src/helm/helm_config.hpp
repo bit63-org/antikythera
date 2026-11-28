@@ -57,6 +57,13 @@
 //   power-marker PATH           a file in a tmpfs whose absence means helm's
 //                               own power returned (default
 //                               /run/ak-helm/powered; cold-start Requirement 3.6)
+//   board-serial TEXT           this board's serial, at most 32 printable
+//                               characters: helm then reports the server's
+//                               hardware identity (server-provisioning
+//                               Requirement 6). Optional: without, none is
+//                               reported
+//   board-firmware TEXT         this board's firmware version, likewise
+//                               (needs board-serial)
 //   power-on-policy apply|skip  `apply` (default) waits out the power-on
 //                               policy after helm's power returns; `skip`
 //                               releases the host at once (a harbor run that
@@ -119,6 +126,8 @@ struct HelmConfig {
     std::optional<std::filesystem::path> boot_function;  // nullopt: helm does not fill it
     std::optional<std::filesystem::path> boot_layer;     // nullopt: no fetches
     std::optional<std::chrono::milliseconds> host_start_timeout;
+    std::string board_serial;    // empty: no hardware identity reported
+    std::string board_firmware;  // empty: none given
     std::filesystem::path power_marker{"/run/ak-helm/powered"};
     bool apply_power_policy{true};
     std::map<SlotNumber, SlotEntry> slots;

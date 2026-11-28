@@ -3,7 +3,7 @@
 Pairs with kythira `.kiro/specs/metal-host-lifecycle/` (tasks 8, 12
 and 16 there). Each task is one PR unless noted.
 
-- [ ] 1. Records and reports
+- [x] 1. Records and reports
   - `host_power` (21) and `decommission` (22) in `src/proto/link.hpp`;
     `hardware_identity` (25) and `decommission_progress` (26) in
     `src/proto/report.hpp`; vectors and fuzz targets

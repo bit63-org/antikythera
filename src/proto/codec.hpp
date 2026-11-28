@@ -93,6 +93,7 @@ enum class DecodeError : std::uint8_t {
     bad_generation,           // standing set generation or power policy version 0
     bad_standing_entry,  // a standing instance's commands, volumes, NICs or secrets break the rules
     bad_power_policy,    // a power-on policy tier or delay outside its rules
+    bad_text,            // a fixed text field that is not printable ASCII padded with zeros
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -221,6 +222,8 @@ enum class DecodeError : std::uint8_t {
             return "standing instance entry breaks its rules";
         case DecodeError::bad_power_policy:
             return "power-on policy field outside its rules";
+        case DecodeError::bad_text:
+            return "text field not printable ASCII padded with zeros";
     }
     return "unknown";
 }

@@ -145,9 +145,36 @@
 //     zero = none, and no previous without an LKG)
 //     standing_generation u64 | policy_version u64 (0 = none stored)
 //     store_free_bytes u64 | store_total_bytes u64 (free <= total)
-//   Kinds 21-26 and 29-31 belong to other specs still being built, so the
+//   Kinds 21-24 and 29-31 belong to other specs still being built, so the
 //   known kinds are not one contiguous range: report_kind() maps each body
 //   to its kind.
+//
+// Server provisioning (.kiro/specs/server-provisioning/ Requirements 5 and
+// 6), from helm. Text fields are printable ASCII (0x20-0x7E) padded with
+// zero bytes, with no zero byte before a printable one.
+//   hardware_identity  -- kind 25, at registration and whenever any of it
+//                         changes
+//     ek_hash [32] (SHA-256 of the secure element's endorsement key; never
+//     all zero) | board_serial [32] (text, non-empty)
+//     firmware [32] (helm's firmware version, text)
+//     memory_bytes u64 | cpu_count u32 (both 0 while helm cannot read them)
+//     flags u8 (bit 0: Secure Boot on; bit 1: IOMMU on; bit 2: hull
+//     reported bits 0-1, which are zero without it) | slot_count u8
+//     drive_count u16
+//     slots   slot_count x 72, strictly increasing slot, at most
+//             max_identity_slots:
+//       slot u8 | kind u8 (SlotKind) | rsvd [6] | serial [32] (text,
+//       non-empty) | firmware [32] (text)
+//     drives  drive_count x 48, strictly increasing (slot, serial), at most
+//             max_identity_drives, each in a listed storage slot:
+//       slot u8 | rsvd [7] | size_bytes u64 (non-zero) | serial [32] (text,
+//       non-empty)
+//   decommission_progress  -- kind 26, after each step of a decommission
+//     step u8 (DecommissionStep) | result u8 (SanitizeResult; non-zero
+//     exactly when step is media) | slot u8 (media only, else 0) | rsvd [5]
+//     drive_serial [32] (text; non-empty exactly when step is media)
+//   One media report is sent per drive, failures included, so the
+//   controller can list by serial every drive that must be destroyed.
 //
 // Enrollment (block-volume-service task 12, design "Keys and crypto-erase"
 // and "hold wire protocol"):
@@ -202,7 +229,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -292,10 +321,26 @@ inline constexpr std::uint8_t cold_start_rollback = 0x01;
 inline constexpr std::uint8_t cold_start_rtc_below_floor = 0x02;
 inline constexpr std::uint8_t known_cold_start_flags =
     cold_start_rollback | cold_start_rtc_below_floor;
+inline constexpr std::size_t identity_text_size = 32;
+inline constexpr std::size_t hardware_identity_fixed_size = (3 * identity_text_size) + 16;
+inline constexpr std::size_t identity_slot_size = 8 + (2 * identity_text_size);
+inline constexpr std::size_t identity_drive_size = 16 + identity_text_size;
+inline constexpr std::size_t max_identity_slots = 16;
+inline constexpr std::size_t max_identity_drives = 64;
+inline constexpr std::size_t max_hardware_identity_size =
+    hardware_identity_fixed_size + (max_identity_slots * identity_slot_size) +
+    (max_identity_drives * identity_drive_size);
+inline constexpr std::size_t decommission_progress_size = 8 + identity_text_size;
+inline constexpr std::uint8_t identity_secure_boot = 0x01;
+inline constexpr std::uint8_t identity_iommu = 0x02;
+inline constexpr std::uint8_t identity_host_reported = 0x04;
+inline constexpr std::uint8_t known_identity_flags =
+    identity_secure_boot | identity_iommu | identity_host_reported;
 
 inline constexpr std::size_t max_report_size =
-    report_header_size + std::max({max_inventory_size, max_group_usage_size,
-                                   max_replica_status_size, max_group_status_size});
+    report_header_size +
+    std::max({max_inventory_size, max_group_usage_size, max_replica_status_size,
+              max_group_status_size, max_hardware_identity_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class ReportKind : std::uint16_t {
@@ -319,8 +364,34 @@ enum class ReportKind : std::uint16_t {
     capacity = 18,
     group_fault = 19,
     conversion_progress = 20,
+    hardware_identity = 25,
+    decommission_progress = 26,
     cold_start = 27,
     boot_cache = 28,
+};
+
+// What a data-plane slot holds (hardware_identity).
+enum class SlotKind : std::uint8_t {
+    network = 1,  // oar-net
+    storage = 2,  // a storage role with drives (hold, khold, instance store)
+    blk = 3,      // oar-blk with no drives of its own
+    gpu = 4,      // oar-gpu
+    control = 5,  // the control slot (helm's own board)
+};
+
+// One step of a decommission (decommission_progress), in the order helm
+// runs them.
+enum class DecommissionStep : std::uint8_t {
+    keys_destroyed = 1,    // every VM key and the master key are gone
+    media = 2,             // one drive's sanitize finished or failed
+    identity_cleared = 3,  // attestation and TLS keys and the server ID next
+};
+
+// How one drive's sanitize ended (decommission_progress, step media).
+enum class SanitizeResult : std::uint8_t {
+    sanitized_crypto = 1,  // NVMe Sanitize with crypto erase
+    sanitized_block = 2,   // block erase (crypto erase not supported)
+    failed = 3,            // neither worked: destroy the drive
 };
 
 // Where helm booted hull from after power returned (cold_start).
@@ -821,6 +892,60 @@ struct BootCache {
     friend auto operator==(const BootCache&, const BootCache&) -> bool = default;
 };
 
+// A fixed text field: printable ASCII padded with zero bytes.
+using IdentityText = std::array<char, identity_text_size>;
+
+// Makes an IdentityText from at most identity_text_size characters; longer
+// text is cut. Characters outside 0x20-0x7E make the field invalid, which
+// encode_report() refuses.
+[[nodiscard]] inline auto identity_text(std::string_view text) noexcept -> IdentityText {
+    IdentityText t{};
+    std::ranges::copy(text.substr(0, identity_text_size), t.begin());
+    return t;
+}
+
+// The text in a field, without its padding.
+[[nodiscard]] inline auto identity_text_view(const IdentityText& t) noexcept -> std::string_view {
+    const auto length = static_cast<std::size_t>(std::ranges::find(t, '\0') - t.begin());
+    return {t.data(), length};
+}
+
+struct IdentitySlot {
+    std::uint8_t slot{0};
+    SlotKind kind{SlotKind::network};
+    IdentityText serial{};
+    IdentityText firmware{};
+    friend auto operator==(const IdentitySlot&, const IdentitySlot&) -> bool = default;
+};
+
+struct IdentityDrive {
+    std::uint8_t slot{0};
+    std::uint64_t size_bytes{0};
+    IdentityText serial{};
+    friend auto operator==(const IdentityDrive&, const IdentityDrive&) -> bool = default;
+};
+
+struct HardwareIdentity {
+    ImageDigest ek_hash{};
+    IdentityText board_serial{};
+    IdentityText firmware{};
+    std::uint64_t memory_bytes{0};
+    std::uint32_t cpu_count{0};
+    std::uint8_t flags{0};              // identity_* bits
+    std::vector<IdentitySlot> slots;    // strictly increasing slot
+    std::vector<IdentityDrive> drives;  // strictly increasing (slot, serial)
+    friend auto operator==(const HardwareIdentity&, const HardwareIdentity&) -> bool = default;
+};
+
+struct DecommissionProgress {
+    DecommissionStep step{DecommissionStep::keys_destroyed};
+    std::optional<SanitizeResult> result;  // exactly when step is media
+    std::uint8_t slot{0};                  // media only
+    IdentityText drive_serial{};           // non-empty exactly when step is media
+    friend auto operator==(const DecommissionProgress&, const DecommissionProgress&)
+        -> bool = default;
+};
+
 struct CertRequest {
     std::uint8_t slot{0};
     StorageRole role{StorageRole::hold};
@@ -828,11 +953,12 @@ struct CertRequest {
     friend auto operator==(const CertRequest&, const CertRequest&) -> bool = default;
 };
 
-using ReportBody = std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport,
-                                MapApplied, HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault,
-                                AttachmentStatus, DemotionConfirmed, OpOutcome, SnapshotProgress,
-                                Enrollment, CertRequest, GroupMembership, GroupStatus, Capacity,
-                                GroupFault, ConversionProgress, ColdStart, BootCache>;
+using ReportBody =
+    std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport, MapApplied,
+                 HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault, AttachmentStatus,
+                 DemotionConfirmed, OpOutcome, SnapshotProgress, Enrollment, CertRequest,
+                 GroupMembership, GroupStatus, Capacity, GroupFault, ConversionProgress, ColdStart,
+                 BootCache, HardwareIdentity, DecommissionProgress>;
 
 struct Report {
     std::uint64_t server_id{0};
@@ -841,10 +967,12 @@ struct Report {
     friend auto operator==(const Report&, const Report&) -> bool = default;
 };
 
-// The variant's alternatives are in ReportKind order: kinds 1-20 are
-// alternatives 0-19, and the later kinds follow in order.
-inline constexpr std::array report_kinds_after_contiguous{ReportKind::cold_start,
-                                                          ReportKind::boot_cache};
+// Kinds 1-20 are the variant's alternatives 0-19; the later alternatives
+// have the kinds in this table, in the variant's order (which is the order
+// they were added, not their kind numbers).
+inline constexpr std::array report_kinds_after_contiguous{
+    ReportKind::cold_start, ReportKind::boot_cache, ReportKind::hardware_identity,
+    ReportKind::decommission_progress};
 [[nodiscard]] inline auto report_kind(const ReportBody& body) noexcept -> ReportKind {
     constexpr auto contiguous = static_cast<std::size_t>(ReportKind::conversion_progress);
     if (body.index() < contiguous) {
@@ -1272,6 +1400,96 @@ namespace detail {
     }
     if (b.store_free_bytes > b.store_total_bytes) {
         return std::unexpected(DecodeError::bad_capacity);
+    }
+    return {};
+}
+
+[[nodiscard]] constexpr auto known(SlotKind k) noexcept -> bool {
+    return k >= SlotKind::network && k <= SlotKind::control;
+}
+[[nodiscard]] constexpr auto known(DecommissionStep s) noexcept -> bool {
+    return s >= DecommissionStep::keys_destroyed && s <= DecommissionStep::identity_cleared;
+}
+[[nodiscard]] constexpr auto known(SanitizeResult r) noexcept -> bool {
+    return r >= SanitizeResult::sanitized_crypto && r <= SanitizeResult::failed;
+}
+
+// Printable ASCII, then only zero bytes.
+[[nodiscard]] inline auto valid_text(const IdentityText& t) noexcept -> bool {
+    bool padding = false;
+    for (const char c : t) {
+        if (c == '\0') {
+            padding = true;
+        } else if (padding || c < 0x20 || c > 0x7E) {
+            return false;
+        }
+    }
+    return true;
+}
+[[nodiscard]] inline auto empty_text(const IdentityText& t) noexcept -> bool {
+    return t[0] == '\0';
+}
+
+[[nodiscard]] inline auto check_body(const HardwareIdentity& h) noexcept
+    -> std::expected<void, DecodeError> {
+    if (all_zero(h.ek_hash)) {
+        return std::unexpected(DecodeError::bad_public_key);
+    }
+    if (!valid_text(h.board_serial) || empty_text(h.board_serial) || !valid_text(h.firmware)) {
+        return std::unexpected(DecodeError::bad_text);
+    }
+    if ((h.flags & ~known_identity_flags) != 0 ||
+        ((h.flags & identity_host_reported) == 0 &&
+         (h.flags & (identity_secure_boot | identity_iommu)) != 0)) {
+        return std::unexpected(DecodeError::unknown_value);
+    }
+    if (h.slots.size() > max_identity_slots || h.drives.size() > max_identity_drives) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    for (std::size_t i = 0; i < h.slots.size(); ++i) {
+        const auto& s = h.slots[i];
+        if (!known(s.kind)) {
+            return std::unexpected(DecodeError::unknown_value);
+        }
+        if (!valid_text(s.serial) || empty_text(s.serial) || !valid_text(s.firmware)) {
+            return std::unexpected(DecodeError::bad_text);
+        }
+        if (i > 0 && h.slots[i - 1].slot >= s.slot) {
+            return std::unexpected(DecodeError::not_ascending);
+        }
+    }
+    for (std::size_t i = 0; i < h.drives.size(); ++i) {
+        const auto& d = h.drives[i];
+        if (d.size_bytes == 0) {
+            return std::unexpected(DecodeError::bad_capacity);
+        }
+        if (!valid_text(d.serial) || empty_text(d.serial)) {
+            return std::unexpected(DecodeError::bad_text);
+        }
+        if (i > 0 &&
+            std::tie(h.drives[i - 1].slot, h.drives[i - 1].serial) >= std::tie(d.slot, d.serial)) {
+            return std::unexpected(DecodeError::not_ascending);
+        }
+        const auto slot = std::ranges::find(h.slots, d.slot, &IdentitySlot::slot);
+        if (slot == h.slots.end() || slot->kind != SlotKind::storage) {
+            return std::unexpected(DecodeError::bad_id);
+        }
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const DecommissionProgress& p) noexcept
+    -> std::expected<void, DecodeError> {
+    if (!known(p.step) || (p.result && !known(*p.result))) {
+        return std::unexpected(DecodeError::unknown_value);
+    }
+    if (!valid_text(p.drive_serial)) {
+        return std::unexpected(DecodeError::bad_text);
+    }
+    const bool media = p.step == DecommissionStep::media;
+    if (p.result.has_value() != media || empty_text(p.drive_serial) == media ||
+        (!media && p.slot != 0)) {
+        return std::unexpected(DecodeError::unknown_value);
     }
     return {};
 }
@@ -2242,6 +2460,124 @@ inline auto write_cold_start_body(wire::Writer& w, const BootCache& b) -> void {
     w.le64(b.store_total_bytes);
 }
 
+inline auto read_text(BodyReader& in, IdentityText& t) -> void {
+    in.bytes(std::as_writable_bytes(std::span{t}));
+}
+inline auto write_text(wire::Writer& w, const IdentityText& t) -> void {
+    w.bytes(std::as_bytes(std::span{t}));
+}
+
+[[nodiscard]] inline auto decode_hardware_identity(std::span<const std::byte> body)
+    -> std::expected<HardwareIdentity, DecodeError> {
+    BodyReader in{.r = wire::Reader{body}};
+    HardwareIdentity h{};
+    in.bytes(h.ek_hash);
+    read_text(in, h.board_serial);
+    read_text(in, h.firmware);
+    h.memory_bytes = in.le64();
+    h.cpu_count = in.le32();
+    h.flags = in.u8();
+    const std::size_t slots = in.u8();
+    const std::size_t drives = in.le16();
+    if (!in.ok) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (slots > max_identity_slots || drives > max_identity_drives) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    const auto size = hardware_identity_fixed_size + (slots * identity_slot_size) +
+                      (drives * identity_drive_size);
+    if (body.size() < size) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (body.size() > size) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    bool zero = true;
+    h.slots.reserve(slots);
+    for (std::size_t i = 0; i < slots; ++i) {
+        IdentitySlot& s = h.slots.emplace_back();
+        s.slot = in.u8();
+        s.kind = static_cast<SlotKind>(in.u8());
+        zero = in.zeros(6) && zero;
+        read_text(in, s.serial);
+        read_text(in, s.firmware);
+    }
+    h.drives.reserve(drives);
+    for (std::size_t i = 0; i < drives; ++i) {
+        IdentityDrive& d = h.drives.emplace_back();
+        d.slot = in.u8();
+        zero = in.zeros(7) && zero;
+        d.size_bytes = in.le64();
+        read_text(in, d.serial);
+    }
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (auto ok = check_body(h); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return h;
+}
+
+[[nodiscard]] inline auto decode_decommission_progress(std::span<const std::byte> body)
+    -> std::expected<DecommissionProgress, DecodeError> {
+    if (body.size() < decommission_progress_size) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (body.size() > decommission_progress_size) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    BodyReader in{.r = wire::Reader{body}};
+    DecommissionProgress p{};
+    p.step = static_cast<DecommissionStep>(in.u8());
+    if (const auto result = in.u8(); result != 0) {
+        p.result = static_cast<SanitizeResult>(result);
+    }
+    p.slot = in.u8();
+    const bool zero = in.zeros(5);
+    read_text(in, p.drive_serial);
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (auto ok = check_body(p); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return p;
+}
+
+inline auto write_provisioning_body(wire::Writer& w, const HardwareIdentity& h) -> void {
+    w.bytes(h.ek_hash);
+    write_text(w, h.board_serial);
+    write_text(w, h.firmware);
+    w.le64(h.memory_bytes);
+    w.le32(h.cpu_count);
+    w.u8(h.flags);
+    w.u8(static_cast<std::uint8_t>(h.slots.size()));
+    w.le16(static_cast<std::uint16_t>(h.drives.size()));
+    for (const auto& s : h.slots) {
+        w.u8(s.slot);
+        w.u8(static_cast<std::uint8_t>(s.kind));
+        w.bytes(std::array<std::byte, 6>{});
+        write_text(w, s.serial);
+        write_text(w, s.firmware);
+    }
+    for (const auto& d : h.drives) {
+        w.u8(d.slot);
+        w.bytes(std::array<std::byte, 7>{});
+        w.le64(d.size_bytes);
+        write_text(w, d.serial);
+    }
+}
+
+inline auto write_provisioning_body(wire::Writer& w, const DecommissionProgress& p) -> void {
+    w.u8(static_cast<std::uint8_t>(p.step));
+    w.u8(p.result ? static_cast<std::uint8_t>(*p.result) : 0);
+    w.u8(p.slot);
+    w.bytes(std::array<std::byte, 5>{});
+    write_text(w, p.drive_serial);
+}
+
 inline auto write_khold_body(wire::Writer& w, const GroupStatus& s) -> void {
     w.u8(s.slot);
     w.u8(0);
@@ -2348,6 +2684,9 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
                 write_khold_body(w, b);
             } else if constexpr (std::is_same_v<T, ColdStart> || std::is_same_v<T, BootCache>) {
                 write_cold_start_body(w, b);
+            } else if constexpr (std::is_same_v<T, HardwareIdentity> ||
+                                 std::is_same_v<T, DecommissionProgress>) {
+                write_provisioning_body(w, b);
             } else if constexpr (volume_event_size<T> != 0) {
                 write_volume_event(w, b);
             } else if constexpr (std::is_same_v<T, Enrollment>) {
@@ -2464,6 +2803,10 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
             return wrap(detail::decode_cold_start(body));
         case ReportKind::boot_cache:
             return wrap(detail::decode_boot_cache(body));
+        case ReportKind::hardware_identity:
+            return wrap(detail::decode_hardware_identity(body));
+        case ReportKind::decommission_progress:
+            return wrap(detail::decode_decommission_progress(body));
     }
     return std::unexpected(DecodeError::unknown_value);
 }

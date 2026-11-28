@@ -161,6 +161,14 @@ public:
                                  std::span<const std::byte> /*frame*/) -> void {}
     virtual auto on_power_policy(const proto::PowerPolicy& /*policy*/,
                                  std::span<const std::byte> /*frame*/) -> void {}
+    // Server provisioning (.kiro/specs/server-provisioning/). A host power
+    // or decommission order for this server, strictly decoded but not yet
+    // verified; `frame` is its exact encoding, whose signature helm checks
+    // before it acts.
+    virtual auto on_host_power(const proto::HostPower& /*order*/,
+                               std::span<const std::byte> /*frame*/) -> void {}
+    virtual auto on_decommission(const proto::Decommission& /*order*/,
+                                 std::span<const std::byte> /*frame*/) -> void {}
 };
 
 enum class SessionError : std::uint8_t {

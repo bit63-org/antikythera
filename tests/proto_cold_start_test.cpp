@@ -691,8 +691,8 @@ BOOST_AUTO_TEST_CASE(link_frames_the_new_records) {
         BOOST_REQUIRE(r->has_value());
         BOOST_TEST(((*r)->type == t));
     }
-    // 19-22 and 25-29 are not this spec's, and stay unknown here.
-    for (int t : {19, 22, 25, 29}) {
+    // 19-20 and 25-29 belong to no record yet, and stay unknown here.
+    for (int t : {19, 20, 25, 29}) {
         BOOST_TEST(!proto::encode_record(static_cast<proto::RecordType>(t), {}).has_value());
     }
 }

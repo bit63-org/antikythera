@@ -322,6 +322,28 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
             _sink->on_power_policy(*policy, rec.payload);
             return {};
         }
+        case proto::RecordType::host_power: {
+            auto power = proto::decode_host_power(rec.payload);
+            if (!power) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (power->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_host_power(*power, rec.payload);
+            return {};
+        }
+        case proto::RecordType::decommission: {
+            auto order = proto::decode_decommission(rec.payload);
+            if (!order) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (order->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_decommission(*order, rec.payload);
+            return {};
+        }
         case proto::RecordType::report_ack: {
             auto ack = proto::decode_report_ack(rec.payload);
             if (!ack) {

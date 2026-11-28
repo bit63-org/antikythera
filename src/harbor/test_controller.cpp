@@ -912,6 +912,8 @@ constexpr std::array kind_names{
     std::pair{"conversion_progress", proto::ReportKind::conversion_progress},
     std::pair{"cold_start", proto::ReportKind::cold_start},
     std::pair{"boot_cache", proto::ReportKind::boot_cache},
+    std::pair{"hardware_identity", proto::ReportKind::hardware_identity},
+    std::pair{"decommission_progress", proto::ReportKind::decommission_progress},
 };
 
 template<typename T, std::size_t N>
@@ -1417,6 +1419,18 @@ auto to_string(const proto::Report& report) -> std::string {
                 os << " standing_generation=" << b.standing_generation
                    << " policy_version=" << b.policy_version << " store_free=" << b.store_free_bytes
                    << "/" << b.store_total_bytes;
+            } else if constexpr (std::is_same_v<T, proto::HardwareIdentity>) {
+                os << " board=" << proto::identity_text_view(b.board_serial)
+                   << " firmware=" << proto::identity_text_view(b.firmware)
+                   << " flags=" << int{b.flags} << " cpus=" << b.cpu_count
+                   << " memory=" << b.memory_bytes << " slots=" << b.slots.size()
+                   << " drives=" << b.drives.size();
+            } else if constexpr (std::is_same_v<T, proto::DecommissionProgress>) {
+                os << " step=" << static_cast<int>(b.step);
+                if (b.result) {
+                    os << " result=" << static_cast<int>(*b.result) << " slot=" << int{b.slot}
+                       << " drive=" << proto::identity_text_view(b.drive_serial);
+                }
             } else {
                 static_assert(std::is_same_v<T, proto::SnapshotProgress>);
                 os << " volume=" << b.volume_id << " cut=" << b.cut_id
@@ -1528,6 +1542,8 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::instance_metadata:
         case proto::RecordType::volume_layout:
         case proto::RecordType::self_test:
+        case proto::RecordType::host_power:
+        case proto::RecordType::decommission:
         case proto::RecordType::standing_set:
         case proto::RecordType::power_policy:
             break;

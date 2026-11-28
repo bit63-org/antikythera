@@ -19,6 +19,7 @@
 #include <csignal>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -598,8 +599,10 @@ struct Rig {
     explicit Rig(std::chrono::milliseconds slot_link_timeout = link_timeout,
                  helm::HostPort* host_port = nullptr, bool with_hold = false,
                  bool with_khold = false, helm::PowerPolicyKeeper* power_policy = nullptr,
-                 helm::TimeFloor* time_floor = nullptr)
-        : daemon{config(slot_link_timeout, with_hold, with_khold, power_policy, time_floor),
+                 helm::TimeFloor* time_floor = nullptr,
+                 std::function<proto::BootCache()> boot_cache = {})
+        : daemon{config(slot_link_timeout, with_hold, with_khold, power_policy, time_floor,
+                        std::move(boot_cache)),
                  keys,
                  audit,
                  host_port != nullptr ? *host_port : host,
@@ -620,10 +623,12 @@ struct Rig {
 
     static auto config(std::chrono::milliseconds slot_link_timeout, bool with_hold = false,
                        bool with_khold = false, helm::PowerPolicyKeeper* power_policy = nullptr,
-                       helm::TimeFloor* time_floor = nullptr) -> helm::DaemonConfig {
+                       helm::TimeFloor* time_floor = nullptr,
+                       std::function<proto::BootCache()> boot_cache = {}) -> helm::DaemonConfig {
         helm::DaemonConfig c;
         c.power_policy = power_policy;
         c.time_floor = time_floor;
+        c.boot_cache = std::move(boot_cache);
         std::vector<SlotNumber> slots{net_slot, blk_slot};
         if (with_hold) {
             slots.push_back(hold_slot);
@@ -2036,6 +2041,28 @@ BOOST_AUTO_TEST_CASE(power_policy_records_reach_the_keeper) {
     // Only the kept record's floor counts (cold-start Requirement 7.1),
     // not the forged one's higher floor.
     BOOST_TEST(time_floor.floor() == 1'795'000'002U);
+}
+
+BOOST_AUTO_TEST_CASE(the_boot_cache_is_read_before_each_publish) {
+    // Without a source there is nothing to send behind the inventory.
+    {
+        Rig plain;
+        BOOST_TEST(!plain.daemon.boot_cache().has_value());
+    }
+    std::uint64_t version = 1;
+    int reads = 0;
+    Rig r{link_timeout, nullptr, false, false, nullptr, nullptr, [&version, &reads] {
+              ++reads;
+              return proto::BootCache{.policy_version = version};
+          }};
+    // Read at construction, so a connection during the power-on wait
+    // already has one.
+    BOOST_REQUIRE(r.daemon.boot_cache().has_value());
+    BOOST_TEST(r.daemon.boot_cache()->policy_version == 1U);
+    version = 2;
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.boot_cache()->policy_version == 2U);
+    BOOST_TEST(reads >= 2);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

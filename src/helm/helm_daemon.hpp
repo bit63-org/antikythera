@@ -220,6 +220,10 @@ struct DaemonConfig {
     TimeFloor* time_floor{nullptr};
     // Called on the loop thread after a scheduled boot (schedule_boot).
     std::function<void(const BootResult&)> on_boot;
+    // The boot cache's state (cold-start Requirement 8.2), read on the loop
+    // thread at construction and before every publish; boot_cache() hands
+    // the newest to other threads. Empty: no boot_cache reports.
+    std::function<proto::BootCache()> boot_cache;
     // Empty: steady_clock::now.
     std::function<Clock::time_point()> clock;
 };
@@ -363,6 +367,9 @@ public:
     auto post_host_slot(const mailbox::Slot& slot) -> void;
     // The newest published snapshot (ControllerSession's InventorySource).
     [[nodiscard]] auto inventory() const -> proto::Inventory;
+    // Thread-safe: the newest DaemonConfig::boot_cache reading, or nothing
+    // when that is empty (ControllerSession's BootCacheSource).
+    [[nodiscard]] auto boot_cache() const -> std::optional<proto::BootCache>;
 
     // ---- callbacks on the loop thread (router and sequencer) ----------------
 
@@ -573,6 +580,7 @@ private:
 
     mutable std::mutex _snapshot_mutex;
     proto::Inventory _snapshot;
+    std::optional<proto::BootCache> _boot_cache;
 };
 
 }  // namespace ak::helm

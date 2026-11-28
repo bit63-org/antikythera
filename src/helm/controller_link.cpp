@@ -56,15 +56,25 @@ auto ControllerSession::queue(proto::ReportBody body) -> std::uint64_t {
     if (_connected) {
         _outbound.insert(_outbound.end(), record->begin(), record->end());
     }
-    // A connection restates the inventory and the enrollment, so an older
-    // unacknowledged one is never replayed.
-    _pending.push_back({.seq = seq,
-                        .inventory = std::holds_alternative<proto::Inventory>(report.body),
-                        .enrollment = std::holds_alternative<proto::Enrollment>(report.body),
-                        .record = std::move(*record)});
+    // A connection restates the inventory, the boot cache and the
+    // enrollment, so an older unacknowledged one is never replayed.
+    const bool inventory = std::holds_alternative<proto::Inventory>(report.body);
+    _pending.push_back(
+        {.seq = seq,
+         .snapshot = inventory || std::holds_alternative<proto::BootCache>(report.body),
+         .enrollment = std::holds_alternative<proto::Enrollment>(report.body),
+         .record = std::move(*record)});
     while (_pending.size() > max_pending_reports) {
         _pending.pop_front();
         ++_dropped;
+    }
+    // The boot cache rides behind every inventory (cold-start Requirement
+    // 8.2), so the controller sees what helm could restart from whenever
+    // it learns what the host has.
+    if (inventory && _boot_cache) {
+        if (auto cache = _boot_cache(); cache) {
+            (void)queue(std::move(*cache));
+        }
     }
     return seq;
 }
@@ -84,9 +94,10 @@ auto ControllerSession::on_connected() -> void {
     if (hello_record) {
         _outbound = std::move(*hello_record);
     }
-    // An inventory or enrollment the controller never acknowledged is
-    // superseded by the fresh one below, so it is not replayed.
-    std::erase_if(_pending, [](const Pending& p) { return p.inventory || p.enrollment; });
+    // An inventory, boot cache or enrollment the controller never
+    // acknowledged is superseded by the fresh one below, so it is not
+    // replayed.
+    std::erase_if(_pending, [](const Pending& p) { return p.snapshot || p.enrollment; });
     // The replay, in sequence order, then the fresh inventory and the
     // enrollment with the highest sequence numbers: the controller
     // processes reports in order and ends up holding the newest snapshot

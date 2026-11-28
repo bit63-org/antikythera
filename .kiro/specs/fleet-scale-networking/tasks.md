@@ -1,6 +1,6 @@
 # Implementation Plan — Network control at fleet scale
 
-## Status: 2/18 tasks complete
+## Status: 3/18 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -30,7 +30,7 @@ tasks 14-15. Phases A, B and C can run in parallel.
   report kind 31 `credential_request`, signing vectors, fuzz targets,
   `ak-test-controller` issuing credentials and revocations.
   _Requirements: 2.1-2.4, 10.1_ (cloud)
-- [ ] 3. Certified handshake in `Tunnel`: the `credential` message (type
+- [x] 3. Certified handshake in `Tunnel`: the `credential` message (type
   0x10), `CredentialCache`, verification order, per-source and role rate
   limits, cookie handling after the exchange, idle peer reclaim, expiry
   and revocation teardown; a reference model test and

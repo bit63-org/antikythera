@@ -32,6 +32,14 @@
 //                32 cookie [16 + 16]                                 (64 bytes)
 //   transport    0 type u8 = 4 | 1 reserved [3] | 4 receiver u32 | 8 counter u64
 //                16 packet [n + 16]                               (32 + n bytes)
+//   credential   0 type u8 = 0x10 | 1 reserved [3] | 4 flags u8 | 5 reserved [3]
+//                8 VtepCredential [160]                           (168 bytes)
+//
+// The credential message is antikythera's, not WireGuard's
+// (.kiro/specs/fleet-scale-networking/ design "Certified handshake"): it
+// uses a type WireGuard leaves unassigned, so a kernel peer never sees one
+// from a role that holds it in a peer list. Flag bit 0 asks the receiver
+// for its own credential; the other flag bits are reserved and zero.
 //
 // One deliberate difference from WireGuard over IP: a transport message
 // carries one Geneve UDP payload, not an IP packet, and so is not padded
@@ -64,6 +72,9 @@ inline constexpr std::size_t initiation_size = 148;
 inline constexpr std::size_t response_size = 92;
 inline constexpr std::size_t cookie_reply_size = 64;
 inline constexpr std::size_t transport_header_size = 16;
+inline constexpr std::size_t credential_body_size = 160;  // proto::vtep_credential_size
+inline constexpr std::size_t credential_message_size = 8 + credential_body_size;
+inline constexpr std::uint8_t credential_flag_send_yours = 0x01;
 // What a transport message adds to its payload: header plus tag. The guest
 // MTU (task 11) subtracts this on top of Geneve's overhead.
 inline constexpr std::size_t transport_overhead = transport_header_size + tag_size;
@@ -83,11 +94,12 @@ enum class MessageType : std::uint8_t {
     response = 2,
     cookie_reply = 3,
     transport = 4,
+    credential = 0x10,
 };
 
 enum class ParseError : std::uint8_t {
     empty,              // no bytes at all
-    unknown_type,       // first byte is not 1-4
+    unknown_type,       // first byte is not 1-4 or 0x10
     reserved_not_zero,  // bytes 1-3 are not zero
     bad_length,         // wrong size for the type (transport: shorter than 32)
 };
@@ -130,7 +142,12 @@ struct Transport {
     std::span<const std::byte> ciphertext;  // payload and tag, at least tag_size
 };
 
-using Message = std::variant<Initiation, Response, CookieReply, Transport>;
+struct Credential {
+    std::uint8_t flags{0};
+    std::span<const std::byte, credential_body_size> credential;
+};
+
+using Message = std::variant<Initiation, Response, CookieReply, Transport, Credential>;
 
 // Structural parse only: type, reserved bytes and length. Nothing is
 // authenticated yet; the Tunnel checks mac1 before any public-key work.

@@ -162,8 +162,9 @@ auto parse(std::span<const std::byte> d) noexcept -> std::expected<Message, Pars
         return std::unexpected(ParseError::empty);
     }
     const auto type = std::to_integer<std::uint8_t>(d[0]);
-    if (type < static_cast<std::uint8_t>(MessageType::initiation) ||
-        type > static_cast<std::uint8_t>(MessageType::transport)) {
+    if ((type < static_cast<std::uint8_t>(MessageType::initiation) ||
+         type > static_cast<std::uint8_t>(MessageType::transport)) &&
+        type != static_cast<std::uint8_t>(MessageType::credential)) {
         return std::unexpected(ParseError::unknown_type);
     }
     if (d.size() < header_size) {
@@ -218,6 +219,18 @@ auto parse(std::span<const std::byte> d) noexcept -> std::expected<Message, Pars
             return Transport{.receiver = receiver,
                              .counter = counter,
                              .ciphertext = d.subspan(transport_header_size)};
+        }
+        case MessageType::credential: {
+            if (d.size() != credential_message_size) {
+                return std::unexpected(ParseError::bad_length);
+            }
+            const auto flags = std::to_integer<std::uint8_t>(d[4]);
+            if ((flags & ~credential_flag_send_yours) != 0 || d[5] != std::byte{0} ||
+                d[6] != std::byte{0} || d[7] != std::byte{0}) {
+                return std::unexpected(ParseError::reserved_not_zero);
+            }
+            return Credential{.flags = flags,
+                              .credential = d.subspan(8).first<credential_body_size>()};
         }
     }
     return std::unexpected(ParseError::unknown_type);

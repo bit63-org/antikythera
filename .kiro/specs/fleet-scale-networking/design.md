@@ -170,9 +170,12 @@ Tunnel messages keep WireGuard's framing (`type u8 | reserved [3]`). One
 type is added in the range WireGuard leaves unused:
 
 ```
-credential (type 0x10): flags u8 (bit 0: send me yours) | reserved [2]
-                        | VtepCredential [160]
+credential (type 0x10): reserved [3] | flags u8 (bit 0: send me yours)
+                        | reserved [3] | VtepCredential [160]   (168 bytes)
 ```
+
+(`src/oar/net/wireguard.hpp`; the reserved bytes and the other flag bits
+must be zero.)
 
 ```
 initiator I                                   responder R
@@ -197,12 +200,30 @@ initiator I                                   responder R
 - **Cost bounds.** Unknown-credential verifies are rate limited per
   source address (default 16/s) and per role (default 2,000/s, about a
   tenth of a core); past the role limit, credentials from sources with no
-  existing session are dropped and counted. Handshake initiations keep
-  WireGuard's mac1/mac2 and cookie reply, which now apply after the
-  credential exchange since the initiator knows R's key.
+  existing session are dropped and counted (`credential_rate_limited`). At
+  most `max_sources` (4,096) sources are tracked; a flood of new sources
+  finds the table full. Replies are one per source per
+  `initiation_interval`, so a credential cannot be reflected faster than
+  the role answers handshakes. Handshake initiations keep mac1, which now
+  applies after the credential exchange since the initiator knows R's key.
+  The Tunnel never implemented WireGuard's cookie replies (oar-net design
+  "Tunnel"); certification does not change that.
 - **Peer state** (`Tunnel` peer record, sessions, counters) is created at
-  the first accepted handshake and reclaimed 5 minutes after its last
-  session expires, so memory follows active peers.
+  the first accepted handshake (on the initiator, when R's credential
+  verifies) and reclaimed 5 minutes after its last session expires, so
+  memory follows active peers; the cached credential outlives it, so a
+  reclaimed peer comes back without a new exchange.
+- **Recovery.** The Tunnel keeps Linux's new-handshake timer: sending for
+  `keepalive_timeout + rekey_timeout` (15 s) with nothing authenticated
+  back starts a handshake, and a certified peer's handshake retry
+  re-sends the credential with "send me yours". An end that dropped the
+  peer (revocation, expiry, reclaim, restart) is so recovered from as
+  soon as the peer is certifiable again.
+- **Rotation.** Once a role holds a credential for a new key of its own,
+  its next tick sends it to every certified peer with a session; they
+  replace the key and handshake again (a peer record holds one key, so
+  the old sessions go there, while the rotating role keeps answering
+  under its old key for the grace).
 - **Coexistence.** `TunnelPeerSet` and `set_tunnel_peer` peers are looked
   up first; a key found there is accepted without a credential, as today.
   A key with neither a list entry nor a valid credential is refused
@@ -211,8 +232,11 @@ initiator I                                   responder R
   VNI's VTEPs off `TunnelPeers` only when all of them set it, and back by
   sending `TunnelPeers` again.
 - **Expiry and revocation.** On credential expiry or revocation the role
-  drops the peer's sessions and cache entry; the peer must present a new
-  credential. Renewal with the same key keeps sessions.
+  drops the peer's sessions and cache entry (checked on every tick, at
+  least once a second); the peer must present a new credential. Within
+  `credential_refresh` (1 hour) of a peer's expiry a role with a session
+  asks it for its current credential; a renewal with the same key keeps
+  sessions.
 
 PSP, when it comes, uses the same credential: the receiver derives a
 per-SPI key from a device key, and the credential exchange is where the

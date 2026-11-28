@@ -150,6 +150,9 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
                     return inside(v.before_mac1, in) && inside(v.mac2, in);
                 } else if constexpr (std::is_same_v<T, wg::CookieReply>) {
                     return inside(v.encrypted_cookie, in);
+                } else if constexpr (std::is_same_v<T, wg::Credential>) {
+                    return inside(v.credential, in) &&
+                           (v.flags & ~wg::credential_flag_send_yours) == 0;
                 } else {
                     return inside(v.ciphertext, in) && v.ciphertext.size() >= wg::tag_size;
                 }

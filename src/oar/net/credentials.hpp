@@ -123,6 +123,12 @@ public:
     auto verify_peer(std::span<const std::byte> frame, const Ipv6Address& source)
         -> std::expected<proto::VtepCredential, PeerCredentialError>;
 
+    // Whether a credential verified earlier may still be used: inside its
+    // validity window and not revoked. No signature work.
+    [[nodiscard]] auto still_valid(const proto::VtepCredential& c) const
+        -> std::expected<void, PeerCredentialError>;
+    [[nodiscard]] auto skew() const noexcept -> std::chrono::seconds { return _config.skew; }
+
     // Unix seconds now, by the configured clock.
     [[nodiscard]] auto now_unix() const -> std::uint64_t;
     [[nodiscard]] auto counters() const noexcept -> const CredentialCounters& { return _counters; }

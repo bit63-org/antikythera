@@ -216,6 +216,10 @@ auto NetRole::create(NetRoleConfig config, const std::vector<NetTransport*>& tra
             return std::unexpected(std::format("tunnel: {}", to_string(tunnel.error())));
         }
         role->_tunnel = std::move(*tunnel);
+        // Certified peers (task 3): peers outside every peer list are
+        // admitted by credential. Until helm delivers this role's own
+        // credential it offers none, so only list peers can reach it.
+        role->_tunnel->set_credentials(role->_credentials.get());
         // The same controller keys sign MapUpdates and TunnelPeers frames.
         role->_peer_set = std::make_unique<TunnelPeerSet>(*role->_tunnel, role->_config.server_id,
                                                           role->_config.vtep, role->_verifier);

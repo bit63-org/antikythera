@@ -11,6 +11,7 @@
 #include <openssl/rand.h>
 
 #include "common/wire.hpp"
+#include "oar/net/credentials.hpp"
 
 namespace ak::oar::net {
 
@@ -104,6 +105,17 @@ struct Tunnel::Peer {
     std::optional<VtepClock::time_point> last_handshake;
     std::uint64_t tx_packets{0};
     std::uint64_t rx_packets{0};
+    // A certified peer: what its credential said when it was admitted
+    // (renewals of the same key update it).
+    bool certified{false};
+    std::uint32_t cell_id{0};
+    std::uint64_t serial{0};
+    std::uint64_t not_after{0};
+    std::optional<VtepClock::time_point> idle_since;
+    std::optional<VtepClock::time_point> refresh_asked;
+    // Linux's new-handshake timer: the first send since anything last
+    // authenticated from this peer.
+    std::optional<VtepClock::time_point> unanswered_since;
 };
 
 auto to_string(TunnelConfigError e) noexcept -> const char* {
@@ -160,6 +172,14 @@ auto to_string(TunnelDrop d) noexcept -> const char* {
             return "cookie_reply";
         case TunnelDrop::bad_key:
             return "bad_key";
+        case TunnelDrop::uncertified:
+            return "uncertified";
+        case TunnelDrop::credential_refused:
+            return "credential_refused";
+        case TunnelDrop::credential_rate_limited:
+            return "credential_rate_limited";
+        case TunnelDrop::credential_conflict:
+            return "credential_conflict";
     }
     return "unknown";
 }
@@ -183,11 +203,19 @@ auto Tunnel::create(DatagramSender& underlay, TunnelConfig config)
     if (config.rekey_after_messages >= config.reject_after_messages) {
         return std::unexpected(TunnelConfigError::bad_limits);
     }
+    if (config.credential_cache_size == 0 || config.max_sources == 0 ||
+        !(config.source_verify_rate > 0) || !(config.role_verify_rate > 0)) {
+        return std::unexpected(TunnelConfigError::bad_limits);
+    }
+    if (config.certified_idle <= milliseconds::zero() ||
+        config.credential_refresh <= std::chrono::seconds::zero()) {
+        return std::unexpected(TunnelConfigError::bad_timers);
+    }
     return std::unique_ptr<Tunnel>{new Tunnel(underlay, std::move(config))};
 }
 
 Tunnel::Tunnel(DatagramSender& underlay, TunnelConfig config)
-    : _underlay{&underlay}, _config{std::move(config)} {
+    : _underlay{&underlay}, _config{std::move(config)}, _cache{_config.credential_cache_size} {
     _initial_chain = wg::hash({text(construction)});
     _initial_hash = wg::hash({_initial_chain, text(identifier)});
 }
@@ -343,6 +371,12 @@ auto Tunnel::set_peer(const Ipv6Address& vtep, std::span<const std::byte, wg::ke
     if (_private && pub == _public) {
         return std::unexpected(TunnelKeyError::own_key);
     }
+    // A peer list wins over a credential: a certified peer holding this key
+    // elsewhere makes way.
+    if (const auto it = _by_key.find(pub);
+        it != _by_key.end() && it->second->vtep != vtep && it->second->certified) {
+        drop_peer(_peers.find(it->second->vtep));
+    }
     if (const auto it = _by_key.find(pub); it != _by_key.end() && it->second->vtep != vtep) {
         return std::unexpected(TunnelKeyError::duplicate_key);
     }
@@ -361,7 +395,8 @@ auto Tunnel::set_peer(const Ipv6Address& vtep, std::span<const std::byte, wg::ke
     if (it != _peers.end()) {
         Peer& p = *it->second;
         if (p.public_key == pub && wg::equal(p.psk.span(), psk)) {
-            return {};  // unchanged: keep the sessions
+            p.certified = false;  // a peer list now names it
+            return {};            // unchanged: keep the sessions
         }
         _by_key.erase(p.public_key);
         clear_sessions(p);
@@ -377,6 +412,7 @@ auto Tunnel::set_peer(const Ipv6Address& vtep, std::span<const std::byte, wg::ke
     p.mac1_key = wg::hash({text(label_mac1), pub});
     p.static_dh = std::move(static_dh);
     p.retiring_dh = std::move(retiring_dh);
+    p.certified = false;
     _by_key[pub] = &p;
     return {};
 }
@@ -440,6 +476,7 @@ auto Tunnel::clear_sessions(Peer& peer) -> void {
     peer.hs_ephemeral.wipe();
     peer.hs_chain.wipe();
     peer.last_handshake.reset();
+    peer.unanswered_since.reset();
 }
 
 auto Tunnel::usable(const Keypair& kp, VtepClock::time_point now) const -> bool {
@@ -501,6 +538,11 @@ auto Tunnel::initiate(Peer& peer, VtepClock::time_point now) -> void {
 
     if (peer.handshaking) {
         release_index(peer.hs_index);  // a retry: the old index is dead
+        // An unanswered certified handshake: the responder may have dropped
+        // us (revoked, expired, reclaimed), so present the credential again.
+        if (peer.certified && send_credential(peer.vtep, wg::credential_flag_send_yours)) {
+            ++_counters.credentials_tx;
+        }
     } else {
         peer.hs_started = now;
     }
@@ -553,15 +595,43 @@ auto Tunnel::handle_initiation(const wg::Initiation& m, const Ipv6Address& outer
     }
     mix_hash(h, m.encrypted_static);
 
-    const auto found = _by_key.find(static_pub);
-    if (found == _by_key.end()) {
-        return drop(TunnelDrop::unknown_peer);
+    Peer* known = nullptr;
+    if (const auto found = _by_key.find(static_pub); found != _by_key.end()) {
+        known = found->second;
     }
-    Peer& peer = *found->second;
-    if (peer.vtep != outer_src) {
+    // A key in no peer list may still be a certified peer: its credential
+    // must be cached, valid, name this source, and the VTEP must not be a
+    // list peer's.
+    std::optional<proto::VtepCredential> certificate;
+    std::optional<SecretKey> fresh_dh;
+    if (known == nullptr) {
+        if (_store == nullptr) {
+            return drop(TunnelDrop::unknown_peer);
+        }
+        const auto* cached = _cache.find(static_pub);
+        if (cached == nullptr) {
+            return drop(TunnelDrop::uncertified);
+        }
+        if (cached->credential.vtep != outer_src) {
+            return drop(TunnelDrop::wrong_source);
+        }
+        if (const auto at = _peers.find(outer_src); at != _peers.end() && !at->second->certified) {
+            return drop(TunnelDrop::uncertified);
+        }
+        if (!_store->still_valid(cached->credential)) {
+            _cache.erase(static_pub);
+            return drop(TunnelDrop::uncertified);
+        }
+        certificate = cached->credential;
+        fresh_dh = wg::dh(own_private->span(), static_pub);
+        if (!fresh_dh) {
+            return drop(TunnelDrop::bad_key);
+        }
+    } else if (known->vtep != outer_src) {
         return drop(TunnelDrop::wrong_source);
     }
-    const auto& static_dh = retiring ? peer.retiring_dh : peer.static_dh;
+    const std::optional<SecretKey>& static_dh =
+        known == nullptr ? fresh_dh : (retiring ? known->retiring_dh : known->static_dh);
     if (!static_dh) {
         return drop(TunnelDrop::bad_key);
     }
@@ -571,6 +641,14 @@ auto Tunnel::handle_initiation(const wg::Initiation& m, const Ipv6Address& outer
         return drop(TunnelDrop::decrypt_failed);
     }
     mix_hash(h, m.encrypted_timestamp);
+    if (known == nullptr) {
+        // The initiator proved it holds the certified key: admit it.
+        known = install_certified(outer_src, static_pub, *certificate);
+        if (known == nullptr) {
+            return drop(TunnelDrop::bad_key);
+        }
+    }
+    Peer& peer = *known;
 
     const auto t = now();
     if (peer.last_timestamp && stamp <= *peer.last_timestamp) {
@@ -720,6 +798,7 @@ auto Tunnel::handle_response(const wg::Response& m, const Ipv6Address& outer_src
     }
     peer.current = std::move(kp);
     peer.last_handshake = t;
+    peer.unanswered_since.reset();
     ++_counters.responses_rx;
     ++_counters.sessions_established;
     // Confirm the session to the responder at once with a keepalive.
@@ -763,6 +842,7 @@ auto Tunnel::handle_transport(const wg::Transport& m, const Ipv6Address& outer_s
     if (!kp->window.accept(m.counter)) {
         return drop(TunnelDrop::replay);
     }
+    peer.unanswered_since.reset();
     if (kp == peer.next.get()) {
         // The initiator used the new session: it is confirmed.
         release(peer.previous);
@@ -792,13 +872,45 @@ auto Tunnel::send_to(const Ipv6Address& dst, std::uint16_t dst_port, std::uint16
         ++_counters.tx_no_key;
         return false;
     }
-    const auto it = _peers.find(dst);
+    auto it = _peers.find(dst);
+    const auto t = now();
+    if (it == _peers.end() && _store != nullptr) {
+        // No list peer: a cached, still valid credential admits it now;
+        // otherwise ask for one, at most once per rekey_timeout.
+        if (const auto* cached = _cache.find_vtep(dst); cached != nullptr) {
+            if (_store->still_valid(cached->credential)) {
+                if (auto* p =
+                        install_certified(dst, cached->credential.public_key, cached->credential);
+                    p != nullptr) {
+                    it = _peers.find(dst);
+                }
+            } else {
+                _cache.erase_vtep(dst);
+            }
+        }
+        if (it == _peers.end() && !_store->own(_public)) {
+            ++_counters.tx_no_peer;  // nothing to offer: only list peers reach us
+            return false;
+        }
+        if (it == _peers.end()) {
+            const auto asked = _wanted.find(dst);
+            if (asked == _wanted.end() || t - asked->second >= _config.rekey_timeout) {
+                if (_wanted.size() < _config.max_sources || asked != _wanted.end()) {
+                    if (send_credential(dst, wg::credential_flag_send_yours)) {
+                        _wanted[dst] = t;
+                        ++_counters.credentials_tx;
+                    }
+                }
+            }
+            ++_counters.tx_no_session;
+            return false;
+        }
+    }
     if (it == _peers.end()) {
         ++_counters.tx_no_peer;
         return false;
     }
     Peer& peer = *it->second;
-    const auto t = now();
     if (!peer.current || !usable(*peer.current, t)) {
         ++_counters.tx_no_session;
         initiate(peer, t);
@@ -809,6 +921,15 @@ auto Tunnel::send_to(const Ipv6Address& dst, std::uint16_t dst_port, std::uint16
     // Linux's keep_key_fresh on send.
     if (kp.initiator && (kp.send_counter > _config.rekey_after_messages ||
                          t - kp.created >= _config.rekey_after_time)) {
+        initiate(peer, t);
+    }
+    // Linux's new-handshake timer: sending for keepalive_timeout +
+    // rekey_timeout with nothing authenticated back means the other end
+    // lost the session (restarted, or dropped us); handshake again.
+    if (!peer.unanswered_since) {
+        peer.unanswered_since = t;
+    } else if (t - *peer.unanswered_since >= _config.keepalive_timeout + _config.rekey_timeout) {
+        peer.unanswered_since = t;
         initiate(peer, t);
     }
     return sent;
@@ -864,6 +985,9 @@ auto Tunnel::receive(std::span<const std::byte> datagram, const Ipv6Address& out
     if (const auto* m = std::get_if<wg::Transport>(&*message)) {
         return handle_transport(*m, outer_src);
     }
+    if (const auto* m = std::get_if<wg::Credential>(&*message)) {
+        return handle_credential(*m, outer_src);
+    }
     return drop(TunnelDrop::cookie_reply);
 }
 
@@ -876,6 +1000,9 @@ auto Tunnel::tick() -> VtepClock::time_point {
         } else {
             next = _retiring->until;
         }
+    }
+    if (_store != nullptr) {
+        next = std::min(next, tick_certified(t));
     }
     for (auto& [vtep, p] : _peers) {
         Peer& peer = *p;
@@ -917,11 +1044,291 @@ auto Tunnel::peers() const -> std::vector<TunnelPeerStatus> {
                        .public_key = p->public_key,
                        .session = p->current && usable(*p->current, t),
                        .handshaking = p->handshaking,
+                       .certified = p->certified,
                        .last_handshake = p->last_handshake,
                        .tx_packets = p->tx_packets,
                        .rx_packets = p->rx_packets});
     }
     return out;
+}
+
+// ---- Certified peers --------------------------------------------------------
+
+auto Tunnel::Bucket::take(double rate, VtepClock::time_point now) -> bool {
+    if (!at) {
+        tokens = rate;
+    } else {
+        const std::chrono::duration<double> elapsed = now - *at;
+        tokens = std::min(rate, tokens + (std::max(0.0, elapsed.count()) * rate));
+    }
+    at = now;
+    if (tokens < 1.0) {
+        return false;
+    }
+    tokens -= 1.0;
+    return true;
+}
+
+auto Tunnel::set_credentials(CredentialStore* store) -> void {
+    if (store == _store) {
+        return;
+    }
+    for (auto it = _peers.begin(); it != _peers.end();) {
+        it = it->second->certified ? drop_peer(it) : std::next(it);
+    }
+    _store = store;
+    _cache = CredentialCache{_config.credential_cache_size};
+    _sources.clear();
+    _wanted.clear();
+    _announced.reset();
+    _role_bucket = {};
+}
+
+auto Tunnel::drop_peer(std::map<Ipv6Address, std::unique_ptr<Peer>>::iterator it)
+    -> std::map<Ipv6Address, std::unique_ptr<Peer>>::iterator {
+    if (it == _peers.end()) {
+        return it;
+    }
+    clear_sessions(*it->second);
+    _by_key.erase(it->second->public_key);
+    return _peers.erase(it);
+}
+
+auto Tunnel::has_session(const Peer& peer) const -> bool {
+    return peer.current || peer.previous || peer.next || peer.handshaking;
+}
+
+auto Tunnel::install_certified(const Ipv6Address& vtep, const Key& key,
+                               const proto::VtepCredential& credential) -> Peer* {
+    if (!_private || key == _public || (_retiring && key == _retiring->public_key)) {
+        return nullptr;
+    }
+    if (const auto held = _by_key.find(key); held != _by_key.end() && held->second->vtep != vtep) {
+        if (!held->second->certified) {
+            return nullptr;  // a list peer's key
+        }
+        drop_peer(_peers.find(held->second->vtep));
+    }
+    auto it = _peers.find(vtep);
+    if (it != _peers.end() && !it->second->certified) {
+        return nullptr;  // a list peer's VTEP: the list decides its key
+    }
+    auto static_dh = wg::dh(_private->span(), key);
+    if (!static_dh) {
+        return nullptr;
+    }
+    if (it == _peers.end()) {
+        it = _peers.emplace(vtep, std::make_unique<Peer>()).first;
+        it->second->vtep = vtep;
+        ++_counters.certified_peers_added;
+    } else if (it->second->public_key != key) {
+        // The peer rotated its key: its sessions were under the old one.
+        _by_key.erase(it->second->public_key);
+        clear_sessions(*it->second);
+        it->second->last_timestamp.reset();
+        it->second->last_initiation_rx.reset();
+    }
+    Peer& p = *it->second;
+    p.public_key = key;
+    p.psk = SecretKey{};
+    p.mac1_key = wg::hash({text(label_mac1), key});
+    p.static_dh = std::move(static_dh);
+    p.retiring_dh.reset();
+    if (_retiring) {
+        p.retiring_dh = wg::dh(_retiring->private_key.span(), key);
+    }
+    p.certified = true;
+    p.cell_id = credential.cell_id;
+    p.serial = credential.serial;
+    p.not_after = credential.not_after;
+    p.idle_since.reset();
+    p.refresh_asked.reset();
+    _by_key[key] = &p;
+    return &p;
+}
+
+auto Tunnel::source(const Ipv6Address& addr, VtepClock::time_point now) -> Source* {
+    auto it = _sources.find(addr);
+    if (it == _sources.end()) {
+        if (_sources.size() >= _config.max_sources) {
+            // Make room from sources quiet for a second; a flood of new
+            // sources finds the table full and is refused.
+            for (auto s = _sources.begin(); s != _sources.end();) {
+                s = now - s->second.last_used >= std::chrono::seconds{1} ? _sources.erase(s)
+                                                                         : std::next(s);
+            }
+            if (_sources.size() >= _config.max_sources) {
+                return nullptr;
+            }
+        }
+        it = _sources.emplace(addr, Source{}).first;
+    }
+    it->second.last_used = now;
+    return &it->second;
+}
+
+auto Tunnel::send_credential(const Ipv6Address& dst, std::uint8_t flags) -> bool {
+    if (_store == nullptr || !_private) {
+        return false;
+    }
+    const auto own = _store->own(_public);
+    if (!own || own->size() != wg::credential_body_size) {
+        return false;
+    }
+    std::array<std::byte, wg::credential_message_size> msg{};
+    const std::span<std::byte> m{msg};
+    put_header(m, wg::MessageType::credential);
+    m[4] = std::byte{flags};
+    std::copy(own->begin(), own->end(), m.begin() + 8);
+    if (!_underlay->send_to(dst, _config.peer_port, flow_port_base, m)) {
+        ++_counters.tx_send_failed;
+        return false;
+    }
+    return true;
+}
+
+auto Tunnel::handle_credential(const wg::Credential& m, const Ipv6Address& outer_src)
+    -> std::optional<Opened> {
+    if (_store == nullptr) {
+        return drop(TunnelDrop::uncertified);
+    }
+    if (!_private) {
+        return drop(TunnelDrop::no_private_key);
+    }
+    const auto t = now();
+    auto* src = source(outer_src, t);
+    if (src == nullptr) {
+        return drop(TunnelDrop::credential_rate_limited);
+    }
+    const auto* cached = _cache.find_vtep(outer_src);
+    std::optional<proto::VtepCredential> credential;
+    if (cached != nullptr && std::ranges::equal(cached->frame, m.credential)) {
+        if (!_store->still_valid(cached->credential)) {
+            _cache.erase_vtep(outer_src);
+            return drop(TunnelDrop::credential_refused);
+        }
+        credential = cached->credential;
+        ++_counters.credentials_cached;
+    } else {
+        const auto at = _peers.find(outer_src);
+        const bool in_session = at != _peers.end() && has_session(*at->second);
+        if (!src->verifies.take(_config.source_verify_rate, t)) {
+            return drop(TunnelDrop::credential_rate_limited);
+        }
+        // Past the role's limit only sources with a session are verified.
+        if (!_role_bucket.take(_config.role_verify_rate, t) && !in_session) {
+            return drop(TunnelDrop::credential_rate_limited);
+        }
+        auto verified = _store->verify_peer(m.credential, outer_src);
+        if (!verified) {
+            return drop(TunnelDrop::credential_refused);
+        }
+        const auto& key = verified->public_key;
+        if (key == _public || (_retiring && key == _retiring->public_key)) {
+            return drop(TunnelDrop::credential_conflict);
+        }
+        if (const auto held = _by_key.find(key);
+            held != _by_key.end() && !held->second->certified && held->second->vtep != outer_src) {
+            return drop(TunnelDrop::credential_conflict);
+        }
+        _cache.insert(*verified, m.credential);
+        ++_counters.credentials_verified;
+        credential = *verified;
+    }
+    // A certified peer at this address follows its newest credential: a
+    // renewal of the same key keeps the sessions, a new key replaces them.
+    const auto at = _peers.find(outer_src);
+    if (at != _peers.end() && at->second->certified) {
+        static_cast<void>(install_certified(outer_src, credential->public_key, *credential));
+    }
+    if ((m.flags & wg::credential_flag_send_yours) != 0 &&
+        (!src->last_reply || t - *src->last_reply >= _config.initiation_interval)) {
+        if (send_credential(outer_src, 0)) {
+            src->last_reply = t;
+            ++_counters.credential_replies_tx;
+        }
+    }
+    // We asked for this one: start the handshake.
+    if (const auto asked = _wanted.find(outer_src); asked != _wanted.end()) {
+        _wanted.erase(asked);
+        if (_peers.find(outer_src) == _peers.end()) {
+            if (auto* p = install_certified(outer_src, credential->public_key, *credential);
+                p != nullptr) {
+                initiate(*p, t);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+auto Tunnel::tick_certified(VtepClock::time_point now) -> VtepClock::time_point {
+    const auto t = now;
+    auto next = VtepClock::time_point::max();
+    const auto unix_now = _store->now_unix();
+    const auto skew = static_cast<std::uint64_t>(_store->skew().count());
+    const auto refresh = static_cast<std::uint64_t>(_config.credential_refresh.count());
+    bool any = false;
+    // A credential for a new key of ours goes to the peers we talk to.
+    const bool announce =
+        _private && (!_announced || *_announced != _public) && _store->own(_public).has_value();
+    if (announce) {
+        _announced = _public;
+    }
+    for (auto it = _peers.begin(); it != _peers.end();) {
+        Peer& peer = *it->second;
+        if (announce && peer.certified && has_session(peer) && send_credential(peer.vtep, 0)) {
+            ++_counters.credentials_tx;
+        }
+        if (!peer.certified) {
+            ++it;
+            continue;
+        }
+        any = true;
+        if (peer.not_after + skew <= unix_now) {
+            _cache.erase(peer.public_key);
+            ++_counters.certified_expired;
+            it = drop_peer(it);
+            continue;
+        }
+        if (_store->revoked(peer.cell_id, peer.serial)) {
+            _cache.erase(peer.public_key);
+            ++_counters.certified_revoked;
+            it = drop_peer(it);
+            continue;
+        }
+        if (has_session(peer)) {
+            peer.idle_since.reset();
+            // Near expiry, ask a peer we talk to for its renewed credential.
+            if (unix_now + refresh >= peer.not_after &&
+                (!peer.refresh_asked || t - *peer.refresh_asked >= _config.rekey_timeout) &&
+                send_credential(peer.vtep, wg::credential_flag_send_yours)) {
+                peer.refresh_asked = t;
+                ++_counters.credentials_tx;
+            }
+        } else if (!peer.idle_since) {
+            peer.idle_since = t;
+        } else if (t - *peer.idle_since >= _config.certified_idle) {
+            ++_counters.certified_peers_reclaimed;
+            it = drop_peer(it);
+            continue;
+        }
+        if (peer.idle_since) {
+            next = std::min(next, *peer.idle_since + _config.certified_idle);
+        }
+        ++it;
+    }
+    // Requests nobody answered are forgotten after a handshake's lifetime.
+    for (auto it = _wanted.begin(); it != _wanted.end();) {
+        it = t - it->second >= _config.rekey_attempt_time ? _wanted.erase(it) : std::next(it);
+    }
+    if (!_wanted.empty()) {
+        any = true;
+    }
+    // Wall-clock deadlines (expiry, revocation) are checked once a second.
+    if (any) {
+        next = std::min(next, t + std::chrono::seconds{1});
+    }
+    return next;
 }
 
 auto pump(UdpEndpoint& endpoint, Tunnel& tunnel, Vtep& vtep, VSwitch& vswitch,

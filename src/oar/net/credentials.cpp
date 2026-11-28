@@ -186,19 +186,27 @@ auto CredentialStore::verify_peer(std::span<const std::byte> frame, const Ipv6Ad
     if (!signature_ok(frame, c->signature, c->key_id)) {
         return refuse(PeerCredentialError::bad_signature);
     }
-    const auto now = now_unix();
-    const auto skew = static_cast<std::uint64_t>(_config.skew.count());
-    if (now + skew < c->not_before) {
-        return refuse(PeerCredentialError::not_yet_valid);
-    }
-    if (c->not_after + skew <= now) {
-        return refuse(PeerCredentialError::expired);
-    }
-    if (revoked(c->cell_id, c->serial)) {
-        return refuse(PeerCredentialError::revoked);
+    if (auto ok = still_valid(*c); !ok) {
+        return refuse(ok.error());
     }
     ++_counters.peer_verified;
     return *c;
+}
+
+auto CredentialStore::still_valid(const proto::VtepCredential& c) const
+    -> std::expected<void, PeerCredentialError> {
+    const auto now = now_unix();
+    const auto skew = static_cast<std::uint64_t>(_config.skew.count());
+    if (now + skew < c.not_before) {
+        return std::unexpected(PeerCredentialError::not_yet_valid);
+    }
+    if (c.not_after + skew <= now) {
+        return std::unexpected(PeerCredentialError::expired);
+    }
+    if (revoked(c.cell_id, c.serial)) {
+        return std::unexpected(PeerCredentialError::revoked);
+    }
+    return {};
 }
 
 }  // namespace ak::oar::net

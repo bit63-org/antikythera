@@ -101,6 +101,15 @@ the frame names their VTEP. Every peer must be in WireGuard mode: the role
 advertises only WireGuard, so a peer in PSP mode (reserved for a later
 move to NIC offload) refuses the whole frame.
 
+At fleet scale peers need not be listed at all
+(`.kiro/specs/fleet-scale-networking/` design "Certified handshake"): the
+Tunnel holds the role's `CredentialStore`, exchanges controller-signed
+VTEP credentials (`credential` messages, type 0x10) with a VTEP in no
+list before WireGuard's handshake, caches what it verified, and creates
+the peer at the first accepted handshake. List peers are looked up first
+and need no credential; a key that is neither listed nor certified is
+refused (`uncertified`).
+
 ### Group policy and metering
 
 Requirement 10. Each VNI has a `GroupPolicy`: `mode` (`drop`, the

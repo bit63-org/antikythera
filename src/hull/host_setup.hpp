@@ -25,13 +25,17 @@
 //       handed out by the slot lines like any other function. The PF itself
 //       is never in the inventory, never opened and never given a DMA
 //       mapping, so its ID may not also be a slot's ID on that port;
-//   server-id cmdline | server-id file <absolute path>
+//   server-id cmdline | server-id file <absolute path> | server-id partition
 //       where the agent's server ID comes from: the kernel command line's
 //       hull.server_id= (part of the signed UKI), or a provisioning file
 //       (a measured one in production): helm's Provisioning frame
 //       (proto/provisioning.hpp), which also carries the boot epoch and
 //       the command sequence floor (.kiro/specs/cold-start/ Requirement
-//       6), or the older file holding only the server ID in decimal.
+//       6), or the older file holding only the server ID in decimal; or
+//       the "ak-provisioning" partition of helm's boot function, which
+//       init measures into the TPM before reading (measured_boot.hpp;
+//       .kiro/specs/server-provisioning/ Requirement 4), the production
+//       source;
 //
 // `#` starts a comment; blank lines are ignored; anything else is an
 // error. The parser is strict and fuzzed (fuzz/fuzz_host_config.cpp).
@@ -88,8 +92,9 @@ struct SriovRule {
 };
 
 enum class ServerIdSource : std::uint8_t {
-    cmdline,  // hull.server_id= on the kernel command line
-    file,     // a provisioning file holding the ID in decimal
+    cmdline,    // hull.server_id= on the kernel command line
+    file,       // a provisioning file holding the ID in decimal
+    partition,  // helm's boot function: the measured "ak-provisioning" partition
 };
 
 struct HostConfig {

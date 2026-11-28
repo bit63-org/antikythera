@@ -164,6 +164,9 @@ BOOST_AUTO_TEST_CASE(parses_the_allow_list) {
     BOOST_TEST_REQUIRE(f.has_value());
     BOOST_TEST(f->slots.empty());
     BOOST_TEST(f->server_id_source == ServerIdSource::file);
+    const auto part = parse_host_config("mailbox 1af4:10ff\nserver-id partition\n");
+    BOOST_TEST_REQUIRE(part.has_value());
+    BOOST_TEST(part->server_id_source == ServerIdSource::partition);
     BOOST_TEST(f->server_id_file == fs::path{"/etc/hull/server-id"});
     BOOST_TEST(parse_host_config("\tmailbox\t1af4:10ff  \n\n# x\nserver-id cmdline").has_value());
 }
@@ -197,7 +200,7 @@ BOOST_AUTO_TEST_CASE(rejects_a_bad_allow_list) {
                       "slot 2 port 0000:00:01.0 type blk_fn id 1b36:0010\n") ==
                "port listed twice");
     BOOST_TEST(reason("mailbox 1af4:10ff\nserver-id file relative\n") ==
-               "server-id cmdline | server-id file <absolute path>");
+               "server-id cmdline | server-id file <absolute path> | server-id partition");
     BOOST_TEST(reason("mailbox 1af4:10ff\nserver-id file /etc/../x\n") ==
                "server-id file path is not normal");
     BOOST_TEST(reason(head + "kernel /boot/vmlinuz\n") == "unknown keyword");

@@ -324,6 +324,8 @@ auto parse_host_config(std::string_view text) -> std::expected<HostConfig, Parse
                 }
                 if (w.size() == 2 && w[1] == "cmdline") {
                     cfg.server_id_source = ServerIdSource::cmdline;
+                } else if (w.size() == 2 && w[1] == "partition") {
+                    cfg.server_id_source = ServerIdSource::partition;
                 } else if (w.size() == 3 && w[1] == "file" && w[2].starts_with('/')) {
                     const fs::path p{w[2]};
                     if (p.lexically_normal() != p) {
@@ -332,7 +334,9 @@ auto parse_host_config(std::string_view text) -> std::expected<HostConfig, Parse
                     cfg.server_id_source = ServerIdSource::file;
                     cfg.server_id_file = p;
                 } else {
-                    return bad(n, "server-id cmdline | server-id file <absolute path>");
+                    return bad(n,
+                               "server-id cmdline | server-id file <absolute path> | "
+                               "server-id partition");
                 }
                 have_server_id = true;
                 return {};

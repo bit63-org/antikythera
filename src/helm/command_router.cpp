@@ -1755,6 +1755,9 @@ auto CommandRouter::on_event(const mailbox::Body& body) -> void {
     } else if (const auto* f = std::get_if<mailbox::HostFault>(&body)) {
         _reports->report(proto::HostFaultReport{
             .code = static_cast<proto::FaultCode>(f->code), .slot = f->slot, .detail = f->detail});
+        if (f->code == mailbox::FaultCode::agent_restarted) {
+            ++_stats.agent_restarts;
+        }
         // hull's first message of a boot: it is up, so standing starts may go.
         if (f->code == mailbox::FaultCode::agent_restarted && _standing && !_standing->ready) {
             _standing->ready = true;

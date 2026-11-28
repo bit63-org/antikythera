@@ -83,7 +83,7 @@ types 23-24 and report kinds 27-28.
 
 | Report | Kind | Body |
 |---|---|---|
-| `cold_start` | 27 | power-return time, time floor, waited ms, boot source, per standing instance: ID and result, store faults, rollback flag |
+| `cold_start` | 27 | power-return time, time floor, waited ms, boot source, per standing instance: ID and result, store faults, rollback flag, assigned image unavailable flag |
 | `boot_cache` | 28 | LKG and previous image digests, standing generation, policy version, store free bytes |
 
 `standing_set` is large (it carries launch bodies and wrapped secrets);

@@ -492,6 +492,7 @@ struct RouterStats {
     std::uint64_t standing_started{0};
     std::uint64_t standing_failed{0};     // attempts that failed (each may be retried)
     std::uint64_t standing_abandoned{0};  // never started: the controller took over
+    std::uint64_t agent_restarts{0};      // HOST_FAULT agent_restarted: hull's agent came up
 };
 
 class CommandRouter {

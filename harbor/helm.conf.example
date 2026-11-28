@@ -27,5 +27,15 @@ host /usr/local/bin/harbor-l1 --server 7
 power-on-policy skip
 # controller-keys 1:<64 hex digits>     # verifies stored power policies
 
+# The boot function (server-provisioning task 4): with a sealed store,
+# helm writes the hull UKI it chose (assigned, else LKG, else previous)
+# and this boot's provisioning frame here before each release; pass the
+# same path to harbor/l1/run.sh --boot-function.
+# store /var/lib/antikythera/helm-store
+# store-anchor /var/lib/antikythera/helm-anchor
+# image-keys 1:<64 hex digits>
+# boot-function /run/antikythera/boot-function.img
+# boot-layer /etc/antikythera/boot-layer.conf   # where assigned images are fetched
+
 command-timeout-ms 30000
 link-timeout-ms 30000

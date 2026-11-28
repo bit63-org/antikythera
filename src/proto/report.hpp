@@ -135,7 +135,8 @@
 //     power_return_time u64 (helm's RTC, Unix seconds) | time_floor u64
 //     waited_ms u32 (the power-on hold helm applied)
 //     boot_source u8 (BootSource) | flags u8 (bit 0: store rollback
-//     detected; bit 1: RTC read below the time floor) | count u16
+//     detected; bit 1: RTC read below the time floor; bit 2: an assigned
+//     image could not be fetched or checked, so another booted) | count u16
 //     store_faults u32 (sealed-store objects discarded) | rsvd u32
 //     entries  count x 16, strictly increasing vm_id, at most
 //              max_standing_instances:
@@ -319,8 +320,9 @@ inline constexpr std::size_t cold_start_entry_size = 16;
 inline constexpr std::size_t boot_cache_size = (2 * image_digest_size) + 32;
 inline constexpr std::uint8_t cold_start_rollback = 0x01;
 inline constexpr std::uint8_t cold_start_rtc_below_floor = 0x02;
+inline constexpr std::uint8_t cold_start_assigned_unavailable = 0x04;
 inline constexpr std::uint8_t known_cold_start_flags =
-    cold_start_rollback | cold_start_rtc_below_floor;
+    cold_start_rollback | cold_start_rtc_below_floor | cold_start_assigned_unavailable;
 inline constexpr std::size_t identity_text_size = 32;
 inline constexpr std::size_t hardware_identity_fixed_size = (3 * identity_text_size) + 16;
 inline constexpr std::size_t identity_slot_size = 8 + (2 * identity_text_size);

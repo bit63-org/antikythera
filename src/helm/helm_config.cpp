@@ -144,6 +144,12 @@ public:
         if (!_config.store && _seen.contains("store-size")) {
             return std::unexpected("store-size without store");
         }
+        if (_config.boot_function && !_config.store) {
+            return std::unexpected("boot-function without store");
+        }
+        if (_config.boot_layer && !_config.boot_function) {
+            return std::unexpected("boot-layer without boot-function");
+        }
         if (_config.controller_name.empty()) {
             _config.controller_name = _config.controller_host;
         }
@@ -212,6 +218,12 @@ private:
             _config.controller_keys = value;
         } else if (name == "image-keys") {
             _config.image_keys = value;
+        } else if (name == "boot-function") {
+            _config.boot_function = std::filesystem::path{value};
+        } else if (name == "boot-layer") {
+            _config.boot_layer = std::filesystem::path{value};
+        } else if (name == "host-start-timeout-ms") {
+            return millis(value, _config.host_start_timeout);
         } else if (name == "power-on-policy") {
             if (value != "apply" && value != "skip") {
                 return fail("power-on-policy must be apply or skip");

@@ -22,6 +22,9 @@ auto make_cold_start(const ColdStartFacts& facts, const SealedStore* store) -> p
     if (facts.rtc_below_floor) {
         c.flags |= proto::cold_start_rtc_below_floor;
     }
+    if (facts.assigned_image_unavailable) {
+        c.flags |= proto::cold_start_assigned_unavailable;
+    }
     if (store != nullptr) {
         c.store_faults = store->faults();
         if (store->rolled_back()) {

@@ -591,7 +591,7 @@ BOOST_AUTO_TEST_CASE(cold_start_layout_and_rules) {
     c.boot_source = static_cast<proto::BootSource>(4);
     BOOST_TEST((report_error(c) == DecodeError::unknown_value));
     c = cold_start();
-    c.flags = 0x04;
+    c.flags = 0x08;
     BOOST_TEST((report_error(c) == DecodeError::unknown_value));
     c = cold_start();
     c.standing[1].vm_id = c.standing[0].vm_id;

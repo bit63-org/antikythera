@@ -212,6 +212,13 @@ enum class RecordType : std::uint16_t {
     boot_image = 25,
 };
 
+// The command code a CommandOutcome carries for a link record helm acts on
+// itself (host_power, decommission): 0x8000 | the record type, outside
+// the mailbox's message types, so it never names a hull command.
+[[nodiscard]] constexpr auto link_record_command(RecordType t) noexcept -> std::uint16_t {
+    return static_cast<std::uint16_t>(0x8000U | static_cast<std::uint16_t>(t));
+}
+
 // Which khold roles a self_test record asks.
 enum class SelfTestScope : std::uint8_t {
     slot = 1,  // the khold role in `slot`

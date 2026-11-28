@@ -1766,6 +1766,55 @@ auto CommandRouter::on_event(const mailbox::Body& body) -> void {
     }
 }
 
+auto CommandRouter::claim_sequence(std::uint64_t seq, std::uint16_t command)
+    -> proto::CommandStatus {
+    if (seq <= _last_seq) {
+        ++_stats.refused;
+        audit(AuditRecord::of(AuditEvent::command_refused)
+                  .with_seq(seq)
+                  .with_command(command)
+                  .with_status(status_code(mailbox::Status::stale_sequence)));
+        return proto::CommandStatus::stale_sequence;
+    }
+    if (_config.sequence_recorder != nullptr && !_config.sequence_recorder->record(seq)) {
+        ++_stats.sequence_record_failures;
+        return proto::CommandStatus::internal_error;
+    }
+    _last_seq = seq;
+    audit(AuditRecord::of(AuditEvent::command_received).with_seq(seq).with_command(command));
+    return proto::CommandStatus::ok;
+}
+
+auto CommandRouter::record_outcome(std::uint64_t seq, std::uint16_t command,
+                                   proto::CommandStatus status) -> void {
+    audit(AuditRecord::of(AuditEvent::command_outcome)
+              .with_seq(seq)
+              .with_command(command)
+              .with_status(static_cast<std::uint16_t>(status)));
+    _reports->report(proto::CommandOutcome{
+        .in_reply_to = seq, .command = command, .status = status, .payload = {}});
+}
+
+auto CommandRouter::host_reset() -> void {
+    std::vector<VmId> vms;
+    vms.reserve(_vms.size());
+    for (const auto& [vm, state] : _vms) {
+        vms.push_back(vm);
+    }
+    for (const auto vm : vms) {
+        const auto held = _pool->held_by(vm);
+        commit(0, mailbox::DestroyVm{.vm_id = vm, .persist_volumes = true}, Undo{});
+        for (const auto id : held) {
+            _deadlines.erase(id);
+            if (pool_event(id, PoolEvent::device_released)) {
+                start_cleaning(id);
+            }
+        }
+        _reports->report(proto::VmExitedReport{
+            .vm_id = vm, .exit_status = 0, .reason = proto::ExitReason::vmm_failure});
+    }
+}
+
 auto CommandRouter::on_map_applied(std::uint32_t vni, std::uint64_t map_version) -> void {
     _networks[vni] = map_version;
     _reports->report(proto::MapApplied{.vni = vni, .map_version = map_version});

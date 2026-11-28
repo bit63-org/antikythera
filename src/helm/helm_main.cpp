@@ -288,7 +288,8 @@ auto run(const helm::HelmConfig& cfg) -> int {
         }
         verifier = std::make_unique<ControllerRecordVerifier>(std::move(*v));
     } else {
-        std::println(stderr, "{}: no controller-keys: power policies are refused", log_name);
+        std::println(stderr, "{}: no controller-keys: power policies and host_power are refused",
+                     log_name);
     }
     // The hull images in the sealed store (cold-start Requirement 2):
     // verified under the image signing keys, compiled in or configured.
@@ -337,6 +338,9 @@ auto run(const helm::HelmConfig& cfg) -> int {
         std::println(stderr, "{}: stored boot image assignment: {}", log_name, helm::to_string(v));
     }
     daemon_config.boot_images = &boot_images;
+    // host_power records (server-provisioning Requirement 3) under the
+    // same controller keys.
+    daemon_config.controller_keys = verifier.get();
     std::unique_ptr<ak::objstore::S3ObjectStore> boot_layer;
     std::string boot_layer_prefix;
     if (cfg.boot_layer) {

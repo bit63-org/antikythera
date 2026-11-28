@@ -116,6 +116,11 @@ auto PowerSequencer::boot(bool release_host) -> BootResult {
     return result;
 }
 
+auto PowerSequencer::hold_host() -> void {
+    (void)_backplane->set_host_power(false);
+    _host_released = false;
+}
+
 auto PowerSequencer::release_host() -> bool {
     _host_released = _backplane->set_host_power(true);
     return _host_released;

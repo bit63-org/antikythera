@@ -342,6 +342,101 @@ auto HelmDaemon::boot_if_due() -> void {
     }
 }
 
+auto HelmDaemon::apply_host_power(const proto::HostPower& order, std::span<const std::byte> frame)
+    -> proto::CommandStatus {
+    constexpr auto command = proto::link_record_command(proto::RecordType::host_power);
+    const auto answer = [&](proto::CommandStatus status) {
+        _router.record_outcome(order.seq, command, status);
+        return status;
+    };
+    // helm verifies it itself: helm is the one that acts (Requirement 3.1).
+    if (_config.controller_keys == nullptr || frame.size() != proto::host_power_size ||
+        !_config.controller_keys->verify(proto::host_lifecycle_signed_bytes(frame), order.signature,
+                                         order.key_id)) {
+        return answer(proto::CommandStatus::bad_signature);
+    }
+    if (const auto claimed = _router.claim_sequence(order.seq, command);
+        claimed != proto::CommandStatus::ok) {
+        return answer(claimed);
+    }
+    // Requirement 3.2: running VMs die with the host unless the
+    // controller says it means it.
+    if (order.action != proto::HostPowerAction::on && _router.vm_count() > 0 && !order.force) {
+        return answer(proto::CommandStatus::conflict);
+    }
+    switch (order.action) {
+        case proto::HostPowerAction::on:
+            return answer(power_host_on());
+        case proto::HostPowerAction::hold:
+            // Kept until an `on`: a pending boot powers the slots but does
+            // not release the host.
+            _host_override = HostPowerOverride::hold;
+            if (_sequencer.host_released()) {
+                _sequencer.hold_host();
+                _start_deadline.reset();
+                _router.host_reset();
+            }
+            return answer(proto::CommandStatus::ok);
+        case proto::HostPowerAction::off:
+            // The host and the slots: the next `on` boots from scratch,
+            // slots first (Requirement 3.3).
+            _boot_at.reset();
+            _host_override = HostPowerOverride::none;
+            if (_booted) {
+                _start_deadline.reset();
+                _router.host_reset();
+                shutdown();
+                _booted = false;
+            }
+            return answer(proto::CommandStatus::ok);
+        case proto::HostPowerAction::cycle:
+            if (!_booted || !_sequencer.host_released()) {
+                return answer(power_host_on());
+            }
+            _start_deadline.reset();
+            _router.host_reset();
+            // A reboot is a new boot: a fresh epoch and frame, the image
+            // chosen again, and its own fallback.
+            _fallback_used = false;
+            if (_config.host_booter != nullptr && !fill_boot_function(std::nullopt)) {
+                _sequencer.hold_host();
+                return answer(proto::CommandStatus::internal_error);
+            }
+            if (!_sequencer.restart_host()) {
+                return answer(proto::CommandStatus::internal_error);
+            }
+            watch_host_start();
+            return answer(proto::CommandStatus::ok);
+    }
+    return answer(proto::CommandStatus::malformed);
+}
+
+auto HelmDaemon::power_host_on() -> proto::CommandStatus {
+    _host_override = HostPowerOverride::none;
+    if (_boot_at) {
+        // The power-on wait (cold-start Requirement 3.5): boot at the next
+        // pass, through boot_if_due and on_boot as a timed boot would.
+        _host_override = HostPowerOverride::on;
+        return proto::CommandStatus::ok;
+    }
+    if (!_booted) {
+        return boot().host_released ? proto::CommandStatus::ok
+                                    : proto::CommandStatus::internal_error;
+    }
+    if (_sequencer.host_released()) {
+        return proto::CommandStatus::ok;
+    }
+    _fallback_used = false;
+    if (_config.host_booter != nullptr && !fill_boot_function(std::nullopt)) {
+        return proto::CommandStatus::internal_error;
+    }
+    if (!_sequencer.release_host()) {
+        return proto::CommandStatus::internal_error;
+    }
+    watch_host_start();
+    return proto::CommandStatus::ok;
+}
+
 auto HelmDaemon::run(const std::stop_token& stop) -> void {
     // Wake the loop promptly when stop is requested.
     const std::stop_callback wake{stop, [this] {
@@ -493,6 +588,11 @@ auto HelmDaemon::on_power_policy(const proto::PowerPolicy& policy, std::span<con
 auto HelmDaemon::on_boot_image(const proto::BootImage& assignment, std::span<const std::byte> frame)
     -> void {
     enqueue(BootImageFrame{.assignment = assignment, .frame = {frame.begin(), frame.end()}});
+}
+
+auto HelmDaemon::on_host_power(const proto::HostPower& order, std::span<const std::byte> frame)
+    -> void {
+    enqueue(HostPowerFrame{.order = order, .frame = {frame.begin(), frame.end()}});
 }
 
 auto HelmDaemon::on_standing_set(const proto::StandingSet& /*set*/,
@@ -656,6 +756,10 @@ auto HelmDaemon::handle(Item& item) -> void {
             _sequencer.release_host()) {
             watch_host_start();
         }
+    } else if (const auto* order = std::get_if<HostPowerFrame>(&item)) {
+        const auto status = apply_host_power(order->order, order->frame);
+        const std::scoped_lock lock{_inbox_mutex};
+        ++(status == proto::CommandStatus::ok ? _stats.host_power : _stats.host_power_refused);
     } else if (const auto* standing = std::get_if<StandingSetFrame>(&item)) {
         // Verified, kept and anchored for the next time helm's power
         // returns (cold-start Requirement 4.2); it starts nothing now.

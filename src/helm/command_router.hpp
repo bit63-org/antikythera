@@ -543,6 +543,28 @@ public:
     // ControllerSession to fill in, core and page counts for hull's report.
     [[nodiscard]] auto inventory() const -> proto::Inventory;
     [[nodiscard]] auto stats() const noexcept -> const RouterStats& { return _stats; }
+
+    // ---- records helm acts on itself (server-provisioning Requirement 3) ----
+
+    // Claims `seq` for a signed link record helm acts on (host_power,
+    // decommission), in the envelopes' sequence space: stale_sequence at or
+    // below the last number accepted; otherwise it becomes the last, is
+    // recorded (sequence_recorder, so hull's next floor covers it) and
+    // audited, and ok is returned. `command` is
+    // proto::link_record_command(type). A failed record is internal_error
+    // and claims nothing.
+    auto claim_sequence(std::uint64_t seq, std::uint16_t command) -> proto::CommandStatus;
+    // Audits a claimed record's outcome and reports it as a CommandOutcome.
+    auto record_outcome(std::uint64_t seq, std::uint16_t command, proto::CommandStatus status)
+        -> void;
+    // VMs helm believes run (hull confirmed their CREATE_VM).
+    [[nodiscard]] auto vm_count() const noexcept -> std::size_t { return _vms.size(); }
+    // The host was reset under its VMs (host_power off, cycle or hold with
+    // force): every VM is gone. Each is forgotten as a DESTROY_VM that
+    // keeps its volumes would, reported exited (vmm_failure), and the
+    // functions it held go straight to cleaning: no hull is left to
+    // reset them and say so.
+    auto host_reset() -> void;
     // A command holds the mailbox: relayed and unanswered, or a
     // cooperative detach waiting for the guest.
     [[nodiscard]] auto busy() const noexcept -> bool {

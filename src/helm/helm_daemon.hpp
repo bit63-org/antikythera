@@ -235,6 +235,10 @@ struct DaemonConfig {
     // kept power policy's keep_image promotes one to LKG (2.3). Null: no
     // image is ever promoted. Not owned.
     ImageCache* images{nullptr};
+    // Verifies the controller's signature on the records helm acts on
+    // alone with the controller present (host_power; server-provisioning
+    // Requirement 3.1). Null: they are refused. Not owned.
+    const RecordVerifier* controller_keys{nullptr};
     // Keeps the controller's boot_image assignment (cold-start Requirement
     // 2.1). Null: boot_image records are dropped and counted. Not owned.
     BootImageKeeper* boot_images{nullptr};
@@ -326,6 +330,9 @@ struct DaemonStats {
     std::uint64_t host_starts{0};          // hull's agent came up after a release
     std::uint64_t host_fallbacks{0};       // rebooted onto another image after a failed start
     std::uint64_t host_start_timeouts{0};  // no agent, and the one fallback was already used
+    // host_power records (server-provisioning Requirement 3).
+    std::uint64_t host_power{0};          // applied
+    std::uint64_t host_power_refused{0};  // unsigned, stale, VMs running, or the backplane failed
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -435,6 +442,8 @@ public:
         -> void override;
     auto on_boot_image(const proto::BootImage& assignment, std::span<const std::byte> frame)
         -> void override;
+    auto on_host_power(const proto::HostPower& order, std::span<const std::byte> frame)
+        -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
     // The newest published snapshot (ControllerSession's InventorySource).
@@ -510,11 +519,15 @@ private:
         proto::BootImage assignment;
         std::vector<std::byte> frame;
     };
-    using Item =
-        std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
-                     proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame, ImageKeyFrame,
-                     VpcFrame, PolicyFrame, MembersFrame, MetadataFrame, LayoutFrame,
-                     proto::SelfTest, PowerPolicyFrame, StandingSetFrame, BootImageFrame>;
+    struct HostPowerFrame {
+        proto::HostPower order;
+        std::vector<std::byte> frame;
+    };
+    using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
+                              proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
+                              ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame, MetadataFrame,
+                              LayoutFrame, proto::SelfTest, PowerPolicyFrame, StandingSetFrame,
+                              BootImageFrame, HostPowerFrame>;
     // Where a NIC with a kept record is plugged: its network role's slot
     // and function.
     struct MetadataHome {
@@ -622,6 +635,12 @@ private:
     auto watch_host_start() -> void;
     // The agent came up, or its time ran out: the fallback (once).
     auto check_host_start() -> void;
+    // A host_power record: verified, sequenced, applied, reported.
+    auto apply_host_power(const proto::HostPower& order, std::span<const std::byte> frame)
+        -> proto::CommandStatus;
+    // host_power on: boots, or releases a held host onto a filled boot
+    // function.
+    auto power_host_on() -> proto::CommandStatus;
     [[nodiscard]] static auto is_storage(const SlotState& slot) -> bool;
     auto poll_identity(SlotState& slot) -> void;
     auto deliver_certificate(const proto::RoleCertificate& certificate) -> void;

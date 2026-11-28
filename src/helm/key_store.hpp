@@ -83,6 +83,10 @@ public:
     // `se` must outlive the KeyStore.
     explicit KeyStore(SecureElement& se) noexcept : _se{&se} {}
 
+    // The secure element behind the store (helm also derives tunnel keys
+    // from it).
+    [[nodiscard]] auto secure_element() const noexcept -> SecureElement& { return *_se; }
+
     auto create_vm_key(VmId vm) -> std::expected<void, KeyError>;
     // Forgets the VM key and every volume key wrapped by it. Returns those
     // volumes, now crypto-erased, in id order.

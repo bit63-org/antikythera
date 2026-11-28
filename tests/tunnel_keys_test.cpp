@@ -412,8 +412,8 @@ BOOST_AUTO_TEST_CASE(controller_distributes_vtep_keys,
 
     // Each helm makes its VTEP's key pair when the role attaches, and
     // gives the role its private key.
-    BOOST_REQUIRE(a.ring.ensure(a.addr).has_value());
-    BOOST_REQUIRE(b.ring.ensure(b.addr).has_value());
+    BOOST_REQUIRE(a.ring.ensure(a.addr, 0).has_value());
+    BOOST_REQUIRE(b.ring.ensure(b.addr, 0).has_value());
     {
         const auto sa = a.serve();
         const auto sb = b.serve();

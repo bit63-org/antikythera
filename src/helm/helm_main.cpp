@@ -273,6 +273,18 @@ auto run(const helm::HelmConfig& cfg) -> int {
         // `power-on-policy skip` counts as a restart: no wait.
         helm::plan_power_on(policy, cfg.apply_power_policy && returned.value_or(true),
                             helm::HostPowerOverride::none, helm::draw_jitter(policy.max_jitter_ms));
+    if (cfg.key_epochs) {
+        auto epochs = helm::KeyEpochs::open(*cfg.key_epochs);
+        if (!epochs) {
+            std::println(stderr, "{}: key epochs {}: {}", log_name, cfg.key_epochs->string(),
+                         helm::to_string(epochs.error()));
+            return exit_failed;
+        }
+        daemon_config.key_epochs = std::move(*epochs);
+    } else {
+        std::println(stderr, "{}: no key-epochs file: tunnel key rotations last until restart",
+                     log_name);
+    }
 
     DetachedHostPort host;
     std::println(stderr, "{}: no mailbox device yet (helm task 8): commands are refused", log_name);

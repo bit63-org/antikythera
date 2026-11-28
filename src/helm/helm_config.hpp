@@ -39,6 +39,10 @@
 //                               policy after helm's power returns; `skip`
 //                               releases the host at once (a harbor run that
 //                               is not testing cold start)
+//   key-epochs PATH             helm's state file of tunnel key epochs
+//                               (fleet-scale-networking Requirement 1;
+//                               optional: without it a rotation lasts only
+//                               until helm restarts)
 //   slot N SOCKET ADDR PEER_ADDR EID PEER_EID ARGV...
 //                               a data-plane slot: the board process to
 //                               launch (ARGV, argv[0] an absolute path), the
@@ -95,6 +99,7 @@ struct HelmConfig {
     std::string controller_keys;                        // empty: none
     std::filesystem::path power_marker{"/run/ak-helm/powered"};
     bool apply_power_policy{true};
+    std::optional<std::filesystem::path> key_epochs;  // nullopt: in memory
     std::map<SlotNumber, SlotEntry> slots;
     std::vector<std::string> host_argv;  // empty: no host process
 

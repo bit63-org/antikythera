@@ -217,6 +217,12 @@ HelmDaemon::HelmDaemon(DaemonConfig config, KeyStore& keys, AuditLog& audit, Hos
       _reports{std::move(reports)},
       _router{_config.router, _pool, keys, host, *this, audit},
       _sequencer{sequencer_config(_config), backplane, *this},
+      _keyring{[se = &keys.secure_element(), server = _config.router.server_id](
+                   std::uint8_t slot, std::uint32_t epoch,
+                   std::span<std::byte, oar::tunnel_key_size> out) {
+                   return se->derive_vtep_key(server, slot, epoch, out).has_value();
+               },
+               _config.key_epochs},
       _groups{{.interval = _config.group_usage_interval,
                .membership_interval = _config.membership_interval,
                .clock = _config.clock},
@@ -435,6 +441,10 @@ auto HelmDaemon::on_self_test(const proto::SelfTest& request) -> void {
     enqueue(request);
 }
 
+auto HelmDaemon::on_rotate_vtep_key(const proto::RotateVtepKey& request) -> void {
+    enqueue(request);
+}
+
 auto HelmDaemon::post_host_slot(const mailbox::Slot& slot) -> void {
     enqueue(slot);
 }
@@ -524,6 +534,8 @@ auto HelmDaemon::handle(Item& item) -> void {
             _config.power_policy->offer(power->policy, power->frame) == PolicyVerdict::kept;
         const std::scoped_lock lock{_inbox_mutex};
         ++(kept ? _stats.power_policies : _stats.power_policies_refused);
+    } else if (const auto* rotation = std::get_if<proto::RotateVtepKey>(&item)) {
+        rotate_tunnel_key(*rotation);
     }
 }
 
@@ -653,7 +665,7 @@ auto HelmDaemon::provision_tunnel(SlotState& slot) -> void {
     }
     const auto& vtep = slot.inventory->vtep;
     std::expected<void, LinkError> done = std::unexpected(LinkError{.code = LinkErrc::bad_request});
-    if (_keyring.ensure(vtep)) {  // fails only if OpenSSL cannot make a key pair
+    if (_keyring.ensure(vtep, slot.number)) {  // fails only if no key pair can be made
         done = _keyring.provision(*slot.link, vtep);
     }
     if (!done && done.error().code == LinkErrc::refused &&
@@ -693,6 +705,34 @@ auto HelmDaemon::forward_peers(const PeersFrame& peers) -> void {
         ++_stats.tunnel_peer_sets_forwarded;
     } else {
         ++_stats.tunnel_peer_sets_held;
+    }
+}
+
+auto HelmDaemon::rotate_tunnel_key(const proto::RotateVtepKey& request) -> void {
+    oar::Vtep vtep{};
+    const auto outcome = _keyring.rotate(request.slot, request.key_epoch, &vtep);
+    bool failed = !outcome;
+    if (outcome && *outcome == RotateOutcome::rotated) {
+        for (auto& [n, slot] : _slots) {
+            if (!is_net(*slot) || slot->keys_pending ||
+                !std::ranges::equal(slot->inventory->vtep, vtep)) {
+                continue;  // a role waiting for its key gets the new one when provisioned
+            }
+            if (!_keyring.deliver_rotation(*slot->link, vtep, _config.tunnel_key_grace)) {
+                // The role still has the old key; provisioning sends the new
+                // one (without grace) on the next check.
+                slot->keys_pending = true;
+                failed = true;
+            }
+        }
+    }
+    const std::scoped_lock lock{_inbox_mutex};
+    if (failed) {
+        ++_stats.tunnel_rotations_failed;
+    } else if (*outcome == RotateOutcome::stale) {
+        ++_stats.tunnel_rotations_stale;
+    } else {
+        ++_stats.tunnel_rotations;
     }
 }
 

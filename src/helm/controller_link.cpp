@@ -311,6 +311,17 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
             _sink->on_power_policy(*policy, rec.payload);
             return {};
         }
+        case proto::RecordType::rotate_vtep_key: {
+            auto request = proto::decode_rotate_vtep_key(rec.payload);
+            if (!request) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (request->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_rotate_vtep_key(*request);
+            return {};
+        }
         case proto::RecordType::report_ack: {
             auto ack = proto::decode_report_ack(rec.payload);
             if (!ack) {

@@ -55,6 +55,11 @@
 //   power_policy  controller -> helm   a PowerPolicy (power_policy.hpp): when
 //                                      helm releases the host after power
 //                                      returns, and which image to keep
+//   rotate_vtep_key controller -> helm server_id u64 | slot u8 | rsvd [3]
+//                                      | key_epoch u32: derive a new tunnel
+//                                      key for the network role in that slot
+//                                      at key_epoch (.kiro/specs/
+//                                      fleet-scale-networking/ Requirement 1)
 //
 // Record numbers 19-22 are claimed by specs still being built
 // (vpc-security-groups, vpc-internet-gateways, server provisioning) and
@@ -85,6 +90,13 @@
 // the signature. self_test is unsigned like lease_grant: it only asks a
 // khold role to measure its drives and link again (Requirement 12.1), and
 // the answer is the role's next capacity report.
+//
+// rotate_vtep_key is unsigned too: it travels only on this authenticated
+// link, carries no key, and only moves the slot's key epoch forward. helm
+// derives the new key from its secure element, keeps the epoch in its
+// state file, and ignores an epoch at or below the one it holds, so a
+// replayed or repeated record changes nothing. key_epoch is 1 to 65,535
+// (the VtepCredential's key_epoch field is 16 bits).
 //
 // role_certificate's chain is DER certificates back to back, leaf first,
 // at most max_cert_chain_certs of them and max_cert_chain_size bytes in
@@ -143,6 +155,8 @@ inline constexpr std::size_t role_certificate_fixed_size = 16;
 inline constexpr std::size_t max_cert_chain_size = 16384;
 inline constexpr std::size_t max_cert_chain_certs = 4;
 inline constexpr std::size_t self_test_size = 16;
+inline constexpr std::size_t rotate_vtep_key_size = 16;
+inline constexpr std::uint32_t max_key_epoch = 0xFFFF;
 inline constexpr std::size_t max_record_payload =
     std::max({envelope_size,
               max_map_update_size,
@@ -163,7 +177,8 @@ inline constexpr std::size_t max_record_payload =
               max_volume_layout_size,
               self_test_size,
               max_standing_set_size,
-              power_policy_size});
+              power_policy_size,
+              rotate_vtep_key_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class RecordType : std::uint16_t {
@@ -187,6 +202,7 @@ enum class RecordType : std::uint16_t {
     self_test = 18,
     standing_set = 23,
     power_policy = 24,
+    rotate_vtep_key = 35,
 };
 
 // Which khold roles a self_test record asks.
@@ -227,6 +243,13 @@ struct SelfTest {
     friend auto operator==(const SelfTest&, const SelfTest&) -> bool = default;
 };
 
+struct RotateVtepKey {
+    std::uint64_t server_id{0};
+    std::uint8_t slot{0};
+    std::uint32_t key_epoch{0};
+    friend auto operator==(const RotateVtepKey&, const RotateVtepKey&) -> bool = default;
+};
+
 struct RoleCertificate {
     std::uint64_t server_id{0};
     std::uint8_t slot{0};
@@ -238,7 +261,8 @@ namespace detail {
 
 [[nodiscard]] constexpr auto known(RecordType t) noexcept -> bool {
     return (t >= RecordType::envelope && t <= RecordType::self_test) ||
-           t == RecordType::standing_set || t == RecordType::power_policy;
+           t == RecordType::standing_set || t == RecordType::power_policy ||
+           t == RecordType::rotate_vtep_key;
 }
 
 }  // namespace detail
@@ -432,6 +456,57 @@ namespace detail {
         return std::unexpected(ok.error());
     }
     return t;
+}
+
+[[nodiscard]] inline auto check_rotate_vtep_key(const RotateVtepKey& k) noexcept
+    -> std::expected<void, DecodeError> {
+    if (k.server_id == 0) {
+        return std::unexpected(DecodeError::bad_server_id);
+    }
+    if (k.key_epoch == 0 || k.key_epoch > max_key_epoch) {
+        return std::unexpected(DecodeError::unknown_value);
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto encode_rotate_vtep_key(const RotateVtepKey& k)
+    -> std::expected<std::vector<std::byte>, DecodeError> {
+    if (auto ok = check_rotate_vtep_key(k); !ok) {
+        return std::unexpected(ok.error());
+    }
+    std::vector<std::byte> out;
+    out.reserve(rotate_vtep_key_size);
+    wire::Writer w{out};
+    w.le64(k.server_id);
+    w.u8(k.slot);
+    w.u8(0);
+    w.le16(0);
+    w.le32(k.key_epoch);
+    return out;
+}
+
+[[nodiscard]] inline auto decode_rotate_vtep_key(std::span<const std::byte> bytes) noexcept
+    -> std::expected<RotateVtepKey, DecodeError> {
+    wire::Reader r{bytes};
+    auto server_id = r.le64();
+    auto slot = r.u8();
+    auto reserved1 = r.u8();
+    auto reserved2 = r.le16();
+    auto epoch = r.le32();
+    if (!server_id || !slot || !reserved1 || !reserved2 || !epoch) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (r.remaining() != 0) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    if (*reserved1 != 0 || *reserved2 != 0) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    const RotateVtepKey k{.server_id = *server_id, .slot = *slot, .key_epoch = *epoch};
+    if (auto ok = check_rotate_vtep_key(k); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return k;
 }
 
 [[nodiscard]] inline auto check_role_certificate(const RoleCertificate& c) noexcept

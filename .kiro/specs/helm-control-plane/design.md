@@ -228,9 +228,20 @@ WireGuard peers and their public keys) the same way and in the same chunk
 format; a chunk of one transfer type never continues the other.
 
 Tunnel keys (`src/helm/tunnel_keyring.*`, controller-interface design
-"TunnelPeers"). helm keeps one X25519 key pair per VTEP, generated from
-the OpenSSL RNG when the VTEP's network role first attaches and held in
-`SecretBytes` for the life of the process. `TunnelKeyring::provision`
+"TunnelPeers"). helm keeps one X25519 key pair per VTEP, held in
+`SecretBytes`. Since fleet-scale-networking task 1 the pair is derived
+when the VTEP's network role first attaches, by
+`SecureElement::derive_vtep_key` (HMAC-SHA256 of the master key over
+"antikythera vtep key v1", the server ID, the slot and the slot's key
+epoch, clamped), so a helm or board restart gives every role the key it
+had. `KeyEpochs` keeps each slot's epoch (1 until rotated) in the
+`key-epochs` state file named by helm's configuration, written to a
+temporary file, fsynced and renamed before an epoch takes effect; a
+corrupt file stops helm rather than bringing back a retired key. A
+controller `rotate_vtep_key` raises a slot's epoch (`TunnelKeyring::rotate`)
+and `deliver_rotation` sends the new key in the 40-byte `set_tunnel_key`
+form with a grace period (`DaemonConfig::tunnel_key_grace`, 10 minutes),
+falling back to the plain form for a role that refuses it. `TunnelKeyring::provision`
 sends a role its private key (`set_tunnel_key`) and then the newest
 controller peer set for its VTEP, on every attach, so a restarted role
 gets both back. `fill` puts the public keys in the inventory. Peer sets

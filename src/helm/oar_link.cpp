@@ -212,9 +212,10 @@ auto OarLink::rewrap_volume(const oar::RewrapVolume& request) -> std::expected<v
     return expect_empty(transact(mctp::VendorType::rewrap_volume, *body));
 }
 
-auto OarLink::set_tunnel_key(std::span<const std::byte, oar::tunnel_key_size> private_key)
-    -> std::expected<void, LinkError> {
-    auto body = oar::encode_set_tunnel_key({.private_key = private_key});
+auto OarLink::set_tunnel_key(std::span<const std::byte, oar::tunnel_key_size> private_key,
+                             std::uint32_t grace_seconds) -> std::expected<void, LinkError> {
+    auto body =
+        oar::encode_set_tunnel_key({.private_key = private_key, .grace_seconds = grace_seconds});
     if (!body) {
         return std::unexpected(bad_request());
     }

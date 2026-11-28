@@ -700,7 +700,13 @@ auto NetRole::set_tunnel_key(const oar::SetTunnelKey& request) -> oar::Status {
     if (!_tunnel) {
         return oar::Status::unsupported;
     }
-    if (!_tunnel->set_private_key(request.private_key)) {
+    // A grace makes it a rotation (fleet-scale-networking Requirement 1.3):
+    // sessions under the old key run on until the grace ends.
+    const auto done = request.grace_seconds != 0
+                          ? _tunnel->rotate_private_key(request.private_key,
+                                                        std::chrono::seconds{request.grace_seconds})
+                          : _tunnel->set_private_key(request.private_key);
+    if (!done) {
         ++_counters.tunnel_keys_refused;
         return oar::Status::failed;
     }

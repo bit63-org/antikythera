@@ -557,6 +557,88 @@ BOOST_FIXTURE_TEST_CASE(new_keys_drop_sessions, Fixture,
     establish();
 }
 
+// fleet-scale-networking Requirement 1.3: a rotation keeps the old key for
+// a grace period instead of cutting every peer off.
+BOOST_FIXTURE_TEST_CASE(rotation_keeps_sessions_until_the_grace_ends, Fixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    establish();
+    const auto old_pub = b.pub;
+    auto k = wg::generate_private_key();
+    BOOST_REQUIRE(k.has_value());
+    // A grace shorter than a session's life, so the end of the grace (not
+    // reject_after_time) is what ends the old sessions here.
+    constexpr auto grace = seconds{150};
+    BOOST_REQUIRE(b.tunnel->rotate_private_key(k->span(), milliseconds{grace}).has_value());
+    BOOST_TEST(b.tunnel->counters().key_rotations == 1U);
+    BOOST_TEST((*b.tunnel->retiring_public_key() == old_pub));
+    BOOST_TEST((*b.tunnel->public_key() != old_pub));
+    BOOST_TEST((b.tunnel->tick() <= world.now + grace));
+    // The session made under the old key still carries both ways.
+    BOOST_TEST(b.tunnel->peers().at(0).session);
+    BOOST_TEST(a.tunnel->send_to(b.addr, geneve::udp_port, flow, bytes("to b")));
+    BOOST_TEST(b.tunnel->send_to(a.addr, geneve::udp_port, flow, bytes("to a")));
+    BOOST_TEST(deliver().size() == 2U);
+    // Rotating to the key already in use changes nothing.
+    BOOST_REQUIRE(b.tunnel->rotate_private_key(k->span(), milliseconds{grace}).has_value());
+    BOOST_TEST(b.tunnel->counters().key_rotations == 1U);
+
+    // a has not been told the new key: its rekey, addressed to the old
+    // one, is answered under the old key during the grace.
+    world.advance(seconds{121});
+    BOOST_TEST(a.tunnel->send_to(b.addr, geneve::udp_port, flow, bytes("rekey")));
+    BOOST_TEST(deliver().size() == 1U);
+    BOOST_TEST(b.tunnel->counters().retiring_handshakes == 1U);
+    BOOST_TEST(a.tunnel->send_to(b.addr, geneve::udp_port, flow, bytes("after")));
+    BOOST_TEST(deliver().size() == 1U);
+
+    // The grace ends: every old-key session goes, the old key is wiped.
+    world.advance(seconds{29});
+    static_cast<void>(b.tunnel->tick());
+    BOOST_TEST(!b.tunnel->retiring_public_key().has_value());
+    BOOST_TEST(b.tunnel->counters().retired_sessions >= 1U);
+    BOOST_TEST(!b.tunnel->peers().at(0).session);
+    BOOST_TEST(a.tunnel->send_to(b.addr, geneve::udp_port, flow, bytes("lost")));
+    static_cast<void>(deliver());
+    BOOST_TEST(drops(*b.tunnel, TunnelDrop::unknown_index) >= 1U);
+    // A handshake to the old key is refused now. (Changing the PSK makes
+    // a drop its session and initiate again, still to the old key.)
+    BOOST_REQUIRE(a.tunnel->set_peer(b.addr, old_pub, key_of(9)).has_value());
+    BOOST_TEST(!a.tunnel->send_to(b.addr, geneve::udp_port, flow, bytes("old key")));
+    static_cast<void>(deliver());
+    BOOST_TEST(drops(*b.tunnel, TunnelDrop::bad_mac1) >= 1U);
+    // Once a learns the new key, traffic flows under it.
+    BOOST_REQUIRE(a.tunnel->set_peer(b.addr, *b.tunnel->public_key(), no_psk).has_value());
+    world.advance(seconds{1});
+    establish();
+    BOOST_TEST(b.tunnel->counters().retiring_handshakes == 1U);
+}
+
+BOOST_FIXTURE_TEST_CASE(rotation_initiates_under_the_new_key, Fixture,
+                        *boost::unit_test::timeout(unit_timeout_seconds)) {
+    // A rotation with no session yet: b's own initiations use the new key,
+    // which a accepts once helm gives it the new public key.
+    auto k = wg::generate_private_key();
+    BOOST_REQUIRE(k.has_value());
+    BOOST_REQUIRE(b.tunnel->rotate_private_key(k->span(), milliseconds{seconds{600}}).has_value());
+    BOOST_REQUIRE(a.tunnel->set_peer(b.addr, *b.tunnel->public_key(), no_psk).has_value());
+    BOOST_TEST(!b.tunnel->send_to(a.addr, geneve::udp_port, flow, bytes("first")));
+    static_cast<void>(deliver());
+    BOOST_TEST(b.tunnel->peers().at(0).session);
+    BOOST_TEST(a.tunnel->peers().at(0).session);
+    // A plain set_private_key ends the grace at once.
+    auto k2 = wg::generate_private_key();
+    BOOST_REQUIRE(k2.has_value());
+    BOOST_REQUIRE(b.tunnel->set_private_key(k2->span()).has_value());
+    BOOST_TEST(!b.tunnel->retiring_public_key().has_value());
+    BOOST_TEST(!b.tunnel->peers().at(0).session);
+    // Without a key, a rotation is just a set.
+    auto lone = net::Tunnel::create(b.sender, world.config());
+    BOOST_REQUIRE(lone.has_value());
+    BOOST_REQUIRE((*lone)->rotate_private_key(k->span(), milliseconds{seconds{1}}).has_value());
+    BOOST_TEST(!(*lone)->retiring_public_key().has_value());
+    BOOST_TEST((*lone)->counters().key_rotations == 0U);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 // ---- With the Vtep --------------------------------------------------------

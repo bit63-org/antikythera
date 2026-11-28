@@ -46,7 +46,9 @@ The parts that make the system a VPC at all are built:
   and take peers from the controller's signed frame (`TunnelPeerSet`),
   and helm's daemon holds the `TunnelKeyring`, keys each network role and
   forwards its peer sets. Not yet exercised across servers in harbor
-  (oar-net task 11).
+  (oar-net task 11). Keys are derived from helm's secure element and
+  survive a helm restart; the controller rotates them with a grace period
+  (fleet-scale-networking task 1).
 
 What the fabric gives a tenant today is one flat L2 segment per VPC: every
 NIC can reach every other NIC in the VPC, nothing outside it can reach in,

@@ -54,6 +54,17 @@
 // is kept if it is newer than the one held for its VTEP and forwarded
 // unmodified to that VTEP's role, which verifies it.
 //
+// Stable tunnel keys (fleet-scale-networking Requirement 1, task 1). The
+// keyring derives each VTEP's pair from the KeyStore's secure element, the
+// server ID and the slot's key epoch (DaemonConfig::key_epochs, loaded
+// from helm's state file), so a helm restart provisions every role with
+// the key it had. A controller rotate_vtep_key raises the slot's epoch
+// (saved first) and, when a network role is attached there, delivers the
+// new key with a tunnel_key_grace period in which the role keeps the old
+// one; the inventory's new public key goes to the controller with the
+// next publish. A rotation whose epoch cannot be saved changes nothing
+// and is counted; the controller sends it again.
+//
 // Network health (oar-net Requirement 6, task 11). Every check helm asks
 // each network role for its health; a degraded role (a peer VTEP down, a
 // path that does not carry full-size frames, an unkeyed tunnel: the
@@ -204,6 +215,11 @@ struct DaemonConfig {
     // How often network roles' group meters are read and reported
     // (Requirement 11.2: at least every minute).
     std::chrono::milliseconds group_usage_interval{std::chrono::minutes{1}};
+    // Each slot's tunnel key epoch (helm's state file; empty: all 1, kept
+    // in memory), and how long a network role keeps its old key after a
+    // rotation (Requirement 1.3: 10 minutes).
+    KeyEpochs key_epochs;
+    std::chrono::seconds tunnel_key_grace{std::chrono::minutes{10}};
     // How often network roles are asked whether their snooped joins
     // changed (one small message each when they did not).
     std::chrono::milliseconds membership_interval{std::chrono::seconds{1}};
@@ -266,8 +282,11 @@ struct DaemonStats {
     std::uint64_t tunnel_peer_sets_held{0};       // stale or duplicate, or no role for the VTEP yet
     std::uint64_t inventory_reports{0};           // sent because VTEPs, keys or health changed
     // Power-on policy (cold-start Requirement 3).
-    std::uint64_t power_policies{0};          // verified, newer and kept
-    std::uint64_t power_policies_refused{0};  // stale, another server's, unsigned or unstorable
+    std::uint64_t power_policies{0};           // verified, newer and kept
+    std::uint64_t power_policies_refused{0};   // stale, another server's, unsigned or unstorable
+    std::uint64_t tunnel_rotations{0};         // epochs raised by the controller
+    std::uint64_t tunnel_rotations_stale{0};   // at or below the epoch held: ignored
+    std::uint64_t tunnel_rotations_failed{0};  // not saved, not derived, or not delivered
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -355,6 +374,7 @@ public:
     auto on_self_test(const proto::SelfTest& request) -> void override;
     auto on_power_policy(const proto::PowerPolicy& policy, std::span<const std::byte> frame)
         -> void override;
+    auto on_rotate_vtep_key(const proto::RotateVtepKey& request) -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
     // The newest published snapshot (ControllerSession's InventorySource).
@@ -423,7 +443,7 @@ private:
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
                               proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
                               ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame, MetadataFrame,
-                              LayoutFrame, proto::SelfTest, PowerPolicyFrame>;
+                              LayoutFrame, proto::SelfTest, PowerPolicyFrame, proto::RotateVtepKey>;
     // Where a NIC with a kept record is plugged: its network role's slot
     // and function.
     struct MetadataHome {
@@ -532,6 +552,7 @@ private:
     [[nodiscard]] static auto is_net(const SlotState& slot) -> bool;
     auto provision_tunnel(SlotState& slot) -> void;
     auto forward_peers(const PeersFrame& peers) -> void;
+    auto rotate_tunnel_key(const proto::RotateVtepKey& request) -> void;
     auto poll_health(SlotState& slot) -> void;
     // Opens the sideband, reads the inventory, registers with the router.
     auto attach(SlotState& slot) -> bool;

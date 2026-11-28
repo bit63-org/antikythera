@@ -27,6 +27,7 @@
 #include "proto/volume_op.hpp"
 #include "proto/vpc_config.hpp"
 #include "proto/tunnel_peers.hpp"
+#include "proto/vpc_stream.hpp"
 #include "proto/vtep_credential.hpp"
 #include "test_support.hpp"
 
@@ -100,6 +101,8 @@ BOOST_AUTO_TEST_CASE(map_frame_limit_matches_proto) {
     BOOST_TEST(oar::max_tunnel_peers_frame == ak::proto::max_tunnel_peers_size);
     BOOST_TEST(oar::vtep_credential_frame == ak::proto::vtep_credential_size);
     BOOST_TEST(oar::frame_notice_body == ak::proto::frame_notice_size);
+    BOOST_TEST(oar::min_vpc_stream_frame == ak::proto::min_vpc_stream_size);
+    BOOST_TEST(oar::max_vpc_stream_frame == ak::proto::max_vpc_stream_size);
     BOOST_TEST(oar::max_credential_revocations_frame == ak::proto::max_credential_revocations_size);
     BOOST_TEST(oar::max_map_chunk + oar::map_chunk_head_size + ak::helm::mctp::vendor_header_size ==
                ak::helm::mctp::max_message_size);

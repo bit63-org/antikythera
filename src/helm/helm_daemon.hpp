@@ -318,6 +318,10 @@ struct DaemonStats {
     std::uint64_t bulk_chunks{0};
     std::uint64_t frame_notices{0};          // forwarded to every network role
     std::uint64_t frame_notices_refused{0};  // a network role refused one
+    // VPC stream frames (task 5): forwarded to every network role, and
+    // refused by one (until task 6 a role answers unsupported).
+    std::uint64_t vpc_streams{0};
+    std::uint64_t vpc_streams_refused{0};
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -410,6 +414,8 @@ public:
         -> void override;
     auto on_rotate_vtep_key(const proto::RotateVtepKey& request) -> void override;
     auto on_frame_notice(const proto::FrameNotice& notice) -> void override;
+    auto on_vpc_stream(const proto::VpcStream& stream, std::span<const std::byte> frame)
+        -> void override;
     auto on_vtep_credential(const proto::VtepCredential& credential,
                             std::span<const std::byte> frame) -> void override;
     auto on_credential_revocations(const proto::CredentialRevocations& list,
@@ -477,6 +483,10 @@ private:
         std::uint64_t list_version{0};
         std::vector<std::byte> frame;
     };
+    struct StreamFrame {
+        std::uint32_t vni{0};
+        std::vector<std::byte> frame;
+    };
     struct LayoutFrame {
         std::uint64_t volume_id{0};
         std::uint64_t epoch{0};
@@ -492,7 +502,7 @@ private:
                               proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
                               ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame, MetadataFrame,
                               LayoutFrame, proto::SelfTest, PowerPolicyFrame, proto::RotateVtepKey,
-                              CredentialFrame, RevocationsFrame, proto::FrameNotice>;
+                              CredentialFrame, RevocationsFrame, proto::FrameNotice, StreamFrame>;
     // Where a NIC with a kept record is plugged: its network role's slot
     // and function.
     struct MetadataHome {
@@ -617,6 +627,7 @@ private:
     auto keep_revocations(RevocationsFrame& list) -> void;
     // Frame notices go to every network role at once, as control traffic.
     auto forward_notice(const proto::FrameNotice& notice) -> void;
+    auto forward_stream(StreamFrame& stream) -> void;
     auto send_credentials(SlotState& slot) -> void;
     auto poll_health(SlotState& slot) -> void;
     // Opens the sideband, reads the inventory, registers with the router.

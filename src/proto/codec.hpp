@@ -96,6 +96,8 @@ enum class DecodeError : std::uint8_t {
     bad_validity,        // a credential's not_before is not before its not_after
     bad_list_version,    // revocation list version 0 (versions start at 1)
     bad_frame_size,      // a frame notice's size is 0 or over max_notice_frame_size
+    bad_stream_header,   // VPC stream kind, part, snapshot or sequence fields that disagree
+    bad_stream_record,   // a VPC stream record body that breaks its type's rules
 };
 
 [[nodiscard]] inline constexpr auto to_string(DecodeError e) noexcept -> const char* {
@@ -230,6 +232,10 @@ enum class DecodeError : std::uint8_t {
             return "revocation list version is zero";
         case DecodeError::bad_frame_size:
             return "frame notice size is zero or too large";
+        case DecodeError::bad_stream_header:
+            return "VPC stream header fields disagree";
+        case DecodeError::bad_stream_record:
+            return "VPC stream record breaks its type's rules";
     }
     return "unknown";
 }

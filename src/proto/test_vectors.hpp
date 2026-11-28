@@ -326,4 +326,25 @@ inline constexpr std::string_view revocations18 =
 inline constexpr std::string_view revocations18_signature =
     "78f2faf25db9394c6fe5f44f5130977619f34e5c592c1919a05010ba82f9d6b75688646d37ee33f63f7d76f4"
     "1734aee5501a8ac920ffeb9ce4249df93137600c";
+
+// Vector 19: a VpcStream delta (format v1, .kiro/specs/fleet-scale-networking/
+// design "VPC streams") signed with key 1 (key_id 1): VPC 0x0FC00001, VNI
+// 0xABCD, incarnation 1, every cell, sequences 7 to 8, four records:
+//   put    NIC binding 0x11, subnet 0x5B01, VTEP fd00::1, MAC 02:00:00:00:00:11
+//   put    IPv4 address 10.0.1.5 for NIC 0x11
+//   remove IPv4 address 10.0.1.4
+//   put    route in table 1: 10.0.2.0/24 to NIC 0x11
+inline constexpr std::uint16_t stream19_key_id = 1;
+inline constexpr std::uint64_t stream19_vpc_id = 0x0FC0'0001;
+inline constexpr std::uint32_t stream19_vni = 0xABCD;
+inline constexpr std::string_view stream19 =
+    "414b5653010001000100c00f00000000cdab0000010000000000000002000000010000000000000000000000"
+    "00000000070000000000000008000000000000000400000068000000010128001100000000000000015b0000"
+    "00000000fd000000000000000000000000000001020000000011000002010c000a0001051100000000000000"
+    "020204000a00010407012000010004180a000200000000000000000000000000020000001100000000000000"
+    "8df839d248ef1d4374c1e41f43f9ae14647bd9d32e22d58a8356c3434fb1697a2deb0ad3ae68a26e7818b8ed"
+    "c9094d472801daa01dfd4e4a8881de9313fb2806";
+inline constexpr std::string_view stream19_signature =
+    "8df839d248ef1d4374c1e41f43f9ae14647bd9d32e22d58a8356c3434fb1697a2deb0ad3ae68a26e7818b8ed"
+    "c9094d472801daa01dfd4e4a8881de9313fb2806";
 }  // namespace ak::proto::vectors

@@ -268,6 +268,7 @@ enum class VendorType : std::uint8_t {
     self_test = 0x1E,
     // 0x1F-0x2F: claimed by specs still being built (security groups,
     // internet gateways). fleet-scale-networking owns 0x30-0x35.
+    vpc_stream = 0x30,
     vtep_credential = 0x31,
     credential_revocations = 0x32,
     frame_notice = 0x33,

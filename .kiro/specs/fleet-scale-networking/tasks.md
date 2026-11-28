@@ -44,10 +44,12 @@ tasks 14-15. Phases A, B and C can run in parallel.
 
 ### Phase B: VPC streams
 
-- [ ] 5. `VpcStream` codec: header, the 16 record types, strict
+- [x] 5. `VpcStream` codec: header, the 16 record types, strict
   ordering and size rules, link record 32, vendor type 0x30, vectors,
-  `fuzz_vpc_stream` with re-encode. _Requirements: 4.1, 5.1, 5.3, 10.1_
-  (cloud)
+  `fuzz_vpc_stream` with re-encode. As built: helm forwards record 32 to
+  every network role as vendor type 0x30 without keeping it; roles answer
+  `unsupported` until task 6. Signing vector 19. _Requirements: 4.1, 5.1,
+  5.3, 10.1_ (cloud)
 - [ ] 6. `StreamApplier` and persistent `VniState` tables: sequence,
   holds and gaps, `need_snapshot`, whole-delta validation and refusal,
   atomic publish to the data-plane thread; VSwitch, router, ARP/ND proxy

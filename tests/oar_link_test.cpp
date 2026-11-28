@@ -838,6 +838,11 @@ public:
         vpc_configs.emplace_back(frame.begin(), frame.end());
         return oar::Status::ok;
     }
+    std::vector<std::vector<std::byte>> vpc_streams;
+    auto vpc_stream(std::span<const std::byte> frame) -> oar::Status override {
+        vpc_streams.emplace_back(frame.begin(), frame.end());
+        return oar::Status::ok;
+    }
     auto group_usage(std::uint16_t cursor) -> std::expected<oar::UsagePage, oar::Status> override {
         return _pager.page(cursor, [this] {
             ++snapshots;
@@ -1117,6 +1122,40 @@ BOOST_AUTO_TEST_CASE(vpc_config_is_forwarded_whole_in_chunks) {
     OarLink other_link{*helm_c, config()};
     const Server server{other, fake};
     const auto refused = other_link.vpc_config(smallest);
+    BOOST_REQUIRE(!refused.has_value());
+    BOOST_TEST((refused.error().status == oar::Status::unsupported));
+}
+
+// fleet-scale-networking task 5: vendor type 0x30 carries a VPC stream
+// frame whole, in chunks, from a header-only delta to the largest frame.
+BOOST_AUTO_TEST_CASE(vpc_streams_are_forwarded_whole_in_chunks) {
+    BOOST_TEST(static_cast<int>(mctp::VendorType::vpc_stream) == 0x30);
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    MeterRole role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const auto smallest = pattern(oar::min_vpc_stream_frame);
+    const auto largest = pattern(oar::max_vpc_stream_frame);
+    {
+        const Server server{endpoint, role};
+        BOOST_TEST(link.vpc_stream(smallest).has_value());
+        BOOST_TEST(link.vpc_stream(largest).has_value());
+        BOOST_TEST(
+            (link.vpc_stream(std::span{smallest}.first(10)).error().code == LinkErrc::bad_request));
+        BOOST_TEST((link.vpc_stream(pattern(oar::max_vpc_stream_frame + 1)).error().code ==
+                    LinkErrc::bad_request));
+    }
+    BOOST_REQUIRE(role.vpc_streams.size() == 2U);
+    BOOST_TEST(role.vpc_streams[0] == smallest);
+    BOOST_TEST(role.vpc_streams[1] == largest);
+
+    // A role that applies no streams (the default) answers unsupported.
+    auto [helm_c, oar_c] = InProcessBinding::make_pair();
+    FakeOar fake;
+    OarEndpoint other{*oar_c, oar_config()};
+    OarLink other_link{*helm_c, config()};
+    const Server server{other, fake};
+    const auto refused = other_link.vpc_stream(smallest);
     BOOST_REQUIRE(!refused.has_value());
     BOOST_TEST((refused.error().status == oar::Status::unsupported));
 }

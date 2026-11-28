@@ -13,15 +13,30 @@
 // test key, which the role trusts), so every frame still crosses the
 // role's verification.
 //
-//   vpc_netns_role --role N --vtep1 ADDR --vtep2 ADDR [--tap NAME=NIC_ID,MAC ...]
+//   vpc_netns_role --role N --vtep1 ADDR --vtep2 ADDR [--vtep3 ADDR]
+//                  [--control FIFO] [--tap NAME=NIC_ID,MAC ...]
 //
-// --role (1 or 2) picks this role's VTEP and server ID; the other is the
-// WireGuard peer. Each --tap opens an existing TAP device NAME in this
+// --role (1 or 2, or 3 with --vtep3) picks this role's VTEP and server ID;
+// the others are its WireGuard peers. Each --tap opens an existing TAP device NAME in this
 // network namespace, gives it MAC and the planned guest MTU, and attaches
 // it as NIC_ID, which must be one of this role's NICs below with that MAC.
 // Once everything is applied it prints "ready MTU" (the guest MTU) on
 // stdout, then runs until SIGTERM or SIGINT and prints the VSwitch's
 // non-zero counters on stderr as it exits.
+//
+// --control (fleet-scale-networking task 4, tests/certified_netns.sh)
+// reads commands, one per line, from FIFO, each with an ID the answer on
+// stdout repeats:
+//
+//   credential ID installs this role's controller credential, as helm
+//                 would forward it; "done ID"
+//   certified ID  installs the credential too and applies a TunnelPeers
+//                 frame with no peers, so every peer must be certified;
+//                 "done ID"
+//   lists ID      applies a TunnelPeers frame listing every peer again;
+//                 "done ID"
+//   status ID     "status ID certified=C list=L sessions=S": the tunnel's
+//                 peers by kind, and how many can send
 //
 // The VPC (tests/vpc_netns.sh uses the same values):
 //
@@ -32,6 +47,7 @@
 //   NIC 0x11  02:00:00:00:00:11  role 1  A  10.0.1.17  fd10:0:0:1::11
 //   NIC 0x22  02:00:00:00:00:22  role 2  B  10.0.2.34  fd10:0:0:2::22
 //   NIC 0x33  02:00:00:00:00:33  role 1  B  10.0.2.51  fd10:0:0:2::33
+//   NIC 0x44  02:00:00:00:00:44  role 3  A  10.0.1.68  fd10:0:0:1::44 (with --vtep3)
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -71,6 +87,7 @@
 #include "proto/map_update.hpp"
 #include "proto/tunnel_peers.hpp"
 #include "proto/vpc_config.hpp"
+#include "proto/vtep_credential.hpp"
 
 namespace {
 
@@ -109,7 +126,9 @@ struct Nic {
     int role;
     std::uint8_t subnet;  // 1 for A, 2 for B: the third octet and the /64
 };
-constexpr std::array<Nic, 3> nics{{{0x11, 1, 1}, {0x22, 2, 2}, {0x33, 1, 2}}};
+constexpr std::array<Nic, 4> nics{{{0x11, 1, 1}, {0x22, 2, 2}, {0x33, 1, 2}, {0x44, 3, 1}}};
+constexpr std::uint64_t credential_life = 86'400;
+constexpr std::uint64_t credential_backdate = 60;
 
 auto mac_of(std::uint64_t nic) -> net::MacAddress {
     net::MacAddress m{};
@@ -149,7 +168,9 @@ auto private_key(int role) -> net::wg::Key {
     return k;
 }
 
-auto map_frame(std::uint64_t server, const net::Ipv6Address& vtep1, const net::Ipv6Address& vtep2)
+// `vteps` holds role N's VTEP at N - 1; NICs of roles not running are left
+// out.
+auto map_frame(std::uint64_t server, const std::vector<net::Ipv6Address>& vteps)
     -> std::optional<std::vector<std::byte>> {
     proto::MapUpdate m{};
     m.server_id = server;
@@ -157,9 +178,12 @@ auto map_frame(std::uint64_t server, const net::Ipv6Address& vtep1, const net::I
     m.vni = vni;
     m.map_version = 1;
     for (const Nic& n : nics) {  // ascending IDs and, with them, addresses
+        if (static_cast<std::size_t>(n.role) > vteps.size()) {
+            continue;
+        }
         m.entries.push_back({.nic_id = n.id,
                              .mac = mac_of(n.id),
-                             .owner_vtep = n.role == 1 ? vtep1 : vtep2,
+                             .owner_vtep = vteps.at(static_cast<std::size_t>(n.role - 1)),
                              .subnet_id = n.subnet == 1 ? subnet_a : subnet_b});
         m.ipv4.push_back({.nic_id = n.id, .address = ipv4_of(n)});
         m.ipv6.push_back({.nic_id = n.id, .address = ipv6_of(n)});
@@ -213,21 +237,57 @@ auto vpc_frame(std::uint64_t server) -> std::optional<std::vector<std::byte>> {
     return *bytes;
 }
 
-auto peers_frame(std::uint64_t server, const net::Ipv6Address& self, const net::Ipv6Address& peer,
-                 const net::wg::Key& peer_key) -> std::optional<std::vector<std::byte>> {
+struct PeerKey {
+    net::Ipv6Address vtep;
+    net::wg::Key key;
+};
+
+auto peers_frame(std::uint64_t server, const net::Ipv6Address& self, std::vector<PeerKey> peers,
+                 std::uint64_t version) -> std::optional<std::vector<std::byte>> {
     proto::TunnelPeers t{};
     t.server_id = server;
     t.key_id = key_id;
     t.vtep = self;
-    t.peers_version = 1;
-    t.peers.push_back(
-        {.vtep = peer, .mode = proto::TunnelMode::wireguard, .spi = 0, .key = peer_key});
+    t.peers_version = version;
+    std::ranges::sort(peers, {}, &PeerKey::vtep);
+    for (const auto& p : peers) {
+        t.peers.push_back(
+            {.vtep = p.vtep, .mode = proto::TunnelMode::wireguard, .spi = 0, .key = p.key});
+    }
     auto bytes = proto::encode_tunnel_peers(t);
     if (!bytes) {
         return std::nullopt;
     }
     proto::set_tunnel_peers_signature(*bytes,
                                       signer().sign(proto::tunnel_peers_signed_bytes(*bytes)));
+    return *bytes;
+}
+
+// This role's credential, as the controller would sign it and helm forward
+// it: valid from a minute ago for a day.
+auto credential_frame(std::uint64_t server, const net::Ipv6Address& self, const net::wg::Key& key,
+                      std::uint64_t serial) -> std::optional<std::vector<std::byte>> {
+    const auto now =
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count());
+    proto::VtepCredential c{.key_id = key_id,
+                            .server_id = server,
+                            .cell_id = 0,
+                            .modes = proto::tunnel_mode_bit(proto::TunnelMode::wireguard),
+                            .slot = 0,
+                            .key_epoch = 1,
+                            .vtep = self,
+                            .public_key = key,
+                            .not_before = now - credential_backdate,
+                            .not_after = now + credential_life,
+                            .serial = serial,
+                            .signature = {}};
+    auto bytes = proto::encode_vtep_credential(c);
+    if (!bytes) {
+        return std::nullopt;
+    }
+    proto::set_credential_signature(*bytes, signer().sign(proto::credential_signed_bytes(*bytes)));
     return *bytes;
 }
 
@@ -333,7 +393,9 @@ auto on_signal(int /*sig*/) -> void {
 }
 
 auto usage() -> int {
-    std::println(stderr, "usage: {} --role N --vtep1 ADDR --vtep2 ADDR [--tap NAME=NIC_ID,MAC ...]",
+    std::println(stderr,
+                 "usage: {} --role N --vtep1 ADDR --vtep2 ADDR [--vtep3 ADDR] [--control FIFO] "
+                 "[--tap NAME=NIC_ID,MAC ...]",
                  log_name);
     return exit_usage;
 }
@@ -372,6 +434,8 @@ struct Options {
     int role{0};
     std::optional<net::Ipv6Address> vtep1;
     std::optional<net::Ipv6Address> vtep2;
+    std::optional<net::Ipv6Address> vtep3;
+    std::string control;
     struct Tap {
         std::string name;
         std::uint64_t nic{0};
@@ -386,11 +450,18 @@ auto parse(int argc, char** argv) -> std::optional<Options> {
         const std::string_view arg{argv[i]};
         const std::string value{argv[i + 1]};
         if (arg == "--role") {
-            o.role = value == "1" ? 1 : value == "2" ? 2 : 0;
+            o.role = value == "1" ? 1 : value == "2" ? 2 : value == "3" ? 3 : 0;
         } else if (arg == "--vtep1") {
             o.vtep1 = parse_ipv6(value);
         } else if (arg == "--vtep2") {
             o.vtep2 = parse_ipv6(value);
+        } else if (arg == "--vtep3") {
+            o.vtep3 = parse_ipv6(value);
+            if (!o.vtep3) {
+                return std::nullopt;
+            }
+        } else if (arg == "--control") {
+            o.control = value;
         } else if (arg == "--tap") {
             const auto eq = value.find('=');
             const auto comma = value.find(',');
@@ -411,7 +482,7 @@ auto parse(int argc, char** argv) -> std::optional<Options> {
             return std::nullopt;
         }
     }
-    if (argc % 2 == 0 || o.role == 0 || !o.vtep1 || !o.vtep2) {
+    if (argc % 2 == 0 || o.role == 0 || !o.vtep1 || !o.vtep2 || (o.role == 3 && !o.vtep3)) {
         return std::nullopt;
     }
     return o;
@@ -425,9 +496,11 @@ auto main(int argc, char** argv) -> int {
         return usage();
     }
     const std::uint64_t server = server_base + static_cast<std::uint64_t>(opts->role);
-    const net::Ipv6Address self = opts->role == 1 ? *opts->vtep1 : *opts->vtep2;
-    const net::Ipv6Address peer = opts->role == 1 ? *opts->vtep2 : *opts->vtep1;
-    const int peer_role = 3 - opts->role;
+    std::vector<net::Ipv6Address> vteps{*opts->vtep1, *opts->vtep2};
+    if (opts->vtep3) {
+        vteps.push_back(*opts->vtep3);
+    }
+    const net::Ipv6Address self = vteps.at(static_cast<std::size_t>(opts->role - 1));
 
     const auto plan = net::plan_mtu(underlay_mtu, net::tunnel_overhead_budget);
     if (!plan) {
@@ -475,11 +548,26 @@ auto main(int argc, char** argv) -> int {
 
     // helm's part: this VTEP's key, then the controller's frames.
     const auto own_key = private_key(opts->role);
-    const auto peer_public = net::wg::public_key(private_key(peer_role));
-    const auto peers = peer_public ? peers_frame(server, self, peer, *peer_public) : std::nullopt;
-    const auto map = map_frame(server, *opts->vtep1, *opts->vtep2);
+    std::vector<PeerKey> peer_keys;
+    for (std::size_t i = 0; i < vteps.size(); ++i) {
+        const int r = static_cast<int>(i) + 1;
+        if (r == opts->role) {
+            continue;
+        }
+        if (const auto pub = net::wg::public_key(private_key(r)); pub) {
+            peer_keys.push_back({.vtep = vteps[i], .key = *pub});
+        }
+    }
+    std::uint64_t peers_version = 1;
+    const auto peers = peer_keys.size() + 1 == vteps.size()
+                           ? peers_frame(server, self, peer_keys, peers_version)
+                           : std::nullopt;
+    const auto map = map_frame(server, vteps);
     const auto vpc = vpc_frame(server);
-    if (!peers || !map || !vpc) {
+    const auto own_public = net::wg::public_key(own_key);
+    const auto credential =
+        own_public ? credential_frame(server, self, *own_public, server) : std::nullopt;
+    if (!peers || !map || !vpc || !credential) {
         std::println(stderr, "{}: building the controller's frames failed", log_name);
         return EXIT_FAILURE;
     }
@@ -512,6 +600,54 @@ auto main(int argc, char** argv) -> int {
         }
     }
 
+    int control = -1;
+    if (!opts->control.empty()) {
+        // Read-write, so the FIFO never reports end of file between writers.
+        control = ::open(opts->control.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (control < 0) {
+            std::println(stderr, "{}: control {}: {}", log_name, opts->control,
+                         std::strerror(errno));
+            return EXIT_FAILURE;
+        }
+    }
+    std::string pending;
+    const auto command = [&](std::string_view line) {
+        const auto space = line.find(' ');
+        const auto verb = line.substr(0, space);
+        const auto id =
+            space == std::string_view::npos ? std::string_view{} : line.substr(space + 1);
+        if (verb == "credential" || verb == "certified" || verb == "lists") {
+            if (verb != "lists" && (*role)->vtep_credential(*credential) != Status::ok) {
+                std::println("refused {}", id);
+                return;
+            }
+            if (verb == "credential") {
+                std::println("done {}", id);
+                return;
+            }
+            const auto frame =
+                peers_frame(server, self, verb == "lists" ? peer_keys : std::vector<PeerKey>{},
+                            ++peers_version);
+            if (!frame || (*role)->tunnel_peers(*frame) != Status::ok) {
+                std::println("refused {}", id);
+                return;
+            }
+            std::println("done {}", id);
+        } else if (verb == "status") {
+            std::size_t certified = 0;
+            std::size_t listed = 0;
+            std::size_t sessions = 0;
+            for (const auto& p : (*role)->tunnel()->peers()) {
+                ++(p.certified ? certified : listed);
+                sessions += p.session ? 1 : 0;
+            }
+            std::println("status {} certified={} list={} sessions={}", id, certified, listed,
+                         sessions);
+        } else {
+            std::println("unknown {}", line);
+        }
+    };
+
     (void)std::signal(SIGTERM, on_signal);
     (void)std::signal(SIGINT, on_signal);
     std::println("ready {}", plan->guest_mtu);
@@ -526,6 +662,9 @@ auto main(int argc, char** argv) -> int {
         fds.push_back({.fd = (*udp)->poll_fd(), .events = POLLIN, .revents = 0});
         for (const auto& t : taps) {
             fds.push_back({.fd = t->fd, .events = POLLIN, .revents = 0});
+        }
+        if (control >= 0) {
+            fds.push_back({.fd = control, .events = POLLIN, .revents = 0});
         }
         const auto wait =
             std::chrono::ceil<std::chrono::milliseconds>(next_tick - net::VtepClock::now());
@@ -553,12 +692,37 @@ auto main(int argc, char** argv) -> int {
                      .frame = std::span{frame}.first(static_cast<std::size_t>(got))});
             }
         }
+        if (control >= 0 && (fds.back().revents & POLLIN) != 0) {
+            std::array<char, 256> buf{};
+            const auto got = ::read(control, buf.data(), buf.size());
+            if (got > 0) {
+                pending.append(buf.data(), static_cast<std::size_t>(got));
+            }
+            for (auto nl = pending.find('\n'); nl != std::string::npos; nl = pending.find('\n')) {
+                command(std::string_view{pending}.substr(0, nl));
+                pending.erase(0, nl + 1);
+            }
+            (void)std::fflush(stdout);
+            next_tick = now;  // run the timers after a change of peers
+        }
         if (now >= next_tick) {
             next_tick = (*role)->tick(now);
         }
         more = (*role)->poll() || busy;
     }
     print_counters((*role)->vswitch().counters());
+    const auto& tc = (*role)->tunnel()->counters();
+    std::println(stderr, "{}: credentials_tx {} credentials_verified {} certified_peers_added {}",
+                 log_name, tc.credentials_tx, tc.credentials_verified, tc.certified_peers_added);
+    for (std::size_t i = 0; i < net::tunnel_drop_count; ++i) {
+        if (tc.rx_drop.at(i) != 0) {
+            std::println(stderr, "{}: tunnel drop {} {}", log_name,
+                         net::to_string(static_cast<net::TunnelDrop>(i)), tc.rx_drop.at(i));
+        }
+    }
+    if (control >= 0) {
+        ::close(control);
+    }
     for (const auto& t : taps) {
         ::close(t->fd);
     }

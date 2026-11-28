@@ -1,6 +1,6 @@
 # Implementation Plan — Network control at fleet scale
 
-## Status: 3/18 tasks complete
+## Status: 4/18 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -36,9 +36,10 @@ tasks 14-15. Phases A, B and C can run in parallel.
   and revocation teardown; a reference model test and
   `fuzz_tunnel_credential`; Linux interop unchanged for list peers.
   _Requirements: 3.1-3.4, 3.6, 3.7, 10.2_ (cloud)
-- [ ] 4. Coexistence: inventory `certified` mode bit, list peers looked
-  up first, refusal counters; a network-namespace test moving a live
-  three-role VPC from `TunnelPeers` to certified peers and back.
+- [x] 4. Coexistence: inventory `certified` flag (`tunnel_flags` bit 0),
+  list peers looked up first, refusal counters; a network-namespace test
+  (`tests/certified_netns.sh`) moving a live three-role VPC from
+  `TunnelPeers` to certified peers and back.
   _Requirements: 3.5, 10.3_ (cloud)
 
 ### Phase B: VPC streams

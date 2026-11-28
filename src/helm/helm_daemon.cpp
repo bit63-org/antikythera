@@ -770,7 +770,12 @@ auto HelmDaemon::keep_credential(CredentialFrame& credential) -> void {
         // Answered: the renewal at two thirds of this credential's life is
         // a new request, not a retry of this one.
         slot->credential_asked = {};
-        refused = !slot->link->vtep_credential(it->second.frame) || refused;
+        if (slot->link->vtep_credential(it->second.frame)) {
+            slot->credential_held = it->second.credential.public_key;
+        } else {
+            slot->credential_held.reset();
+            refused = true;
+        }
     }
     const std::scoped_lock lock{_inbox_mutex};
     ++_stats.vtep_credentials;
@@ -807,10 +812,14 @@ auto HelmDaemon::send_credentials(SlotState& slot) -> void {
     std::uint64_t credential_refused = 0;
     std::uint64_t lists_refused = 0;
     const auto& vtep = slot.inventory->vtep;
+    slot.credential_held.reset();
     if (const auto it = _credentials.find(vtep);
-        it != _credentials.end() && _keyring.public_key(vtep) == it->second.credential.public_key &&
-        !slot.link->vtep_credential(it->second.frame)) {
-        ++credential_refused;
+        it != _credentials.end() && _keyring.public_key(vtep) == it->second.credential.public_key) {
+        if (slot.link->vtep_credential(it->second.frame)) {
+            slot.credential_held = it->second.credential.public_key;
+        } else {
+            ++credential_refused;
+        }
     }
     for (const auto& [cell, list] : _revocations) {
         if (!slot.link->credential_revocations(list.frame)) {
@@ -1296,6 +1305,31 @@ auto HelmDaemon::publish() -> void {
         }
     }
     _keyring.fill(inv);
+    // Certified: the role took a credential for the key it holds now, and
+    // that credential has not expired.
+    const auto unix_now = now_unix();
+    for (const auto& [n, slot] : _slots) {
+        if (!is_net(*slot) || !slot->credential_held || slot->keys_pending) {
+            continue;
+        }
+        const auto& vtep = slot->inventory->vtep;
+        const auto held = _credentials.find(vtep);
+        if (held == _credentials.end() ||
+            held->second.credential.public_key != *slot->credential_held ||
+            held->second.credential.not_after <= unix_now) {
+            continue;
+        }
+        proto::VtepAddress v{};
+        std::ranges::copy(vtep, v.begin());
+        const auto at = std::ranges::find(inv.vteps, v);
+        if (at == inv.vteps.end() || inv.tunnels.size() != inv.vteps.size()) {
+            continue;
+        }
+        auto& t = inv.tunnels[static_cast<std::size_t>(at - inv.vteps.begin())];
+        if (t.public_key == *slot->credential_held) {
+            t.flags |= proto::tunnel_flag_certified;
+        }
+    }
     bool changed = false;
     {
         const std::scoped_lock lock{_snapshot_mutex};

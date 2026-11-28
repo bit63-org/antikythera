@@ -98,3 +98,9 @@ jobs:
         run: |
           sudo apt-get install -y -qq --no-install-recommends isc-dhcp-client busybox
           sudo tests/vpc_netns.sh build/tests/vpc_netns_role
+
+      # tests/certified_netns.sh: three network roles move from peer
+      # lists to controller credentials one at a time under ping, and
+      # back (fleet-scale-networking task 4).
+      - name: Certified VTEPs in network namespaces
+        run: sudo tests/certified_netns.sh build/tests/vpc_netns_role

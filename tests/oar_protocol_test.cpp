@@ -788,11 +788,17 @@ BOOST_AUTO_TEST_CASE(cert_answer_round_trip_and_rules) {
     auto khold = oar::encode_cert_answer({.role = oar::Role::khold, .csr = csr});
     BOOST_REQUIRE(khold.has_value());
     BOOST_TEST((oar::decode_cert_answer(*khold).value().role == oar::Role::khold));
-    BOOST_TEST(oar::is_storage_role(oar::Role::khold));
-    BOOST_TEST(!oar::is_storage_role(oar::Role::gpu));
+    BOOST_TEST(oar::enrolls(oar::Role::khold));
+    BOOST_TEST(!oar::enrolls(oar::Role::gpu));
     BOOST_TEST(!oar::role_serves(oar::Role::khold, FunctionType::blk_fn));
     BOOST_TEST(std::string_view{oar::to_string(oar::Role::khold)} == "khold");
-    BOOST_TEST((oar::encode_cert_answer({.role = oar::Role::net, .csr = csr}).error() ==
+    // A network role enrolls for its bulk channel (fleet-scale-networking
+    // task 10); a role with no certificate to ask for does not.
+    BOOST_TEST(oar::enrolls(oar::Role::net));
+    auto net = oar::encode_cert_answer({.role = oar::Role::net, .csr = csr});
+    BOOST_REQUIRE(net.has_value());
+    BOOST_TEST((oar::decode_cert_answer(*net).value().role == oar::Role::net));
+    BOOST_TEST((oar::encode_cert_answer({.role = oar::Role::gpu, .csr = csr}).error() ==
                 oar::BodyError::unknown_enum));
     const std::vector<std::byte> huge(oar::max_csr + 1);
     BOOST_TEST((oar::encode_cert_answer({.role = oar::Role::blk, .csr = huge}).error() ==

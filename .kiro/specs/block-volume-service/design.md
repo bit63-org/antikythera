@@ -255,7 +255,9 @@ certificates the controller's CA issues at enrollment (the role creates
 its key; helm relays the CSR). The certificate binds the `server_id`
 (a URI subjectAltName `urn:antikythera:server:<id>`, exactly one),
 which is what a hold role checks against the ReplicaConfig
-(Requirement 13.2); its packets carry the storage I/O class, or the
+(Requirement 13.2). The same flow enrolls a network role for its bulk
+channel (`StorageRole::net` = 4, fleet-scale-networking task 10), whose
+certificate carries its control address as the IP SAN; its packets carry the storage I/O class, or the
 background class for rebuild, hydration and scrub sessions. A session is opened per (volume, peer) with `HELLO`
 naming the volume, epoch, and either the attachment and its generation
 (initiator) or the member's `replica_gen` (peer).

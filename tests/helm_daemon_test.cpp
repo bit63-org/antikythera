@@ -1402,7 +1402,6 @@ BOOST_AUTO_TEST_CASE(storage_roles_enroll_through_the_controller) {
     r.blk.role.enrolls = true;
     r.hold.role.set_csr(hold_csr);
     r.hold.role.enrolls = true;
-    r.net.role.enrolls = true;  // not a storage role: never asked
     (void)r.daemon.boot();
     BOOST_REQUIRE(r.count<proto::CertRequest>() == 2U);
     for (const auto& b : r.reports) {
@@ -1422,17 +1421,15 @@ BOOST_AUTO_TEST_CASE(storage_roles_enroll_through_the_controller) {
 
     const auto chain = ak::test::bytes_of(0x30, 0x01, 0x07);
     r.daemon.on_role_certificate({.server_id = server, .slot = blk_slot, .chain = chain});
-    r.daemon.on_role_certificate({.server_id = server, .slot = net_slot, .chain = chain});
     r.daemon.on_role_certificate({.server_id = server, .slot = 99, .chain = chain});
     r.hold.role.install_status = oar::Status::failed;
     r.daemon.on_role_certificate({.server_id = server, .slot = hold_slot, .chain = chain});
     r.daemon.run_once(0ms);
     BOOST_REQUIRE(r.blk.role.chains().size() == 1U);
     BOOST_TEST((r.blk.role.chains()[0] == chain));
-    BOOST_TEST(r.net.role.chains().empty());
     BOOST_TEST(r.hold.role.chains().size() == 1U);
     BOOST_TEST(r.daemon.stats().role_certificates == 1U);
-    BOOST_TEST(r.daemon.stats().role_certificates_refused == 3U);
+    BOOST_TEST(r.daemon.stats().role_certificates_refused == 2U);
     BOOST_TEST(r.daemon.stats().cert_requests == 2U);
     BOOST_TEST(r.count<proto::CertRequest>() == 2U);  // blk wants nothing now; hold already asked
 
@@ -1605,6 +1602,30 @@ BOOST_AUTO_TEST_CASE(khold_roles_enroll_as_khold) {
     r.daemon.run_once(0ms);
     BOOST_REQUIRE(r.khold.role.chains().size() == 1U);
     BOOST_TEST(r.daemon.stats().role_certificates == 1U);
+}
+
+// fleet-scale-networking task 10: a network role enrolls for the client
+// certificate its bulk channel presents, reported with role kind net.
+BOOST_AUTO_TEST_CASE(network_roles_enroll_as_net) {
+    Rig r;
+    const auto csr = ak::test::bytes_of(0x30, 0x02, 0x44, 0x44);
+    r.net.role.set_csr(csr);
+    r.net.role.enrolls = true;
+    (void)r.daemon.boot();
+    BOOST_REQUIRE(r.count<proto::CertRequest>() == 1U);
+    const auto c = r.last<proto::CertRequest>();
+    BOOST_TEST(c.slot == net_slot);
+    BOOST_TEST((c.role == proto::StorageRole::net));
+    BOOST_TEST((c.csr == csr));
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.count<proto::CertRequest>() == 1U);  // already with the controller
+    const auto chain = ak::test::bytes_of(0x30, 0x01, 0x07);
+    r.daemon.on_role_certificate({.server_id = server, .slot = net_slot, .chain = chain});
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.net.role.chains().size() == 1U);
+    BOOST_TEST((r.net.role.chains()[0] == chain));
+    BOOST_TEST(r.daemon.stats().role_certificates == 1U);
+    BOOST_TEST(r.daemon.stats().cert_requests == 1U);
 }
 
 BOOST_AUTO_TEST_CASE(volume_keys_are_opened_and_kept_per_attachment) {

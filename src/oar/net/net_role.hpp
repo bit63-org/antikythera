@@ -139,6 +139,7 @@
 #include <vector>
 
 #include "helm/oar_link.hpp"
+#include "helm/role_enrollment.hpp"
 #include "oar/net/mapping_table.hpp"
 #include "oar/net/metadata_server.hpp"
 #include "oar/net/metadata_store.hpp"
@@ -303,6 +304,21 @@ public:
     auto vtep_credential(std::span<const std::byte> frame) -> helm::oar::Status override;
     auto credential_revocations(std::span<const std::byte> frame) -> helm::oar::Status override;
 
+    // Enrollment (fleet-scale-networking task 10): the role certificate its
+    // bulk channel presents to frame stores. Without set_enrollment the
+    // role answers both unsupported. `enrollment` must outlive the role;
+    // its Apply should call set_bulk_tls.
+    auto cert_request() -> std::expected<helm::oar::CertAnswer, helm::oar::Status> override;
+    auto role_certificate(std::span<const std::byte> chain) -> helm::oar::Status override;
+    auto set_enrollment(helm::RoleEnrollment& enrollment) noexcept -> void {
+        _enrollment = &enrollment;
+    }
+    auto set_bulk_tls(const tls::Config& config) -> void { _bulk_tls = config; }
+    // The bulk channel's client configuration, once a certificate passed.
+    [[nodiscard]] auto bulk_tls() const noexcept -> const std::optional<tls::Config>& {
+        return _bulk_tls;
+    }
+
     // One datagram from the underlay, from `outer_src` at `now`: through
     // the tunnel if there is one, then the Vtep and the VSwitch. True if a
     // data packet reached the VSwitch.
@@ -381,6 +397,8 @@ private:
     std::unique_ptr<Tunnel> _tunnel;
     std::unique_ptr<TunnelPeerSet> _peer_set;
     std::unique_ptr<CredentialStore> _credentials;
+    helm::RoleEnrollment* _enrollment{nullptr};
+    std::optional<tls::Config> _bulk_tls;
     std::unique_ptr<Vtep> _vtep;
     std::unique_ptr<VSwitch> _vswitch;
     std::map<std::uint32_t, std::uint64_t> _vpc_versions;      // applied config version, by VNI

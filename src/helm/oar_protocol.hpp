@@ -159,7 +159,8 @@
 // self_test while one runs answers ok and starts nothing.
 //
 // Enrollment (block-volume-service task 12), to a storage role (blk,
-// hold or khold): cert_request asks the role whether it wants a certificate, and
+// hold or khold) or a network role (fleet-scale-networking task 10):
+// cert_request asks the role whether it wants a certificate, and
 // the role answers with its PKCS#10 request (DER), or csr_len 0 while the
 // certificate it holds is good. helm reports a request to the controller
 // (proto::CertRequest) and passes the controller's answer down with
@@ -206,7 +207,8 @@
 //                       6  uptime_seconds u32
 //   hold_reports        2  report_seq u64 | 10 total u32 | 14 offset u32 | 18 chunk
 //                       (total 0: nothing to report, and the rest zero and empty)
-//   cert_request        2  role u8 (Role: blk, hold or khold) | 3  reserved u8 | 4  csr_len u16
+//   cert_request        2  role u8 (Role: blk, hold, khold or net) | 3  reserved u8
+//                       4  csr_len u16
 //                       6  csr [csr_len] (0..max_csr bytes)
 //   eject               2  state u8 (EjectState) | 3  reserved u8
 //   copy_volume         2  state u8 (CopyVolumeState) | 3  failure u8 (CopyVolumeFailure)
@@ -460,9 +462,11 @@ enum class CopyVolumeFailure : std::uint8_t {
 
 [[nodiscard]] auto to_string(Status s) noexcept -> const char*;
 [[nodiscard]] auto to_string(Role r) noexcept -> const char*;
-// Whether a role takes part in enrollment (blk, hold, khold).
-[[nodiscard]] constexpr auto is_storage_role(Role r) noexcept -> bool {
-    return r == Role::blk || r == Role::hold || r == Role::khold;
+// Whether a role takes part in enrollment: the storage roles (blk, hold,
+// khold) and the network role, whose bulk channel (fleet-scale-networking
+// Requirement 6.1) authenticates with its role certificate.
+[[nodiscard]] constexpr auto enrolls(Role r) noexcept -> bool {
+    return r == Role::blk || r == Role::hold || r == Role::khold || r == Role::net;
 }
 [[nodiscard]] auto to_string(HealthState h) noexcept -> const char*;
 

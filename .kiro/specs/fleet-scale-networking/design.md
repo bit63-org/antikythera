@@ -352,9 +352,15 @@ FrameNotice {                 // controller link record 33 / vendor type 0x33
   marks bulk traffic CS6. It dials only frame-store addresses helm passes
   it with the notice batch; it listens on nothing for this.
 - **Identity.** The role enrolls for a role certificate with the existing
-  `cert_request` flow, role kind `net` added to `StorageRole`'s
-  neighbour enum (block-volume-service design "Enrollment"), naming its
-  server and control address.
+  `cert_request` flow: `StorageRole::net` = 4 in the report, `Role::net`
+  in the OarLink answer (`oar::enrolls()` now covers it), naming its
+  server (URI SAN) and control address (IP SAN), common name `oar-net`.
+  `tls::RoleIdentity` and `helm::RoleEnrollment` are reused unchanged,
+  as a TLS client. ak-oar-net takes `--control-addr` with
+  `--role-ca/--role-cert/--role-key`, all or none; without them it
+  answers `cert_request` unsupported and stays on OarLink chunks. The
+  controller signs the control address from the server's configuration,
+  as it does the VTEP, never from the request alone.
 - **Fetch.** `BulkFetcher` (`src/oar/net/bulk_fetch.*`) runs HTTP/1.1 over
   TLS 1.3 (`ak::tls`), `GET /v1/frames/<sha256-hex>`, response body
   exactly `size` bytes, digest checked before decode, then the frame's

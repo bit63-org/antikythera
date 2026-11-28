@@ -156,7 +156,7 @@
 //                  inventory on every connection
 //     kem u16 (HPKE KEM ID; 0x0020, DHKEM(X25519, HKDF-SHA256)) | rsvd [6]
 //     transport_key [32] (never all zero)
-//   cert_request  -- a storage role asks for its storage certificate
+//   cert_request  -- a storage or network role asks for its role certificate
 //     slot u8 | role u8 (StorageRole) | csr_len u16 | rsvd u32
 //     csr [csr_len] (a DER PKCS#10 request, 1..max_csr_size bytes)
 //
@@ -175,7 +175,10 @@
 // here (der.hpp) and the rest is the controller's to parse. The controller
 // signs a request only with names it vouches for: exactly one URI SAN, the
 // reporting server's (server_identity.hpp), plus for a hold role the IP
-// SANs of that server's storage endpoints, and answers with a
+// SANs of that server's storage endpoints and for a network role the IP
+// SAN of its control address (fleet-scale-networking task 10; the
+// controller knows it from the server's configuration, as it knows the
+// VTEP), and answers with a
 // role_certificate record (link.hpp) for the same slot.
 //
 // group_usage entries are in strictly increasing (slot, nic_id, attachment)
@@ -380,11 +383,13 @@ enum class ConversionFailure : std::uint8_t {
     lost = 7,   // the storage role no longer knew the copy
 };
 
-// Which storage role a certificate is for.
+// Which role a certificate is for. Named for the storage roles that
+// enrolled first; a network role enrolls too, for its bulk channel.
 enum class StorageRole : std::uint8_t {
     hold = 1,
     initiator = 2,  // oar-blk
     khold = 3,      // a khold node (kythira khold-block-service)
+    net = 4,        // oar-net (fleet-scale-networking Requirement 6.1)
 };
 
 // A khold member's state in its stripe group (group_status).
@@ -925,7 +930,7 @@ namespace detail {
     return s >= SnapshotState::frozen && s <= SnapshotState::failed;
 }
 [[nodiscard]] constexpr auto known(StorageRole r) noexcept -> bool {
-    return r >= StorageRole::hold && r <= StorageRole::khold;
+    return r >= StorageRole::hold && r <= StorageRole::net;
 }
 [[nodiscard]] constexpr auto known(GroupMemberState s) noexcept -> bool {
     return s >= GroupMemberState::leader && s <= GroupMemberState::unavailable;

@@ -559,6 +559,11 @@ public:
         -> void;
     // VMs helm believes run (hull confirmed their CREATE_VM).
     [[nodiscard]] auto vm_count() const noexcept -> std::size_t { return _vms.size(); }
+    // Network volumes attached here, or whose config still fences one here.
+    [[nodiscard]] auto network_volume_count() const noexcept -> std::size_t {
+        return _network.size();
+    }
+    [[nodiscard]] auto server_id() const noexcept -> std::uint64_t { return _config.server_id; }
     // The host was reset under its VMs (host_power off, cycle or hold with
     // force): every VM is gone. Each is forgotten as a DESTROY_VM that
     // keeps its volumes would, reported exited (vmm_failure), and the

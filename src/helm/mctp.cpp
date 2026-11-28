@@ -92,6 +92,7 @@ constexpr auto known_vendor_type(std::uint8_t raw) noexcept -> bool {
         case VendorType::self_test:
         case VendorType::instance_secrets:
         case VendorType::role_identity:
+        case VendorType::sanitize:
             return true;
     }
     return false;

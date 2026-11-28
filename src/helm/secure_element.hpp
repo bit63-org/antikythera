@@ -51,6 +51,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -216,6 +217,14 @@ public:
     // delivered. The default draws it from OpenSSL's RNG.
     virtual auto create_ephemeral_key() -> std::expected<ScopedKey, SeError>;
 
+    // Destroys the master key (server-provisioning Requirement 5.2,
+    // decommission): every VM key wrapped by it, every volume key under
+    // those, and the transport key derived from it can no longer be
+    // opened. The element carries on under a fresh random master key, so
+    // a decommission interrupted after this step finds an element that
+    // opens and simply holds nothing of the old keys.
+    virtual auto destroy_master_key() -> std::expected<void, SeError> = 0;
+
 protected:
     SecureElement(SecureElement&&) noexcept = default;
     auto operator=(SecureElement&&) noexcept -> SecureElement& = default;
@@ -264,6 +273,11 @@ public:
                          std::span<const std::byte, hpke::enc_size> enc,
                          std::span<const std::byte, volume_key_size + hpke::tag_size> wrapped)
         -> std::expected<void, SeError> override;
+    // A file-backed element replaces the file's key (written beside it,
+    // synced, renamed over it). The old bytes may survive on the flash
+    // underneath a file system; a hardware element destroys the key in
+    // place.
+    auto destroy_master_key() -> std::expected<void, SeError> override;
     auto import_image_key(const WrappedVmKey& owner, VolumeId volume,
                           std::span<const std::byte> aad,
                           std::span<const std::byte, hpke::enc_size> enc,
@@ -271,8 +285,10 @@ public:
         -> std::expected<WrappedVolumeKey, SeError> override;
 
 private:
-    explicit SoftwareSecureElement(SecretBytes<master_key_size> master) noexcept
-        : _master{std::move(master)} {}
+    explicit SoftwareSecureElement(
+        SecretBytes<master_key_size> master,
+        std::optional<std::filesystem::path> path = std::nullopt) noexcept
+        : _master{std::move(master)}, _path{std::move(path)} {}
 
     [[nodiscard]] auto unwrap_vm_key(const WrappedVmKey& vm) const
         -> std::expected<SecretBytes<vm_key_size>, SeError>;
@@ -285,6 +301,7 @@ private:
         std::span<std::byte, volume_key_size> out) const -> std::expected<void, SeError>;
 
     SecretBytes<master_key_size> _master;
+    std::optional<std::filesystem::path> _path;  // nullopt: ephemeral
 };
 
 }  // namespace ak::helm

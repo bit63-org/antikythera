@@ -209,6 +209,9 @@ public:
     // The board's serial, firmware and drives (server-provisioning
     // Requirement 6.1); unsupported from a role that has none configured.
     auto role_identity() -> std::expected<oar::RoleIdentity, LinkError>;
+    // Starts or queries a storage role's media sanitize (server-
+    // provisioning Requirement 5.3); unsupported from any other role.
+    auto sanitize(oar::SanitizeOp op) -> std::expected<oar::SanitizeStatus, LinkError>;
 
     [[nodiscard]] auto stats() const noexcept -> const LinkStats& { return _stats; }
 
@@ -255,7 +258,7 @@ public:
     virtual auto map_update(std::span<const std::byte> frame) -> oar::Status = 0;
     virtual auto health() -> std::expected<oar::Health, oar::Status> = 0;
     // The board's identity: the one set_identity() gave (a role process's
-    // --serial, --firmware and --drive options), else unsupported.
+    // --serial, --firmware and --drive-serial options), else unsupported.
     virtual auto role_identity() -> std::expected<oar::RoleIdentity, oar::Status> {
         if (!_identity) {
             return std::unexpected(oar::Status::unsupported);
@@ -263,6 +266,13 @@ public:
         return *_identity;
     }
     auto set_identity(oar::RoleIdentity identity) -> void { _identity = std::move(identity); }
+    // Media sanitize at decommission: a storage role starts it (once; a
+    // start while one runs or after it finished reports that one) or
+    // reports how it stands. Every other role answers unsupported.
+    virtual auto sanitize(oar::SanitizeOp /*op*/)
+        -> std::expected<oar::SanitizeStatus, oar::Status> {
+        return std::unexpected(oar::Status::unsupported);
+    }
     // The volume store, which only the storage role keeps; every other
     // role answers unsupported. request.wrapped_key is valid only during
     // the call.

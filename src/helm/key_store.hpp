@@ -139,6 +139,12 @@ public:
     auto import_vm_key(WrappedVmKey key) -> std::expected<void, KeyError>;
     auto import_volume_key(WrappedVolumeKey key) -> std::expected<void, KeyError>;
 
+    // Decommission (server-provisioning Requirement 5.2): forgets every VM
+    // key, and with them every volume key, then every attachment and image
+    // key frame, then has the secure element destroy its master key. Run
+    // again after a failure (or a power loss), it finishes the job.
+    auto destroy_all() -> std::expected<void, KeyError>;
+
     [[nodiscard]] auto find_vm_key(VmId vm) const -> std::optional<WrappedVmKey>;
     [[nodiscard]] auto find_volume_key(VolumeId volume) const -> std::optional<WrappedVolumeKey>;
     [[nodiscard]] auto owner(VolumeId volume) const -> std::optional<VmId>;

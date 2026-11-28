@@ -461,7 +461,9 @@ auto ControllerLink::report(proto::ReportBody body) -> std::uint64_t {
 
 auto ControllerLink::stats() const -> ControllerLinkStats {
     const std::scoped_lock lock{_mutex};
-    return _stats;
+    auto s = _stats;
+    s.pending_reports = _session->pending_reports();
+    return s;
 }
 
 auto ControllerLink::flush(tls::Stream& stream) -> bool {

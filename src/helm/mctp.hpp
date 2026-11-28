@@ -268,6 +268,7 @@ enum class VendorType : std::uint8_t {
     self_test = 0x1E,
     instance_secrets = 0x1F,
     role_identity = 0x20,
+    sanitize = 0x21,
 };
 
 struct VendorHeader {

@@ -154,6 +154,24 @@ public:
     auto function_inventory() -> std::expected<oar::Inventory, oar::Status> override {
         return _inventory;
     }
+
+    // Media sanitize: unsupported until an answer is set.
+    auto set_sanitize(std::optional<oar::SanitizeStatus> answer) -> void {
+        const std::scoped_lock lock{_mutex};
+        _sanitize = std::move(answer);
+    }
+    [[nodiscard]] auto sanitize_ops() const -> std::vector<oar::SanitizeOp> {
+        const std::scoped_lock lock{_mutex};
+        return _sanitize_ops;
+    }
+    auto sanitize(oar::SanitizeOp op) -> std::expected<oar::SanitizeStatus, oar::Status> override {
+        const std::scoped_lock lock{_mutex};
+        _sanitize_ops.push_back(op);
+        if (!_sanitize) {
+            return std::unexpected(oar::Status::unsupported);
+        }
+        return *_sanitize;
+    }
     auto prepare_function(const oar::PrepareFunction& r) -> oar::Status override {
         const std::scoped_lock lock{_mutex};
         _prepared.push_back(r);
@@ -411,6 +429,8 @@ public:
 
 private:
     oar::Inventory _inventory;
+    std::optional<oar::SanitizeStatus> _sanitize;
+    std::vector<oar::SanitizeOp> _sanitize_ops;
     mutable std::mutex _mutex;
     std::vector<std::vector<std::byte>> _configs;
     std::vector<std::vector<std::byte>> _layouts;
@@ -2702,6 +2722,224 @@ BOOST_AUTO_TEST_CASE(the_hardware_identity_is_reported_and_a_swap_is_a_fault) {
     const auto fault = r->last<proto::HostFaultReport>();
     BOOST_TEST((fault.code == proto::FaultCode::hardware_changed));
     BOOST_TEST(r->daemon.stats().hardware_changes == 1U);
+}
+
+// ---- decommission (server-provisioning Requirement 5) ----
+
+namespace {
+
+auto decommission_order(std::uint64_t seq, std::uint8_t sig = 1)
+    -> std::pair<proto::Decommission, std::vector<std::byte>> {
+    proto::Decommission d{.key_id = 1, .server_id = server, .seq = seq, .signature = {}};
+    d.signature.fill(std::byte{sig});
+    auto f = proto::encode_decommission(d);
+    BOOST_REQUIRE(f.has_value());
+    return {d, *f};
+}
+
+auto drive_result(std::string_view serial, proto::SanitizeResult r) -> oar::DriveSanitize {
+    return {.serial = proto::identity_text(serial), .result = r};
+}
+
+// A daemon over net, blk and hold boards, its decommission kept in `b`'s
+// sealed store.
+auto decommission_rig(BootRig& b, int& finished) -> std::unique_ptr<Rig> {
+    return std::make_unique<Rig>(link_timeout, nullptr, true, false, nullptr, nullptr,
+                                 std::function<proto::BootCache()>{}, nullptr, nullptr, nullptr,
+                                 [&b, &finished](helm::DaemonConfig& c) {
+                                     c.controller_keys = &b.verifier;
+                                     c.store = b.store.get();
+                                     c.router.server_id = server;
+                                     c.on_decommissioned = [&finished] { ++finished; };
+                                 });
+}
+
+auto progress(const Rig& r) -> std::vector<proto::DecommissionProgress> {
+    std::vector<proto::DecommissionProgress> out;
+    for (const auto& body : r.reports) {
+        if (const auto* p = std::get_if<proto::DecommissionProgress>(&body)) {
+            out.push_back(*p);
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(a_decommission_is_signed_and_waits_for_an_empty_server) {
+    BootRig b;
+    int finished = 0;
+    auto r = decommission_rig(b, finished);
+    BOOST_REQUIRE(r->daemon.boot().host_released);
+    const auto send = [&](std::uint64_t seq, std::uint8_t sig = 1) {
+        const auto [d, f] = decommission_order(seq, sig);
+        r->daemon.on_decommission(d, f);
+        r->daemon.run_once(0ms);
+        const auto outcome = r->last<proto::CommandOutcome>();
+        BOOST_TEST(outcome.in_reply_to == seq);
+        BOOST_TEST(outcome.command == 0x8016U);
+        return outcome.status;
+    };
+    BOOST_TEST((send(1, 0) == proto::CommandStatus::bad_signature));
+
+    // A VM on the server (Requirement 5.1).
+    r->daemon.on_envelope(
+        envelope(2, mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib}));
+    r->daemon.run_once(0ms);
+    r->daemon.post_host_slot(response(2, mb::Type::create_vm));
+    r->daemon.run_once(0ms);
+    BOOST_REQUIRE(r->daemon.router().vm_count() == 1U);
+    BOOST_TEST((send(3) == proto::CommandStatus::conflict));
+    BOOST_TEST(!r->daemon.decommissioning());
+    BOOST_TEST(!b.store->contains(helm::decommission_object));
+
+    r->daemon.on_envelope(envelope(4, mb::DestroyVm{.vm_id = vm_one, .persist_volumes = false}));
+    r->daemon.run_once(0ms);
+    r->daemon.post_host_slot(response(4, mb::Type::destroy_vm));
+    r->daemon.run_once(0ms);
+    BOOST_REQUIRE(r->daemon.router().vm_count() == 0U);
+    BOOST_TEST((send(5) == proto::CommandStatus::ok));
+    BOOST_TEST(r->daemon.stats().decommissions_refused == 2U);
+    // Replayed: refused like any replay.
+    BOOST_TEST((send(5) == proto::CommandStatus::stale_sequence));
+}
+
+BOOST_AUTO_TEST_CASE(a_decommission_destroys_keys_sanitizes_media_and_clears_identity) {
+    BootRig b;
+    int finished = 0;
+    auto r = decommission_rig(b, finished);
+    r->hold.role.set_sanitize(
+        oar::SanitizeStatus{.state = oar::SanitizeState::running, .drives = {}});
+    BOOST_REQUIRE(r->daemon.boot().host_released);
+    BOOST_REQUIRE(r->keys.create_vm_key(vm_one).has_value());
+
+    const auto [d, f] = decommission_order(1);
+    r->daemon.on_decommission(d, f);
+    r->daemon.run_once(0ms);  // accepted, kept, and the keys go at once
+    BOOST_TEST(r->daemon.decommissioning());
+    BOOST_TEST(!r->backplane.host);  // held to the end
+    BOOST_TEST(r->keys.vm_count() == 0U);
+    auto steps = progress(*r);
+    BOOST_REQUIRE(steps.size() == 1U);
+    BOOST_TEST((steps[0].step == proto::DecommissionStep::keys_destroyed));
+    const auto kept = b.store->get(helm::decommission_object);
+    BOOST_REQUIRE((kept && *kept));
+    BOOST_TEST((helm::decode_decommission_state(**kept)->phase == helm::DecommissionPhase::media));
+
+    // The hold role is asked to start, then how it stands.
+    r->daemon.run_once(0ms);
+    BOOST_TEST(progress(*r).size() == 1U);  // still running
+    r->hold.role.set_sanitize(
+        oar::SanitizeStatus{.state = oar::SanitizeState::done,
+                            .drives = {drive_result("D-A", proto::SanitizeResult::sanitized_crypto),
+                                       drive_result("D-B", proto::SanitizeResult::failed)}});
+    r->daemon.run_once(0ms);
+    const auto ops = r->hold.role.sanitize_ops();
+    BOOST_REQUIRE(ops.size() >= 2U);
+    BOOST_TEST((ops.front() == oar::SanitizeOp::start));
+    BOOST_TEST((ops.back() == oar::SanitizeOp::query));
+    BOOST_TEST(r->net.role.sanitize_ops().empty());  // only storage roles
+    BOOST_TEST(r->blk.role.sanitize_ops().empty());
+
+    steps = progress(*r);
+    BOOST_REQUIRE(steps.size() == 4U);
+    BOOST_TEST((steps[1].step == proto::DecommissionStep::media));
+    BOOST_TEST(steps[1].slot == hold_slot);
+    BOOST_TEST(proto::identity_text_view(steps[1].drive_serial) == "D-A");
+    BOOST_TEST((*steps[2].result == proto::SanitizeResult::failed));
+    BOOST_TEST((steps[3].step == proto::DecommissionStep::identity_cleared));
+    BOOST_TEST(finished == 1);
+    BOOST_TEST(r->daemon.decommissioned());
+    BOOST_TEST(!r->daemon.decommissioning());
+    BOOST_TEST(!r->backplane.host);
+    const auto st = r->daemon.stats();
+    BOOST_TEST(st.drives_sanitized == 1U);
+    BOOST_TEST(st.drives_failed == 1U);
+
+    // Nothing starts on a decommissioned server.
+    r->daemon.on_envelope(
+        envelope(2, mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib}));
+    r->daemon.run_once(0ms);
+    BOOST_TEST(r->daemon.stats().decommission_dropped == 1U);
+    BOOST_TEST(r->host.posted.empty());
+}
+
+BOOST_AUTO_TEST_CASE(a_role_that_cannot_sanitize_has_its_drives_reported_failed) {
+    BootRig b;
+    int finished = 0;
+    helm::HelmIdentity me;
+    me.ek_hash.fill(std::byte{0x22});
+    me.board_serial = proto::identity_text("HELM-7");
+    helm::HardwareIdentityTracker identity{server, me, nullptr};
+    auto r = std::make_unique<Rig>(link_timeout, nullptr, true, false, nullptr, nullptr,
+                                   std::function<proto::BootCache()>{}, nullptr, nullptr, nullptr,
+                                   [&](helm::DaemonConfig& c) {
+                                       c.controller_keys = &b.verifier;
+                                       c.store = b.store.get();
+                                       c.router.server_id = server;
+                                       c.identity = &identity;
+                                       c.on_decommissioned = [&finished] { ++finished; };
+                                   });
+    r->hold.role.set_identity(
+        {.serial = proto::identity_text("STOR-3"),
+         .firmware = {},
+         .drives = {{.serial = proto::identity_text("D-1"), .size_bytes = 1},
+                    {.serial = proto::identity_text("D-2"), .size_bytes = 1}}});
+    (void)r->daemon.boot();
+    const auto [d, f] = decommission_order(1);
+    r->daemon.on_decommission(d, f);
+    r->daemon.run_once(0ms);
+    const auto steps = progress(*r);
+    BOOST_REQUIRE(steps.size() == 4U);  // keys, two drives, identity
+    BOOST_TEST(proto::identity_text_view(steps[1].drive_serial) == "D-1");
+    BOOST_TEST(proto::identity_text_view(steps[2].drive_serial) == "D-2");
+    BOOST_TEST((*steps[1].result == proto::SanitizeResult::failed));
+    BOOST_TEST(finished == 1);
+    BOOST_TEST(!identity.baseline().has_value());  // forgotten with the rest
+}
+
+BOOST_AUTO_TEST_CASE(an_interrupted_decommission_resumes_before_anything_else) {
+    BootRig b;
+    int finished = 0;
+    {
+        auto r = decommission_rig(b, finished);
+        r->hold.role.set_sanitize(
+            oar::SanitizeStatus{.state = oar::SanitizeState::running, .drives = {}});
+        (void)r->daemon.boot();
+        const auto [d, f] = decommission_order(1);
+        r->daemon.on_decommission(d, f);
+        r->daemon.run_once(0ms);
+        r->daemon.run_once(0ms);
+        BOOST_REQUIRE(r->daemon.decommissioning());
+        // Power is lost while the media sanitize runs.
+    }
+    auto r = decommission_rig(b, finished);
+    r->hold.role.set_sanitize(oar::SanitizeStatus{
+        .state = oar::SanitizeState::done,
+        .drives = {drive_result("D-A", proto::SanitizeResult::sanitized_block)}});
+    BOOST_REQUIRE(r->daemon.load_decommission());
+    // The power-on wait does not hold it up, and the host stays held.
+    r->daemon.schedule_boot(std::chrono::steady_clock::now() + 1h);
+    r->daemon.run_once(0ms);  // boots the slots
+    BOOST_TEST(r->daemon.booted());
+    BOOST_TEST(!r->backplane.host);
+    r->daemon.run_once(0ms);  // sanitizes and finishes
+    const auto steps = progress(*r);
+    BOOST_REQUIRE(steps.size() == 2U);  // the keys step is not repeated
+    BOOST_TEST((*steps[0].result == proto::SanitizeResult::sanitized_block));
+    BOOST_TEST((steps[1].step == proto::DecommissionStep::identity_cleared));
+    BOOST_TEST(finished == 1);
+
+    // A record that does not verify is dropped, not resumed.
+    const auto [d, f] = decommission_order(2, 0);
+    BOOST_REQUIRE(b.store
+                      ->put(helm::decommission_object,
+                            *helm::encode_decommission_state(
+                                {.phase = helm::DecommissionPhase::keys, .frame = f}))
+                      .has_value());
+    auto other = decommission_rig(b, finished);
+    BOOST_TEST(!other->daemon.load_decommission());
+    BOOST_TEST(!b.store->contains(helm::decommission_object));
 }
 
 BOOST_AUTO_TEST_CASE(the_boot_cache_is_read_before_each_publish) {

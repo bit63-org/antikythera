@@ -4,6 +4,7 @@
 #include "helm/helm_daemon.hpp"
 
 #include <algorithm>
+#include <string>
 #include <utility>
 
 namespace ak::helm {
@@ -244,7 +245,8 @@ auto HelmDaemon::boot() -> BootResult {
     _booted = true;
     // The boot function is filled before the host can read it
     // (cold-start Requirement 2.1); with no image the host stays held.
-    const bool release = _config.host_booter == nullptr || fill_boot_function(std::nullopt);
+    const bool release = !_decommission && !_decommissioned &&
+                         (_config.host_booter == nullptr || fill_boot_function(std::nullopt));
     auto result = _sequencer.boot(release);
     if (result.host_released) {
         watch_host_start();
@@ -331,7 +333,19 @@ auto HelmDaemon::set_host_power_override(HostPowerOverride override_) -> void {
 }
 
 auto HelmDaemon::boot_if_due() -> void {
-    if (!_boot_at || _host_override == HostPowerOverride::hold) {
+    if (!_boot_at || _decommissioned) {
+        return;
+    }
+    if (_decommission) {
+        // Resumed: the storage roles are needed now, not after the
+        // power-on wait, and the host stays held (boot() sees to it).
+        const auto result = boot();
+        if (_config.on_boot) {
+            _config.on_boot(result);
+        }
+        return;
+    }
+    if (_host_override == HostPowerOverride::hold) {
         return;
     }
     if (_host_override == HostPowerOverride::on || now() >= *_boot_at) {
@@ -411,6 +425,284 @@ auto HelmDaemon::apply_host_power(const proto::HostPower& order, std::span<const
     return answer(proto::CommandStatus::malformed);
 }
 
+auto HelmDaemon::apply_decommission(const proto::Decommission& order,
+                                    std::span<const std::byte> frame) -> proto::CommandStatus {
+    constexpr auto command = proto::link_record_command(proto::RecordType::decommission);
+    const auto answer = [&](proto::CommandStatus status) {
+        _router.record_outcome(order.seq, command, status);
+        return status;
+    };
+    if (_config.controller_keys == nullptr || frame.size() != proto::decommission_size ||
+        !_config.controller_keys->verify(proto::host_lifecycle_signed_bytes(frame), order.signature,
+                                         order.key_id)) {
+        return answer(proto::CommandStatus::bad_signature);
+    }
+    if (const auto claimed = _router.claim_sequence(order.seq, command);
+        claimed != proto::CommandStatus::ok) {
+        return answer(claimed);
+    }
+    if (_decommission || _decommissioned) {
+        return answer(proto::CommandStatus::ok);  // already under way
+    }
+    // Requirement 5.1: the controller moves everything off first.
+    if (server_in_use()) {
+        return answer(proto::CommandStatus::conflict);
+    }
+    _decommission = DecommissionRun{.phase = DecommissionPhase::keys,
+                                    .frame = {frame.begin(), frame.end()},
+                                    .slots = {},
+                                    .media_deadline = std::nullopt,
+                                    .next_media = {}};
+    // Kept before the first step, so a power loss from here on resumes.
+    if (_config.store != nullptr) {
+        const auto bytes = encode_decommission_state(
+            {.phase = DecommissionPhase::keys, .frame = _decommission->frame});
+        if (!bytes || !_config.store->put(decommission_object, *bytes)) {
+            _decommission.reset();
+            return answer(proto::CommandStatus::internal_error);
+        }
+    }
+    hold_host_for_decommission();
+    return answer(proto::CommandStatus::ok);
+}
+
+auto HelmDaemon::server_in_use() const -> bool {
+    if (_router.vm_count() > 0 || _router.network_volume_count() > 0 ||
+        _keys->attachment_key_count() > 0) {
+        return true;
+    }
+    const auto me = _router.server_id();
+    for (const auto& [volume, config] : _volume_configs) {
+        const auto c = proto::decode_replica_config(config.frame);
+        if (c && std::ranges::any_of(c->members, [me](const proto::ReplicaMember& m) {
+                return m.server_id == me;
+            })) {
+            return true;
+        }
+    }
+    return std::ranges::any_of(_layouts, [](const auto& entry) { return entry.second.member; });
+}
+
+auto HelmDaemon::hold_host_for_decommission() -> void {
+    _host_override = HostPowerOverride::hold;
+    _start_deadline.reset();
+    if (_sequencer.host_released()) {
+        _sequencer.hold_host();
+        _router.host_reset();
+    }
+}
+
+auto HelmDaemon::load_decommission() -> bool {
+    if (_config.store == nullptr) {
+        return false;
+    }
+    const auto bytes = _config.store->get(decommission_object);
+    if (!bytes || !*bytes) {
+        return false;
+    }
+    const auto state = decode_decommission_state(**bytes);
+    const auto order = state ? proto::decode_decommission(state->frame)
+                             : std::unexpected(proto::DecodeError::truncated);
+    // Checked again: only the controller's order erases a server. A copy
+    // from a rolled-back store is still resumed: its steps only repeat.
+    if (!order || order->server_id != _router.server_id() || _config.controller_keys == nullptr ||
+        !_config.controller_keys->verify(proto::host_lifecycle_signed_bytes(state->frame),
+                                         order->signature, order->key_id)) {
+        (void)_config.store->remove(decommission_object);
+        return false;
+    }
+    _decommission = DecommissionRun{.phase = state->phase,
+                                    .frame = state->frame,
+                                    .slots = {},
+                                    .media_deadline = std::nullopt,
+                                    .next_media = {}};
+    hold_host_for_decommission();
+    {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.decommissions;
+    }
+    return true;
+}
+
+auto HelmDaemon::save_decommission() -> void {
+    if (_config.store == nullptr || !_decommission) {
+        return;
+    }
+    const auto bytes =
+        encode_decommission_state({.phase = _decommission->phase, .frame = _decommission->frame});
+    if (!bytes || !_config.store->put(decommission_object, *bytes)) {
+        // The work goes on; a power loss now repeats a step.
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.decommission_retries;
+    }
+}
+
+auto HelmDaemon::step_decommission() -> void {
+    auto& run = *_decommission;
+    if (run.phase == DecommissionPhase::keys) {
+        // Requirement 5.2: VM keys, then the master key. Every volume on
+        // the server is crypto-erased from here on.
+        if (!_keys->destroy_all()) {
+            const std::scoped_lock lock{_inbox_mutex};
+            ++_stats.decommission_retries;
+            return;
+        }
+        report(proto::DecommissionProgress{.step = proto::DecommissionStep::keys_destroyed,
+                                           .result = std::nullopt,
+                                           .slot = 0,
+                                           .drive_serial = {}});
+        run.phase = DecommissionPhase::media;
+        save_decommission();
+    }
+    if (run.phase == DecommissionPhase::media) {
+        if (!_booted) {
+            // A resumed decommission, or one sent before helm booted: the
+            // storage roles must be up to sanitize. The host stays held.
+            _boot_at = now();
+            return;
+        }
+        if (now() < run.next_media) {
+            return;
+        }
+        run.next_media = now() + _config.check_interval;
+        if (!run.media_deadline) {
+            run.media_deadline = now() + _config.sanitize_timeout;
+        }
+        const bool overdue = now() >= *run.media_deadline;
+        bool all_done = true;
+        for (auto& [n, slot] : _slots) {
+            auto& step = run.slots[n];
+            if (step != SanitizeStep::done && !sanitize_slot(*slot, step, overdue)) {
+                all_done = false;
+            }
+        }
+        if (!all_done) {
+            return;
+        }
+        run.phase = DecommissionPhase::identity;
+        save_decommission();
+    }
+    if (run.phase == DecommissionPhase::identity) {
+        finish_decommission();
+    }
+}
+
+auto HelmDaemon::sanitize_slot(SlotState& slot, SanitizeStep& step, bool overdue) -> bool {
+    if (!slot.link || !slot.inventory) {
+        // Not attached (a dead board, or still starting): waited for
+        // until the deadline, then its drives are reported failed.
+        if (!overdue) {
+            return false;
+        }
+        report_failed_drives(slot.number);
+        step = SanitizeStep::done;
+        return true;
+    }
+    // Only the storage roles keep data at rest outside the volumes the
+    // master key protected; network and blk boards have nothing to erase.
+    if (!is_hold(slot) && !is_khold(slot)) {
+        step = SanitizeStep::done;
+        return true;
+    }
+    auto st = slot.link->sanitize(step == SanitizeStep::pending ? oar::SanitizeOp::start
+                                                                : oar::SanitizeOp::query);
+    if (!st) {
+        if (st.error().code == LinkErrc::refused || overdue) {
+            // A role that cannot sanitize: its drives must be destroyed.
+            report_failed_drives(slot.number);
+            step = SanitizeStep::done;
+            return true;
+        }
+        return false;  // asked again on the next pass
+    }
+    if (st->state == oar::SanitizeState::running) {
+        step = SanitizeStep::running;
+        if (overdue) {
+            report_failed_drives(slot.number);
+            step = SanitizeStep::done;
+            return true;
+        }
+        return false;
+    }
+    std::uint64_t sanitized = 0;
+    std::uint64_t failed = 0;
+    for (const auto& d : st->drives) {
+        report(proto::DecommissionProgress{.step = proto::DecommissionStep::media,
+                                           .result = d.result,
+                                           .slot = slot.number,
+                                           .drive_serial = d.serial});
+        ++(d.result == proto::SanitizeResult::failed ? failed : sanitized);
+    }
+    {
+        const std::scoped_lock lock{_inbox_mutex};
+        _stats.drives_sanitized += sanitized;
+        _stats.drives_failed += failed;
+    }
+    step = SanitizeStep::done;
+    return true;
+}
+
+auto HelmDaemon::report_failed_drives(SlotNumber slot) -> void {
+    std::vector<proto::IdentityText> serials;
+    proto::IdentityText board{};
+    if (_config.identity != nullptr) {
+        // What the role said this boot, else what the baseline recorded.
+        const auto collect = [&](const proto::HardwareIdentity& id) {
+            for (const auto& d : id.drives) {
+                if (d.slot == slot) {
+                    serials.push_back(d.serial);
+                }
+            }
+            for (const auto& s : id.slots) {
+                if (s.slot == slot) {
+                    board = s.serial;
+                }
+            }
+        };
+        collect(_config.identity->current());
+        if (serials.empty() && _config.identity->baseline()) {
+            collect(*_config.identity->baseline());
+        }
+    }
+    if (serials.empty()) {
+        // No drive known by serial: the board stands for them, so the
+        // controller still learns this slot's media were not sanitized.
+        serials.push_back(proto::detail::empty_text(board)
+                              ? proto::identity_text("slot " + std::to_string(slot))
+                              : board);
+    }
+    for (const auto& serial : serials) {
+        report(proto::DecommissionProgress{.step = proto::DecommissionStep::media,
+                                           .result = proto::SanitizeResult::failed,
+                                           .slot = slot,
+                                           .drive_serial = serial});
+    }
+    const std::scoped_lock lock{_inbox_mutex};
+    _stats.drives_failed += serials.size();
+}
+
+auto HelmDaemon::finish_decommission() -> void {
+    report(proto::DecommissionProgress{.step = proto::DecommissionStep::identity_cleared,
+                                       .result = std::nullopt,
+                                       .slot = 0,
+                                       .drive_serial = {}});
+    if (_config.identity != nullptr) {
+        _config.identity->clear_baseline();
+    }
+    _decommission.reset();
+    _decommissioned = true;
+    _boot_at.reset();
+    if (_booted) {
+        shutdown();
+        _booted = false;
+    }
+    if (_config.on_decommissioned) {
+        _config.on_decommissioned();
+    } else if (_config.store != nullptr) {
+        (void)_config.store->remove(decommission_object);
+    }
+}
+
 auto HelmDaemon::power_host_on() -> proto::CommandStatus {
     _host_override = HostPowerOverride::none;
     if (_boot_at) {
@@ -459,6 +751,9 @@ auto HelmDaemon::run_once(std::chrono::milliseconds wait) -> void {
     }
     for (auto& item : items) {
         handle(item);
+    }
+    if (_decommission) {
+        step_decommission();  // before anything else (Requirement 5.5)
     }
     boot_if_due();
     _router.poll();
@@ -596,6 +891,11 @@ auto HelmDaemon::on_host_power(const proto::HostPower& order, std::span<const st
     enqueue(HostPowerFrame{.order = order, .frame = {frame.begin(), frame.end()}});
 }
 
+auto HelmDaemon::on_decommission(const proto::Decommission& order, std::span<const std::byte> frame)
+    -> void {
+    enqueue(DecommissionFrame{.order = order, .frame = {frame.begin(), frame.end()}});
+}
+
 auto HelmDaemon::on_standing_set(const proto::StandingSet& /*set*/,
                                  std::span<const std::byte> frame) -> void {
     enqueue(StandingSetFrame{.frame = {frame.begin(), frame.end()}});
@@ -641,6 +941,12 @@ auto HelmDaemon::boot_cache() const -> std::optional<proto::BootCache> {
 
 auto HelmDaemon::handle(Item& item) -> void {
     if (const auto* env = std::get_if<proto::Envelope>(&item)) {
+        if (_decommission || _decommissioned) {
+            // No VM may start on a server whose keys are going or gone.
+            const std::scoped_lock lock{_inbox_mutex};
+            ++_stats.decommission_dropped;
+            return;
+        }
         {
             const std::scoped_lock lock{_inbox_mutex};
             ++_stats.envelopes;
@@ -758,9 +1064,23 @@ auto HelmDaemon::handle(Item& item) -> void {
             watch_host_start();
         }
     } else if (const auto* order = std::get_if<HostPowerFrame>(&item)) {
+        if (_decommission || _decommissioned) {
+            // The host stays held to the end (Requirement 5).
+            _router.record_outcome(order->order.seq,
+                                   proto::link_record_command(proto::RecordType::host_power),
+                                   proto::CommandStatus::conflict);
+            const std::scoped_lock lock{_inbox_mutex};
+            ++_stats.decommission_dropped;
+            return;
+        }
         const auto status = apply_host_power(order->order, order->frame);
         const std::scoped_lock lock{_inbox_mutex};
         ++(status == proto::CommandStatus::ok ? _stats.host_power : _stats.host_power_refused);
+    } else if (const auto* retire = std::get_if<DecommissionFrame>(&item)) {
+        const auto status = apply_decommission(retire->order, retire->frame);
+        const std::scoped_lock lock{_inbox_mutex};
+        ++(status == proto::CommandStatus::ok ? _stats.decommissions
+                                              : _stats.decommissions_refused);
     } else if (const auto* standing = std::get_if<StandingSetFrame>(&item)) {
         // Verified, kept and anchored for the next time helm's power
         // returns (cold-start Requirement 4.2); it starts nothing now.
@@ -1383,7 +1703,9 @@ auto HelmDaemon::read_identity(SlotState& slot) -> void {
 }
 
 auto HelmDaemon::report_identity() -> void {
-    if (_config.identity == nullptr) {
+    // A server being decommissioned is leaving: its identity is cleared,
+    // not reported or baselined again.
+    if (_config.identity == nullptr || _decommission || _decommissioned) {
         return;
     }
     const bool settled =

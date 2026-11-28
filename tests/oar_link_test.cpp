@@ -909,6 +909,63 @@ BOOST_AUTO_TEST_CASE(role_identity_is_answered_once_set) {
     BOOST_TEST((*got == id));
 }
 
+BOOST_AUTO_TEST_CASE(sanitize_is_started_and_queried) {
+    class Storage final : public OarHandler {
+    public:
+        auto function_inventory() -> std::expected<oar::Inventory, oar::Status> override {
+            return std::unexpected(oar::Status::failed);
+        }
+        auto prepare_function(const oar::PrepareFunction&) -> oar::Status override {
+            return oar::Status::ok;
+        }
+        auto clean_function(const oar::CleanFunction&) -> oar::Status override {
+            return oar::Status::ok;
+        }
+        auto deliver_key(const oar::DeliverKey&) -> oar::Status override { return oar::Status::ok; }
+        auto drop_key(const oar::DropKey&) -> oar::Status override { return oar::Status::ok; }
+        auto map_update(std::span<const std::byte>) -> oar::Status override {
+            return oar::Status::ok;
+        }
+        auto health() -> std::expected<oar::Health, oar::Status> override { return oar::Health{}; }
+        auto sanitize(oar::SanitizeOp op)
+            -> std::expected<oar::SanitizeStatus, oar::Status> override {
+            ops.push_back(op);
+            oar::SanitizeStatus st{.state = oar::SanitizeState::running, .drives = {}};
+            if (op == oar::SanitizeOp::query) {
+                st.state = oar::SanitizeState::done;
+                st.drives.push_back({.serial = ak::proto::identity_text("D-1"),
+                                     .result = ak::proto::SanitizeResult::sanitized_block});
+            }
+            return st;
+        }
+        std::vector<oar::SanitizeOp> ops;
+    };
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    Storage role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    {
+        const Server server{endpoint, role};
+        BOOST_TEST(
+            (link.sanitize(oar::SanitizeOp::start).value().state == oar::SanitizeState::running));
+        const auto done = link.sanitize(oar::SanitizeOp::query);
+        BOOST_REQUIRE(done.has_value());
+        BOOST_REQUIRE(done->drives.size() == 1U);
+        BOOST_TEST((done->drives[0].result == ak::proto::SanitizeResult::sanitized_block));
+    }
+    BOOST_TEST(role.ops.size() == 2U);
+
+    // Any other role: unsupported.
+    auto [helm_c, oar_c] = InProcessBinding::make_pair();
+    FakeOar fake;
+    OarEndpoint other{*oar_c, oar_config()};
+    OarLink other_link{*helm_c, config()};
+    const Server server{other, fake};
+    const auto refused = other_link.sanitize(oar::SanitizeOp::start);
+    BOOST_REQUIRE(!refused.has_value());
+    BOOST_TEST((refused.error().status == oar::Status::unsupported));
+}
+
 BOOST_AUTO_TEST_CASE(instance_metadata_is_forwarded_in_chunks) {
     auto [helm_b, oar_b] = InProcessBinding::make_pair();
     MeterRole role;

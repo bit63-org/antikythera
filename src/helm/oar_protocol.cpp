@@ -1955,4 +1955,116 @@ auto valid_role_identity(const RoleIdentity& identity) -> bool {
     return check_role_identity(identity).has_value();
 }
 
+namespace {
+
+auto check_sanitize_status(const SanitizeStatus& st) -> std::expected<void, BodyError> {
+    if (st.state != SanitizeState::running && st.state != SanitizeState::done) {
+        return std::unexpected(BodyError::unknown_enum);
+    }
+    if (st.state == SanitizeState::running && !st.drives.empty()) {
+        return std::unexpected(BodyError::too_many_entries);
+    }
+    if (st.drives.size() > max_role_drives) {
+        return std::unexpected(BodyError::too_many_entries);
+    }
+    for (std::size_t i = 0; i < st.drives.size(); ++i) {
+        const auto& d = st.drives[i];
+        if (!proto::detail::valid_text(d.serial) || proto::detail::empty_text(d.serial)) {
+            return std::unexpected(BodyError::bad_text);
+        }
+        if (!proto::detail::known(d.result)) {
+            return std::unexpected(BodyError::unknown_enum);
+        }
+        if (i > 0 && st.drives[i - 1].serial >= d.serial) {
+            return std::unexpected(BodyError::not_increasing);
+        }
+    }
+    return {};
+}
+
+}  // namespace
+
+auto encode_sanitize_request(SanitizeOp op) -> std::vector<std::byte> {
+    std::vector<std::byte> out(sanitize_request_size);
+    out[0] = static_cast<std::byte>(op);
+    return out;
+}
+
+auto decode_sanitize_request(std::span<const std::byte> body)
+    -> std::expected<SanitizeOp, BodyError> {
+    if (body.size() < sanitize_request_size) {
+        return std::unexpected(BodyError::truncated);
+    }
+    if (body.size() > sanitize_request_size) {
+        return std::unexpected(BodyError::trailing_bytes);
+    }
+    if (std::ranges::any_of(body.subspan(1), [](std::byte b) { return b != std::byte{0}; })) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    const auto op = static_cast<SanitizeOp>(body[0]);
+    if (op != SanitizeOp::start && op != SanitizeOp::query) {
+        return std::unexpected(BodyError::unknown_enum);
+    }
+    return op;
+}
+
+auto encode_sanitize_status(const SanitizeStatus& status)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (auto ok = check_sanitize_status(status); !ok) {
+        return std::unexpected(ok.error());
+    }
+    std::vector<std::byte> out;
+    out.reserve(sanitize_fixed_size + (status.drives.size() * sanitize_drive_size));
+    wire::Writer w{out};
+    w.u8(static_cast<std::uint8_t>(status.state));
+    w.u8(0);
+    w.le16(static_cast<std::uint16_t>(status.drives.size()));
+    w.le16(0);
+    for (const auto& d : status.drives) {
+        write_text(w, d.serial);
+        w.u8(static_cast<std::uint8_t>(d.result));
+        w.bytes(std::array<std::byte, 7>{});
+    }
+    return out;
+}
+
+auto decode_sanitize_status(std::span<const std::byte> body)
+    -> std::expected<SanitizeStatus, BodyError> {
+    if (body.size() < sanitize_fixed_size) {
+        return std::unexpected(BodyError::truncated);
+    }
+    wire::Reader r{body};
+    SanitizeStatus st;
+    st.state = static_cast<SanitizeState>(r.u8().value_or(0));
+    const auto reserved1 = r.u8().value_or(0);
+    const auto count = r.le16().value_or(0);
+    const auto reserved2 = r.le16().value_or(0);
+    if (reserved1 != 0 || reserved2 != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    if (count > max_role_drives) {
+        return std::unexpected(BodyError::too_many_entries);
+    }
+    const auto want = sanitize_fixed_size + (std::size_t{count} * sanitize_drive_size);
+    if (body.size() < want) {
+        return std::unexpected(BodyError::truncated);
+    }
+    if (body.size() > want) {
+        return std::unexpected(BodyError::trailing_bytes);
+    }
+    st.drives.resize(count);
+    for (auto& d : st.drives) {
+        d.serial = read_text(r);
+        d.result = static_cast<proto::SanitizeResult>(r.u8().value_or(0));
+        const auto pad = r.bytes(7).value_or(std::span<const std::byte>{});
+        if (std::ranges::any_of(pad, [](std::byte b) { return b != std::byte{0}; })) {
+            return std::unexpected(BodyError::reserved_not_zero);
+        }
+    }
+    if (auto ok = check_sanitize_status(st); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return st;
+}
+
 }  // namespace ak::helm::oar

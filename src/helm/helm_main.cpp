@@ -25,6 +25,7 @@
 #include <sys/random.h>
 #include <sys/stat.h>
 
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -40,6 +41,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -475,6 +477,43 @@ auto run(const helm::HelmConfig& cfg) -> int {
     // (Requirement 8.1), queued so it goes out on the first connection.
     std::unique_ptr<helm::ControllerLink> link;
     helm::HelmDaemon* daemon_ptr = nullptr;  // set once the daemon exists
+    std::stop_source stop;                   // SIGTERM, SIGINT, or a finished decommission
+    // A decommission in progress resumes before anything else, and its
+    // record lives in the sealed store (Requirement 5.5).
+    daemon_config.store = store ? &*store : nullptr;
+    // Requirement 5.4, once identity_cleared is queued: give the link a
+    // little while to deliver the last reports, then remove the TLS keys
+    // and the master key file, destroy the sealed store (which takes the
+    // decommission record with it) and stop. helm's server ID is in its
+    // configuration file, which the operator replaces; without TLS keys
+    // this helm cannot reach a controller again until it is re-enrolled.
+    daemon_config.on_decommissioned = [&link, &store, &stop, &cfg] {
+        constexpr auto drain_limit = std::chrono::seconds{30};
+        const auto give_up = std::chrono::steady_clock::now() + drain_limit;
+        while (link && link->stats().pending_reports > 0 &&
+               std::chrono::steady_clock::now() < give_up) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        }
+        std::error_code ec;
+        for (const auto& path : {cfg.key, cfg.cert}) {
+            std::filesystem::remove(path, ec);
+            if (ec) {
+                std::println(stderr, "{}: decommission: remove {}: {}", log_name, path.string(),
+                             ec.message());
+            }
+        }
+        if (cfg.master_key) {
+            std::filesystem::remove(*cfg.master_key, ec);
+        }
+        if (store) {
+            if (auto ok = store->erase(); !ok) {
+                std::println(stderr, "{}: decommission: sealed store erase: {}", log_name,
+                             helm::to_string(ok.error()));
+            }
+        }
+        std::println(stderr, "{}: decommissioned: keys, media and identity cleared", log_name);
+        (void)stop.request_stop();
+    };
     const bool power_returned = returned.value_or(true);
     daemon_config.on_boot = [&link, &daemon_ptr, &time_floor, &store, power_returned, started_at,
                              rtc_below_floor, waited = plan.wait](const helm::BootResult& booted) {
@@ -579,7 +618,6 @@ auto run(const helm::HelmConfig& cfg) -> int {
     sigemptyset(&stop_signals);
     sigaddset(&stop_signals, SIGTERM);
     sigaddset(&stop_signals, SIGINT);
-    std::stop_source stop;
     std::jthread signal_waiter{[&stop, stop_signals](const std::stop_token& st) {
         while (!st.stop_requested()) {
             const timespec poll_interval{.tv_sec = 0, .tv_nsec = 200'000'000};
@@ -595,6 +633,9 @@ auto run(const helm::HelmConfig& cfg) -> int {
     std::println(stderr, "{}: boot {:#x}: tier {} slot {}{}, host released in {} ms", log_name,
                  *boot_id, policy.tier, policy.slot,
                  power_policy.from_record() ? "" : " (default policy)", plan.wait.count());
+    if (daemon.load_decommission()) {
+        std::println(stderr, "{}: resuming the decommission a power loss interrupted", log_name);
+    }
     daemon.schedule_boot(std::chrono::steady_clock::now() + plan.wait);
 
     std::jthread link_runner{[&link](const std::stop_token& st) { link->run(st); }};

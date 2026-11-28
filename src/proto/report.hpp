@@ -129,6 +129,26 @@
 //     failure u8 (ConversionFailure; non-zero exactly when failed) | slot u8
 //     rsvd u32
 //
+// AZ cold start (.kiro/specs/cold-start/ Requirement 8), from helm:
+//   cold_start  -- kind 27, once, on the first link after helm's own power
+//                  returned
+//     power_return_time u64 (helm's RTC, Unix seconds) | time_floor u64
+//     waited_ms u32 (the power-on hold helm applied)
+//     boot_source u8 (BootSource) | flags u8 (bit 0: store rollback
+//     detected; bit 1: RTC read below the time floor) | count u16
+//     store_faults u32 (sealed-store objects discarded) | rsvd u32
+//     entries  count x 16, strictly increasing vm_id, at most
+//              max_standing_instances:
+//       vm_id u64 | result u8 (StandingResult) | rsvd u8 | attempts u16 | rsvd u32
+//   boot_cache  -- kind 28, after every inventory
+//     lkg_image [32] | previous_image [32] (SHA-256 of the hull UKIs; all
+//     zero = none, and no previous without an LKG)
+//     standing_generation u64 | policy_version u64 (0 = none stored)
+//     store_free_bytes u64 | store_total_bytes u64 (free <= total)
+//   Kinds 21-26 and 29-31 belong to other specs still being built, so the
+//   known kinds are not one contiguous range: report_kind() maps each body
+//   to its kind.
+//
 // Enrollment (block-volume-service task 12, design "Keys and crypto-erase"
 // and "hold wire protocol"):
 //   enrollment  -- helm's secure-element transport key, sent after the
@@ -195,6 +215,7 @@
 #include "proto/group_members.hpp"
 #include "proto/map_update.hpp"
 #include "proto/replica_config.hpp"
+#include "proto/standing_set.hpp"
 #include "proto/volume_op.hpp"
 #include "proto/tunnel_peers.hpp"
 
@@ -264,6 +285,13 @@ inline constexpr std::size_t capacity_entry_size = 56;
 inline constexpr std::size_t max_capacity_drives = 64;
 inline constexpr std::size_t group_fault_size = 48;
 inline constexpr std::size_t conversion_progress_size = 48;
+inline constexpr std::size_t cold_start_fixed_size = 0x20;
+inline constexpr std::size_t cold_start_entry_size = 16;
+inline constexpr std::size_t boot_cache_size = (2 * image_digest_size) + 32;
+inline constexpr std::uint8_t cold_start_rollback = 0x01;
+inline constexpr std::uint8_t cold_start_rtc_below_floor = 0x02;
+inline constexpr std::uint8_t known_cold_start_flags =
+    cold_start_rollback | cold_start_rtc_below_floor;
 
 inline constexpr std::size_t max_report_size =
     report_header_size + std::max({max_inventory_size, max_group_usage_size,
@@ -291,6 +319,25 @@ enum class ReportKind : std::uint16_t {
     capacity = 18,
     group_fault = 19,
     conversion_progress = 20,
+    cold_start = 27,
+    boot_cache = 28,
+};
+
+// Where helm booted hull from after power returned (cold_start).
+enum class BootSource : std::uint8_t {
+    lkg = 1,       // the last-known-good image in the sealed store
+    previous = 2,  // the image before it, after the LKG failed to start
+    netboot = 3,   // an assigned image fetched from the metal boot layer
+};
+
+// The latest outcome of one standing start (cold_start).
+enum class StandingResult : std::uint8_t {
+    started = 1,         // hull started the instance
+    image_missing = 2,   // its root volume or image could not be read
+    volume_refused = 3,  // a storage role refused a standing attachment
+    device_missing = 4,  // a NIC or device function was not available
+    refused = 5,         // hull refused the standing start
+    failed = 6,          // any other failure
 };
 
 // Which way a conversion copies (mailbox CONVERT_VOLUME's direction).
@@ -745,6 +792,35 @@ struct Enrollment {
     friend auto operator==(const Enrollment&, const Enrollment&) -> bool = default;
 };
 
+struct StandingStartResult {
+    std::uint64_t vm_id{0};
+    StandingResult result{StandingResult::started};
+    std::uint16_t attempts{0};
+    friend auto operator==(const StandingStartResult&, const StandingStartResult&)
+        -> bool = default;
+};
+
+struct ColdStart {
+    std::uint64_t power_return_time{0};
+    std::uint64_t time_floor{0};
+    std::uint32_t waited_ms{0};
+    BootSource boot_source{BootSource::lkg};
+    std::uint8_t flags{0};  // cold_start_* bits
+    std::uint32_t store_faults{0};
+    std::vector<StandingStartResult> standing;  // strictly increasing vm_id
+    friend auto operator==(const ColdStart&, const ColdStart&) -> bool = default;
+};
+
+struct BootCache {
+    ImageDigest lkg_image{};
+    ImageDigest previous_image{};
+    std::uint64_t standing_generation{0};
+    std::uint64_t policy_version{0};
+    std::uint64_t store_free_bytes{0};
+    std::uint64_t store_total_bytes{0};
+    friend auto operator==(const BootCache&, const BootCache&) -> bool = default;
+};
+
 struct CertRequest {
     std::uint8_t slot{0};
     StorageRole role{StorageRole::hold};
@@ -752,11 +828,11 @@ struct CertRequest {
     friend auto operator==(const CertRequest&, const CertRequest&) -> bool = default;
 };
 
-using ReportBody =
-    std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport, MapApplied,
-                 HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault, AttachmentStatus,
-                 DemotionConfirmed, OpOutcome, SnapshotProgress, Enrollment, CertRequest,
-                 GroupMembership, GroupStatus, Capacity, GroupFault, ConversionProgress>;
+using ReportBody = std::variant<Inventory, CommandOutcome, PoolStateChange, VmExitedReport,
+                                MapApplied, HostFaultReport, GroupUsage, ReplicaStatus, VolumeFault,
+                                AttachmentStatus, DemotionConfirmed, OpOutcome, SnapshotProgress,
+                                Enrollment, CertRequest, GroupMembership, GroupStatus, Capacity,
+                                GroupFault, ConversionProgress, ColdStart, BootCache>;
 
 struct Report {
     std::uint64_t server_id{0};
@@ -765,12 +841,20 @@ struct Report {
     friend auto operator==(const Report&, const Report&) -> bool = default;
 };
 
-// The variant's alternatives are in ReportKind order, starting at 1.
+// The variant's alternatives are in ReportKind order: kinds 1-20 are
+// alternatives 0-19, and the later kinds follow in order.
+inline constexpr std::array report_kinds_after_contiguous{ReportKind::cold_start,
+                                                          ReportKind::boot_cache};
 [[nodiscard]] inline auto report_kind(const ReportBody& body) noexcept -> ReportKind {
-    return static_cast<ReportKind>(body.index() + 1);
+    constexpr auto contiguous = static_cast<std::size_t>(ReportKind::conversion_progress);
+    if (body.index() < contiguous) {
+        return static_cast<ReportKind>(body.index() + 1);
+    }
+    return report_kinds_after_contiguous.at(body.index() - contiguous);
 }
 static_assert(std::variant_size_v<ReportBody> ==
-              static_cast<std::size_t>(ReportKind::conversion_progress));
+              static_cast<std::size_t>(ReportKind::conversion_progress) +
+                  report_kinds_after_contiguous.size());
 
 namespace detail {
 
@@ -1146,6 +1230,47 @@ namespace detail {
         return std::unexpected(DecodeError::bad_id);
     }
     if (p.done_bytes > p.total_bytes || p.written_bytes > p.total_bytes) {
+        return std::unexpected(DecodeError::bad_capacity);
+    }
+    return {};
+}
+
+[[nodiscard]] constexpr auto known(BootSource b) noexcept -> bool {
+    return b >= BootSource::lkg && b <= BootSource::netboot;
+}
+[[nodiscard]] constexpr auto known(StandingResult r) noexcept -> bool {
+    return r >= StandingResult::started && r <= StandingResult::failed;
+}
+
+[[nodiscard]] inline auto check_body(const ColdStart& c) noexcept
+    -> std::expected<void, DecodeError> {
+    if (!known(c.boot_source) || (c.flags & ~known_cold_start_flags) != 0) {
+        return std::unexpected(DecodeError::unknown_value);
+    }
+    if (c.standing.size() > max_standing_instances) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    for (std::size_t i = 0; i < c.standing.size(); ++i) {
+        const auto& e = c.standing[i];
+        if (e.vm_id == 0) {
+            return std::unexpected(DecodeError::bad_id);
+        }
+        if (!known(e.result)) {
+            return std::unexpected(DecodeError::unknown_value);
+        }
+        if (i > 0 && c.standing[i - 1].vm_id >= e.vm_id) {
+            return std::unexpected(DecodeError::not_ascending);
+        }
+    }
+    return {};
+}
+
+[[nodiscard]] inline auto check_body(const BootCache& b) noexcept
+    -> std::expected<void, DecodeError> {
+    if (all_zero(b.lkg_image) && !all_zero(b.previous_image)) {
+        return std::unexpected(DecodeError::bad_id);
+    }
+    if (b.store_free_bytes > b.store_total_bytes) {
         return std::unexpected(DecodeError::bad_capacity);
     }
     return {};
@@ -2026,6 +2151,97 @@ inline auto write_volume_event(wire::Writer& w, const ConversionProgress& b) -> 
     return f;
 }
 
+[[nodiscard]] inline auto decode_cold_start(std::span<const std::byte> body)
+    -> std::expected<ColdStart, DecodeError> {
+    BodyReader in{.r = wire::Reader{body}};
+    ColdStart c{};
+    c.power_return_time = in.le64();
+    c.time_floor = in.le64();
+    c.waited_ms = in.le32();
+    c.boot_source = static_cast<BootSource>(in.u8());
+    c.flags = in.u8();
+    const auto count = in.le16();
+    c.store_faults = in.le32();
+    bool zero = in.zeros(4);
+    if (!in.ok) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (count > max_standing_instances) {
+        return std::unexpected(DecodeError::too_many_entries);
+    }
+    if (body.size() < cold_start_fixed_size + (count * cold_start_entry_size)) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (body.size() > cold_start_fixed_size + (count * cold_start_entry_size)) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    c.standing.reserve(count);
+    for (std::uint16_t i = 0; i < count; ++i) {
+        StandingStartResult& e = c.standing.emplace_back();
+        e.vm_id = in.le64();
+        e.result = static_cast<StandingResult>(in.u8());
+        zero = in.zeros(1) && zero;
+        e.attempts = in.le16();
+        zero = in.zeros(4) && zero;
+    }
+    if (!zero) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
+    if (auto ok = check_body(c); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return c;
+}
+
+[[nodiscard]] inline auto decode_boot_cache(std::span<const std::byte> body)
+    -> std::expected<BootCache, DecodeError> {
+    if (body.size() < boot_cache_size) {
+        return std::unexpected(DecodeError::truncated);
+    }
+    if (body.size() > boot_cache_size) {
+        return std::unexpected(DecodeError::trailing_bytes);
+    }
+    BodyReader in{.r = wire::Reader{body}};
+    BootCache b{};
+    in.bytes(b.lkg_image);
+    in.bytes(b.previous_image);
+    b.standing_generation = in.le64();
+    b.policy_version = in.le64();
+    b.store_free_bytes = in.le64();
+    b.store_total_bytes = in.le64();
+    if (auto ok = check_body(b); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return b;
+}
+
+inline auto write_cold_start_body(wire::Writer& w, const ColdStart& c) -> void {
+    w.le64(c.power_return_time);
+    w.le64(c.time_floor);
+    w.le32(c.waited_ms);
+    w.u8(static_cast<std::uint8_t>(c.boot_source));
+    w.u8(c.flags);
+    w.le16(static_cast<std::uint16_t>(c.standing.size()));
+    w.le32(c.store_faults);
+    w.le32(0);
+    for (const auto& e : c.standing) {
+        w.le64(e.vm_id);
+        w.u8(static_cast<std::uint8_t>(e.result));
+        w.u8(0);
+        w.le16(e.attempts);
+        w.le32(0);
+    }
+}
+
+inline auto write_cold_start_body(wire::Writer& w, const BootCache& b) -> void {
+    w.bytes(b.lkg_image);
+    w.bytes(b.previous_image);
+    w.le64(b.standing_generation);
+    w.le64(b.policy_version);
+    w.le64(b.store_free_bytes);
+    w.le64(b.store_total_bytes);
+}
+
 inline auto write_khold_body(wire::Writer& w, const GroupStatus& s) -> void {
     w.u8(s.slot);
     w.u8(0);
@@ -2130,6 +2346,8 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
             } else if constexpr (std::is_same_v<T, GroupStatus> || std::is_same_v<T, Capacity> ||
                                  std::is_same_v<T, GroupFault>) {
                 write_khold_body(w, b);
+            } else if constexpr (std::is_same_v<T, ColdStart> || std::is_same_v<T, BootCache>) {
+                write_cold_start_body(w, b);
             } else if constexpr (volume_event_size<T> != 0) {
                 write_volume_event(w, b);
             } else if constexpr (std::is_same_v<T, Enrollment>) {
@@ -2242,6 +2460,10 @@ inline auto write_body(wire::Writer& w, const ReportBody& body) -> void {
             return wrap(detail::decode_group_fault(body));
         case ReportKind::conversion_progress:
             return wrap(detail::decode_volume_event<ConversionProgress>(body));
+        case ReportKind::cold_start:
+            return wrap(detail::decode_cold_start(body));
+        case ReportKind::boot_cache:
+            return wrap(detail::decode_boot_cache(body));
     }
     return std::unexpected(DecodeError::unknown_value);
 }

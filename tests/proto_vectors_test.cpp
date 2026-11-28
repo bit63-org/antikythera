@@ -23,7 +23,9 @@
 #include "hull/signature_verifier.hpp"
 #include "proto/envelope.hpp"
 #include "proto/map_update.hpp"
+#include "proto/power_policy.hpp"
 #include "proto/replica_config.hpp"
+#include "proto/standing_set.hpp"
 #include "proto/test_vectors.hpp"
 #include "proto/volume_layout.hpp"
 #include "proto/volume_op.hpp"
@@ -392,6 +394,55 @@ BOOST_AUTO_TEST_CASE(layout6_reproduces_and_verifies) {
         [](std::span<std::byte> b, const auto& sig) {
             proto::set_volume_layout_signature(b, sig);
         });
+}
+
+BOOST_AUTO_TEST_CASE(policy13_reproduces_and_verifies) {
+    proto::PowerPolicy fields{};
+    fields.server_id = vec::policy13_server_id;
+    fields.key_id = vec::policy13_key_id;
+    fields.policy_version = vec::policy13_version;
+    fields.time_floor = vec::policy13_time_floor;
+    fields.tier = 0;
+    fields.slot = 2;
+    fields.tier_delay_s = 0;
+    fields.slot_interval_ms = 5000;
+    fields.max_jitter_ms = 2000;
+    fields.keep_image.fill(std::byte{0xAB});
+    check_signed_vector(
+        vec::policy13, vec::policy13_signature, fields, TestSigner{vec::key1_secret},
+        [](const proto::PowerPolicy& p) { return proto::encode_power_policy(p); },
+        [](std::span<const std::byte> b) { return proto::decode_power_policy(b); },
+        [](std::span<const std::byte> b) { return proto::power_policy_signed_bytes(b); },
+        [](std::span<std::byte> b, const auto& sig) { proto::set_power_policy_signature(b, sig); });
+}
+
+BOOST_AUTO_TEST_CASE(standing14_reproduces_and_verifies) {
+    proto::StandingInstance in{};
+    in.vm_id = vec::standing14_vm_id;
+    in.manifest_digest.fill(std::byte{0xD1});
+    in.commands = {{.type = proto::StandingCommandType::create_vm,
+                    .body = mb::encode_body(mb::CreateVm{.vm_id = vec::standing14_vm_id,
+                                                         .vcpus = 4,
+                                                         .memory_mib = 8192,
+                                                         .boot_mode = mb::BootMode::volume})}};
+    in.nics = {{.nic_id = 0x10, .vni = 0xABCD}};
+    proto::InstanceSecret secret{.name = "hsm-share",
+                                 .hpke_enc = {},
+                                 .ciphertext = std::vector<std::byte>(20, std::byte{0x51})};
+    secret.hpke_enc.fill(std::byte{0x33});
+    in.secrets = {secret};
+    proto::StandingSet fields{};
+    fields.server_id = vec::standing14_server_id;
+    fields.key_id = vec::standing14_key_id;
+    fields.generation = vec::standing14_generation;
+    fields.time_floor = vec::policy13_time_floor;
+    fields.instances = {in};
+    check_signed_vector(
+        vec::standing14, vec::standing14_signature, fields, TestSigner{vec::key1_secret},
+        [](const proto::StandingSet& s) { return proto::encode_standing_set(s); },
+        [](std::span<const std::byte> b) { return proto::decode_standing_set(b); },
+        [](std::span<const std::byte> b) { return proto::standing_set_signed_bytes(b); },
+        [](std::span<std::byte> b, const auto& sig) { proto::set_standing_set_signature(b, sig); });
 }
 
 BOOST_AUTO_TEST_SUITE_END()

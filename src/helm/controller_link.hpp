@@ -153,6 +153,14 @@ public:
                                   std::span<const std::byte> /*frame*/) -> void {}
     // Run the storage self-test on one khold role or all of them.
     virtual auto on_self_test(const proto::SelfTest& /*request*/) -> void {}
+    // AZ cold start (.kiro/specs/cold-start/). A standing set or power-on
+    // policy for this server, strictly decoded but not yet verified;
+    // `frame` is its exact encoding, which helm verifies and keeps in its
+    // sealed store.
+    virtual auto on_standing_set(const proto::StandingSet& /*set*/,
+                                 std::span<const std::byte> /*frame*/) -> void {}
+    virtual auto on_power_policy(const proto::PowerPolicy& /*policy*/,
+                                 std::span<const std::byte> /*frame*/) -> void {}
 };
 
 enum class SessionError : std::uint8_t {

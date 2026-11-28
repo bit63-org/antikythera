@@ -98,6 +98,16 @@ struct RecordingSink final : helm::ControllerSink {
     }
     std::vector<proto::SelfTest> self_tests;
     auto on_self_test(const proto::SelfTest& t) -> void override { self_tests.push_back(t); }
+    std::vector<std::pair<proto::StandingSet, std::vector<std::byte>>> standing_sets;
+    auto on_standing_set(const proto::StandingSet& set, std::span<const std::byte> frame)
+        -> void override {
+        standing_sets.emplace_back(set, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
+    std::vector<std::pair<proto::PowerPolicy, std::vector<std::byte>>> power_policies;
+    auto on_power_policy(const proto::PowerPolicy& p, std::span<const std::byte> frame)
+        -> void override {
+        power_policies.emplace_back(p, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
     std::vector<proto::RoleCertificate> certificates;
     auto on_role_certificate(const proto::RoleCertificate& c) -> void override {
         certificates.push_back(c);
@@ -337,6 +347,27 @@ auto self_test_record(std::uint64_t to) -> std::vector<std::byte> {
     return framed(RecordType::self_test, *b);
 }
 
+auto standing_set_record(std::uint64_t to) -> std::vector<std::byte> {
+    proto::StandingSet set{};
+    set.server_id = to;
+    set.key_id = key;
+    set.generation = 2;
+    auto b = proto::encode_standing_set(set);
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::standing_set, *b);
+}
+
+auto power_policy_record(std::uint64_t to) -> std::vector<std::byte> {
+    proto::PowerPolicy p{};
+    p.server_id = to;
+    p.key_id = key;
+    p.policy_version = 3;
+    p.tier = 0;
+    auto b = proto::encode_power_policy(p);
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::power_policy, *b);
+}
+
 auto tunnel_peers_record(std::uint64_t to) -> std::vector<std::byte> {
     proto::TunnelPeers t{
         .server_id = to,
@@ -551,6 +582,38 @@ BOOST_FIXTURE_TEST_CASE(khold_records_reach_the_sink_unmodified, Fixture) {
     BOOST_REQUIRE(!res.has_value());
     BOOST_TEST((res.error() == SessionError::bad_record));
     BOOST_TEST(sink.layouts.size() == 1U);
+}
+
+// .kiro/specs/cold-start/ task 1.
+BOOST_FIXTURE_TEST_CASE(cold_start_records_reach_the_sink_unmodified, Fixture) {
+    session.on_connected();
+    const auto set = standing_set_record(server);
+    const auto policy = power_policy_record(server);
+    BOOST_REQUIRE(session.on_bytes(set).has_value());
+    BOOST_REQUIRE(session.on_bytes(policy).has_value());
+    BOOST_REQUIRE(sink.standing_sets.size() == 1U);
+    BOOST_TEST(sink.standing_sets[0].first.generation == 2U);
+    BOOST_TEST(std::ranges::equal(sink.standing_sets[0].second,
+                                  std::span{set}.subspan(proto::record_header_size)));
+    BOOST_REQUIRE(sink.power_policies.size() == 1U);
+    BOOST_TEST(sink.power_policies[0].first.policy_version == 3U);
+    BOOST_TEST(std::ranges::equal(sink.power_policies[0].second,
+                                  std::span{policy}.subspan(proto::record_header_size)));
+    for (const auto& r : {standing_set_record(other_server), power_policy_record(other_server)}) {
+        session.on_disconnected();
+        session.on_connected();
+        auto res = session.on_bytes(r);
+        BOOST_REQUIRE(!res.has_value());
+        BOOST_TEST((res.error() == SessionError::wrong_server));
+    }
+    auto bad = power_policy_record(server);
+    bad[proto::record_header_size + 0x20] = std::byte{4};  // tier 4
+    session.on_disconnected();
+    session.on_connected();
+    auto res = session.on_bytes(bad);
+    BOOST_REQUIRE(!res.has_value());
+    BOOST_TEST((res.error() == SessionError::bad_record));
+    BOOST_TEST(sink.power_policies.size() == 1U);
 }
 
 BOOST_AUTO_TEST_CASE(block_volume_records_default_to_dropped) {

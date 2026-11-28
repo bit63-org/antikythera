@@ -28,7 +28,7 @@ and `helm-control-plane`. Pairs with kythira's
     fallback on a failed start, verification before store and boot
   - _Requirements: 2.1-2.5_
 
-- [ ] 5. Local power-on policy
+- [x] 5. Local power-on policy
   - Store the newest `power_policy`; tier, slot and jitter wait after
     helm's own power returns; slot stagger; `host_power` override;
     defaults with no policy

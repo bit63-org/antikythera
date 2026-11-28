@@ -208,6 +208,18 @@ private:
             if (value != "ephemeral") {
                 _config.store_anchor = std::filesystem::path{value};
             }
+        } else if (name == "controller-keys") {
+            _config.controller_keys = value;
+        } else if (name == "power-on-policy") {
+            if (value != "apply" && value != "skip") {
+                return fail("power-on-policy must be apply or skip");
+            }
+            _config.apply_power_policy = value == "apply";
+        } else if (name == "power-marker") {
+            if (!value.starts_with('/')) {
+                return fail("power-marker must be an absolute path");
+            }
+            _config.power_marker = value;
         } else if (name == "command-timeout-ms") {
             return millis(value, _config.command_timeout);
         } else if (name == "release-timeout-ms") {

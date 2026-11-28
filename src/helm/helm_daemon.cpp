@@ -237,9 +237,33 @@ auto HelmDaemon::now() const -> Clock::time_point {
 }
 
 auto HelmDaemon::boot() -> BootResult {
+    _boot_at.reset();
+    _booted = true;
     auto result = _sequencer.boot();
     publish();
     return result;
+}
+
+auto HelmDaemon::schedule_boot(Clock::time_point at) -> void {
+    if (!_booted) {
+        _boot_at = at;
+    }
+}
+
+auto HelmDaemon::set_host_power_override(HostPowerOverride override_) -> void {
+    _host_override = override_;
+}
+
+auto HelmDaemon::boot_if_due() -> void {
+    if (!_boot_at || _host_override == HostPowerOverride::hold) {
+        return;
+    }
+    if (_host_override == HostPowerOverride::on || now() >= *_boot_at) {
+        const auto result = boot();
+        if (_config.on_boot) {
+            _config.on_boot(result);
+        }
+    }
 }
 
 auto HelmDaemon::run(const std::stop_token& stop) -> void {
@@ -265,6 +289,7 @@ auto HelmDaemon::run_once(std::chrono::milliseconds wait) -> void {
     for (auto& item : items) {
         handle(item);
     }
+    boot_if_due();
     _router.poll();
     if (now() >= _next_check) {
         check();
@@ -383,6 +408,11 @@ auto HelmDaemon::on_group_members(const proto::GroupMembers& members,
     enqueue(MembersFrame{.members = members, .frame = {frame.begin(), frame.end()}});
 }
 
+auto HelmDaemon::on_power_policy(const proto::PowerPolicy& policy, std::span<const std::byte> frame)
+    -> void {
+    enqueue(PowerPolicyFrame{.policy = policy, .frame = {frame.begin(), frame.end()}});
+}
+
 auto HelmDaemon::on_instance_metadata(const proto::InstanceMetadata& metadata,
                                       std::span<const std::byte> frame) -> void {
     enqueue(MetadataFrame{.nic_id = metadata.nic_id,
@@ -485,6 +515,15 @@ auto HelmDaemon::handle(Item& item) -> void {
         forward_layout(*layout);
     } else if (const auto* test = std::get_if<proto::SelfTest>(&item)) {
         forward_self_test(*test);
+    } else if (const auto* power = std::get_if<PowerPolicyFrame>(&item)) {
+        // Verified and kept for the next time helm's power returns
+        // (cold-start Requirement 3.1); it does not move a boot already
+        // scheduled.
+        const bool kept =
+            _config.power_policy != nullptr &&
+            _config.power_policy->offer(power->policy, power->frame) == PolicyVerdict::kept;
+        const std::scoped_lock lock{_inbox_mutex};
+        ++(kept ? _stats.power_policies : _stats.power_policies_refused);
     }
 }
 

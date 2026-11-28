@@ -6,7 +6,8 @@
 // PowerSequencer: backplane power for the data-plane slots and the host
 // (.kiro/specs/helm-control-plane/ Requirement 6, design "PowerSequencer").
 //
-//   boot()          host held in reset; every slot powered; wait until each
+//   boot()          host held in reset; every slot powered, slot_stagger
+//                   apart (cold-start Requirement 3.3); wait until each
 //                   is link-ready or its link_timeout passes (that slot is
 //                   powered off again and faulted); only then release the
 //                   host, so it enumerates a fixed, fully ready device tree
@@ -97,6 +98,10 @@ struct SequencerConfig {
     // How long a slot stays off in a power cycle.
     std::chrono::milliseconds off_time{std::chrono::milliseconds{500}};
     unsigned max_recoveries{3};
+    // Time between powering one slot and the next at boot, so their inrush
+    // does not add up (.kiro/specs/cold-start/ Requirement 3.3: at most one
+    // slot per 500 ms).
+    std::chrono::milliseconds slot_stagger{std::chrono::milliseconds{500}};
     // Empty: steady_clock and std::this_thread::sleep_for.
     std::function<Clock::time_point()> clock;
     std::function<void(std::chrono::milliseconds)> sleep;

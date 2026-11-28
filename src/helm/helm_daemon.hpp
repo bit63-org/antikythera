@@ -167,6 +167,7 @@
 #include "helm/key_store.hpp"
 #include "helm/mailbox.hpp"
 #include "helm/oar_link.hpp"
+#include "helm/power_on.hpp"
 #include "helm/power_sequencer.hpp"
 #include "helm/sideband_binding.hpp"
 #include "helm/tunnel_keyring.hpp"
@@ -209,6 +210,12 @@ struct DaemonConfig {
     // Items waiting for the loop; more are dropped and counted. Only a loop
     // stuck far longer than any timeout fills it.
     std::size_t max_inbox{4096};
+    // Keeps the power-on policy (.kiro/specs/cold-start/ Requirement 3):
+    // power_policy records from the controller go to it. Null: they are
+    // dropped and counted. Not owned; must outlive the daemon.
+    PowerPolicyKeeper* power_policy{nullptr};
+    // Called on the loop thread after a scheduled boot (schedule_boot).
+    std::function<void(const BootResult&)> on_boot;
     // Empty: steady_clock::now.
     std::function<Clock::time_point()> clock;
 };
@@ -258,6 +265,9 @@ struct DaemonStats {
     std::uint64_t tunnel_peer_sets_refused{0};    // the role refused it, or its link failed
     std::uint64_t tunnel_peer_sets_held{0};       // stale or duplicate, or no role for the VTEP yet
     std::uint64_t inventory_reports{0};           // sent because VTEPs, keys or health changed
+    // Power-on policy (cold-start Requirement 3).
+    std::uint64_t power_policies{0};          // verified, newer and kept
+    std::uint64_t power_policies_refused{0};  // stale, another server's, unsigned or unstorable
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -284,6 +294,16 @@ public:
     // Powers the slots, attaches every one that comes up, releases the host
     // (PowerSequencer::boot) and publishes the first inventory.
     auto boot() -> BootResult;
+    // Boots (as boot()) from the loop once `at` has passed, unless the host
+    // is held: helm keeps serving its controller link while it waits out
+    // the power-on policy (cold-start Requirement 3.2).
+    auto schedule_boot(Clock::time_point at) -> void;
+    // A host_power override (Requirement 3.5): `on` boots at the next pass
+    // whatever the wait, `hold` keeps the host in reset, `none` returns to
+    // the scheduled time. No effect once booted.
+    auto set_host_power_override(HostPowerOverride override_) -> void;
+    [[nodiscard]] auto boot_pending() const noexcept -> bool { return _boot_at.has_value(); }
+    [[nodiscard]] auto booted() const noexcept -> bool { return _booted; }
     // Serves queued traffic, router deadlines and sequencer checks until
     // stop is requested.
     auto run(const std::stop_token& stop) -> void;
@@ -333,6 +353,8 @@ public:
     auto on_volume_layout(const proto::VolumeLayout& layout, std::span<const std::byte> frame)
         -> void override;
     auto on_self_test(const proto::SelfTest& request) -> void override;
+    auto on_power_policy(const proto::PowerPolicy& policy, std::span<const std::byte> frame)
+        -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
     // The newest published snapshot (ControllerSession's InventorySource).
@@ -394,10 +416,14 @@ private:
         bool attached{false};  // an attachment names this server: for blk roles
         std::vector<std::byte> frame;
     };
+    struct PowerPolicyFrame {
+        proto::PowerPolicy policy;
+        std::vector<std::byte> frame;
+    };
     using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
                               proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
                               ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame, MetadataFrame,
-                              LayoutFrame, proto::SelfTest>;
+                              LayoutFrame, proto::SelfTest, PowerPolicyFrame>;
     // Where a NIC with a kept record is plugged: its network role's slot
     // and function.
     struct MetadataHome {
@@ -497,6 +523,7 @@ private:
     auto replay_layouts(SlotState& slot) -> void;
     auto count_layout_refusal(const std::expected<void, LinkError>& r) -> void;
     auto forward_self_test(const proto::SelfTest& request) -> void;
+    auto boot_if_due() -> void;
     [[nodiscard]] static auto is_storage(const SlotState& slot) -> bool;
     auto poll_identity(SlotState& slot) -> void;
     auto deliver_certificate(const proto::RoleCertificate& certificate) -> void;
@@ -520,6 +547,9 @@ private:
     DevicePool _pool;
     CommandRouter _router;
     PowerSequencer _sequencer;
+    std::optional<Clock::time_point> _boot_at;
+    HostPowerOverride _host_override{HostPowerOverride::none};
+    bool _booted{false};
     std::map<SlotNumber, std::unique_ptr<SlotState>> _slots;
     Clock::time_point _next_check;
     Clock::time_point _next_reports;

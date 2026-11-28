@@ -597,8 +597,8 @@ struct Rig {
 
     explicit Rig(std::chrono::milliseconds slot_link_timeout = link_timeout,
                  helm::HostPort* host_port = nullptr, bool with_hold = false,
-                 bool with_khold = false)
-        : daemon{config(slot_link_timeout, with_hold, with_khold),
+                 bool with_khold = false, helm::PowerPolicyKeeper* power_policy = nullptr)
+        : daemon{config(slot_link_timeout, with_hold, with_khold, power_policy),
                  keys,
                  audit,
                  host_port != nullptr ? *host_port : host,
@@ -618,8 +618,10 @@ struct Rig {
                  [this](proto::ReportBody b) { reports.push_back(std::move(b)); }} {}
 
     static auto config(std::chrono::milliseconds slot_link_timeout, bool with_hold = false,
-                       bool with_khold = false) -> helm::DaemonConfig {
+                       bool with_khold = false, helm::PowerPolicyKeeper* power_policy = nullptr)
+        -> helm::DaemonConfig {
         helm::DaemonConfig c;
+        c.power_policy = power_policy;
         std::vector<SlotNumber> slots{net_slot, blk_slot};
         if (with_hold) {
             slots.push_back(hold_slot);
@@ -638,8 +640,9 @@ struct Rig {
         c.sequencer.poll_interval = settle;
         c.sequencer.off_time = settle;
         c.sequencer.max_recoveries = 1;
-        c.check_interval = 0ms;     // every pass checks
-        c.identity_interval = 0ms;  // and asks storage roles for requests
+        c.sequencer.slot_stagger = 0ms;  // power_sequencer_test covers it
+        c.check_interval = 0ms;          // every pass checks
+        c.identity_interval = 0ms;       // and asks storage roles for requests
         // Group meters are read on the first pass and after a NIC detach:
         // the tests never wait out an interval.
         c.group_usage_interval = 1h;
@@ -1952,6 +1955,80 @@ BOOST_AUTO_TEST_CASE(serves_the_harbor_test_controller) {
     auto decoded = proto::decode_map_update(frame);
     BOOST_REQUIRE(decoded.has_value());
     BOOST_TEST(decoded->vni == vni);
+}
+
+// cold-start Requirement 3.2 and 3.5: a scheduled boot waits out the
+// power-on policy while the loop keeps running; a host_power override
+// starts the host at once or keeps it held.
+BOOST_AUTO_TEST_CASE(a_scheduled_boot_waits_and_overrides_win) {
+    {
+        Rig r;
+        r.daemon.schedule_boot(std::chrono::steady_clock::now() + 1h);
+        r.daemon.run_once(0ms);
+        BOOST_TEST(r.daemon.boot_pending());
+        BOOST_TEST(!r.daemon.booted());
+        BOOST_TEST(!r.backplane.host);
+        // A hold keeps it in reset even after `on` was cleared again.
+        r.daemon.set_host_power_override(helm::HostPowerOverride::hold);
+        r.daemon.run_once(0ms);
+        BOOST_TEST(!r.daemon.booted());
+        r.daemon.set_host_power_override(helm::HostPowerOverride::on);
+        r.daemon.run_once(0ms);
+        BOOST_TEST(r.daemon.booted());
+        BOOST_TEST(!r.daemon.boot_pending());
+        BOOST_TEST(r.backplane.host);
+        BOOST_TEST(r.daemon.attached(net_slot));
+        // Once booted, scheduling again does nothing.
+        r.daemon.schedule_boot(std::chrono::steady_clock::now());
+        BOOST_TEST(!r.daemon.boot_pending());
+    }
+    {
+        Rig r;
+        r.daemon.schedule_boot(std::chrono::steady_clock::now() - 1s);
+        r.daemon.set_host_power_override(helm::HostPowerOverride::hold);
+        r.daemon.run_once(0ms);
+        BOOST_TEST(!r.daemon.booted());
+        r.daemon.set_host_power_override(helm::HostPowerOverride::none);
+        r.daemon.run_once(0ms);
+        BOOST_TEST(r.daemon.booted());
+        BOOST_TEST(r.backplane.host);
+    }
+}
+
+// Requirement 3.1: power_policy records reach the keeper from the link
+// thread, and only verified, newer ones are kept.
+BOOST_AUTO_TEST_CASE(power_policy_records_reach_the_keeper) {
+    struct AcceptOnes final : helm::RecordVerifier {
+        [[nodiscard]] auto verify(std::span<const std::byte> /*message*/,
+                                  std::span<const std::byte, proto::ed25519_signature_size> sig,
+                                  std::uint16_t /*key_id*/) const -> bool override {
+            return sig[0] == std::byte{1};
+        }
+    } verifier;
+    helm::PowerPolicyKeeper keeper{server, nullptr, &verifier};
+    Rig r{link_timeout, nullptr, false, false, &keeper};
+    const auto frame = [](std::uint64_t version, std::uint8_t sig) {
+        proto::PowerPolicy p = proto::default_power_policy(server);
+        p.key_id = 1;
+        p.policy_version = version;
+        p.tier = 0;
+        p.tier_delay_s = 0;
+        p.signature.fill(std::byte{sig});
+        auto bytes = proto::encode_power_policy(p);
+        BOOST_REQUIRE(bytes.has_value());
+        return std::pair{p, *bytes};
+    };
+    const auto [good, good_bytes] = frame(2, 1);
+    const auto [old, old_bytes] = frame(1, 1);
+    const auto [forged, forged_bytes] = frame(3, 0);
+    r.daemon.on_power_policy(good, good_bytes);
+    r.daemon.on_power_policy(old, old_bytes);
+    r.daemon.on_power_policy(forged, forged_bytes);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().power_policies == 1U);
+    BOOST_TEST(r.daemon.stats().power_policies_refused == 2U);
+    BOOST_TEST(keeper.current().policy_version == 2U);
+    BOOST_TEST(keeper.current().tier == 0U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

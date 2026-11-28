@@ -23,6 +23,7 @@
 #include "hull/signature_verifier.hpp"
 #include "proto/envelope.hpp"
 #include "proto/map_update.hpp"
+#include "proto/host_lifecycle.hpp"
 #include "proto/power_policy.hpp"
 #include "proto/replica_config.hpp"
 #include "proto/standing_set.hpp"
@@ -414,6 +415,38 @@ BOOST_AUTO_TEST_CASE(policy13_reproduces_and_verifies) {
         [](std::span<const std::byte> b) { return proto::decode_power_policy(b); },
         [](std::span<const std::byte> b) { return proto::power_policy_signed_bytes(b); },
         [](std::span<std::byte> b, const auto& sig) { proto::set_power_policy_signature(b, sig); });
+}
+
+BOOST_AUTO_TEST_CASE(power17_reproduces_and_verifies) {
+    const proto::HostPower fields{.key_id = vec::power17_key_id,
+                                  .server_id = vec::power17_server_id,
+                                  .seq = vec::power17_seq,
+                                  .action = proto::HostPowerAction::cycle,
+                                  .force = true,
+                                  .signature = {}};
+    check_signed_vector(
+        vec::power17, vec::power17_signature, fields, TestSigner{vec::key1_secret},
+        [](const proto::HostPower& p) { return proto::encode_host_power(p); },
+        [](std::span<const std::byte> b) { return proto::decode_host_power(b); },
+        [](std::span<const std::byte> b) { return proto::host_lifecycle_signed_bytes(b); },
+        [](std::span<std::byte> b, const auto& sig) {
+            proto::set_host_lifecycle_signature(b, sig);
+        });
+}
+
+BOOST_AUTO_TEST_CASE(decommission18_reproduces_and_verifies) {
+    const proto::Decommission fields{.key_id = vec::decommission18_key_id,
+                                     .server_id = vec::decommission18_server_id,
+                                     .seq = vec::decommission18_seq,
+                                     .signature = {}};
+    check_signed_vector(
+        vec::decommission18, vec::decommission18_signature, fields, TestSigner{vec::key1_secret},
+        [](const proto::Decommission& d) { return proto::encode_decommission(d); },
+        [](std::span<const std::byte> b) { return proto::decode_decommission(b); },
+        [](std::span<const std::byte> b) { return proto::host_lifecycle_signed_bytes(b); },
+        [](std::span<std::byte> b, const auto& sig) {
+            proto::set_host_lifecycle_signature(b, sig);
+        });
 }
 
 BOOST_AUTO_TEST_CASE(standing14_reproduces_and_verifies) {

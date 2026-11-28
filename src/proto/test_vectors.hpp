@@ -295,4 +295,53 @@ inline constexpr std::string_view report_boot_cache16 =
     "abababababababababababababababababababab000000000000000000000000000000000000000000000000"
     "00000000000000000500000000000000040000000000000000000040000000000000008000000000";
 
+// Vector 17: a HostPower (.kiro/specs/server-provisioning/) for server 7,
+// seq 0x40, action cycle, force set, signed with key 1 (key_id 1).
+inline constexpr std::uint64_t power17_server_id = 7;
+inline constexpr std::uint16_t power17_key_id = 1;
+inline constexpr std::uint64_t power17_seq = 0x40;
+inline constexpr std::string_view power17 =
+    "414b485001000100070000000000000040000000000000000301000000000000a5f71f0146dca6b324d6215d"
+    "18355387e4d109eb04df883598906993eebd39f356ff768c16f721c893c93b24ba0f9071323fab770e19773b"
+    "a18df9b00e19f20e";
+inline constexpr std::string_view power17_signature =
+    "a5f71f0146dca6b324d6215d18355387e4d109eb04df883598906993eebd39f356ff768c16f721c893c93b24"
+    "ba0f9071323fab770e19773ba18df9b00e19f20e";
+
+// Vector 18: a Decommission (.kiro/specs/server-provisioning/) for server
+// 7, seq 0x41, signed with key 1 (key_id 1).
+inline constexpr std::uint64_t decommission18_server_id = 7;
+inline constexpr std::uint16_t decommission18_key_id = 1;
+inline constexpr std::uint64_t decommission18_seq = 0x41;
+inline constexpr std::string_view decommission18 =
+    "414b4443010001000700000000000000410000000000000000000000000000003939b3b17b30ba6e482807eb"
+    "f0e2cac095727b07ae0bc93bcb51dd0869376dd37f32db1bc3d27c6f3eb11fcecd0f1a0c91484c729384ae2f"
+    "16528f0ea11c850b";
+inline constexpr std::string_view decommission18_signature =
+    "3939b3b17b30ba6e482807ebf0e2cac095727b07ae0bc93bcb51dd0869376dd37f32db1bc3d27c6f3eb11fce"
+    "cd0f1a0c91484c729384ae2f16528f0ea11c850b";
+
+// Vector 19: an unsigned hardware_identity report (format v2) from server
+// 7, report_seq 3: EK hash 0xE7 x 32, board "AKB-0001", firmware
+// "helm 1.4.2", 512 GiB, 64 CPUs, Secure Boot and IOMMU on as hull
+// reported; slot 1 network "OAR-N-11" ("oar-net 2.0"), slot 2 storage
+// "OAR-S-22" ("hold 3.1") with drives "NVA" and "NVB" of 3840 GiB each.
+inline constexpr std::string_view report_hardware_identity19 =
+    "414b525002001900070000000000000003000000000000006001000000000000e7e7e7e7e7e7e7e7e7e7e7e7"
+    "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7414b422d3030303100000000000000000000000000000000"
+    "000000000000000068656c6d20312e342e320000000000000000000000000000000000000000000000000000"
+    "80000000400000000702020001010000000000004f41522d4e2d313100000000000000000000000000000000"
+    "00000000000000006f61722d6e657420322e3000000000000000000000000000000000000000000002020000"
+    "000000004f41522d532d3232000000000000000000000000000000000000000000000000686f6c6420332e31"
+    "000000000000000000000000000000000000000000000000020000000000000000000000c00300004e564100"
+    "00000000000000000000000000000000000000000000000000000000020000000000000000000000c0030000"
+    "4e56420000000000000000000000000000000000000000000000000000000000";
+
+// Vector 20: an unsigned decommission_progress report (format v2) from
+// server 7, report_seq 4: step media, drive "NVA" in slot 2 sanitized with
+// crypto erase.
+inline constexpr std::string_view report_decommission_progress20 =
+    "414b525002001a0007000000000000000400000000000000280000000000000002010200000000004e564100"
+    "00000000000000000000000000000000000000000000000000000000";
+
 }  // namespace ak::proto::vectors

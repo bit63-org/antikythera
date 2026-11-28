@@ -57,13 +57,18 @@ draft). This spec takes link types 21-22 and report kinds 25-26.
 
 | Record | Direction | Body | Signed |
 |---|---|---|---|
-| `host_power` (21) | controller → helm | `server_id u64 \| seq u64 \| action u8 (on, off, cycle, hold) \| force u8 \| rsvd [6] \| key_id u16 \| sig [64]` | yes, Ed25519 by the controller key, like an envelope |
-| `decommission` (22) | controller → helm | `server_id u64 \| seq u64 \| rsvd [8] \| key_id u16 \| sig [64]` | yes |
+| `host_power` (21) | controller → helm | `magic 'AKHP' \| version u16 \| key_id u16 \| server_id u64 \| seq u64 \| action u8 (on, off, cycle, hold) \| force u8 \| rsvd [6] \| sig [64]` | yes, Ed25519 by the controller key, like an envelope |
+| `decommission` (22) | controller → helm | `magic 'AKDC' \| version u16 \| key_id u16 \| server_id u64 \| seq u64 \| rsvd [8] \| sig [64]` | yes |
 
 | Report | Kind | Body |
 |---|---|---|
 | `hardware_identity` | 25 | endorsement key hash, board serial, per-slot serials and firmware, per-drive serial and size, Secure Boot and IOMMU flags |
 | `decommission_progress` | 26 | step (`keys_destroyed`, `media`, `identity_cleared`), per-drive result (`sanitized_crypto`, `sanitized_block`, `failed`), drive serial |
+
+The magic and version lead each frame, as on every other frame the
+controller key signs, so the signed bytes of one kind of frame never
+parse as another (`src/proto/host_lifecycle.hpp`). The reports' exact
+layouts are in `src/proto/report.hpp`.
 
 Both records use the same per-server sequence space as envelopes so a
 replayed power or decommission record is refused like a replayed

@@ -109,6 +109,16 @@ struct RecordingSink final : helm::ControllerSink {
         -> void override {
         power_policies.emplace_back(p, std::vector<std::byte>{frame.begin(), frame.end()});
     }
+    std::vector<std::pair<proto::HostPower, std::vector<std::byte>>> host_powers;
+    auto on_host_power(const proto::HostPower& p, std::span<const std::byte> frame)
+        -> void override {
+        host_powers.emplace_back(p, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
+    std::vector<std::pair<proto::Decommission, std::vector<std::byte>>> decommissions;
+    auto on_decommission(const proto::Decommission& d, std::span<const std::byte> frame)
+        -> void override {
+        decommissions.emplace_back(d, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
     std::vector<proto::RoleCertificate> certificates;
     auto on_role_certificate(const proto::RoleCertificate& c) -> void override {
         certificates.push_back(c);
@@ -369,6 +379,24 @@ auto power_policy_record(std::uint64_t to) -> std::vector<std::byte> {
     return framed(RecordType::power_policy, *b);
 }
 
+auto host_power_record(std::uint64_t to) -> std::vector<std::byte> {
+    auto b = proto::encode_host_power({.key_id = key,
+                                       .server_id = to,
+                                       .seq = 9,
+                                       .action = proto::HostPowerAction::off,
+                                       .force = false,
+                                       .signature = {}});
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::host_power, *b);
+}
+
+auto decommission_record(std::uint64_t to) -> std::vector<std::byte> {
+    auto b =
+        proto::encode_decommission({.key_id = key, .server_id = to, .seq = 10, .signature = {}});
+    BOOST_REQUIRE(b.has_value());
+    return framed(RecordType::decommission, *b);
+}
+
 auto tunnel_peers_record(std::uint64_t to) -> std::vector<std::byte> {
     proto::TunnelPeers t{
         .server_id = to,
@@ -615,6 +643,38 @@ BOOST_FIXTURE_TEST_CASE(cold_start_records_reach_the_sink_unmodified, Fixture) {
     BOOST_REQUIRE(!res.has_value());
     BOOST_TEST((res.error() == SessionError::bad_record));
     BOOST_TEST(sink.power_policies.size() == 1U);
+}
+
+// .kiro/specs/server-provisioning/ task 1.
+BOOST_FIXTURE_TEST_CASE(host_lifecycle_records_reach_the_sink_unmodified, Fixture) {
+    session.on_connected();
+    const auto power = host_power_record(server);
+    const auto order = decommission_record(server);
+    BOOST_REQUIRE(session.on_bytes(power).has_value());
+    BOOST_REQUIRE(session.on_bytes(order).has_value());
+    BOOST_REQUIRE(sink.host_powers.size() == 1U);
+    BOOST_TEST((sink.host_powers[0].first.action == proto::HostPowerAction::off));
+    BOOST_TEST(std::ranges::equal(sink.host_powers[0].second,
+                                  std::span{power}.subspan(proto::record_header_size)));
+    BOOST_REQUIRE(sink.decommissions.size() == 1U);
+    BOOST_TEST(sink.decommissions[0].first.seq == 10U);
+    BOOST_TEST(std::ranges::equal(sink.decommissions[0].second,
+                                  std::span{order}.subspan(proto::record_header_size)));
+    for (const auto& r : {host_power_record(other_server), decommission_record(other_server)}) {
+        session.on_disconnected();
+        session.on_connected();
+        auto res = session.on_bytes(r);
+        BOOST_REQUIRE(!res.has_value());
+        BOOST_TEST((res.error() == SessionError::wrong_server));
+    }
+    auto bad = host_power_record(server);
+    bad[proto::record_header_size + 0x18] = std::byte{9};  // no such action
+    session.on_disconnected();
+    session.on_connected();
+    auto res = session.on_bytes(bad);
+    BOOST_REQUIRE(!res.has_value());
+    BOOST_TEST((res.error() == SessionError::bad_record));
+    BOOST_TEST(sink.host_powers.size() == 1U);
 }
 
 BOOST_AUTO_TEST_CASE(block_volume_records_default_to_dropped) {

@@ -121,6 +121,8 @@ public:
     // Powers the slots and, unless `release_host` is false (no image to
     // boot yet), releases the host.
     auto boot(bool release_host = true) -> BootResult;
+    // Holds the host in reset; the slots stay powered.
+    auto hold_host() -> void;
     // Releases a host boot() left held. True if it is released.
     auto release_host() -> bool;
     // Holds the host for off_time and releases it again: a host reboot

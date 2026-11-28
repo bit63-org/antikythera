@@ -37,6 +37,7 @@
 #include "helm/helm_daemon.hpp"
 #include "helm/host_boot.hpp"
 #include "proto/boot_image.hpp"
+#include "proto/host_lifecycle.hpp"
 #include <openssl/sha.h>
 #include "proto/host_image.hpp"
 #include "helm/store_anchor.hpp"
@@ -2499,6 +2500,152 @@ BOOST_AUTO_TEST_CASE(a_host_with_nothing_to_boot_waits_for_an_assignment) {
     r.daemon.run_once(0ms);
     BOOST_TEST(r.daemon.stats().boot_images == 2U);
     BOOST_TEST(b.writes == 1);
+}
+
+// server-provisioning Requirement 3: host_power records. Signed and
+// sequenced like envelopes, refused while VMs run unless forced, and
+// applied through the sequencer; a forced reset forgets the VMs and
+// cleans what they held.
+BOOST_AUTO_TEST_CASE(host_power_records_are_verified_sequenced_and_applied) {
+    BootRig b;
+    b.make_lkg(BootRig::uki(0xA1));
+    const auto base = b.adjust();
+    Rig r{link_timeout,
+          nullptr,
+          false,
+          false,
+          nullptr,
+          nullptr,
+          {},
+          nullptr,
+          nullptr,
+          b.images.get(),
+          [&](helm::DaemonConfig& c) {
+              base(c);
+              c.controller_keys = &b.verifier;
+          }};
+    const auto order = [&](std::uint64_t seq, proto::HostPowerAction action, bool force = false,
+                           std::uint8_t sig = 1) {
+        proto::HostPower p{.key_id = 1,
+                           .server_id = server,
+                           .seq = seq,
+                           .action = action,
+                           .force = force,
+                           .signature = {}};
+        p.signature.fill(std::byte{sig});
+        auto f = proto::encode_host_power(p);
+        BOOST_REQUIRE(f.has_value());
+        r.daemon.on_host_power(p, *f);
+        r.daemon.run_once(0ms);
+        const auto outcome = r.last<proto::CommandOutcome>();
+        BOOST_TEST(outcome.in_reply_to == seq);
+        BOOST_TEST(outcome.command == 0x8015U);
+        return outcome.status;
+    };
+    using enum proto::HostPowerAction;
+    using proto::CommandStatus;
+
+    BOOST_REQUIRE(r.daemon.boot().host_released);
+    r.daemon.on_envelope(
+        envelope(1, mb::CreateVm{.vm_id = vm_one, .vcpus = vcpus, .memory_mib = memory_mib}));
+    r.daemon.run_once(0ms);
+    r.daemon.post_host_slot(response(1, mb::Type::create_vm));
+    mb::AttachDevice attach{
+        .vm_id = vm_one,
+        .device = {.slot = net_slot, .type = mb::DeviceType::nic_vf, .function = 0},
+        .vni = vni,
+        .nic_id = nic_id,
+        .mac = {}};
+    attach.mac[0] = std::byte{0x02};
+    r.daemon.on_envelope(envelope(2, attach));
+    r.daemon.run_once(0ms);
+    r.daemon.post_host_slot(response(2, mb::Type::attach_device));
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.daemon.router().vm_count() == 1U);
+    const auto free_before = r.free_functions();
+
+    // A VM runs: off, cycle and hold need force (Requirement 3.2).
+    BOOST_TEST((order(3, off) == CommandStatus::conflict));
+    BOOST_TEST((order(4, hold) == CommandStatus::conflict));
+    BOOST_TEST(r.backplane.host);
+    BOOST_TEST(r.daemon.router().vm_count() == 1U);
+    // Unsigned: refused before its number is claimed.
+    BOOST_TEST((order(5, cycle, true, 0) == CommandStatus::bad_signature));
+
+    BOOST_TEST((order(5, cycle, true) == CommandStatus::ok));
+    BOOST_TEST(r.backplane.host);
+    BOOST_TEST(b.writes == 2);  // a reboot is a new boot: a fresh frame
+    BOOST_TEST(r.daemon.router().vm_count() == 0U);
+    BOOST_TEST(r.last<proto::VmExitedReport>().vm_id == vm_one);
+    BOOST_TEST((r.last<proto::VmExitedReport>().reason == proto::ExitReason::vmm_failure));
+    // The NIC the dead VM held is being cleaned, not left assigned.
+    BOOST_TEST(std::ranges::none_of(r.daemon.pool().all(), [](const helm::FunctionInfo& f) {
+        return f.state == FunctionState::assigned;
+    }));
+    BOOST_TEST(r.free_functions() + 1 >= free_before);
+    // Replays are refused like replayed envelopes, and so is an envelope
+    // under a number host_power used.
+    BOOST_TEST((order(5, cycle, true) == CommandStatus::stale_sequence));
+    r.daemon.on_envelope(envelope(5, mb::DestroyVm{.vm_id = vm_one, .persist_volumes = false}));
+    r.daemon.run_once(0ms);
+    BOOST_TEST((r.last<proto::CommandOutcome>().status == CommandStatus::stale_sequence));
+
+    // hold keeps the slots up; on releases the host onto a fresh disk.
+    BOOST_TEST((order(6, hold) == CommandStatus::ok));
+    BOOST_TEST(!r.backplane.host);
+    BOOST_TEST(r.backplane.powered.size() == 2U);
+    BOOST_TEST((order(7, on) == CommandStatus::ok));
+    BOOST_TEST(r.backplane.host);
+    BOOST_TEST(b.writes == 3);
+    BOOST_TEST((order(8, on) == CommandStatus::ok));  // already on
+    BOOST_TEST(b.writes == 3);
+
+    // off takes the slots down too; on boots slots first (Requirement 3.3).
+    BOOST_TEST((order(9, off) == CommandStatus::ok));
+    BOOST_TEST(!r.backplane.host);
+    BOOST_TEST(r.backplane.powered.empty());
+    BOOST_TEST(!r.daemon.booted());
+    BOOST_TEST((order(10, on) == CommandStatus::ok));
+    BOOST_TEST(r.backplane.host);
+    BOOST_TEST(r.backplane.powered.size() == 2U);
+    BOOST_TEST(r.daemon.attached(net_slot));
+    BOOST_TEST(r.daemon.stats().host_power == 6U);
+    BOOST_TEST(r.daemon.stats().host_power_refused == 4U);
+}
+
+BOOST_AUTO_TEST_CASE(host_power_on_ends_the_power_on_wait) {
+    BootRig b;
+    b.make_lkg(BootRig::uki(0xA1));
+    const auto base = b.adjust();
+    Rig r{link_timeout,
+          nullptr,
+          false,
+          false,
+          nullptr,
+          nullptr,
+          {},
+          nullptr,
+          nullptr,
+          b.images.get(),
+          [&](helm::DaemonConfig& c) {
+              base(c);
+              c.controller_keys = &b.verifier;
+          }};
+    r.daemon.schedule_boot(b.now + 1h);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(!r.daemon.booted());
+    proto::HostPower p{.key_id = 1,
+                       .server_id = server,
+                       .seq = 1,
+                       .action = proto::HostPowerAction::on,
+                       .force = false,
+                       .signature = {}};
+    p.signature.fill(std::byte{1});
+    r.daemon.on_host_power(p, *proto::encode_host_power(p));
+    r.daemon.run_once(0ms);  // takes the record
+    r.daemon.run_once(0ms);  // boots
+    BOOST_TEST(r.daemon.booted());
+    BOOST_TEST(r.backplane.host);
 }
 
 BOOST_AUTO_TEST_CASE(the_boot_cache_is_read_before_each_publish) {

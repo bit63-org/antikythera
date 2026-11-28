@@ -29,7 +29,8 @@
 //                               (cold-start Requirement 6.3)
 //   controller-keys ID:HEX;...  the controller's Ed25519 public keys, as hull's
 //                               AK_HULL_CONTROLLER_KEYS; helm verifies signed
-//                               records it acts on alone (power_policy) with
+//                               records it acts on (power_policy, boot_image,
+//                               host_power) with
 //                               them. Optional: without, every such record is
 //                               refused and the defaults apply
 //   image-keys ID:HEX;...       image signing public keys (same format) that

@@ -15,9 +15,20 @@ and 16 there). Each task is one PR unless noted.
     certificate renewal; exhaustive transition tests
   - _Requirements: 1.1-1.4, 2.1-2.4, 7.2_
 
-- [ ] 3. Host power records
+- [x] 3. Host power records
   - Verify, sequence and apply `host_power`; refusal with running VMs
   - _Requirements: 3.1-3.3_
+  - Built: helm verifies the record under the controller keys, claims
+    its number in the envelope space (`CommandRouter::claim_sequence`,
+    recorded for hull's next floor) and reports a `CommandOutcome` with
+    command `0x8000 | 21`. `off`, `cycle` and `hold` are refused
+    (`conflict`) while a VM runs unless forced; a forced one forgets
+    every VM as a volume-keeping DESTROY_VM would, reports it exited
+    and sends its functions to cleaning (`host_reset`). `on` ends the
+    power-on wait, or releases a held host onto a freshly filled boot
+    function; `hold` keeps the slots up; `off` powers the slots down
+    too, so the next `on` sequences them first; `cycle` is a new boot
+    with a fresh epoch and its own fallback.
 
 - [ ] 4. Boot function and provisioning file
   - Fetch and verify the UKI; build the ESP and provisioning partition;

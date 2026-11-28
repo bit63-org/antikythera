@@ -61,4 +61,19 @@ auto seal_image_key(const hpke::PublicKey& recipient, proto::ImageKey header,
     return std::move(*frame);
 }
 
+auto seal_instance_secret(const hpke::PublicKey& recipient, std::uint64_t server, std::uint64_t vm,
+                          std::string_view name, std::span<const std::byte> secret)
+    -> std::expected<proto::InstanceSecret, hpke::Error> {
+    const auto info = proto::instance_secret_info;
+    auto sealed = hpke::seal(recipient, std::as_bytes(std::span{info.data(), info.size()}),
+                             proto::instance_secret_aad(server, vm, name), secret);
+    if (!sealed) {
+        return std::unexpected(sealed.error());
+    }
+    proto::InstanceSecret out{.name = std::string{name}, .hpke_enc = {}, .ciphertext = {}};
+    std::ranges::copy(sealed->enc, out.hpke_enc.begin());
+    out.ciphertext = std::move(sealed->ciphertext);
+    return out;
+}
+
 }  // namespace ak::helm

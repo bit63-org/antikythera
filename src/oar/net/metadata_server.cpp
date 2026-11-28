@@ -9,12 +9,22 @@
 #include <utility>
 
 #include <fcntl.h>
+#include <openssl/crypto.h>
 #include <netinet/in.h>
 #include <unistd.h>
 
 namespace ak::oar::net {
 
 namespace {
+
+// Responses may hold an instance secret (MetadataView::secrets): every
+// written response is wiped, which costs little and needs no tracking.
+auto cleanse(std::string& s) noexcept -> void {
+    if (!s.empty()) {
+        OPENSSL_cleanse(s.data(), s.size());
+    }
+    s.clear();
+}
 
 // Accepts per run_once(), so a flood of connections cannot starve the
 // ones already open.
@@ -107,6 +117,7 @@ auto MetadataServer::close(std::size_t index, bool reset) -> void {
     } else {
         ::close(c.fd);
     }
+    cleanse(c.out);
     if (const auto it = _per_nic.find(c.nic_id); it != _per_nic.end() && --it->second == 0) {
         _per_nic.erase(it);
     }
@@ -154,7 +165,7 @@ auto MetadataServer::serve(Connection& c, MetadataClock::time_point now) -> Next
             c.written += static_cast<std::size_t>(n);
             c.last_activity = now;
         }
-        c.out.clear();
+        cleanse(c.out);
         c.written = 0;
         if (c.close_after) {
             return Next::close;
@@ -192,12 +203,16 @@ auto MetadataServer::serve(Connection& c, MetadataClock::time_point now) -> Next
                                         .token_ttl = {},
                                         .hop_limit = {},
                                         .close = true,
-                                        .reset = false};
+                                        .reset = false,
+                                        .secret = false};
             } else {
                 ++_counters.tokens;
             }
         }
         c.out = render(response, request->method == HttpMethod::head);
+        if (response.secret) {
+            cleanse(response.body);
+        }
         c.close_after = response.close;
         c.in.erase(0, request->head_bytes);
         c.request_started = c.in.empty() ? std::nullopt : std::optional{now};

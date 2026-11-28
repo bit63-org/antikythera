@@ -19,6 +19,7 @@
 
 #include "common/wire.hpp"
 #include "proto/image_key.hpp"
+#include "proto/standing_set.hpp"
 #include "proto/volume_key.hpp"
 
 namespace ak::helm {
@@ -424,6 +425,29 @@ auto SoftwareSecureElement::open_transport(
     }
     auto opened = hpke::open(pair->private_key.span(), enc,
                              std::as_bytes(std::span{info.data(), info.size()}), aad, wrapped, out);
+    if (!opened) {
+        ERR_clear_error();
+        return std::unexpected(opened.error() == hpke::Error::crypto_failure
+                                   ? SeError::crypto_failure
+                                   : SeError::authentication_failed);
+    }
+    return {};
+}
+
+auto SoftwareSecureElement::open_instance_secret(std::span<const std::byte> aad,
+                                                 std::span<const std::byte, hpke::enc_size> enc,
+                                                 std::span<const std::byte> ciphertext,
+                                                 std::span<std::byte> out)
+    -> std::expected<void, SeError> {
+    auto pair = transport_key();
+    if (!pair) {
+        secure_zero(out);
+        return std::unexpected(pair.error());
+    }
+    const auto info = proto::instance_secret_info;
+    auto opened =
+        hpke::open(pair->private_key.span(), enc,
+                   std::as_bytes(std::span{info.data(), info.size()}), aad, ciphertext, out);
     if (!opened) {
         ERR_clear_error();
         return std::unexpected(opened.error() == hpke::Error::crypto_failure

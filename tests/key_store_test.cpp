@@ -442,6 +442,43 @@ BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_AUTO_TEST_SUITE(key_store)
 
+// cold-start Requirement 5.4: an instance secret opens only for its own
+// server, instance and name, and only in the secure element it was sealed
+// to.
+BOOST_AUTO_TEST_CASE(instance_secrets_open_only_for_their_instance,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    auto se = make_se();
+    ak::helm::KeyStore store{se};
+    const std::vector<std::byte> plain{std::byte{1}, std::byte{2}, std::byte{3}};
+    const auto pk = se.transport_public_key().value();
+    const auto sealed = ak::helm::seal_instance_secret(pk, 42, 0x1001, "hsm.share", plain);
+    BOOST_REQUIRE(sealed.has_value());
+    std::vector<std::byte> out(plain.size());
+    BOOST_REQUIRE(store.open_instance_secret(42, 0x1001, *sealed, out).has_value());
+    BOOST_TEST((out == plain));
+    // Another instance, server or name: the AAD differs.
+    BOOST_TEST(
+        (store.open_instance_secret(42, 0x1002, *sealed, out).error() == KeyError::corrupt_key));
+    BOOST_TEST((std::ranges::all_of(out, [](std::byte b) { return b == std::byte{0}; })));
+    BOOST_TEST(
+        (store.open_instance_secret(43, 0x1001, *sealed, out).error() == KeyError::corrupt_key));
+    auto renamed = *sealed;
+    renamed.name = "tls.key";
+    BOOST_TEST(
+        (store.open_instance_secret(42, 0x1001, renamed, out).error() == KeyError::corrupt_key));
+    // The wrong output size.
+    std::vector<std::byte> small(2);
+    BOOST_TEST(
+        (store.open_instance_secret(42, 0x1001, *sealed, small).error() == KeyError::corrupt_key));
+    // Sealed to another secure element.
+    auto other = make_se();
+    const auto stray = ak::helm::seal_instance_secret(other.transport_public_key().value(), 42,
+                                                      0x1001, "hsm.share", plain);
+    BOOST_REQUIRE(stray.has_value());
+    BOOST_TEST(
+        (store.open_instance_secret(42, 0x1001, *stray, out).error() == KeyError::corrupt_key));
+}
+
 BOOST_AUTO_TEST_CASE(unwrap_is_stable_and_keys_distinct,
                      *boost::unit_test::timeout(unit_timeout_seconds)) {
     Fixture f;

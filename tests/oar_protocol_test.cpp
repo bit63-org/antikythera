@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -1252,6 +1253,74 @@ BOOST_AUTO_TEST_CASE(membership_pager_answers_unchanged_and_pages_one_snapshot) 
     }
     BOOST_TEST(pager.page({.cursor = 0, .since = std::nullopt}, 5, snap).value().total ==
                oar::max_memberships);
+}
+
+// cold-start Requirement 5.4: helm's InstanceSecrets frame.
+BOOST_AUTO_TEST_CASE(instance_secrets_round_trip_and_rules) {
+    oar::InstanceSecrets s{.nic_id = 0x21, .vm_id = 0x1001, .secrets = {}};
+    s.secrets.push_back({.name = "hsm.share", .value = bytes_of(1, 2, 3)});
+    s.secrets.push_back({.name = "tls.key", .value = std::vector<std::byte>(4096, std::byte{7})});
+    const auto frame = oar::encode_instance_secrets(s);
+    BOOST_REQUIRE(frame.has_value());
+    BOOST_TEST(frame->size() == oar::instance_secrets_head_size + (2 * 4) + 9 + 3 + 7 + 4096);
+    const auto back = oar::decode_instance_secrets(*frame);
+    BOOST_REQUIRE(back.has_value());
+    BOOST_TEST((*back == s));
+
+    // No entries: removes the NIC's secrets.
+    const oar::InstanceSecrets none{.nic_id = 0x21, .vm_id = 0x1001, .secrets = {}};
+    const auto empty = oar::encode_instance_secrets(none);
+    BOOST_REQUIRE(empty.has_value());
+    BOOST_TEST(empty->size() == oar::instance_secrets_head_size);
+    BOOST_TEST((oar::decode_instance_secrets(*empty).value() == none));
+
+    // Encoder rules.
+    auto bad = s;
+    bad.nic_id = 0;
+    BOOST_TEST((oar::encode_instance_secrets(bad).error() == BodyError::zero_id));
+    bad = s;
+    std::swap(bad.secrets[0], bad.secrets[1]);  // out of order
+    BOOST_TEST((oar::encode_instance_secrets(bad).error() == BodyError::bad_secret));
+    bad = s;
+    bad.secrets[0].name = "bad name";
+    BOOST_TEST((oar::encode_instance_secrets(bad).error() == BodyError::bad_secret));
+    bad = s;
+    bad.secrets[0].value.clear();
+    BOOST_TEST((oar::encode_instance_secrets(bad).error() == BodyError::bad_secret));
+    bad = s;
+    bad.secrets[1].value.push_back(std::byte{0});  // 4097 bytes
+    BOOST_TEST((oar::encode_instance_secrets(bad).error() == BodyError::bad_secret));
+    bad = s;
+    bad.secrets.clear();
+    for (char c = 'a'; c < 'a' + 9; ++c) {
+        bad.secrets.push_back({.name = std::string(1, c), .value = bytes_of(1)});
+    }
+    BOOST_TEST((oar::encode_instance_secrets(bad).error() == BodyError::too_many_entries));
+
+    // Decoder rules, from the good frame.
+    auto f = *frame;
+    f[17] = std::byte{1};  // reserved
+    BOOST_TEST((oar::decode_instance_secrets(f).error() == BodyError::reserved_not_zero));
+    f = *frame;
+    f[oar::instance_secrets_head_size + 1] = std::byte{1};  // an entry's reserved byte
+    BOOST_TEST((oar::decode_instance_secrets(f).error() == BodyError::reserved_not_zero));
+    f = *frame;
+    f.pop_back();
+    BOOST_TEST((oar::decode_instance_secrets(f).error() == BodyError::truncated));
+    f = *frame;
+    f.push_back(std::byte{0});
+    BOOST_TEST((oar::decode_instance_secrets(f).error() == BodyError::trailing_bytes));
+    f = *frame;
+    f[16] = std::byte{9};  // count
+    BOOST_TEST((oar::decode_instance_secrets(f).error() == BodyError::too_many_entries));
+    f = *frame;
+    f[oar::instance_secrets_head_size + 4] = std::byte{' '};  // the first name's first byte
+    BOOST_TEST((oar::decode_instance_secrets(f).error() == BodyError::bad_secret));
+    BOOST_TEST((oar::decode_instance_secrets(std::span(*frame).first(10)).error() ==
+                BodyError::truncated));
+
+    oar::wipe(s);
+    BOOST_TEST(s.secrets.empty());
 }
 
 BOOST_AUTO_TEST_CASE(names) {

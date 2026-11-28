@@ -20,7 +20,13 @@
 //   4. keeps the decoded record for the NIC, replacing the older one.
 //
 // A record arrives before the attach that plugs its NIC and stays until
-// the role cleans that NIC (drop()). At most `capacity` records are kept,
+// the role cleans that NIC (drop()).
+//
+// It also holds the NIC's instance secrets (.kiro/specs/cold-start/
+// Requirement 5.4), which helm opened in its secure element and sent for
+// a standing instance (put_secrets()). They are in the clear, so they
+// are wiped when replaced, dropped with the NIC, or the store goes. They
+// count against the same capacity as records. At most `capacity` records are kept,
 // one per NIC the role can host; a record for a new NIC when the store is
 // full is refused, so a misbehaving sender cannot grow the role's memory
 // (each record may hold 16 KiB of user data).
@@ -32,7 +38,9 @@
 #include <functional>
 #include <map>
 #include <span>
+#include <vector>
 
+#include "oar/net/metadata_http.hpp"
 #include "proto/instance_metadata.hpp"
 
 namespace ak::oar::net {
@@ -73,10 +81,22 @@ struct MetadataCounters {
 class MetadataStore {
 public:
     MetadataStore(std::uint64_t server_id, std::size_t capacity, MetadataVerifier verifier);
+    ~MetadataStore();
+    MetadataStore(const MetadataStore&) = delete;
+    auto operator=(const MetadataStore&) -> MetadataStore& = delete;
+    MetadataStore(MetadataStore&&) = delete;
+    auto operator=(MetadataStore&&) -> MetadataStore& = delete;
 
     auto put(std::span<const std::byte> frame) -> MetadataResult;
-    // The NIC was cleaned: its record goes. False if it had none.
+    // The NIC was cleaned: its record and secrets go. False if it had no
+    // record.
     auto drop(std::uint64_t nic_id) -> bool;
+    // Replaces the NIC's secrets, taking the values (an empty list removes
+    // them). False, keeping nothing, for a new NIC when `capacity` NICs
+    // have secrets already.
+    auto put_secrets(std::uint64_t nic_id, std::vector<InstanceSecret> secrets) -> bool;
+    // The NIC's secrets, if any; valid until the next put_secrets() or drop().
+    [[nodiscard]] auto secrets(std::uint64_t nic_id) const -> const std::vector<InstanceSecret>*;
 
     // The NIC's record, if any; valid until the next put() or drop().
     [[nodiscard]] auto find(std::uint64_t nic_id) const -> const proto::InstanceMetadata*;
@@ -88,7 +108,8 @@ private:
     std::uint64_t _server_id;
     std::size_t _capacity;
     MetadataVerifier _verifier;
-    std::map<std::uint64_t, proto::InstanceMetadata> _records;  // by NIC ID
+    std::map<std::uint64_t, proto::InstanceMetadata> _records;      // by NIC ID
+    std::map<std::uint64_t, std::vector<InstanceSecret>> _secrets;  // by NIC ID
     MetadataCounters _counters;
 };
 

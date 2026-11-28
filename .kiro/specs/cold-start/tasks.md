@@ -51,7 +51,7 @@ and `helm-control-plane`. Pairs with kythira's
     results. Feeding stored replica configs, keys and network frames
     into the prepare is task 7.
 
-- [ ] 7. Volumes, NICs and secrets of standing instances
+- [x] 7. Volumes, NICs and secrets of standing instances
   - Stored `ReplicaConfig` and volume keys to oar-blk; stored network
     frames to the network role before plugging NICs; tunnel keys until
     `fleet-scale-networking` lands; instance secrets through instance
@@ -64,8 +64,16 @@ and `helm-control-plane`. Pairs with kythira's
     configuration, instance metadata and peer set per standing NIC) to
     the network roles. SecurityPolicy joins when the security-group
     build adds the record. 5.3 is met by fleet-scale-networking's
-    stable tunnel keys, so the set carries none. Next: instance secrets
-    (5.4) and reading the image from the root volume (5.5).
+    stable tunnel keys, so the set carries none.
+  - Built: instance secrets (5.4). When a pinned instance's NIC is
+    plugged, and again when its network role restarts, helm opens the
+    instance's secrets in the secure element and sends them to that
+    role in an unsigned `instance_secrets` sideband frame, wiping every
+    copy. The role serves them under `/latest/instance-secrets/`,
+    always behind an IMDSv2 token and outside `/meta-data`, and wipes
+    them with the NIC. 5.5 holds by construction: a standing entry may
+    run only CREATE_VM, ATTACH_VOLUME and ATTACH_DEVICE, never an image
+    CREATE_VOLUME, so a standing start never reads the object store.
 
 - [x] 8. Time floor in helm
   - _Requirements: 7.1, 7.2_

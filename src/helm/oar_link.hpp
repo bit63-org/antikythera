@@ -159,6 +159,10 @@ public:
     // tunnel_peers; fails without sending if it is empty or larger than
     // oar::max_instance_metadata_frame.
     auto instance_metadata(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
+    // A standing instance's secrets for one of its NICs (cold-start
+    // Requirement 5.4), to a network role. Every buffer that held them is
+    // wiped once sent, success or not; the caller wipes `secrets`.
+    auto instance_secrets(const oar::InstanceSecrets& secrets) -> std::expected<void, LinkError>;
     // Sends one controller VolumeLayout frame in chunks, like tunnel_peers,
     // to a blk role (khold volumes); fails without sending if it is empty
     // or larger than oar::max_volume_layout_frame.
@@ -216,7 +220,7 @@ private:
         -> std::expected<std::vector<std::byte>, LinkError>;
     // Sends a frame as consecutive chunks of `type` (map_update,
     // tunnel_peers, role_certificate).
-    auto send_chunked(mctp::VendorType type, std::span<const std::byte> frame)
+    auto send_chunked(mctp::VendorType type, std::span<const std::byte> frame, bool secret = false)
         -> std::expected<void, LinkError>;
 
     Binding* _binding;
@@ -344,6 +348,11 @@ public:
     // Starts the storage self-test, which only the khold role runs; its
     // results arrive later as a capacity report.
     virtual auto self_test() -> oar::Status { return oar::Status::unsupported; }
+    // A standing instance's secrets for one NIC, which only the network
+    // role serves. The values are wiped after the call: copy them.
+    virtual auto instance_secrets(const oar::InstanceSecrets& /*secrets*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
     // Cooperative detach, which only the storage role (blk) implements.
     virtual auto eject(const oar::Eject& /*request*/)
         -> std::expected<oar::EjectState, oar::Status> {

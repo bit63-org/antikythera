@@ -251,6 +251,7 @@ auto HelmDaemon::expect_standing(StandingRoundDone done) -> bool {
     if (_config.standing_set == nullptr || _config.standing_set->pinned() == 0) {
         return false;
     }
+    seed_standing(*_config.standing_set->current());
     _router.expect_standing(_config.standing_set->frame(), *_config.standing_set->current(),
                             std::move(done));
     return _router.standing();
@@ -480,6 +481,7 @@ auto HelmDaemon::handle(Item& item) -> void {
             const std::scoped_lock lock{_inbox_mutex};
             ++_stats.map_updates;
         }
+        keep_standing_frame(proto::RecordType::map_update, map->frame);
         apply_map(*map);
     } else if (const auto* slot = std::get_if<mailbox::Slot>(&item)) {
         {
@@ -524,14 +526,17 @@ auto HelmDaemon::handle(Item& item) -> void {
             const std::scoped_lock lock{_inbox_mutex};
             ++_stats.tunnel_peer_sets;
         }
+        keep_standing_frame(proto::RecordType::tunnel_peers, peers->frame);
         forward_peers(*peers);
     } else if (const auto* policy = std::get_if<PolicyFrame>(&item)) {
         _groups.on_group_policy(policy->policy, policy->frame);
     } else if (auto* metadata = std::get_if<MetadataFrame>(&item)) {
+        keep_standing_frame(proto::RecordType::instance_metadata, metadata->frame);
         keep_metadata(*metadata);
     } else if (const auto* members = std::get_if<MembersFrame>(&item)) {
         _groups.on_group_members(members->members, members->frame);
     } else if (auto* vpc = std::get_if<VpcFrame>(&item)) {
+        keep_standing_frame(proto::RecordType::vpc_config, vpc->frame);
         forward_vpc_config(*vpc);
     } else if (auto* layout = std::get_if<LayoutFrame>(&item)) {
         forward_layout(*layout);
@@ -561,9 +566,99 @@ auto HelmDaemon::handle(Item& item) -> void {
         if (kept && _config.time_floor != nullptr) {
             (void)_config.time_floor->observe(_config.standing_set->current()->time_floor);
         }
+        // The frames kept follow the new set's NICs.
+        if (kept && _config.standing_frames != nullptr) {
+            _config.standing_frames->retain(&*_config.standing_set->current());
+        }
         const std::scoped_lock lock{_inbox_mutex};
         ++(kept ? _stats.standing_sets : _stats.standing_sets_refused);
     }
+}
+
+// ---- standing instances ---------------------------------------------------------
+
+auto HelmDaemon::keep_standing_frame(proto::RecordType type, std::span<const std::byte> frame)
+    -> void {
+    if (_config.standing_frames == nullptr) {
+        return;
+    }
+    const auto verdict = _config.standing_frames->offer(type, frame);
+    if (verdict != FrameVerdict::kept && verdict != FrameVerdict::bad_signature &&
+        verdict != FrameVerdict::store_failed) {
+        return;  // not for a standing NIC, or no newer than the one kept
+    }
+    const std::scoped_lock lock{_inbox_mutex};
+    ++(verdict == FrameVerdict::kept ? _stats.standing_frames : _stats.standing_frames_refused);
+}
+
+auto HelmDaemon::seed_standing(const proto::StandingSet& set) -> void {
+    // Handled here, on the loop thread, before the router can prepare a
+    // standing start: the roles are up (boot), so each frame reaches them
+    // now, ahead of the NIC plugs and attaches that need it.
+    std::uint64_t seeded = 0;
+    auto run = [&](Item item) {
+        handle(item);
+        ++seeded;
+    };
+    if (_config.standing_frames != nullptr) {
+        for (auto& f : _config.standing_frames->frames()) {
+            switch (f.type) {
+                case proto::RecordType::tunnel_peers:
+                    if (auto p = proto::decode_tunnel_peers(f.frame); p) {
+                        run(PeersFrame{.peers = std::move(*p), .frame = std::move(f.frame)});
+                    }
+                    break;
+                case proto::RecordType::vpc_config:
+                    if (auto c = proto::decode_vpc_config(f.frame); c) {
+                        run(VpcFrame{.vni = c->vni,
+                                     .config_version = c->config_version,
+                                     .frame = std::move(f.frame)});
+                    }
+                    break;
+                case proto::RecordType::map_update:
+                    if (auto m = proto::decode_map_update(f.frame); m) {
+                        run(MapFrame{.vni = m->vni,
+                                     .map_version = m->map_version,
+                                     .frame = std::move(f.frame)});
+                    }
+                    break;
+                case proto::RecordType::instance_metadata:
+                    if (auto m = proto::decode_instance_metadata(f.frame); m) {
+                        run(MetadataFrame{.nic_id = m->nic_id,
+                                          .metadata_version = m->metadata_version,
+                                          .frame = std::move(f.frame)});
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+    // Requirement 5.1: each volume's frame to its storage role and its key
+    // into the secure element, as for a live attach. decode_standing_set
+    // decoded both strictly, so neither fails here.
+    for (const auto& in : set.instances) {
+        for (const auto& v : in.volumes) {
+            if (v.frame_type == proto::StandingVolumeFrame::replica_config) {
+                if (auto c = proto::decode_replica_config(v.frame); c) {
+                    run(ConfigFrame{
+                        .volume_id = c->volume_id, .epoch = c->epoch, .frame = v.frame});
+                }
+            } else if (auto l = proto::decode_volume_layout(v.frame); l) {
+                const auto roles = layout_roles(*l, l->server_id);
+                run(LayoutFrame{.volume_id = l->volume_id,
+                                .epoch = l->epoch,
+                                .member = roles.member,
+                                .attached = roles.attached,
+                                .frame = v.frame});
+            }
+            if (auto key = proto::encode_volume_key(v.key); key) {
+                run(KeyFrame{.frame = std::move(*key)});
+            }
+        }
+    }
+    const std::scoped_lock lock{_inbox_mutex};
+    _stats.standing_seeded += seeded;
 }
 
 // ---- VPC configuration ----------------------------------------------------------

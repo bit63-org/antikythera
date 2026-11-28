@@ -39,6 +39,8 @@
 #include "helm/mailbox.hpp"
 #include "helm/oar_link.hpp"
 #include "helm/secure_element.hpp"
+#include "helm/standing_frames.hpp"
+#include "helm/standing_set_keeper.hpp"
 #include "helm/sideband_binding.hpp"
 #include "helm/volume_key_seal.hpp"
 #include "hull/signature_verifier.hpp"
@@ -47,6 +49,8 @@
 #include "proto/test_vectors.hpp"
 #include "proto/tunnel_peers.hpp"
 #include "proto/instance_metadata.hpp"
+#include "proto/map_update.hpp"
+#include "proto/standing_set.hpp"
 #include "proto/volume_layout.hpp"
 #include "proto/vpc_config.hpp"
 #include "test_support.hpp"
@@ -600,9 +604,11 @@ struct Rig {
                  helm::HostPort* host_port = nullptr, bool with_hold = false,
                  bool with_khold = false, helm::PowerPolicyKeeper* power_policy = nullptr,
                  helm::TimeFloor* time_floor = nullptr,
-                 std::function<proto::BootCache()> boot_cache = {})
+                 std::function<proto::BootCache()> boot_cache = {},
+                 helm::StandingSetKeeper* standing_set = nullptr,
+                 helm::StandingFrames* standing_frames = nullptr)
         : daemon{config(slot_link_timeout, with_hold, with_khold, power_policy, time_floor,
-                        std::move(boot_cache)),
+                        std::move(boot_cache), standing_set, standing_frames),
                  keys,
                  audit,
                  host_port != nullptr ? *host_port : host,
@@ -624,9 +630,13 @@ struct Rig {
     static auto config(std::chrono::milliseconds slot_link_timeout, bool with_hold = false,
                        bool with_khold = false, helm::PowerPolicyKeeper* power_policy = nullptr,
                        helm::TimeFloor* time_floor = nullptr,
-                       std::function<proto::BootCache()> boot_cache = {}) -> helm::DaemonConfig {
+                       std::function<proto::BootCache()> boot_cache = {},
+                       helm::StandingSetKeeper* standing_set = nullptr,
+                       helm::StandingFrames* standing_frames = nullptr) -> helm::DaemonConfig {
         helm::DaemonConfig c;
         c.power_policy = power_policy;
+        c.standing_set = standing_set;
+        c.standing_frames = standing_frames;
         c.time_floor = time_floor;
         c.boot_cache = std::move(boot_cache);
         std::vector<SlotNumber> slots{net_slot, blk_slot};
@@ -1816,6 +1826,113 @@ BOOST_AUTO_TEST_CASE(shutdown_holds_the_host_and_powers_slots_off) {
     BOOST_TEST(!r.backplane.host);
     BOOST_TEST(r.backplane.powered.empty());
     BOOST_TEST(!r.daemon.attached(net_slot));
+}
+
+// Cold-start Requirements 4.2 and 5.1-5.2: standing_set records reach the
+// keeper; network frames for its NICs are kept as they arrive; and before
+// the standing starts, the standing volume's frame and key and the kept
+// frames reach the roles and key store, as if the controller sent them.
+BOOST_AUTO_TEST_CASE(standing_volumes_and_frames_reach_the_roles_before_standing_starts) {
+    struct AcceptOnes final : helm::RecordVerifier {
+        [[nodiscard]] auto verify(std::span<const std::byte> /*message*/,
+                                  std::span<const std::byte, proto::ed25519_signature_size> sig,
+                                  std::uint16_t /*key_id*/) const -> bool override {
+            return sig[0] == std::byte{1};
+        }
+    } verifier;
+    helm::StandingSetKeeper keeper{server, nullptr, nullptr, &verifier};
+    helm::StandingFrames frames{server, nullptr, &verifier};
+    Rig r{link_timeout, nullptr, true, false, nullptr, nullptr, {}, &keeper, &frames};
+    // Signed: every one of these frames ends in its signature.
+    const auto sign = [](std::vector<std::byte> f) {
+        f[f.size() - proto::ed25519_signature_size] = std::byte{1};
+        return f;
+    };
+
+    constexpr std::uint64_t attachment = 55;
+    const auto [config, config_bytes] = hold_config(1);
+    const std::array<std::byte, proto::volume_data_key_size> data_key{std::byte{9}};
+    const auto key_frame = helm::seal_volume_key(r.se.transport_public_key().value(),
+                                                 proto::VolumeKey{.server_id = server,
+                                                                  .volume_id = config.volume_id,
+                                                                  .attachment_id = attachment,
+                                                                  .generation = 1,
+                                                                  .hpke_enc = {},
+                                                                  .wrapped_key = {}},
+                                                 data_key);
+    BOOST_REQUIRE(key_frame.has_value());
+    proto::StandingSet set{.server_id = server,
+                           .key_id = 1,
+                           .generation = 1,
+                           .time_floor = 0,
+                           .instances = {},
+                           .signature = {}};
+    proto::StandingInstance in;
+    in.vm_id = 0x1001;
+    in.manifest_digest.fill(std::byte{0xAB});
+    in.commands.push_back({.type = proto::StandingCommandType::create_vm,
+                           .body = std::vector<std::byte>(16, std::byte{1})});
+    in.volumes.push_back(
+        proto::StandingVolume{.frame_type = proto::StandingVolumeFrame::replica_config,
+                              .frame = config_bytes,
+                              .key = proto::decode_volume_key(*key_frame).value()});
+    in.nics.push_back({.nic_id = 0x21, .vni = vni});
+    set.instances.push_back(in);
+    set.signature.fill(std::byte{1});
+    const auto set_bytes = proto::encode_standing_set(set);
+    BOOST_REQUIRE(set_bytes.has_value());
+    r.daemon.on_standing_set(set, *set_bytes);
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.daemon.stats().standing_sets == 1U);
+    BOOST_REQUIRE(keeper.pinned() == 1U);
+
+    // Live frames: the standing VNI's are kept, another VNI's are not,
+    // and an unsigned one is refused.
+    const auto [vpc, vpc_bytes] = vpc_frame(vni, 1);
+    const auto signed_vpc = sign(vpc_bytes);
+    r.daemon.on_vpc_config(vpc, signed_vpc);
+    const auto map_bytes = [](std::uint32_t net, std::uint64_t version) {
+        proto::MapUpdate m{.server_id = server,
+                           .key_id = 1,
+                           .vni = net,
+                           .map_version = version,
+                           .entries = {},
+                           .ipv4 = {},
+                           .ipv6 = {},
+                           .signature = {}};
+        m.signature.fill(std::byte{1});
+        auto b = proto::encode_map_update(m);
+        BOOST_REQUIRE(b.has_value());
+        return std::pair{m, *b};
+    };
+    const auto [standing_map, standing_map_bytes] = map_bytes(vni, 1);
+    const auto [other_map, other_map_bytes] = map_bytes(vni + 1, 1);
+    r.daemon.on_map_update(standing_map, standing_map_bytes);
+    r.daemon.on_map_update(other_map, other_map_bytes);
+    const auto [unsigned_vpc, unsigned_vpc_bytes] = vpc_frame(vni, 2);
+    r.daemon.on_vpc_config(unsigned_vpc, unsigned_vpc_bytes);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().standing_frames == 2U);
+    BOOST_TEST(r.daemon.stats().standing_frames_refused == 1U);
+    BOOST_TEST(frames.size() == 2U);
+
+    // Power returned: the roles are up, and the standing round seeds them.
+    (void)r.daemon.boot();
+    const auto maps_before = r.net.role.frames().size();
+    const auto vpcs_before = r.net.role.vpc_configs().size();
+    const auto configs_before = r.hold.role.configs().size();
+    BOOST_REQUIRE(!r.keys.attachment_key(attachment).has_value());
+    BOOST_TEST(r.daemon.expect_standing([](const std::vector<helm::StandingAttempt>&) {}));
+    BOOST_TEST(r.daemon.stats().standing_seeded == 4U);  // map, VPC, config, key
+    BOOST_REQUIRE(r.net.role.frames().size() == maps_before + 1);
+    BOOST_TEST((r.net.role.frames().back() == standing_map_bytes));
+    // The live VPC configuration already reached the role at attach; the
+    // stored copy is not newer, so it is not sent twice.
+    BOOST_TEST(vpcs_before == 1U);
+    BOOST_TEST(r.net.role.vpc_configs().size() == vpcs_before);
+    BOOST_REQUIRE(r.hold.role.configs().size() == configs_before + 1);
+    BOOST_TEST((r.hold.role.configs().back() == config_bytes));
+    BOOST_TEST(r.keys.attachment_key(attachment).has_value());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

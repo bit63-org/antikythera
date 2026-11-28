@@ -52,6 +52,7 @@
 #include "helm/helm_daemon.hpp"
 #include "helm/key_store.hpp"
 #include "helm/power_on.hpp"
+#include "helm/standing_frames.hpp"
 #include "helm/standing_set_keeper.hpp"
 #include "helm/power_sequencer.hpp"
 #include "helm/sealed_store.hpp"
@@ -269,6 +270,15 @@ auto run(const helm::HelmConfig& cfg) -> int {
         std::println(stderr, "{}: stored standing set: {}", log_name, helm::to_string(v));
     }
     daemon_config.standing_set = &standing_set;
+    // The network frames of its NICs (Requirement 5.2), replayed to the
+    // network roles before the standing starts.
+    helm::StandingFrames standing_frames{cfg.server_id, store ? &*store : nullptr, verifier.get()};
+    const auto frames_kept =
+        standing_frames.load(standing_set.current() ? &*standing_set.current() : nullptr);
+    if (frames_kept > 0) {
+        std::println(stderr, "{}: {} stored frame(s) for standing NICs", log_name, frames_kept);
+    }
+    daemon_config.standing_frames = &standing_frames;
     // The time floor (cold-start Requirement 7): the newest stored, raised
     // by the stored policy's; certificates are checked against
     // max(RTC, floor).

@@ -102,6 +102,7 @@ add_library(ak_helm
   helm/boot_state.cpp
   helm/power_on.cpp
   helm/standing_set_keeper.cpp
+  helm/standing_frames.cpp
   helm/time_floor.cpp
   helm/cold_start_reports.cpp
   helm/secure_element.cpp

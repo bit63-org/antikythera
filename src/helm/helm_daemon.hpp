@@ -168,6 +168,7 @@
 #include "helm/mailbox.hpp"
 #include "helm/oar_link.hpp"
 #include "helm/power_on.hpp"
+#include "helm/standing_frames.hpp"
 #include "helm/standing_set_keeper.hpp"
 #include "helm/power_sequencer.hpp"
 #include "helm/sideband_binding.hpp"
@@ -220,6 +221,11 @@ struct DaemonConfig {
     // records go to it, and expect_standing() starts its instances. Null:
     // records are dropped and counted. Not owned; must outlive the daemon.
     StandingSetKeeper* standing_set{nullptr};
+    // Keeps the network frames of the standing NICs (cold-start Requirement
+    // 5.2): every map, VPC configuration, instance metadata and peer set
+    // is offered to it, and expect_standing() replays what it holds. Null:
+    // nothing is kept across a power loss. Not owned.
+    StandingFrames* standing_frames{nullptr};
     // Raised by the time_floor of every kept power policy and standing set
     // (cold-start Requirement 7.1). Null: not tracked. Not owned.
     TimeFloor* time_floor{nullptr};
@@ -283,6 +289,9 @@ struct DaemonStats {
     std::uint64_t power_policies_refused{0};  // stale, another server's, unsigned or unstorable
     std::uint64_t standing_sets{0};           // verified, newer and kept
     std::uint64_t standing_sets_refused{0};
+    std::uint64_t standing_frames{0};          // network frames kept for standing NICs
+    std::uint64_t standing_frames_refused{0};  // for a standing NIC, but unsigned or unstorable
+    std::uint64_t standing_seeded{0};          // stored frames replayed before standing starts
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -319,7 +328,11 @@ public:
     auto set_host_power_override(HostPowerOverride override_) -> void;
     // After helm's power returned (call from on_boot): starts the kept
     // standing set's instances before any envelope is relayed (cold-start
-    // Requirement 4.4; CommandRouter::expect_standing). False, with
+    // Requirement 4.4; CommandRouter::expect_standing). First it hands
+    // the standing volumes' frames and keys to the storage roles and key
+    // store, and the stored network frames to the network roles, as if
+    // the controller had just sent them (Requirement 5.1-5.2), so the
+    // standing starts' prepares find them. False, with
     // nothing to wait for, when no set is kept or it pins nothing; `done`
     // is then never called.
     auto expect_standing(StandingRoundDone done) -> bool;
@@ -561,6 +574,10 @@ private:
     [[nodiscard]] static auto is_net(const SlotState& slot) -> bool;
     auto provision_tunnel(SlotState& slot) -> void;
     auto forward_peers(const PeersFrame& peers) -> void;
+    // Offers a network frame to the standing frames keeper.
+    auto keep_standing_frame(proto::RecordType type, std::span<const std::byte> frame) -> void;
+    // The standing volumes and stored network frames (expect_standing).
+    auto seed_standing(const proto::StandingSet& set) -> void;
     auto poll_health(SlotState& slot) -> void;
     // Opens the sideband, reads the inventory, registers with the router.
     auto attach(SlotState& slot) -> bool;

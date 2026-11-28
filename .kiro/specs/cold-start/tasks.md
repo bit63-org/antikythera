@@ -57,6 +57,15 @@ and `helm-control-plane`. Pairs with kythira's
     `fleet-scale-networking` lands; instance secrets through instance
     metadata only
   - _Requirements: 5.1-5.5_
+  - Built: volumes and NIC frames (5.1, 5.2). Before the standing
+    starts, helm hands each standing volume's frame to its storage role
+    and opens its VolumeKey in the secure element, and replays the
+    stored network frames (`StandingFrames`: newest verified map, VPC
+    configuration, instance metadata and peer set per standing NIC) to
+    the network roles. SecurityPolicy joins when the security-group
+    build adds the record. 5.3 is met by fleet-scale-networking's
+    stable tunnel keys, so the set carries none. Next: instance secrets
+    (5.4) and reading the image from the root volume (5.5).
 
 - [x] 8. Time floor in helm
   - _Requirements: 7.1, 7.2_

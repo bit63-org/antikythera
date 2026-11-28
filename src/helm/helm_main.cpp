@@ -56,6 +56,7 @@
 #include "helm/secure_element.hpp"
 #include "helm/sideband_binding.hpp"
 #include "helm/store_anchor.hpp"
+#include "helm/time_floor.hpp"
 #include "hull/host_setup.hpp"
 #include "hull/signature_verifier.hpp"
 
@@ -257,6 +258,21 @@ auto run(const helm::HelmConfig& cfg) -> int {
         std::println(stderr, "{}: stored power policy: {}", log_name, helm::to_string(loaded));
     }
     daemon_config.power_policy = &power_policy;
+    // The time floor (cold-start Requirement 7): the newest stored, raised
+    // by the stored policy's; certificates are checked against
+    // max(RTC, floor).
+    helm::TimeFloor time_floor{store ? &*store : nullptr};
+    if (auto ok = time_floor.load(); !ok) {
+        std::println(stderr, "{}: time floor: {}", log_name, helm::to_string(ok.error()));
+    }
+    if (power_policy.from_record()) {
+        (void)time_floor.observe(power_policy.current().time_floor);
+    }
+    if (!time_floor.rtc_trusted(helm::TimeFloor::rtc_now())) {
+        std::println(stderr, "{}: RTC reads {} s, below the time floor {} s: not trusted", log_name,
+                     helm::TimeFloor::rtc_now(), time_floor.floor());
+    }
+    daemon_config.time_floor = &time_floor;
     daemon_config.on_boot = [](const helm::BootResult& booted) {
         std::println(stderr, "{}: boot: {} slot(s) ready, {} faulted, host {}", log_name,
                      booted.ready.size(), booted.faulted.size(),
@@ -310,14 +326,17 @@ auto run(const helm::HelmConfig& cfg) -> int {
                      helm::to_string(pk.error()));
         return exit_failed;
     }
-    auto created = helm::ControllerLink::create({.host = cfg.controller_host,
-                                                 .port = cfg.controller_port,
-                                                 .tls = {.role = ak::tls::Role::client,
-                                                         .ca_pem = *ca,
-                                                         .cert_pem = *cert,
-                                                         .key_pem = *key,
-                                                         .peer_name = cfg.controller_name}},
-                                                session);
+    auto created = helm::ControllerLink::create(
+        {.host = cfg.controller_host,
+         .port = cfg.controller_port,
+         .tls = {.role = ak::tls::Role::client,
+                 .ca_pem = *ca,
+                 .cert_pem = *cert,
+                 .key_pem = *key,
+                 .peer_name = cfg.controller_name,
+                 .verification_time =
+                     [&time_floor] { return std::optional{time_floor.verification_time_now()}; }}},
+        session);
     if (!created) {
         std::println(stderr, "{}: TLS configuration: {}", log_name,
                      ak::tls::to_string(created.error()));

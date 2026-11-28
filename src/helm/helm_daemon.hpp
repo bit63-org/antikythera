@@ -170,6 +170,7 @@
 #include "helm/power_on.hpp"
 #include "helm/power_sequencer.hpp"
 #include "helm/sideband_binding.hpp"
+#include "helm/time_floor.hpp"
 #include "helm/tunnel_keyring.hpp"
 #include "proto/envelope.hpp"
 #include "proto/report.hpp"
@@ -214,6 +215,9 @@ struct DaemonConfig {
     // power_policy records from the controller go to it. Null: they are
     // dropped and counted. Not owned; must outlive the daemon.
     PowerPolicyKeeper* power_policy{nullptr};
+    // Raised by the time_floor of every kept power policy (cold-start
+    // Requirement 7.1). Null: not tracked. Not owned.
+    TimeFloor* time_floor{nullptr};
     // Called on the loop thread after a scheduled boot (schedule_boot).
     std::function<void(const BootResult&)> on_boot;
     // Empty: steady_clock::now.

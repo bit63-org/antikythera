@@ -23,6 +23,9 @@
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <ctime>
+#include <functional>
+#include <optional>
 #include <utility>
 
 namespace ak::tls {
@@ -178,6 +181,7 @@ struct ContextImpl {
     SslCtxPtr ctx;
     Role role{Role::client};
     std::string peer_name;
+    std::function<std::optional<std::int64_t>()> verification_time;
 };
 
 struct StreamImpl {
@@ -235,6 +239,7 @@ auto Context::create(const Config& config) -> std::expected<Context, Error> {
     impl->ctx = std::move(ctx);
     impl->role = config.role;
     impl->peer_name = config.peer_name;
+    impl->verification_time = config.verification_time;
     return Context{std::move(impl)};
 }
 
@@ -257,6 +262,11 @@ auto handshake(const Context& ctx, int fd, Clock::time_point deadline)
     if (!impl->ssl || SSL_set_fd(impl->ssl.get(), fd) != 1) {
         ERR_clear_error();
         return std::unexpected(Error::io);
+    }
+    if (ctx.impl().verification_time) {
+        if (const auto t = ctx.impl().verification_time()) {
+            X509_VERIFY_PARAM_set_time(SSL_get0_param(impl->ssl.get()), static_cast<time_t>(*t));
+        }
     }
     const bool client = ctx.role() == Role::client;
     if (client && !is_ip_literal(ctx.impl().peer_name) &&

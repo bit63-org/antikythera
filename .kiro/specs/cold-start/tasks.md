@@ -47,7 +47,7 @@ and `helm-control-plane`. Pairs with kythira's
     metadata only
   - _Requirements: 5.1-5.5_
 
-- [ ] 8. Time floor in helm
+- [x] 8. Time floor in helm
   - _Requirements: 7.1, 7.2_
 
 - [ ] 9. Cold-start reports

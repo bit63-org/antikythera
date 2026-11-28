@@ -597,8 +597,9 @@ struct Rig {
 
     explicit Rig(std::chrono::milliseconds slot_link_timeout = link_timeout,
                  helm::HostPort* host_port = nullptr, bool with_hold = false,
-                 bool with_khold = false, helm::PowerPolicyKeeper* power_policy = nullptr)
-        : daemon{config(slot_link_timeout, with_hold, with_khold, power_policy),
+                 bool with_khold = false, helm::PowerPolicyKeeper* power_policy = nullptr,
+                 helm::TimeFloor* time_floor = nullptr)
+        : daemon{config(slot_link_timeout, with_hold, with_khold, power_policy, time_floor),
                  keys,
                  audit,
                  host_port != nullptr ? *host_port : host,
@@ -618,10 +619,11 @@ struct Rig {
                  [this](proto::ReportBody b) { reports.push_back(std::move(b)); }} {}
 
     static auto config(std::chrono::milliseconds slot_link_timeout, bool with_hold = false,
-                       bool with_khold = false, helm::PowerPolicyKeeper* power_policy = nullptr)
-        -> helm::DaemonConfig {
+                       bool with_khold = false, helm::PowerPolicyKeeper* power_policy = nullptr,
+                       helm::TimeFloor* time_floor = nullptr) -> helm::DaemonConfig {
         helm::DaemonConfig c;
         c.power_policy = power_policy;
+        c.time_floor = time_floor;
         std::vector<SlotNumber> slots{net_slot, blk_slot};
         if (with_hold) {
             slots.push_back(hold_slot);
@@ -2006,13 +2008,15 @@ BOOST_AUTO_TEST_CASE(power_policy_records_reach_the_keeper) {
         }
     } verifier;
     helm::PowerPolicyKeeper keeper{server, nullptr, &verifier};
-    Rig r{link_timeout, nullptr, false, false, &keeper};
+    helm::TimeFloor time_floor{nullptr};
+    Rig r{link_timeout, nullptr, false, false, &keeper, &time_floor};
     const auto frame = [](std::uint64_t version, std::uint8_t sig) {
         proto::PowerPolicy p = proto::default_power_policy(server);
         p.key_id = 1;
         p.policy_version = version;
         p.tier = 0;
         p.tier_delay_s = 0;
+        p.time_floor = 1'795'000'000 + version;
         p.signature.fill(std::byte{sig});
         auto bytes = proto::encode_power_policy(p);
         BOOST_REQUIRE(bytes.has_value());
@@ -2029,6 +2033,9 @@ BOOST_AUTO_TEST_CASE(power_policy_records_reach_the_keeper) {
     BOOST_TEST(r.daemon.stats().power_policies_refused == 2U);
     BOOST_TEST(keeper.current().policy_version == 2U);
     BOOST_TEST(keeper.current().tier == 0U);
+    // Only the kept record's floor counts (cold-start Requirement 7.1),
+    // not the forged one's higher floor.
+    BOOST_TEST(time_floor.floor() == 1'795'000'002U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

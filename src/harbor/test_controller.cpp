@@ -1546,6 +1546,7 @@ auto TestController::handle(const proto::Record& rec)
         case proto::RecordType::decommission:
         case proto::RecordType::standing_set:
         case proto::RecordType::power_policy:
+        case proto::RecordType::boot_image:
             break;
     }
     return std::unexpected("helm sent a controller-only record");

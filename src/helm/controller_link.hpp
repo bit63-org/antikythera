@@ -169,6 +169,11 @@ public:
                                std::span<const std::byte> /*frame*/) -> void {}
     virtual auto on_decommission(const proto::Decommission& /*order*/,
                                  std::span<const std::byte> /*frame*/) -> void {}
+    // A boot_image record for this server, decoded but not verified;
+    // `frame` is its exact encoding (BootImageKeeper checks both
+    // signatures before keeping it).
+    virtual auto on_boot_image(const proto::BootImage& /*assignment*/,
+                               std::span<const std::byte> /*frame*/) -> void {}
 };
 
 enum class SessionError : std::uint8_t {

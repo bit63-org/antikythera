@@ -119,6 +119,11 @@ struct RecordingSink final : helm::ControllerSink {
         -> void override {
         decommissions.emplace_back(d, std::vector<std::byte>{frame.begin(), frame.end()});
     }
+    std::vector<std::pair<proto::BootImage, std::vector<std::byte>>> boot_images;
+    auto on_boot_image(const proto::BootImage& b, std::span<const std::byte> frame)
+        -> void override {
+        boot_images.emplace_back(b, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
     std::vector<proto::RoleCertificate> certificates;
     auto on_role_certificate(const proto::RoleCertificate& c) -> void override {
         certificates.push_back(c);
@@ -395,6 +400,21 @@ auto decommission_record(std::uint64_t to) -> std::vector<std::byte> {
         proto::encode_decommission({.key_id = key, .server_id = to, .seq = 10, .signature = {}});
     BOOST_REQUIRE(b.has_value());
     return framed(RecordType::decommission, *b);
+}
+
+auto boot_image_record(std::uint64_t to) -> std::vector<std::byte> {
+    proto::BootImage b{
+        .key_id = key, .server_id = to, .assignment_version = 2, .image = {}, .signature = {}};
+    b.image = {.key_id = 1,
+               .image_version = 3,
+               .size = 4096,
+               .kind = proto::HostImageKind::hull,
+               .digest = {},
+               .signature = {}};
+    b.image.digest.fill(std::byte{0xC4});
+    auto f = proto::encode_boot_image(b);
+    BOOST_REQUIRE(f.has_value());
+    return framed(RecordType::boot_image, *f);
 }
 
 auto tunnel_peers_record(std::uint64_t to) -> std::vector<std::byte> {
@@ -675,6 +695,21 @@ BOOST_FIXTURE_TEST_CASE(host_lifecycle_records_reach_the_sink_unmodified, Fixtur
     BOOST_REQUIRE(!res.has_value());
     BOOST_TEST((res.error() == SessionError::bad_record));
     BOOST_TEST(sink.host_powers.size() == 1U);
+}
+
+BOOST_FIXTURE_TEST_CASE(boot_image_assignments_reach_the_sink_unmodified, Fixture) {
+    session.on_connected();
+    const auto assignment = boot_image_record(server);
+    BOOST_REQUIRE(session.on_bytes(assignment).has_value());
+    BOOST_REQUIRE(sink.boot_images.size() == 1U);
+    BOOST_TEST(sink.boot_images[0].first.assignment_version == 2U);
+    BOOST_TEST(std::ranges::equal(sink.boot_images[0].second,
+                                  std::span{assignment}.subspan(proto::record_header_size)));
+    session.on_disconnected();
+    session.on_connected();
+    auto res = session.on_bytes(boot_image_record(other_server));
+    BOOST_REQUIRE(!res.has_value());
+    BOOST_TEST((res.error() == SessionError::wrong_server));
 }
 
 BOOST_AUTO_TEST_CASE(block_volume_records_default_to_dropped) {

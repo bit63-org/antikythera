@@ -344,6 +344,17 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
             _sink->on_decommission(*order, rec.payload);
             return {};
         }
+        case proto::RecordType::boot_image: {
+            auto assignment = proto::decode_boot_image(rec.payload);
+            if (!assignment) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            if (assignment->server_id != _server_id) {
+                return std::unexpected(SessionError::wrong_server);
+            }
+            _sink->on_boot_image(*assignment, rec.payload);
+            return {};
+        }
         case proto::RecordType::report_ack: {
             auto ack = proto::decode_report_ack(rec.payload);
             if (!ack) {

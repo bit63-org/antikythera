@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <span>
 #include <string_view>
 
@@ -69,6 +70,13 @@ enum class BootDiskError : std::uint8_t {
 // Writes the whole disk to `target` and syncs it.
 auto write_boot_disk(Flash& target, std::span<const std::byte> uki,
                      const proto::Provisioning& provisioning, BootArch arch = BootArch::x86_64)
+    -> std::expected<void, BootDiskError>;
+
+// Writes the disk to a fresh file beside `path` and renames it over
+// `path`, so whatever reads the boot function sees the old disk or the
+// new one, never half of each.
+auto write_boot_disk_file(const std::filesystem::path& path, std::span<const std::byte> uki,
+                          const proto::Provisioning& provisioning, BootArch arch = BootArch::x86_64)
     -> std::expected<void, BootDiskError>;
 
 // The IEEE 802.3 CRC-32 GPT uses (exposed for tests).

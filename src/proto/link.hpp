@@ -62,21 +62,24 @@
 //   decommission  controller -> helm   a Decommission (host_lifecycle.hpp):
 //                                      destroy the keys, sanitize the media,
 //                                      clear the identity
+//   boot_image    controller -> helm   a BootImage (boot_image.hpp): the hull
+//                                      image this server should boot
 //
 // Record numbers 19-20 are claimed by specs still being built
 // (vpc-security-groups, vpc-internet-gateways) and 30-35 by
 // fleet-scale-networking; the AZ cold start (.kiro/specs/cold-start/) owns
-// 23-24 and server provisioning (.kiro/specs/server-provisioning/) 21-22.
+// 23-24 and server provisioning (.kiro/specs/server-provisioning/) 21-22
+// and 25.
 // The known types are not one contiguous range.
 //
 // host_power and decommission are signed with the controller key and
 // carry a sequence number from the envelope space; helm verifies them
 // itself, since helm is the one that acts on them.
 //
-// standing_set and power_policy are signed and kept by helm in its sealed
-// store across power loss; helm verifies them itself (it acts on them with
-// no controller), and hull verifies a standing set again before it starts
-// anything from it.
+// standing_set, power_policy and boot_image are signed and kept by helm in
+// its sealed store across power loss; helm verifies them itself (it acts
+// on them with no controller), and hull verifies a standing set again
+// before it starts anything from it.
 //
 // The block volume records (.kiro/specs/block-volume-service/ task 12):
 // helm forwards replica_config, volume_op and lease_grant to its storage
@@ -127,6 +130,7 @@
 #include <vector>
 
 #include "common/wire.hpp"
+#include "proto/boot_image.hpp"
 #include "proto/codec.hpp"
 #include "proto/der.hpp"
 #include "proto/envelope.hpp"
@@ -178,7 +182,8 @@ inline constexpr std::size_t max_record_payload =
               max_standing_set_size,
               power_policy_size,
               host_power_size,
-              decommission_size});
+              decommission_size,
+              boot_image_size});
 
 // Values are part of the wire protocol: never renumber.
 enum class RecordType : std::uint16_t {
@@ -204,6 +209,7 @@ enum class RecordType : std::uint16_t {
     decommission = 22,
     standing_set = 23,
     power_policy = 24,
+    boot_image = 25,
 };
 
 // Which khold roles a self_test record asks.
@@ -255,7 +261,7 @@ namespace detail {
 
 [[nodiscard]] constexpr auto known(RecordType t) noexcept -> bool {
     return (t >= RecordType::envelope && t <= RecordType::self_test) ||
-           (t >= RecordType::host_power && t <= RecordType::power_policy);
+           (t >= RecordType::host_power && t <= RecordType::boot_image);
 }
 
 }  // namespace detail

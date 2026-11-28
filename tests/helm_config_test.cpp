@@ -153,6 +153,31 @@ BOOST_AUTO_TEST_CASE(power_on_directives_parse) {
     BOOST_TEST(contains(error_of(base + "power-marker relative\n"), "absolute path"));
 }
 
+// server-provisioning Requirement 4: the boot function and the boot layer.
+BOOST_AUTO_TEST_CASE(boot_function_directives_parse) {
+    auto plain = helm::parse_helm_config(base);
+    BOOST_REQUIRE(plain.has_value());
+    BOOST_TEST(!plain->boot_function.has_value());
+    BOOST_TEST(!plain->boot_layer.has_value());
+    BOOST_TEST(!plain->host_start_timeout.has_value());
+
+    const std::string store = "store /s\nstore-anchor /a\n";
+    auto c = helm::parse_helm_config(base + store +
+                                     "boot-function /run/helm/boot.img\n"
+                                     "boot-layer /etc/ak/boot-layer.conf\n"
+                                     "host-start-timeout-ms 30000\n");
+    BOOST_REQUIRE_MESSAGE(c.has_value(), (c ? std::string{} : c.error()));
+    BOOST_TEST(c->boot_function->string() == "/run/helm/boot.img");
+    BOOST_TEST(c->boot_layer->string() == "/etc/ak/boot-layer.conf");
+    BOOST_TEST(c->host_start_timeout->count() == 30000);
+
+    // Images come from the sealed store, and a boot layer only feeds it.
+    BOOST_TEST(contains(error_of(base + "boot-function /b\n"), "boot-function without store"));
+    BOOST_TEST(
+        contains(error_of(base + store + "boot-layer /l\n"), "boot-layer without boot-function"));
+    BOOST_TEST(contains(error_of(base + "host-start-timeout-ms 0\n"), "bad milliseconds"));
+}
+
 BOOST_AUTO_TEST_CASE(ipv6_controllers_use_brackets) {
     std::string text = base;
     text.replace(text.find("10.0.0.1:7443"), std::string_view{"10.0.0.1:7443"}.size(),

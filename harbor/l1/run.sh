@@ -12,6 +12,16 @@
 #
 # Usage: harbor/l1/run.sh [--name srv1] [--slots N] [--topology rootports|switch]
 #                         [--mem 4G] [--cpus 4] [--ssh-port 2222]
+#                         [--boot-function PATH]
+#
+# --boot-function attaches the disk helm writes before every host release
+# (ak-helm's boot-function directive; .kiro/specs/server-provisioning/
+# design "The boot function") as a read-only virtio-blk drive: the GPT
+# with the hull UKI and the "ak-provisioning" partition that hull-init
+# measures and reads. It stands in for the control slot's read-only block
+# function. Booting the UKI from it also needs OVMF in place of this
+# VM's firmware, which the strict hull run (phase 6, server-provisioning
+# task 7) supplies.
 #
 # Topologies:
 #   rootports  one pcie-root-port per slot (default)
@@ -30,6 +40,7 @@ mem="4G"
 cpus=4
 ssh_port=2222
 overlay_size="20G"
+boot_function=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -39,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --mem) mem="$2"; shift 2 ;;
         --cpus) cpus="$2"; shift 2 ;;
         --ssh-port) ssh_port="$2"; shift 2 ;;
+        --boot-function) boot_function="$2"; shift 2 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -117,6 +129,11 @@ args=(
     -display none -serial "file:${dir}/console.log"
     -pidfile "${dir}/qemu.pid" -daemonize
 )
+
+if [[ -n "${boot_function}" ]]; then
+    [[ -f "${boot_function}" ]] || die "boot function ${boot_function} does not exist (has helm filled it?)"
+    args+=(-drive "file=${boot_function},if=virtio,format=raw,readonly=on")
+fi
 
 if [[ "${topology}" == "switch" ]]; then
     args+=(-device "pcie-root-port,id=rp0,chassis=1,slot=0"

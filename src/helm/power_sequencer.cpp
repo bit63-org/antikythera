@@ -76,7 +76,7 @@ auto PowerSequencer::wait_ready(const std::vector<SlotNumber>& slots) -> std::ve
     }
 }
 
-auto PowerSequencer::boot() -> BootResult {
+auto PowerSequencer::boot(bool release_host) -> BootResult {
     BootResult result;
     // The host must not see a half-built device tree.
     (void)_backplane->set_host_power(false);
@@ -111,9 +111,21 @@ auto PowerSequencer::boot() -> BootResult {
         result.faulted.push_back(slot);
         _observer->on_slot_faulted(slot);
     }
-    _host_released = _backplane->set_host_power(true);
+    _host_released = release_host && _backplane->set_host_power(true);
     result.host_released = _host_released;
     return result;
+}
+
+auto PowerSequencer::release_host() -> bool {
+    _host_released = _backplane->set_host_power(true);
+    return _host_released;
+}
+
+auto PowerSequencer::restart_host() -> bool {
+    (void)_backplane->set_host_power(false);
+    _host_released = false;
+    _config.sleep(_config.off_time);
+    return release_host();
 }
 
 auto PowerSequencer::cycle(SlotNumber slot) -> bool {

@@ -108,6 +108,9 @@ BOOST_AUTO_TEST_CASE(flags_a_slow_clock_and_a_rolled_back_store) {
 
     const auto c = helm::make_cold_start({.rtc_below_floor = true}, &store);
     BOOST_TEST(c.flags == (proto::cold_start_rollback | proto::cold_start_rtc_below_floor));
+    const auto u = helm::make_cold_start(
+        {.rtc_below_floor = false, .assigned_image_unavailable = true}, &store);
+    BOOST_TEST(u.flags == (proto::cold_start_rollback | proto::cold_start_assigned_unavailable));
     BOOST_TEST(c.store_faults == store.faults());
     (void)round_trip(c);
 }

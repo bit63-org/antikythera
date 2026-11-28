@@ -35,6 +35,8 @@
 #include "helm/audit_log.hpp"
 #include "helm/controller_link.hpp"
 #include "helm/helm_daemon.hpp"
+#include "helm/host_boot.hpp"
+#include "proto/boot_image.hpp"
 #include <openssl/sha.h>
 #include "proto/host_image.hpp"
 #include "helm/store_anchor.hpp"
@@ -624,9 +626,11 @@ struct Rig {
                  std::function<proto::BootCache()> boot_cache = {},
                  helm::StandingSetKeeper* standing_set = nullptr,
                  helm::StandingFrames* standing_frames = nullptr,
-                 helm::ImageCache* images = nullptr)
-        : daemon{config(slot_link_timeout, with_hold, with_khold, power_policy, time_floor,
-                        std::move(boot_cache), standing_set, standing_frames, images),
+                 helm::ImageCache* images = nullptr,
+                 const std::function<void(helm::DaemonConfig&)>& adjust = {})
+        : daemon{adjusted(config(slot_link_timeout, with_hold, with_khold, power_policy, time_floor,
+                                 std::move(boot_cache), standing_set, standing_frames, images),
+                          adjust),
                  keys,
                  audit,
                  host_port != nullptr ? *host_port : host,
@@ -644,6 +648,15 @@ struct Rig {
                      }
                  },
                  [this](proto::ReportBody b) { reports.push_back(std::move(b)); }} {}
+
+    static auto adjusted(helm::DaemonConfig c,
+                         const std::function<void(helm::DaemonConfig&)>& adjust)
+        -> helm::DaemonConfig {
+        if (adjust) {
+            adjust(c);
+        }
+        return c;
+    }
 
     static auto config(std::chrono::milliseconds slot_link_timeout, bool with_hold = false,
                        bool with_khold = false, helm::PowerPolicyKeeper* power_policy = nullptr,
@@ -2309,6 +2322,183 @@ BOOST_AUTO_TEST_CASE(keep_image_promotes_a_held_image) {
     BOOST_TEST((images.digest(helm::ImageSlot::lkg) == d.digest));
     BOOST_TEST(r.daemon.stats().images_promoted == 1U);
     BOOST_TEST(r.daemon.stats().image_promotions_failed == 1U);
+}
+
+// server-provisioning Requirement 4 and cold-start Requirement 2: helm
+// fills the boot function before it releases the host, holds the host
+// while it has nothing to boot, boots an assignment that arrives
+// meanwhile, and after a failed start reboots once onto another image.
+namespace {
+
+struct BootRig {
+    struct Verifier final : helm::RecordVerifier {
+        [[nodiscard]] auto verify(std::span<const std::byte> /*message*/,
+                                  std::span<const std::byte, proto::ed25519_signature_size> sig,
+                                  std::uint16_t /*key_id*/) const -> bool override {
+            return sig[0] == std::byte{1};
+        }
+    };
+
+    BootRig() {
+        auto a = helm::SoftwareStoreAnchor::ephemeral();
+        BOOST_REQUIRE(a.has_value());
+        anchor = std::move(*a);
+        auto s = helm::SealedStore::open(flash, *anchor);
+        BOOST_REQUIRE(s.has_value());
+        store = std::make_unique<helm::SealedStore>(std::move(*s));
+        images = std::make_unique<helm::ImageCache>(*store, &verifier);
+        keeper = std::make_unique<helm::BootImageKeeper>(server, store.get(), &verifier, &verifier);
+        booter = std::make_unique<helm::HostBooter>(
+            helm::HostBootConfig{.server_id = server}, *images, *keeper, *store, *anchor,
+            helm::ImageFetch{},
+            [this](std::span<const std::byte> uki,
+                   const proto::Provisioning& /*p*/) -> std::expected<void, helm::BootDiskError> {
+                written.assign(uki.begin(), uki.end());
+                ++writes;
+                return {};
+            });
+    }
+
+    static auto uki(std::uint8_t fill) -> std::vector<std::byte> {
+        return std::vector<std::byte>(3000, std::byte{fill});
+    }
+    static auto descriptor(std::span<const std::byte> img) -> proto::HostImage {
+        proto::HostImage d{.key_id = 1,
+                           .image_version = 1,
+                           .size = img.size(),
+                           .kind = proto::HostImageKind::hull,
+                           .digest = {},
+                           .signature = {}};
+        SHA256(reinterpret_cast<const unsigned char*>(img.data()), img.size(),
+               reinterpret_cast<unsigned char*>(d.digest.data()));
+        d.signature.fill(std::byte{1});
+        return d;
+    }
+    auto stage(std::span<const std::byte> img) -> void {
+        BOOST_REQUIRE(images->stage(*proto::encode_host_image(descriptor(img)), img).has_value());
+    }
+    auto make_lkg(std::span<const std::byte> img) -> void {
+        stage(img);
+        BOOST_REQUIRE(images->promote(descriptor(img).digest).has_value());
+    }
+    auto adjust() -> std::function<void(helm::DaemonConfig&)> {
+        return [this](helm::DaemonConfig& c) {
+            c.boot_images = keeper.get();
+            c.host_booter = booter.get();
+            c.host_start_timeout = 120s;
+            c.clock = [this] { return now; };
+        };
+    }
+
+    Verifier verifier;
+    helm::MemoryFlash flash{std::uint64_t{1} << 20};
+    std::unique_ptr<helm::SoftwareStoreAnchor> anchor;
+    std::unique_ptr<helm::SealedStore> store;
+    std::unique_ptr<helm::ImageCache> images;
+    std::unique_ptr<helm::BootImageKeeper> keeper;
+    std::unique_ptr<helm::HostBooter> booter;
+    std::vector<std::byte> written;
+    int writes{0};
+    helm::DaemonConfig::Clock::time_point now{helm::DaemonConfig::Clock::time_point{} + 1h};
+};
+
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(the_boot_function_is_filled_before_release_and_falls_back_once) {
+    BootRig b;
+    const auto a = BootRig::uki(0xA1);
+    const auto lkg = BootRig::uki(0xB2);
+    b.make_lkg(a);
+    b.make_lkg(lkg);  // a is now the previous image
+    Rig r{link_timeout, nullptr, false,   false,          nullptr,   nullptr,
+          {},           nullptr, nullptr, b.images.get(), b.adjust()};
+
+    const auto booted = r.daemon.boot();
+    BOOST_TEST(booted.host_released);
+    BOOST_TEST(r.backplane.host);
+    BOOST_TEST((b.written == lkg));
+    BOOST_REQUIRE(r.daemon.host_boot().has_value());
+    BOOST_TEST((r.daemon.host_boot()->source == proto::BootSource::lkg));
+    BOOST_TEST(r.daemon.stats().host_boots == 1U);
+
+    // No agent within 120 s: the previous image, once (Requirement 2.4).
+    b.now += 119s;
+    r.daemon.run_once(0ms);
+    BOOST_TEST(b.writes == 1);
+    b.now += 2s;
+    r.daemon.run_once(0ms);
+    BOOST_TEST(b.writes == 2);
+    BOOST_TEST((b.written == a));
+    BOOST_TEST((r.daemon.host_boot()->source == proto::BootSource::previous));
+    BOOST_TEST(r.daemon.stats().host_fallbacks == 1U);
+    BOOST_TEST(r.backplane.host);
+
+    // Still nothing: the controller decides from here.
+    b.now += 121s;
+    r.daemon.run_once(0ms);
+    BOOST_TEST(b.writes == 2);
+    BOOST_TEST(r.daemon.stats().host_start_timeouts == 1U);
+}
+
+BOOST_AUTO_TEST_CASE(an_agent_that_comes_up_ends_the_watch) {
+    BootRig b;
+    b.make_lkg(BootRig::uki(0xA1));
+    Rig r{link_timeout, nullptr, false,   false,          nullptr,   nullptr,
+          {},           nullptr, nullptr, b.images.get(), b.adjust()};
+    BOOST_REQUIRE(r.daemon.boot().host_released);
+    r.daemon.post_host_slot(
+        event(mb::HostFault{.code = mb::FaultCode::agent_restarted, .slot = 0, .detail = 0}));
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().host_starts == 1U);
+    b.now += 1h;
+    r.daemon.run_once(0ms);
+    BOOST_TEST(b.writes == 1);
+    BOOST_TEST(r.daemon.stats().host_fallbacks == 0U);
+    BOOST_TEST(r.daemon.stats().host_start_timeouts == 0U);
+}
+
+BOOST_AUTO_TEST_CASE(a_host_with_nothing_to_boot_waits_for_an_assignment) {
+    BootRig b;
+    const auto img = BootRig::uki(0xC3);
+    b.stage(img);  // staged, but nothing vouches for it yet
+    Rig r{link_timeout, nullptr, false,   false,          nullptr,   nullptr,
+          {},           nullptr, nullptr, b.images.get(), b.adjust()};
+    const auto booted = r.daemon.boot();
+    BOOST_TEST(!booted.host_released);
+    BOOST_TEST(!r.backplane.host);
+    BOOST_TEST(r.daemon.stats().host_boots_failed == 1U);
+    // The slots still came up: only the host waits.
+    BOOST_TEST(booted.ready.size() == 2U);
+
+    proto::BootImage assigned{.key_id = 1,
+                              .server_id = server,
+                              .assignment_version = 1,
+                              .image = BootRig::descriptor(img),
+                              .signature = {}};
+    // An unsigned assignment changes nothing.
+    auto frame = proto::encode_boot_image(assigned);
+    BOOST_REQUIRE(frame.has_value());
+    r.daemon.on_boot_image(assigned, *frame);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().boot_images_refused == 1U);
+    BOOST_TEST(!r.backplane.host);
+
+    assigned.signature.fill(std::byte{1});
+    frame = proto::encode_boot_image(assigned);
+    r.daemon.on_boot_image(assigned, *frame);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().boot_images == 1U);
+    BOOST_TEST(r.backplane.host);
+    BOOST_TEST((b.written == img));
+    BOOST_TEST((r.daemon.host_boot()->source == proto::BootSource::netboot));
+
+    // A newer assignment for a running host waits for its next boot.
+    assigned.assignment_version = 2;
+    frame = proto::encode_boot_image(assigned);
+    r.daemon.on_boot_image(assigned, *frame);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().boot_images == 2U);
+    BOOST_TEST(b.writes == 1);
 }
 
 BOOST_AUTO_TEST_CASE(the_boot_cache_is_read_before_each_publish) {

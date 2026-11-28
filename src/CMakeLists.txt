@@ -130,7 +130,8 @@ configure_file(helm/image_keys.hpp.in
   ${CMAKE_CURRENT_BINARY_DIR}/generated/helm/image_keys.hpp @ONLY)
 add_executable(ak-helm helm/helm_main.cpp)
 target_include_directories(ak-helm PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_link_libraries(ak-helm PRIVATE ak::helm ak::hull ak::warnings ak::hardening)
+target_link_libraries(ak-helm
+  PRIVATE ak::helm ak::hull ak::objstore_s3 ak::warnings ak::hardening)
 install(TARGETS ak-helm RUNTIME DESTINATION bin)
 
 # hull: host-agent command authentication (Ed25519 signatures and sequence

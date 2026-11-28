@@ -23,6 +23,7 @@
 // or configuration error.
 
 #include <sys/random.h>
+#include <sys/stat.h>
 
 #include <csignal>
 #include <cstdint>
@@ -50,6 +51,7 @@
 #include "helm/flash.hpp"
 #include "helm/helm_config.hpp"
 #include "helm/helm_daemon.hpp"
+#include "helm/host_boot.hpp"
 #include "helm/image_cache.hpp"
 #include "helm/image_keys.hpp"
 #include "helm/key_store.hpp"
@@ -64,6 +66,8 @@
 #include "helm/time_floor.hpp"
 #include "hull/host_setup.hpp"
 #include "hull/signature_verifier.hpp"
+#include "objstore/image_store_config.hpp"
+#include "objstore/s3_object_store.hpp"
 
 namespace {
 
@@ -81,6 +85,35 @@ auto read_file(const std::filesystem::path& path) -> std::optional<std::string> 
         return std::nullopt;
     }
     return std::string{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
+
+// The metal boot layer from an image store file (as ak-oar-blk reads
+// one): the store and its key prefix. A file holding a secret key must
+// not be readable by group or others.
+auto load_boot_layer(const std::filesystem::path& path)
+    -> std::expected<std::pair<std::unique_ptr<ak::objstore::S3ObjectStore>, std::string>,
+                     std::string> {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) {
+        return std::unexpected(path.string() + ": cannot stat");
+    }
+    const auto text = read_file(path);
+    if (!text) {
+        return std::unexpected(path.string() + ": cannot read");
+    }
+    auto cfg = ak::objstore::parse_image_store_config(*text);
+    if (!cfg) {
+        return std::unexpected(path.string() + ": " + cfg.error());
+    }
+    if (cfg->s3.credentials && (st.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        return std::unexpected(path.string() +
+                               ": holds a secret key but is readable by group or others");
+    }
+    auto store = ak::objstore::S3ObjectStore::create(std::move(cfg->s3));
+    if (!store) {
+        return std::unexpected(path.string() + ": " + ak::objstore::to_string(store.error()));
+    }
+    return std::pair{std::move(*store), std::move(cfg->prefix)};
 }
 
 // A fresh, non-zero boot ID: the controller drops duplicate reports by
@@ -293,6 +326,59 @@ auto run(const helm::HelmConfig& cfg) -> int {
         }
     }
     daemon_config.images = images ? &*images : nullptr;
+    // The controller's image assignment and the boot function
+    // (server-provisioning Requirement 4, cold-start Requirement 2.1): with
+    // a boot-function file helm writes the disk the host boots before
+    // every release, from the images in its store.
+    helm::BootImageKeeper boot_images{cfg.server_id, store ? &*store : nullptr, verifier.get(),
+                                      image_verifier.get()};
+    if (const auto v = boot_images.load();
+        v != helm::PolicyVerdict::kept && v != helm::PolicyVerdict::none) {
+        std::println(stderr, "{}: stored boot image assignment: {}", log_name, helm::to_string(v));
+    }
+    daemon_config.boot_images = &boot_images;
+    std::unique_ptr<ak::objstore::S3ObjectStore> boot_layer;
+    std::string boot_layer_prefix;
+    if (cfg.boot_layer) {
+        auto loaded = load_boot_layer(*cfg.boot_layer);
+        if (!loaded) {
+            std::println(stderr, "{}: boot-layer {}", log_name, loaded.error());
+            return exit_usage;
+        }
+        boot_layer = std::move(loaded->first);
+        boot_layer_prefix = std::move(loaded->second);
+    }
+    std::optional<helm::HostBooter> host_booter;
+    if (cfg.boot_function && images) {
+        host_booter.emplace(helm::HostBootConfig{.server_id = cfg.server_id}, *images, boot_images,
+                            *store, *anchor,
+                            boot_layer ? helm::object_store_fetch(*boot_layer, boot_layer_prefix)
+                                       : helm::ImageFetch{},
+                            [path = *cfg.boot_function](std::span<const std::byte> uki,
+                                                        const ak::proto::Provisioning& p) {
+                                return helm::write_boot_disk_file(path, uki, p);
+                            });
+        daemon_config.host_booter = &*host_booter;
+        // No mailbox device yet (helm task 8): hull's agent cannot be
+        // heard, so a start timeout would always fire.
+        daemon_config.host_start_timeout =
+            cfg.host_start_timeout.value_or(std::chrono::milliseconds{0});
+        daemon_config.on_host_boot =
+            [](const std::expected<helm::HostBoot, helm::HostBootFailure>& b) {
+                if (!b) {
+                    std::println(stderr, "{}: boot function: {}; the host stays held", log_name,
+                                 helm::to_string(b.error().error));
+                    return;
+                }
+                std::println(stderr, "{}: boot function: hull {} ({}) from {}, boot epoch {}{}",
+                             log_name, ak::proto::digest_hex(b->digest).substr(0, 16),
+                             b->image_version, helm::to_string(b->slot), b->provisioning.boot_epoch,
+                             b->assigned_unavailable ? "; the assigned image was unavailable" : "");
+            };
+    } else if (cfg.boot_function) {
+        std::println(stderr, "{}: boot-function: no image cache; the host boots as configured",
+                     log_name);
+    }
     helm::PowerPolicyKeeper power_policy{cfg.server_id, store ? &*store : nullptr, verifier.get()};
     const auto loaded = power_policy.load();
     if (loaded != helm::PolicyVerdict::kept && loaded != helm::PolicyVerdict::none) {
@@ -373,16 +459,25 @@ auto run(const helm::HelmConfig& cfg) -> int {
         if (!power_returned || !link) {
             return;
         }
-        // hull comes from the boot layer until the boot cache exists (task 4).
-        auto send = [&link, &time_floor, &store, started_at, rtc_below_floor,
+        // Where hull came from: the image helm filled the boot function
+        // with when the report goes, or the boot layer when helm does not
+        // fill it.
+        auto send = [&link, &time_floor, &store, &daemon_ptr, started_at, rtc_below_floor,
                      waited](std::vector<ak::proto::StandingStartResult> standing) {
-            (void)link->report(helm::make_cold_start({.power_return_time = started_at,
-                                                      .time_floor = time_floor.floor(),
-                                                      .waited = waited,
-                                                      .boot_source = ak::proto::BootSource::netboot,
-                                                      .rtc_below_floor = rtc_below_floor,
-                                                      .standing = std::move(standing)},
-                                                     store ? &*store : nullptr));
+            const auto* hull_boot = daemon_ptr != nullptr && daemon_ptr->host_boot()
+                                        ? &*daemon_ptr->host_boot()
+                                        : nullptr;
+            (void)link->report(helm::make_cold_start(
+                {.power_return_time = started_at,
+                 .time_floor = time_floor.floor(),
+                 .waited = waited,
+                 .boot_source =
+                     hull_boot != nullptr ? hull_boot->source : ak::proto::BootSource::netboot,
+                 .rtc_below_floor = rtc_below_floor,
+                 .assigned_image_unavailable =
+                     hull_boot != nullptr && hull_boot->assigned_unavailable,
+                 .standing = std::move(standing)},
+                store ? &*store : nullptr));
         };
         // Standing starts go before any envelope (Requirement 4.4); the
         // report waits for their first round, so it lists every one.

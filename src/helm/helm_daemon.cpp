@@ -242,9 +242,72 @@ auto HelmDaemon::now() const -> Clock::time_point {
 auto HelmDaemon::boot() -> BootResult {
     _boot_at.reset();
     _booted = true;
-    auto result = _sequencer.boot();
+    // The boot function is filled before the host can read it
+    // (cold-start Requirement 2.1); with no image the host stays held.
+    const bool release = _config.host_booter == nullptr || fill_boot_function(std::nullopt);
+    auto result = _sequencer.boot(release);
+    if (result.host_released) {
+        watch_host_start();
+    }
     publish();
     return result;
+}
+
+auto HelmDaemon::fill_boot_function(const std::optional<proto::ImageDigest>& failed) -> bool {
+    auto prepared = _config.host_booter->prepare(failed);
+    if (prepared) {
+        _host_boot = *prepared;
+    }
+    {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++(prepared ? _stats.host_boots : _stats.host_boots_failed);
+    }
+    if (_config.on_host_boot) {
+        _config.on_host_boot(prepared);
+    }
+    return prepared.has_value();
+}
+
+auto HelmDaemon::watch_host_start() -> void {
+    if (_config.host_booter == nullptr || _config.host_start_timeout.count() <= 0) {
+        return;
+    }
+    _restarts_at_release = _router.stats().agent_restarts;
+    _start_deadline = now() + _config.host_start_timeout;
+}
+
+auto HelmDaemon::check_host_start() -> void {
+    if (!_start_deadline) {
+        return;
+    }
+    if (_router.stats().agent_restarts > _restarts_at_release) {
+        _start_deadline.reset();
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.host_starts;
+        return;
+    }
+    if (now() < *_start_deadline) {
+        return;
+    }
+    _start_deadline.reset();
+    // Requirement 2.4: once per helm boot, then the controller decides.
+    // Rebooting onto the image that just failed would only fail again.
+    if (_fallback_used || !_host_boot) {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.host_start_timeouts;
+        return;
+    }
+    _fallback_used = true;
+    if (!fill_boot_function(_host_boot->digest)) {
+        return;  // nothing else to boot: the host keeps running what it has
+    }
+    {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.host_fallbacks;
+    }
+    if (_sequencer.restart_host()) {
+        watch_host_start();
+    }
 }
 
 auto HelmDaemon::expect_standing(StandingRoundDone done) -> bool {
@@ -304,6 +367,7 @@ auto HelmDaemon::run_once(std::chrono::milliseconds wait) -> void {
     }
     boot_if_due();
     _router.poll();
+    check_host_start();
     if (now() >= _next_check) {
         check();
         _next_check = now() + _config.check_interval;
@@ -424,6 +488,11 @@ auto HelmDaemon::on_group_members(const proto::GroupMembers& members,
 auto HelmDaemon::on_power_policy(const proto::PowerPolicy& policy, std::span<const std::byte> frame)
     -> void {
     enqueue(PowerPolicyFrame{.policy = policy, .frame = {frame.begin(), frame.end()}});
+}
+
+auto HelmDaemon::on_boot_image(const proto::BootImage& assignment, std::span<const std::byte> frame)
+    -> void {
+    enqueue(BootImageFrame{.assignment = assignment, .frame = {frame.begin(), frame.end()}});
 }
 
 auto HelmDaemon::on_standing_set(const proto::StandingSet& /*set*/,
@@ -570,6 +639,22 @@ auto HelmDaemon::handle(Item& item) -> void {
         ++(kept ? _stats.power_policies : _stats.power_policies_refused);
         if (promoted) {
             ++(*promoted ? _stats.images_promoted : _stats.image_promotions_failed);
+        }
+    } else if (const auto* assigned = std::get_if<BootImageFrame>(&item)) {
+        // Kept for the next host boot; a running host is not rebooted for
+        // it (the controller sends host_power cycle when it wants that).
+        // A host held for want of any image boots now.
+        const bool kept = _config.boot_images != nullptr &&
+                          _config.boot_images->offer(assigned->assignment, assigned->frame) ==
+                              PolicyVerdict::kept;
+        {
+            const std::scoped_lock lock{_inbox_mutex};
+            ++(kept ? _stats.boot_images : _stats.boot_images_refused);
+        }
+        if (kept && _booted && !_sequencer.host_released() && _config.host_booter != nullptr &&
+            _host_override != HostPowerOverride::hold && fill_boot_function(std::nullopt) &&
+            _sequencer.release_host()) {
+            watch_host_start();
         }
     } else if (const auto* standing = std::get_if<StandingSetFrame>(&item)) {
         // Verified, kept and anchored for the next time helm's power

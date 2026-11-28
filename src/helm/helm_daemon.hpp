@@ -167,6 +167,7 @@
 #include "helm/key_store.hpp"
 #include "helm/mailbox.hpp"
 #include "helm/oar_link.hpp"
+#include "helm/host_boot.hpp"
 #include "helm/image_cache.hpp"
 #include "helm/power_on.hpp"
 #include "helm/standing_frames.hpp"
@@ -234,6 +235,21 @@ struct DaemonConfig {
     // kept power policy's keep_image promotes one to LKG (2.3). Null: no
     // image is ever promoted. Not owned.
     ImageCache* images{nullptr};
+    // Keeps the controller's boot_image assignment (cold-start Requirement
+    // 2.1). Null: boot_image records are dropped and counted. Not owned.
+    BootImageKeeper* boot_images{nullptr};
+    // Fills the boot function before every host release (server-
+    // provisioning Requirement 4, cold-start Requirement 2.1). Null: the
+    // host boots whatever its boot function already holds. Not owned.
+    HostBooter* host_booter{nullptr};
+    // With a host_booter: how long hull's agent has to announce itself
+    // (HOST_FAULT agent_restarted) after the host is released before helm
+    // reboots the host once onto another image (Requirement 2.4). Zero:
+    // never (no mailbox to hear the agent on).
+    std::chrono::milliseconds host_start_timeout{std::chrono::seconds{120}};
+    // Called on the loop thread after every attempt to fill the boot
+    // function, including the fallback reboot.
+    std::function<void(const std::expected<HostBoot, HostBootFailure>&)> on_host_boot;
     // Called on the loop thread after a scheduled boot (schedule_boot).
     std::function<void(const BootResult&)> on_boot;
     // The boot cache's state (cold-start Requirement 8.2), read on the loop
@@ -302,6 +318,14 @@ struct DaemonStats {
     std::uint64_t standing_seeded{0};           // stored frames replayed before standing starts
     std::uint64_t instance_secrets{0};          // NICs given their standing instance's secrets
     std::uint64_t instance_secrets_refused{0};  // a secret did not open, or the role refused
+    // Host images (cold-start Requirement 2, server-provisioning task 4).
+    std::uint64_t boot_images{0};          // assignments verified, newer and kept
+    std::uint64_t boot_images_refused{0};  // stale, unsigned, unstorable, or no keeper
+    std::uint64_t host_boots{0};           // boot function filled and the host released
+    std::uint64_t host_boots_failed{0};    // no image to boot, or the fill failed: host held
+    std::uint64_t host_starts{0};          // hull's agent came up after a release
+    std::uint64_t host_fallbacks{0};       // rebooted onto another image after a failed start
+    std::uint64_t host_start_timeouts{0};  // no agent, and the one fallback was already used
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -325,8 +349,11 @@ public:
 
     // ---- loop thread --------------------------------------------------------
 
-    // Powers the slots, attaches every one that comes up, releases the host
-    // (PowerSequencer::boot) and publishes the first inventory.
+    // Powers the slots, attaches every one that comes up, fills the boot
+    // function (with a host_booter), releases the host
+    // (PowerSequencer::boot) and publishes the first inventory. With
+    // nothing to boot the host stays held until a boot_image record gives
+    // it an image.
     auto boot() -> BootResult;
     // Boots (as boot()) from the loop once `at` has passed, unless the host
     // is held: helm keeps serving its controller link while it waits out
@@ -348,6 +375,11 @@ public:
     auto expect_standing(StandingRoundDone done) -> bool;
     [[nodiscard]] auto boot_pending() const noexcept -> bool { return _boot_at.has_value(); }
     [[nodiscard]] auto booted() const noexcept -> bool { return _booted; }
+    // The image the host was last released onto (loop thread); empty
+    // before that, or with no host_booter.
+    [[nodiscard]] auto host_boot() const noexcept -> const std::optional<HostBoot>& {
+        return _host_boot;
+    }
     // Serves queued traffic, router deadlines and sequencer checks until
     // stop is requested.
     auto run(const std::stop_token& stop) -> void;
@@ -400,6 +432,8 @@ public:
     auto on_power_policy(const proto::PowerPolicy& policy, std::span<const std::byte> frame)
         -> void override;
     auto on_standing_set(const proto::StandingSet& set, std::span<const std::byte> frame)
+        -> void override;
+    auto on_boot_image(const proto::BootImage& assignment, std::span<const std::byte> frame)
         -> void override;
     // A slot hull wrote (RSP_SLOT or EVT_SLOT), from the MailboxDevice.
     auto post_host_slot(const mailbox::Slot& slot) -> void;
@@ -472,10 +506,15 @@ private:
     struct StandingSetFrame {
         std::vector<std::byte> frame;
     };
-    using Item = std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
-                              proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame,
-                              ImageKeyFrame, VpcFrame, PolicyFrame, MembersFrame, MetadataFrame,
-                              LayoutFrame, proto::SelfTest, PowerPolicyFrame, StandingSetFrame>;
+    struct BootImageFrame {
+        proto::BootImage assignment;
+        std::vector<std::byte> frame;
+    };
+    using Item =
+        std::variant<proto::Envelope, MapFrame, mailbox::Slot, ConfigFrame, OpFrame,
+                     proto::LeaseGrant, KeyFrame, proto::RoleCertificate, PeersFrame, ImageKeyFrame,
+                     VpcFrame, PolicyFrame, MembersFrame, MetadataFrame, LayoutFrame,
+                     proto::SelfTest, PowerPolicyFrame, StandingSetFrame, BootImageFrame>;
     // Where a NIC with a kept record is plugged: its network role's slot
     // and function.
     struct MetadataHome {
@@ -576,6 +615,13 @@ private:
     auto count_layout_refusal(const std::expected<void, LinkError>& r) -> void;
     auto forward_self_test(const proto::SelfTest& request) -> void;
     auto boot_if_due() -> void;
+    // Fills the boot function (skipping `failed`), reporting the attempt
+    // to on_host_boot. True if the host may be released.
+    auto fill_boot_function(const std::optional<proto::ImageDigest>& failed) -> bool;
+    // Starts watching for hull's agent after a release.
+    auto watch_host_start() -> void;
+    // The agent came up, or its time ran out: the fallback (once).
+    auto check_host_start() -> void;
     [[nodiscard]] static auto is_storage(const SlotState& slot) -> bool;
     auto poll_identity(SlotState& slot) -> void;
     auto deliver_certificate(const proto::RoleCertificate& certificate) -> void;
@@ -608,6 +654,12 @@ private:
     CommandRouter _router;
     PowerSequencer _sequencer;
     std::optional<Clock::time_point> _boot_at;
+    // The host start being watched (Requirement 2.4): the agent restarts
+    // counted at release, and when the agent must have come up by.
+    std::optional<HostBoot> _host_boot;
+    std::optional<Clock::time_point> _start_deadline;
+    std::uint64_t _restarts_at_release{0};
+    bool _fallback_used{false};
     HostPowerOverride _host_override{HostPowerOverride::none};
     bool _booted{false};
     std::map<SlotNumber, std::unique_ptr<SlotState>> _slots;

@@ -84,20 +84,23 @@ auto BootImageKeeper::offer(const proto::BootImage& assignment, std::span<const 
     return PolicyVerdict::kept;
 }
 
-auto object_store_fetch(objstore::ObjectStore& store) -> ImageFetch {
-    return
-        [&store](const proto::HostImage& image, objstore::ObjectStore::Clock::time_point deadline)
-            -> std::expected<std::vector<std::byte>, objstore::FetchError> {
-            auto bytes = store.get(proto::host_image_data_key(image.digest),
-                                   static_cast<std::size_t>(image.size), deadline);
-            if (!bytes) {
-                return std::unexpected(bytes.error());
-            }
-            if (bytes->size() != image.size) {
-                return std::unexpected(objstore::FetchError::bad_response);
-            }
-            return bytes;
-        };
+auto object_store_fetch(objstore::ObjectStore& store, std::string prefix) -> ImageFetch {
+    return [&store, prefix = std::move(prefix)](const proto::HostImage& image,
+                                                objstore::ObjectStore::Clock::time_point deadline)
+               -> std::expected<std::vector<std::byte>, objstore::FetchError> {
+        auto key = proto::host_image_data_key(image.digest);
+        if (!prefix.empty()) {
+            key = prefix + "/" + key;
+        }
+        auto bytes = store.get(key, static_cast<std::size_t>(image.size), deadline);
+        if (!bytes) {
+            return std::unexpected(bytes.error());
+        }
+        if (bytes->size() != image.size) {
+            return std::unexpected(objstore::FetchError::bad_response);
+        }
+        return bytes;
+    };
 }
 
 auto to_string(HostBootError e) noexcept -> const char* {

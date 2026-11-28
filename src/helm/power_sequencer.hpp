@@ -118,7 +118,14 @@ public:
     // `backplane` and `observer` must outlive the sequencer.
     PowerSequencer(SequencerConfig config, Backplane& backplane, SequencerObserver& observer);
 
-    auto boot() -> BootResult;
+    // Powers the slots and, unless `release_host` is false (no image to
+    // boot yet), releases the host.
+    auto boot(bool release_host = true) -> BootResult;
+    // Releases a host boot() left held. True if it is released.
+    auto release_host() -> bool;
+    // Holds the host for off_time and releases it again: a host reboot
+    // onto a rewritten boot function. True if it is released.
+    auto restart_host() -> bool;
     // True if the slot came back link-ready.
     auto power_cycle(SlotNumber slot) -> bool;
     // Looks for ready slots that lost their link and recovers them.

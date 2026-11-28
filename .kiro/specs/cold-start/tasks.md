@@ -22,11 +22,25 @@ and `helm-control-plane`. Pairs with kythira's
     the floor
   - _Requirements: 6.1-6.3_
 
-- [ ] 4. LKG images and fallback boot
+- [x] 4. LKG images and fallback boot
   - Store two images, fill the boot function from LKG, fetch an assigned
     image with a 30 s limit, `keep_image` promotion, previous-image
     fallback on a failed start, verification before store and boot
   - _Requirements: 2.1-2.5_
+  - Built (with server-provisioning task 4): `ImageCache` keeps staged,
+    LKG and previous images as shared 1 MiB chunks in the sealed store,
+    checked under the image keys when stored and again when read to boot;
+    `keep_image` promotes. The controller assigns an image with a
+    `boot_image` record (link type 25, added because no record assigned
+    one). Before every release `HostBooter` boots the assigned image
+    (cached, else fetched by digest within 30 s), else the LKG, else the
+    previous image, and writes the boot function with that boot's
+    provisioning frame. With no agent within `host-start-timeout-ms`
+    (120 s) helm reboots the host once onto the next image. The
+    cold_start report carries the boot source and a flag (bit 2) when an
+    assigned image was unavailable. ak-helm cannot hear hull's agent
+    until its mailbox device exists (helm task 8), so the start timeout
+    is off there unless configured.
 
 - [x] 5. Local power-on policy
   - Store the newest `power_policy`; tier, slot and jitter wait after

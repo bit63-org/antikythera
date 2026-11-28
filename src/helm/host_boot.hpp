@@ -52,6 +52,7 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -111,10 +112,12 @@ private:
 using ImageFetch = std::function<std::expected<std::vector<std::byte>, objstore::FetchError>(
     const proto::HostImage& image, objstore::ObjectStore::Clock::time_point deadline)>;
 
-// Fetches host_image_data_key(image.digest) from `store`, refusing an
-// object that is not exactly image.size bytes. `store` must outlive the
-// returned function.
-[[nodiscard]] auto object_store_fetch(objstore::ObjectStore& store) -> ImageFetch;
+// Fetches host_image_data_key(image.digest) from `store`, under
+// `prefix` (an image store file's prefix) when it is not empty, refusing
+// an object that is not exactly image.size bytes. `store` must outlive
+// the returned function.
+[[nodiscard]] auto object_store_fetch(objstore::ObjectStore& store, std::string prefix = {})
+    -> ImageFetch;
 
 // Writes the boot disk for `uki` with `provisioning` (write_boot_disk_file
 // on the boot function's backing file in production).

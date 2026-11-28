@@ -38,6 +38,21 @@
 //                               when ak-helm was built with
 //                               AK_HELM_IMAGE_KEYS. Optional: without either,
 //                               no image is stored or promoted
+//   boot-function PATH          the boot function's disk image (a file here,
+//                               rewritten before every host release; harbor's
+//                               QEMU attaches it read-only). helm then boots
+//                               hull from its sealed store: requires store
+//                               (server-provisioning Requirement 4,
+//                               cold-start Requirement 2). Optional: without,
+//                               the host boots however it is configured
+//   boot-layer PATH             the metal boot layer as an image store file
+//                               (objstore/image_store_config.hpp), where an
+//                               assigned image not in the store is fetched;
+//                               requires boot-function. Optional: without,
+//                               only stored images boot
+//   host-start-timeout-ms N     how long hull's agent has to come up before
+//                               helm reboots the host once onto another
+//                               image (default 120000; cold-start 2.4)
 //   power-marker PATH           a file in a tmpfs whose absence means helm's
 //                               own power returned (default
 //                               /run/ak-helm/powered; cold-start Requirement 3.6)
@@ -97,9 +112,12 @@ struct HelmConfig {
     std::optional<std::filesystem::path> master_key;  // nullopt: ephemeral
     std::optional<std::filesystem::path> store;       // nullopt: no sealed store
     std::uint64_t store_size{std::uint64_t{1} << 20};
-    std::optional<std::filesystem::path> store_anchor;  // nullopt: ephemeral
-    std::string controller_keys;                        // empty: none
-    std::string image_keys;                             // empty: none
+    std::optional<std::filesystem::path> store_anchor;   // nullopt: ephemeral
+    std::string controller_keys;                         // empty: none
+    std::string image_keys;                              // empty: none
+    std::optional<std::filesystem::path> boot_function;  // nullopt: helm does not fill it
+    std::optional<std::filesystem::path> boot_layer;     // nullopt: no fetches
+    std::optional<std::chrono::milliseconds> host_start_timeout;
     std::filesystem::path power_marker{"/run/ak-helm/powered"};
     bool apply_power_policy{true};
     std::map<SlotNumber, SlotEntry> slots;

@@ -18,10 +18,10 @@
 //     space, so the controller knows what this server can restart from on
 //     its own.
 //
-// Until the boot cache (task 4) and standing set (task 6) exist, hull
-// always comes from the boot layer (netboot), the image digests are zero
-// and no standing starts are reported; the builders take those values as
-// arguments so the later tasks only change what ak-helm passes in.
+// boot_source is where the image helm last released the host onto came
+// from (HostBoot::source); ak-helm passes netboot when helm does not fill
+// the boot function (no boot-function configured), since the host then
+// boots from the boot layer as before task 4.
 
 #include <chrono>
 #include <cstdint>
@@ -39,7 +39,8 @@ struct ColdStartFacts {
     std::uint64_t time_floor{0};
     std::chrono::milliseconds waited{0};  // the power-on hold applied
     proto::BootSource boot_source{proto::BootSource::netboot};
-    bool rtc_below_floor{false};  // the RTC read below the floor at start
+    bool rtc_below_floor{false};             // the RTC read below the floor at start
+    bool assigned_image_unavailable{false};  // HostBoot::assigned_unavailable
     std::vector<proto::StandingStartResult> standing{};
 };
 

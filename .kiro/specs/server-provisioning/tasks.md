@@ -25,6 +25,16 @@ and 16 there). Each task is one PR unless noted.
     function; last-known-good UKI in helm's sealed store, fetched only
     to change images; harbor stand-in with OVMF HTTP Boot
   - _Requirements: 4.1-4.5_
+  - Built: the signed `HostImage` descriptor and image cache, the
+    `boot_image` assignment (link type 25), image choice and fetch
+    (`src/helm/host_boot.hpp`), the GPT/FAT32 boot disk
+    (`src/helm/boot_function.hpp`), hull-init's PCR 15 measurement of
+    the provisioning partition (`server-id partition`), and ak-helm's
+    `boot-function` / `boot-layer` directives. The harbor stand-in is the
+    boot disk attached read-only (`harbor/l1/run.sh --boot-function`)
+    rather than OVMF HTTP Boot, so harbor boots the same bytes a board
+    would. Left: the agent releasing the function (a mailbox command, with
+    helm's mailbox device) and booting the UKI under OVMF (task 7).
 
 - [ ] 5. Decommission
   - Key destruction, `sanitize` MCTP request to storage roles, identity

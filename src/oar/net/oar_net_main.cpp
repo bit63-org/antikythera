@@ -11,6 +11,19 @@
 //              --sideband PATH --addr A --helm-addr A --eid E --helm-eid E
 //              --function SOCKET [--function SOCKET ...]
 //              [--port P] [--source-ports N] [--scope IFINDEX] [--metadata TUN]
+//              [--control-addr ADDR --role-ca FILE --role-cert FILE --role-key FILE]
+//
+// --control-addr and the --role-* files are the role's identity for its
+// bulk channel (fleet-scale-networking Requirement 6.1, task 10), all of
+// them or none. --control-addr is the role's control address on its
+// underlay port (IPv6, from the server's configuration like --vtep); the
+// role enrolls with helm's cert_request flow as role kind net, and the
+// certificate the controller's CA issues must carry that address as an IP
+// SAN and this server's URI. --role-key is the role's own ECDSA key,
+// created (0600) if the file does not exist, --role-cert where it keeps
+// the certificate, and --role-ca the CA it checks the chain against. A
+// --role-cert that already passes is used at once. Without them the role
+// answers cert_request unsupported and never uses the bulk channel.
 //
 // --metadata serves the instance metadata service (oar-net Requirement 13,
 // metadata_tap.hpp): it makes the TUN device of that name (usually akmd0)
@@ -64,6 +77,8 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
@@ -343,6 +358,10 @@ constexpr std::string_view arg_port = "--port";
 constexpr std::string_view arg_source_ports = "--source-ports";
 constexpr std::string_view arg_scope = "--scope";
 constexpr std::string_view arg_metadata = "--metadata";
+constexpr std::string_view arg_control_addr = "--control-addr";
+constexpr std::string_view arg_role_ca = "--role-ca";
+constexpr std::string_view arg_role_cert = "--role-cert";
+constexpr std::string_view arg_role_key = "--role-key";
 constexpr std::string_view role_log = "ak-oar-net";
 constexpr std::uint64_t max_bus_addr = 0x7F;
 constexpr std::uint64_t max_eid = 0xFE;
@@ -355,12 +374,13 @@ auto role_usage() -> int {
     std::println(stderr,
                  "usage: {} {} ADDR {} N {} N [{} N] {} ID:HEX [...] {} PATH {} A {} A {} E {} E "
                  "{} SOCKET [...] [{} P] [{} N] [{} IFINDEX] [{} TUN]\n"
+                 "          [{} ADDR {} FILE {} FILE {} FILE]\n"
                  "   or: {} {} PATH {} ID {} MAC ({} N | {} N [{} N]) [{} IFNAME]",
                  role_log, arg_vtep, arg_server_id, arg_underlay_mtu, arg_tunnel_overhead,
                  arg_controller_key, arg_sideband, arg_addr, arg_helm_addr, arg_eid, arg_helm_eid,
-                 arg_function, arg_port, arg_source_ports, arg_scope, arg_metadata, role_log,
-                 arg_socket, arg_nic_id, arg_mac, arg_mtu, arg_underlay_mtu, arg_tunnel_overhead,
-                 arg_tap);
+                 arg_function, arg_port, arg_source_ports, arg_scope, arg_metadata,
+                 arg_control_addr, arg_role_ca, arg_role_cert, arg_role_key, role_log, arg_socket,
+                 arg_nic_id, arg_mac, arg_mtu, arg_underlay_mtu, arg_tunnel_overhead, arg_tap);
     return exit_usage;
 }
 
@@ -429,7 +449,21 @@ struct RoleOptions {
     std::uint64_t source_ports{0};
     std::uint64_t scope{0};
     std::optional<std::string> metadata;  // the TUN's name
+    // The bulk channel's identity (task 10): all or none.
+    std::optional<net::Ipv6Address> control_addr;
+    std::string control_text;  // as given, for the certificate's IP SAN
+    std::string role_ca;
+    std::string role_cert;
+    std::string role_key;
 };
+
+auto read_text(const std::string& path) -> std::optional<std::string> {
+    std::ifstream in{path, std::ios::binary};
+    if (!in) {
+        return std::nullopt;
+    }
+    return std::string{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
 
 auto parse_role(int argc, char** argv) -> std::optional<RoleOptions> {
     RoleOptions o;
@@ -484,9 +518,28 @@ auto parse_role(int argc, char** argv) -> std::optional<RoleOptions> {
                 return std::nullopt;
             }
             o.metadata = value;
+        } else if (arg == arg_control_addr) {
+            o.control_addr = parse_ipv6(value);
+            if (!o.control_addr) {
+                return std::nullopt;
+            }
+            o.control_text = value;
+        } else if (arg == arg_role_ca) {
+            o.role_ca = value;
+        } else if (arg == arg_role_cert) {
+            o.role_cert = value;
+        } else if (arg == arg_role_key) {
+            o.role_key = value;
         } else {
             return std::nullopt;
         }
+    }
+    const bool any_identity =
+        o.control_addr || !o.role_ca.empty() || !o.role_cert.empty() || !o.role_key.empty();
+    const bool all_identity =
+        o.control_addr && !o.role_ca.empty() && !o.role_cert.empty() && !o.role_key.empty();
+    if (any_identity && !all_identity) {
+        return std::nullopt;
     }
     if (!o.vtep || !o.server_id || *o.server_id == 0 || !o.underlay_mtu || o.keys.empty() ||
         o.sideband.empty() || !o.addr || !o.helm_addr || !o.eid || !o.helm_eid ||
@@ -612,6 +665,40 @@ auto run_role(const RoleOptions& opts) -> int {
     if (!role) {
         std::println(stderr, "{}: {}", role_log, role.error());
         return EXIT_FAILURE;
+    }
+    // The bulk channel's client identity (task 10).
+    std::optional<ak::tls::RoleIdentity> identity;
+    std::optional<helm::RoleEnrollment> enrollment;
+    if (opts.control_addr) {
+        const auto ca = read_text(opts.role_ca);
+        if (!ca) {
+            std::println(stderr, "{}: cannot read {}", role_log, opts.role_ca);
+            return EXIT_FAILURE;
+        }
+        auto opened = ak::tls::RoleIdentity::open({.key_path = opts.role_key,
+                                                   .cert_path = opts.role_cert,
+                                                   .ca_pem = *ca,
+                                                   .server_id = *opts.server_id,
+                                                   .common_name = "oar-net",
+                                                   .addresses = {opts.control_text}});
+        if (!opened) {
+            std::println(stderr, "{}: role identity: {}", role_log,
+                         ak::tls::to_string(opened.error()));
+            return EXIT_FAILURE;
+        }
+        identity = std::move(*opened);
+        if (auto cfg = identity->config(ak::tls::Role::client)) {
+            (*role)->set_bulk_tls(*cfg);
+        } else {
+            std::println(stderr, "{}: no role certificate yet: waiting for enrollment", role_log);
+        }
+        enrollment.emplace(*identity, helm::oar::Role::net, ak::tls::Role::client,
+                           [&role](const ak::tls::Config& cfg) {
+                               (*role)->set_bulk_tls(cfg);
+                               std::println(stderr, "{}: role certificate installed", role_log);
+                               return true;
+                           });
+        (*role)->set_enrollment(*enrollment);
     }
 
     remove_stale_socket(opts.sideband);

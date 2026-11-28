@@ -590,7 +590,7 @@ private:
     auto count_layout_refusal(const std::expected<void, LinkError>& r) -> void;
     auto forward_self_test(const proto::SelfTest& request) -> void;
     auto boot_if_due() -> void;
-    [[nodiscard]] static auto is_storage(const SlotState& slot) -> bool;
+    [[nodiscard]] static auto enrolls(const SlotState& slot) -> bool;
     auto poll_identity(SlotState& slot) -> void;
     auto deliver_certificate(const proto::RoleCertificate& certificate) -> void;
     auto count_refusal(const std::expected<void, LinkError>& r) -> void;

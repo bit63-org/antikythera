@@ -1168,7 +1168,7 @@ auto decode_copy_answer(std::span<const std::byte> body) noexcept
 }
 
 auto encode_cert_answer(const CertAnswer& a) -> std::expected<std::vector<std::byte>, BodyError> {
-    if (!is_storage_role(a.role)) {
+    if (!enrolls(a.role)) {
         return std::unexpected(BodyError::unknown_enum);
     }
     if (a.csr.size() > max_csr) {
@@ -1196,7 +1196,7 @@ auto decode_cert_answer(std::span<const std::byte> body) noexcept
     if (reserved != 0) {
         return std::unexpected(BodyError::reserved_not_zero);
     }
-    if (!is_storage_role(role)) {
+    if (!enrolls(role)) {
         return std::unexpected(BodyError::unknown_enum);
     }
     if (len > max_csr) {

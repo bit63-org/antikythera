@@ -904,12 +904,14 @@ auto HelmDaemon::poll_health(SlotState& slot) -> void {
 
 // ---- enrollment ---------------------------------------------------------------
 
-auto HelmDaemon::is_storage(const SlotState& slot) -> bool {
-    return is_blk(slot) || is_hold(slot) || is_khold(slot);
+// Storage roles and network roles (fleet-scale-networking task 10: the
+// bulk channel's client certificate) enroll alike.
+auto HelmDaemon::enrolls(const SlotState& slot) -> bool {
+    return slot.link && slot.inventory && oar::enrolls(slot.inventory->role);
 }
 
 auto HelmDaemon::poll_identity(SlotState& slot) -> void {
-    if (!is_storage(slot)) {
+    if (!enrolls(slot)) {
         return;
     }
     auto asked = slot.link->cert_request();
@@ -925,6 +927,8 @@ auto HelmDaemon::poll_identity(SlotState& slot) -> void {
                 return proto::StorageRole::hold;
             case oar::Role::khold:
                 return proto::StorageRole::khold;
+            case oar::Role::net:
+                return proto::StorageRole::net;
             default:
                 return proto::StorageRole::initiator;
         }
@@ -945,7 +949,7 @@ auto HelmDaemon::poll_identity(SlotState& slot) -> void {
 auto HelmDaemon::deliver_certificate(const proto::RoleCertificate& certificate) -> void {
     auto* slot = slot_state(certificate.slot);
     const bool taken =
-        slot != nullptr && is_storage(*slot) && slot->link->role_certificate(certificate.chain);
+        slot != nullptr && enrolls(*slot) && slot->link->role_certificate(certificate.chain);
     if (taken) {
         slot->reported_csr.clear();  // a later request is a renewal: report it
     }

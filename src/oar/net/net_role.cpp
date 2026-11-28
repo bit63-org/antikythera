@@ -773,6 +773,17 @@ auto NetRole::vtep_credential(std::span<const std::byte> frame) -> oar::Status {
     return oar::Status::ok;
 }
 
+auto NetRole::cert_request() -> std::expected<oar::CertAnswer, oar::Status> {
+    if (_enrollment == nullptr) {
+        return std::unexpected(oar::Status::unsupported);
+    }
+    return _enrollment->answer();
+}
+
+auto NetRole::role_certificate(std::span<const std::byte> chain) -> oar::Status {
+    return _enrollment == nullptr ? oar::Status::unsupported : _enrollment->install(chain);
+}
+
 auto NetRole::credential_revocations(std::span<const std::byte> frame) -> oar::Status {
     if (!_credentials) {
         return oar::Status::unsupported;

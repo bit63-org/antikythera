@@ -1,6 +1,6 @@
 # Implementation Plan — Network control at fleet scale
 
-## Status: 4/18 tasks complete
+## Status: 5/18 tasks complete
 
 Tasks are in priority order: take the first open one whose prerequisites
 are done. "cloud" tasks build and test in a cloud container; "tikhov"
@@ -68,7 +68,7 @@ tasks 14-15. Phases A, B and C can run in parallel.
 
 ### Phase C: bulk frames over Ethernet
 
-- [ ] 10. Network role certificates: role kind `net` in `cert_request`,
+- [x] 10. Network role certificates: role kind `net` in `cert_request`,
   the role's control address as an IP SAN, `tls::RoleIdentity` reused.
   _Requirements: 6.1_ (cloud)
 - [ ] 11. `FrameNotice` codec (link record 33, vendor type 0x33) and

@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <optional>
@@ -38,6 +39,8 @@
 #include "helm/sideband_binding.hpp"
 #include "hull/signature_verifier.hpp"
 #include "metadata_packets.hpp"
+#include "proto/server_identity.hpp"
+#include "tls_test_support.hpp"
 #include "net_frames.hpp"
 #include "oar/net/net_role.hpp"
 #include "proto/group_members.hpp"
@@ -1910,4 +1913,53 @@ BOOST_AUTO_TEST_CASE(roles_route_between_subnets_through_a_middlebox,
     BOOST_TEST(!f.take(one, fn0).has_value());
     BOOST_TEST(f.vswitch(one).rx_drop_route_mismatch == 1U);
     BOOST_TEST(f.vswitch(one).rx_drop_cross_subnet == 1U);
+}
+
+// fleet-scale-networking task 10: the role enrolls for the client
+// certificate its bulk channel presents, naming its control address.
+BOOST_AUTO_TEST_CASE(a_network_role_enrolls_for_its_bulk_channel,
+                     *boost::unit_test::timeout(unit_timeout_seconds)) {
+    One b;
+    BOOST_TEST((b.role->cert_request().error() == oar::Status::unsupported));
+    BOOST_TEST((b.role->role_certificate({}) == oar::Status::unsupported));
+
+    namespace fs = std::filesystem;
+    std::string tmpl = (fs::temp_directory_path() / "ak-net-identity-XXXXXX").string();
+    BOOST_REQUIRE(::mkdtemp(tmpl.data()) != nullptr);
+    const fs::path dir{tmpl};
+    ak::test::TestCa ca{"role CA"};
+    const std::string control = "fd00:c0::7";
+    {
+        auto identity = ak::tls::RoleIdentity::open({.key_path = dir / "net.key",
+                                                     .cert_path = dir / "net.crt",
+                                                     .ca_pem = ca.cert_pem(),
+                                                     .server_id = server_one,
+                                                     .common_name = "oar-net",
+                                                     .addresses = {control}});
+        BOOST_REQUIRE(identity.has_value());
+        ak::helm::RoleEnrollment enrollment{*identity, oar::Role::net, ak::tls::Role::client,
+                                            [&b](const ak::tls::Config& cfg) {
+                                                b.role->set_bulk_tls(cfg);
+                                                return true;
+                                            }};
+        b.role->set_enrollment(enrollment);
+        const auto asked = b.role->cert_request();
+        BOOST_REQUIRE(asked.has_value());
+        BOOST_TEST((asked->role == oar::Role::net));
+        BOOST_REQUIRE(!asked->csr.empty());
+        const std::string uri = "URI:" + proto::server_uri(server_one);
+        // A certificate without the control address is refused.
+        BOOST_TEST(
+            (b.role->role_certificate(ca.sign_request(asked->csr, uri)) == oar::Status::failed));
+        BOOST_TEST(!b.role->bulk_tls().has_value());
+        BOOST_TEST((b.role->role_certificate(ca.sign_request(asked->csr, uri + ",IP:" + control)) ==
+                    oar::Status::ok));
+        BOOST_REQUIRE(b.role->bulk_tls().has_value());
+        BOOST_TEST((b.role->bulk_tls()->role == ak::tls::Role::client));
+        BOOST_TEST(b.role->cert_request().value().csr.empty());  // fresh: nothing to ask for
+        BOOST_TEST(enrollment.stats().installed == 1U);
+        BOOST_TEST(enrollment.stats().refused == 1U);
+    }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }

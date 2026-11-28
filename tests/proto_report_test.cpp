@@ -444,6 +444,8 @@ auto every_body() -> std::vector<proto::ReportBody> {
     all.emplace_back(proto::GroupMembership{.slot = 1, .entries = {}});
     all.emplace_back(
         proto::CertRequest{.slot = 4, .role = proto::StorageRole::khold, .csr = der_seq(0)});
+    all.emplace_back(
+        proto::CertRequest{.slot = 5, .role = proto::StorageRole::net, .csr = der_seq(0)});
     std::ranges::move(khold_bodies(), std::back_inserter(all));
     all.emplace_back(sample_conversion());
     all.emplace_back(proto::ConversionProgress{.local_volume_id = 1,
@@ -1092,7 +1094,7 @@ BOOST_AUTO_TEST_CASE(cert_request_layout_and_rules) {
     BOOST_TEST(std::to_integer<int>(b[body + 8]) == 0x30);  // the CSR's SEQUENCE
 
     auto bad_role = req;
-    bad_role.role = static_cast<proto::StorageRole>(4);
+    bad_role.role = static_cast<proto::StorageRole>(5);
     BOOST_TEST((encode_error(make_report(bad_role)) == DecodeError::unknown_value));
     for (const auto& csr : std::vector<std::vector<std::byte>>{
              {},                                                   // empty
@@ -1202,6 +1204,7 @@ BOOST_AUTO_TEST_CASE(khold_kinds_are_numbered_by_the_spec) {
         BOOST_TEST(std::to_integer<int>(bytes[off_kind]) == kind);
     }
     BOOST_TEST(static_cast<int>(proto::StorageRole::khold) == 3);
+    BOOST_TEST(static_cast<int>(proto::StorageRole::net) == 4);
 }
 
 BOOST_AUTO_TEST_CASE(conversion_progress_layout_and_rules) {

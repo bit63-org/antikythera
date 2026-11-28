@@ -180,6 +180,10 @@ public:
     // to a network role; fails without sending if it is shorter than
     // oar::min_vpc_config_frame or longer than oar::max_vpc_config_frame.
     auto vpc_config(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
+    // Sends one controller VpcStream frame (a snapshot part or delta) in
+    // chunks to a network role; fails without sending if it is shorter
+    // than oar::min_vpc_stream_frame or longer than oar::max_vpc_stream_frame.
+    auto vpc_stream(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
     // Block volumes, to a hold role: one controller ReplicaConfig or
     // VolumeOp frame unmodified, and a lease acknowledgement.
     auto replica_config(std::span<const std::byte> frame) -> std::expected<void, LinkError>;
@@ -370,6 +374,12 @@ public:
     // (oar-net Requirement 12). `frame` is not yet decoded or verified and
     // is valid only during the call.
     virtual auto vpc_config(std::span<const std::byte> /*frame*/) -> oar::Status {
+        return oar::Status::unsupported;
+    }
+    // One VpcStream frame (fleet-scale-networking task 5), which only the
+    // network role applies (task 6). Not yet decoded or verified; valid
+    // only during the call.
+    virtual auto vpc_stream(std::span<const std::byte> /*frame*/) -> oar::Status {
         return oar::Status::unsupported;
     }
     // Block volumes, which only the hold role keeps. The frames are not yet

@@ -47,6 +47,8 @@ constexpr auto frame_limit(mctp::VendorType type) noexcept -> std::size_t {
             return oar::max_volume_layout_frame;
         case mctp::VendorType::vpc_config:
             return oar::max_vpc_config_frame;
+        case mctp::VendorType::vpc_stream:
+            return oar::max_vpc_stream_frame;
         case mctp::VendorType::group_policy:
             return oar::max_group_policy_frame;
         default:
@@ -466,6 +468,8 @@ auto frame_size_ok(mctp::VendorType type, std::size_t size) -> std::optional<boo
             return size != 0 && size <= oar::max_volume_layout_frame;
         case mctp::VendorType::vpc_config:
             return size >= oar::min_vpc_config_frame && size <= oar::max_vpc_config_frame;
+        case mctp::VendorType::vpc_stream:
+            return size >= oar::min_vpc_stream_frame && size <= oar::max_vpc_stream_frame;
         case mctp::VendorType::group_policy:
             return size == oar::group_policy_frame_size ||
                    (size >= oar::min_group_policy_v2_frame && size <= oar::max_group_policy_frame);
@@ -567,6 +571,13 @@ auto OarLink::vpc_config(std::span<const std::byte> frame) -> std::expected<void
         return std::unexpected(bad_request());
     }
     return send_chunked(mctp::VendorType::vpc_config, frame);
+}
+
+auto OarLink::vpc_stream(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
+    if (frame.size() < oar::min_vpc_stream_frame || frame.size() > oar::max_vpc_stream_frame) {
+        return std::unexpected(bad_request());
+    }
+    return send_chunked(mctp::VendorType::vpc_stream, frame);
 }
 
 auto OarLink::replica_config(std::span<const std::byte> frame) -> std::expected<void, LinkError> {
@@ -884,6 +895,7 @@ auto OarEndpoint::dispatch(OarHandler& handler, mctp::VendorType type,
         case mctp::VendorType::instance_metadata:
         case mctp::VendorType::volume_layout:
         case mctp::VendorType::vpc_config:
+        case mctp::VendorType::vpc_stream:
         case mctp::VendorType::group_policy:
         case mctp::VendorType::role_certificate:
             return status_only(frame_chunk(handler, type, body));
@@ -1055,6 +1067,9 @@ auto OarEndpoint::deliver_frame(OarHandler& handler, mctp::VendorType type,
             break;
         case mctp::VendorType::vpc_config:
             status = handler.vpc_config(frame);
+            break;
+        case mctp::VendorType::vpc_stream:
+            status = handler.vpc_stream(frame);
             break;
         case mctp::VendorType::group_policy:
             status = handler.group_policy(frame);

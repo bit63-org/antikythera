@@ -331,6 +331,16 @@ auto ControllerSession::handle(const proto::Record& rec) -> std::expected<void, 
             _sink->on_credential_revocations(*list, rec.payload);
             return {};
         }
+        case proto::RecordType::vpc_stream: {
+            // Per VPC, not per server: every server hosting it gets the
+            // same signed bytes.
+            auto stream = proto::decode_vpc_stream(rec.payload);
+            if (!stream) {
+                return std::unexpected(SessionError::bad_record);
+            }
+            _sink->on_vpc_stream(*stream, rec.payload);
+            return {};
+        }
         case proto::RecordType::frame_notice: {
             auto notice = proto::decode_frame_notice_record(rec.payload);
             if (!notice) {

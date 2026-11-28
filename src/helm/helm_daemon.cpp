@@ -474,6 +474,11 @@ auto HelmDaemon::on_frame_notice(const proto::FrameNotice& notice) -> void {
     enqueue(notice);
 }
 
+auto HelmDaemon::on_vpc_stream(const proto::VpcStream& stream, std::span<const std::byte> frame)
+    -> void {
+    enqueue(StreamFrame{.vni = stream.vni, .frame = {frame.begin(), frame.end()}});
+}
+
 auto HelmDaemon::on_vtep_credential(const proto::VtepCredential& credential,
                                     std::span<const std::byte> frame) -> void {
     enqueue(CredentialFrame{.credential = credential, .frame = {frame.begin(), frame.end()}});
@@ -583,6 +588,8 @@ auto HelmDaemon::handle(Item& item) -> void {
         keep_revocations(*list);
     } else if (const auto* notice = std::get_if<proto::FrameNotice>(&item)) {
         forward_notice(*notice);
+    } else if (auto* stream = std::get_if<StreamFrame>(&item)) {
+        forward_stream(*stream);
     }
 }
 
@@ -862,6 +869,30 @@ auto HelmDaemon::forward_notice(const proto::FrameNotice& notice) -> void {
     const std::scoped_lock lock{_inbox_mutex};
     ++_stats.frame_notices;
     _stats.frame_notices_refused += refused;
+}
+
+auto HelmDaemon::forward_stream(StreamFrame& stream) -> void {
+    // Forwarded in arrival order (send_frame keeps one type in order) and
+    // not kept: a role that missed a frame finds the gap and asks for a
+    // snapshot through stream_status (task 9). Holding the newest
+    // snapshot for replay is the StreamApplier's design, not helm's yet.
+    {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.vpc_streams;
+    }
+    auto counted = std::make_shared<bool>(false);  // a frame refused by any role counts once
+    for (auto& [n, slot] : _slots) {
+        if (is_net_role(*slot)) {
+            slot->link->send_frame(mctp::VendorType::vpc_stream, stream.frame,
+                                   [this, counted](const auto& r) {
+                                       if (!r && !*counted) {
+                                           *counted = true;
+                                           const std::scoped_lock lock{_inbox_mutex};
+                                           ++_stats.vpc_streams_refused;
+                                       }
+                                   });
+        }
+    }
 }
 
 auto HelmDaemon::send_credentials(SlotState& slot) -> void {

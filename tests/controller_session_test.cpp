@@ -22,6 +22,7 @@
 #include "proto/instance_metadata.hpp"
 #include "proto/vpc_config.hpp"
 #include "test_support.hpp"
+#include "vpc_stream_support.hpp"
 
 namespace helm = ak::helm;
 namespace mb = ak::helm::mailbox;
@@ -114,6 +115,11 @@ struct RecordingSink final : helm::ControllerSink {
     }
     std::vector<proto::FrameNotice> notices;
     auto on_frame_notice(const proto::FrameNotice& n) -> void override { notices.push_back(n); }
+    std::vector<std::pair<proto::VpcStream, std::vector<std::byte>>> streams;
+    auto on_vpc_stream(const proto::VpcStream& s, std::span<const std::byte> frame)
+        -> void override {
+        streams.emplace_back(s, std::vector<std::byte>{frame.begin(), frame.end()});
+    }
     std::vector<std::pair<proto::VtepCredential, std::vector<std::byte>>> credentials;
     auto on_vtep_credential(const proto::VtepCredential& c, std::span<const std::byte> frame)
         -> void override {
@@ -390,6 +396,14 @@ auto rotate_record(std::uint64_t to) -> std::vector<std::byte> {
     return framed(RecordType::rotate_vtep_key, *b);
 }
 
+auto stream_record() -> std::pair<std::vector<std::byte>, std::vector<std::byte>> {
+    auto d = ak::test::stream::delta(3, 4);
+    d.records = {ak::test::stream::nic_binding(0x11, 0, 1, 0x11)};
+    auto b = proto::encode_vpc_stream(d);
+    BOOST_REQUIRE(b.has_value());
+    return {*b, framed(RecordType::vpc_stream, *b)};
+}
+
 auto notice_record(std::uint64_t to) -> std::vector<std::byte> {
     auto b = proto::encode_frame_notice_record({.server_id = to,
                                                 .notice = {.kind = proto::FrameKind::vpc_stream,
@@ -650,6 +664,27 @@ BOOST_FIXTURE_TEST_CASE(frame_notices_reach_the_sink_for_this_server_only, Fixtu
     BOOST_REQUIRE(!res.has_value());
     BOOST_TEST((res.error() == SessionError::bad_record));
     BOOST_TEST(sink.notices.size() == 1U);
+}
+
+// fleet-scale-networking task 5: a VPC stream frame names no server (it
+// is signed once for every server hosting the VPC) and reaches the sink
+// with its exact bytes; a malformed one is refused.
+BOOST_FIXTURE_TEST_CASE(vpc_streams_reach_the_sink_whole, Fixture) {
+    session.on_connected();
+    const auto [frame, record] = stream_record();
+    BOOST_REQUIRE(session.on_bytes(record).has_value());
+    BOOST_REQUIRE(sink.streams.size() == 1U);
+    BOOST_TEST(sink.streams[0].first.vni == 0xABCDU);
+    BOOST_TEST(sink.streams[0].first.to_sequence == 4U);
+    BOOST_TEST(sink.streams[0].second == frame);
+    session.on_disconnected();
+    session.on_connected();
+    auto bad = record;
+    bad[proto::record_header_size + 0x1C] = std::byte{3};  // an unknown kind
+    const auto res = session.on_bytes(bad);
+    BOOST_REQUIRE(!res.has_value());
+    BOOST_TEST((res.error() == SessionError::bad_record));
+    BOOST_TEST(sink.streams.size() == 1U);
 }
 
 // fleet-scale-networking task 2: a credential for this server and any

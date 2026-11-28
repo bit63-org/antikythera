@@ -270,7 +270,7 @@ VpcStream {                   // controller -> frame store / helm -> role, signe
 
 Sequence rules are the edge table's: a snapshot is `part_count` parts
 with one non-zero `snapshot_id`, consistent at `to_sequence`; a delta
-covers `from_sequence ..= to_sequence`. A part is at most 295,032 bytes
+covers `from_sequence ..= to_sequence`. A part is at most 491,624 bytes
 (`proto::max_record_payload`), so a 4,096-part snapshot holds well over a
 million NICs.
 
@@ -295,6 +295,47 @@ million NICs.
 
 Records in a snapshot part are in ascending (type, key) order; records in
 a delta are in change order. A remove carries only the key.
+
+As built (task 5, `src/proto/vpc_stream.hpp`, whose header comment gives
+every body byte by byte):
+- **Keys are prefixes.** Each body starts with its key, so a remove is the
+  put body's first `stream_key_size(type)` bytes, and snapshots sort by
+  that key with integers compared as values and addresses as bytes. A
+  route therefore carries its table (`table u16 | family | length |
+  prefix [16] | kind | target`), a membership its count after the NIC,
+  and a group member list its VTEP count after the group. An SG rule's
+  key is the whole 48-byte record, so a changed rule is a remove and a
+  put.
+- **Bodies follow the frames they replace, by spec rather than by codec.**
+  VpcConfig version 3 and SecurityPolicy are not built yet, so types 4
+  to 13 are checked against their specs' field rules here (gateway and
+  NAT kinds, the 0..62 port blocks, the SG rule's protocol, port and
+  ICMP rules, tracking ranges); when those codecs land they should share
+  these checks rather than restate them. A gateway record holds its NAT
+  addresses but not its blocks: each block is a type 9 record keyed by
+  gateway, address index and block, with the owning server as its value,
+  so a block moves between servers as one put.
+- **Type 4 is never removed**, and is not keyed: a VPC always has one set
+  of settings.
+- **Size.** The largest frame is the largest MapUpdate, 491,624 bytes
+  (`proto::max_record_payload`), not 295,032 as first written above: the
+  guest-address lists grew MapUpdate after this design was drafted. The
+  link limit does not grow.
+- **The codec checks each record alone.** Cross-record rules (an address
+  naming a missing NIC, MAC uniqueness, a route to an unknown table, a
+  NAT block naming an address index the gateway lacks, budgets) belong
+  to the StreamApplier (task 6).
+- **Transport.** Link record 32 names no server: the controller signs a
+  frame once per VPC change and every server hosting the VPC gets the
+  same bytes. helm forwards each frame unmodified to every network role
+  as OarLink vendor type 0x30 (chunked, in arrival order behind earlier
+  frames of the type) and keeps none: a role that misses one finds the
+  gap and asks for a snapshot through `stream_status` (task 9). Until
+  task 6 a role answers `unsupported`, which helm counts
+  (`vpc_streams_refused`).
+- Signing vector 19 in `src/proto/test_vectors.hpp` is a four-record
+  delta for kythira's controller; `fuzz_vpc_stream` checks that anything
+  accepted re-encodes to its input.
 
 `StreamApplier` (`src/oar/net/stream_applier.*`) owns, per VNI, the
 incarnation, the applied sequence, at most 64 held deltas and a timer.

@@ -33,6 +33,7 @@
 #include "proto/vtep_credential.hpp"
 #include "proto/vpc_config.hpp"
 #include "test_support.hpp"
+#include "vpc_stream_support.hpp"
 
 namespace mb = ak::helm::mailbox;
 namespace proto = ak::proto;
@@ -487,6 +488,23 @@ BOOST_AUTO_TEST_CASE(revocations18_reproduces_and_verifies) {
         [](std::span<const std::byte> b) { return proto::decode_credential_revocations(b); },
         [](std::span<const std::byte> b) { return proto::credential_signed_bytes(b); },
         [](std::span<std::byte> b, const auto& sig) { proto::set_credential_signature(b, sig); });
+}
+
+BOOST_AUTO_TEST_CASE(stream19_reproduces_and_verifies) {
+    namespace st = ak::test::stream;
+    auto fields = st::delta(7, 8);
+    BOOST_TEST(fields.key_id == vec::stream19_key_id);
+    BOOST_TEST(fields.vpc_id == vec::stream19_vpc_id);
+    BOOST_TEST(fields.vni == vec::stream19_vni);
+    fields.records = {st::nic_binding(0x11, 0x5B01, 1, 0x11), st::ipv4_address({10, 0, 1, 5}, 0x11),
+                      st::remove_of(st::ipv4_address({10, 0, 1, 4}, 0x11)),
+                      st::route4(1, 2, proto::StreamRouteKind::nic, 0x11)};
+    check_signed_vector(
+        vec::stream19, vec::stream19_signature, fields, TestSigner{vec::key1_secret},
+        [](const proto::VpcStream& s) { return proto::encode_vpc_stream(s); },
+        [](std::span<const std::byte> b) { return proto::decode_vpc_stream(b); },
+        [](std::span<const std::byte> b) { return proto::vpc_stream_signed_bytes(b); },
+        [](std::span<std::byte> b, const auto& sig) { proto::set_vpc_stream_signature(b, sig); });
 }
 
 BOOST_AUTO_TEST_SUITE_END()

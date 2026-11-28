@@ -229,13 +229,20 @@ BOOST_AUTO_TEST_CASE(credential_records_are_framed) {
     BOOST_REQUIRE(back.size() == 1U);
     BOOST_TEST((back[0].type == RecordType::credential_revocations));
     BOOST_TEST(back[0].payload.size() == full.size());
-    for (const std::uint16_t t : {std::uint16_t{29}, std::uint16_t{32}, std::uint16_t{34}}) {
+    for (const std::uint16_t t : {std::uint16_t{29}, std::uint16_t{34}, std::uint16_t{36}}) {
         BOOST_TEST(!proto::encode_record(static_cast<RecordType>(t), {}).has_value());
     }
 }
 
 // fleet-scale-networking task 11: link record 33 and the 56-byte notice
 // helm passes to its network roles (vendor type 0x33).
+BOOST_AUTO_TEST_CASE(vpc_streams_are_a_known_record_that_does_not_grow_the_limit) {
+    BOOST_TEST(static_cast<std::uint16_t>(RecordType::vpc_stream) == 32U);
+    BOOST_TEST(proto::max_record_payload == proto::max_vpc_stream_size);
+    std::vector<std::byte> payload(proto::max_vpc_stream_size);
+    BOOST_TEST(proto::encode_record(RecordType::vpc_stream, payload).has_value());
+}
+
 BOOST_AUTO_TEST_CASE(frame_notices_round_trip_and_are_strict) {
     BOOST_TEST(static_cast<std::uint16_t>(RecordType::frame_notice) == 33U);
     BOOST_TEST(proto::max_record_payload >= proto::frame_notice_record_size);

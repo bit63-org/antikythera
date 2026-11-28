@@ -350,6 +350,11 @@ inline constexpr std::size_t min_vpc_config_frame = 0x48 + 0x08 + 0x20 + 0x08 + 
 inline constexpr std::size_t max_vpc_config_frame =
     0x48 + (5 * 0x08) + (4 * 4) + (4 * 16) + (200 * 0x20) + (200 * 0x08) + (4096 * 0x20) + 253 + 64;
 static_assert(max_vpc_config_frame <= max_map_frame);
+// proto::VpcStream sizes, mirrored (a header and signature with no
+// records; the largest MapUpdate, which bounds every link record);
+// tests/oar_protocol_test.cpp pins them.
+inline constexpr std::size_t min_vpc_stream_frame = 0x48 + 64;
+inline constexpr std::size_t max_vpc_stream_frame = max_map_frame;
 // Largest GroupMembers frame (proto::max_group_members_size: 32-byte
 // header, 512 groups of 24 bytes, 4096 VTEPs of 16, 64-byte signature),
 // pinned the same way.

@@ -79,6 +79,7 @@
 #include "proto/group_members.hpp"
 #include "proto/instance_metadata.hpp"
 #include "proto/vpc_config.hpp"
+#include "proto/vpc_stream.hpp"
 #include "tls/tls.hpp"
 
 namespace ak::helm {
@@ -174,6 +175,11 @@ public:
     // A frame waiting in a frame store for the network roles to fetch
     // over their bulk channel (fleet-scale-networking task 11).
     virtual auto on_frame_notice(const proto::FrameNotice& /*notice*/) -> void {}
+    // One VPC's stream frame (a snapshot part or delta), signed once for
+    // every server; `frame` is its exact encoding, which helm forwards to
+    // the network roles unmodified. The default drops it.
+    virtual auto on_vpc_stream(const proto::VpcStream& /*stream*/,
+                               std::span<const std::byte> /*frame*/) -> void {}
 };
 
 enum class SessionError : std::uint8_t {

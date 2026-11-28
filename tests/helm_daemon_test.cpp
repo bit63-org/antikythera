@@ -50,6 +50,7 @@
 #include "proto/volume_layout.hpp"
 #include "proto/vpc_config.hpp"
 #include "test_support.hpp"
+#include "vpc_stream_support.hpp"
 #include "tls_test_support.hpp"
 
 namespace harbor = ak::harbor;
@@ -214,6 +215,17 @@ public:
         const std::scoped_lock lock{_mutex};
         _notices.emplace_back(notice.begin(), notice.end());
         return notice_status.load();
+    }
+    // fleet-scale-networking task 5: VPC stream frames, exactly as sent.
+    std::atomic<oar::Status> stream_status{oar::Status::ok};
+    [[nodiscard]] auto streams() const -> std::vector<std::vector<std::byte>> {
+        const std::scoped_lock lock{_mutex};
+        return _streams;
+    }
+    auto vpc_stream(std::span<const std::byte> frame) -> oar::Status override {
+        const std::scoped_lock lock{_mutex};
+        _streams.emplace_back(frame.begin(), frame.end());
+        return stream_status.load();
     }
     auto vtep_credential(std::span<const std::byte> frame) -> oar::Status override {
         if (!tunnel) {
@@ -451,6 +463,7 @@ private:
     std::vector<std::vector<std::byte>> _peer_sets;
     std::vector<std::vector<std::byte>> _credentials;
     std::vector<std::vector<std::byte>> _notices;
+    std::vector<std::vector<std::byte>> _streams;
     std::vector<std::vector<std::byte>> _revocation_lists;
     std::vector<oar::PrepareFunction> _prepared;
     std::vector<std::vector<std::byte>> _frames;
@@ -1857,6 +1870,36 @@ BOOST_AUTO_TEST_CASE(frame_notices_reach_network_roles_only) {
     BOOST_TEST(r.daemon.stats().frame_notices == 2U);
     BOOST_TEST(r.daemon.stats().frame_notices_refused == 1U);
     r.drain();
+}
+
+// fleet-scale-networking task 5: a VPC stream frame goes, unmodified and
+// in order, to every network role and to no other role; a refusal counts.
+BOOST_AUTO_TEST_CASE(vpc_streams_reach_network_roles_in_order) {
+    Rig r;
+    (void)r.daemon.boot();
+    std::vector<std::vector<std::byte>> frames;
+    for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+        auto d = ak::test::stream::delta(seq, seq);
+        // The second is big enough to cross in several chunks.
+        for (std::uint64_t i = 0; i < (seq == 2 ? 2000U : 1U); ++i) {
+            d.records.push_back(ak::test::stream::nic_binding(i + 1, 0, 1, 1));
+        }
+        auto frame = proto::encode_vpc_stream(d);
+        BOOST_REQUIRE(frame.has_value());
+        r.daemon.on_vpc_stream(d, *frame);
+        frames.push_back(std::move(*frame));
+    }
+    r.daemon.run_once(0ms);
+    r.drain();
+    BOOST_TEST((r.net.role.streams() == frames));
+    BOOST_TEST(r.daemon.stats().vpc_streams == 3U);
+    BOOST_TEST(r.daemon.stats().vpc_streams_refused == 0U);
+    r.net.role.stream_status = oar::Status::unsupported;
+    r.daemon.on_vpc_stream(proto::decode_vpc_stream(frames[0]).value(), frames[0]);
+    r.daemon.run_once(0ms);
+    r.drain();
+    BOOST_TEST(r.daemon.stats().vpc_streams == 4U);
+    BOOST_TEST(r.daemon.stats().vpc_streams_refused == 1U);
 }
 
 // fleet-scale-networking task 11 (Requirement 6.4): a lease grant reaches

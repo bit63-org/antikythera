@@ -4,6 +4,7 @@
 #include "helm/helm_daemon.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <utility>
 
 namespace ak::helm {
@@ -287,11 +288,15 @@ auto HelmDaemon::run_once(std::chrono::milliseconds wait) -> void {
     std::vector<Item> items;
     {
         std::unique_lock lock{_inbox_mutex};
-        if (_inbox.empty() && wait.count() > 0) {
+        if (_inbox.empty() && wait.count() > 0 && !bulk_pending()) {
             _inbox_ready.wait_for(lock, wait);
         }
         items.swap(_inbox);
     }
+    // Control first (keys, commands, credentials, leases: everything the
+    // inbox carries goes out now, or queues behind a bulk transfer of its
+    // own type), then status polls, then one chunk of each link's oldest
+    // bulk transfer (fleet-scale-networking Requirement 6.4).
     for (auto& item : items) {
         handle(item);
     }
@@ -311,8 +316,28 @@ auto HelmDaemon::run_once(std::chrono::milliseconds wait) -> void {
         }
         _next_identity = now() + _config.identity_interval;
     }
+    pump_bulk();
     _groups.poll();
     publish();
+}
+
+auto HelmDaemon::bulk_pending() const -> bool {
+    return std::ranges::any_of(
+        _slots, [](const auto& kv) { return kv.second->link && kv.second->link->bulk_pending(); });
+}
+
+auto HelmDaemon::pump_bulk() -> void {
+    std::uint64_t chunks = 0;
+    for (auto& [n, slot] : _slots) {
+        if (slot->link && slot->link->bulk_pending()) {
+            static_cast<void>(slot->link->pump_bulk());
+            ++chunks;
+        }
+    }
+    if (chunks != 0) {
+        const std::scoped_lock lock{_inbox_mutex};
+        _stats.bulk_chunks += chunks;
+    }
 }
 
 auto HelmDaemon::shutdown() -> void {
@@ -582,7 +607,8 @@ auto HelmDaemon::forward_vpc_config(VpcFrame& config) -> void {
     auto& frame = _vpc_configs.insert_or_assign(config.vni, std::move(config)).first->second;
     for (auto& [n, slot] : _slots) {
         if (is_net_role(*slot)) {
-            count_vpc_refusal(slot->link->vpc_config(frame.frame));
+            slot->link->send_frame(mctp::VendorType::vpc_config, frame.frame,
+                                   [this](const auto& r) { count_vpc_refusal(r); });
         }
     }
 }
@@ -591,6 +617,8 @@ auto HelmDaemon::replay_vpc_configs(SlotState& slot) -> void {
     if (!is_net_role(slot)) {
         return;
     }
+    // Replays on a new sideband go whole, before anything else: a
+    // restarted role holds its configuration before its first prepare.
     for (const auto& [vni, config] : _vpc_configs) {
         count_vpc_refusal(slot.link->vpc_config(config.frame));
     }
@@ -624,7 +652,8 @@ auto HelmDaemon::keep_metadata(MetadataFrame& metadata) -> void {
     }
     auto* slot = slot_state(home->second.slot);
     if (slot != nullptr && is_net_role(*slot)) {
-        count_metadata_refusal(slot->link->instance_metadata(frame.frame));
+        slot->link->send_frame(mctp::VendorType::instance_metadata, frame.frame,
+                               [this](const auto& r) { count_metadata_refusal(r); });
     }
 }
 
@@ -635,7 +664,8 @@ auto HelmDaemon::plug_metadata(SlotState& slot, oar::FunctionNumber fn, std::uin
     }
     _metadata_homes.insert_or_assign(nic_id, MetadataHome{.slot = slot.number, .fn = fn});
     if (const auto kept = _metadata.find(nic_id); kept != _metadata.end()) {
-        count_metadata_refusal(slot.link->instance_metadata(kept->second.frame));
+        slot.link->send_frame(mctp::VendorType::instance_metadata, kept->second.frame,
+                              [this](const auto& r) { count_metadata_refusal(r); });
     }
 }
 
@@ -792,16 +822,23 @@ auto HelmDaemon::keep_revocations(RevocationsFrame& list) -> void {
         return;
     }
     held = std::move(list);
-    bool refused = false;
+    {
+        const std::scoped_lock lock{_inbox_mutex};
+        ++_stats.credential_revocations;
+    }
+    // A list refused by any role counts once.
+    auto counted = std::make_shared<bool>(false);
     for (auto& [n, slot] : _slots) {
         if (is_net(*slot) && !slot->keys_pending) {
-            refused = !slot->link->credential_revocations(held.frame) || refused;
+            slot->link->send_frame(mctp::VendorType::credential_revocations, held.frame,
+                                   [this, counted](const auto& r) {
+                                       if (!r && !*counted) {
+                                           *counted = true;
+                                           const std::scoped_lock lock{_inbox_mutex};
+                                           ++_stats.credential_revocations_refused;
+                                       }
+                                   });
         }
-    }
-    const std::scoped_lock lock{_inbox_mutex};
-    ++_stats.credential_revocations;
-    if (refused) {
-        ++_stats.credential_revocations_refused;
     }
 }
 
@@ -810,7 +847,6 @@ auto HelmDaemon::send_credentials(SlotState& slot) -> void {
         return;
     }
     std::uint64_t credential_refused = 0;
-    std::uint64_t lists_refused = 0;
     const auto& vtep = slot.inventory->vtep;
     slot.credential_held.reset();
     if (const auto it = _credentials.find(vtep);
@@ -821,6 +857,8 @@ auto HelmDaemon::send_credentials(SlotState& slot) -> void {
             ++credential_refused;
         }
     }
+    // A new sideband: sent whole, like the other replays.
+    std::uint64_t lists_refused = 0;
     for (const auto& [cell, list] : _revocations) {
         if (!slot.link->credential_revocations(list.frame)) {
             ++lists_refused;
@@ -836,29 +874,42 @@ auto HelmDaemon::send_credentials(SlotState& slot) -> void {
 auto HelmDaemon::forward_peers(const PeersFrame& peers) -> void {
     // Kept even with no role for the VTEP attached yet: provision() hands
     // it over when the role's sideband opens.
-    bool forwarded = false;
-    bool refused = false;
+    // Counted once every role it went to has answered (a large set is a
+    // bulk transfer, so that can be a few passes later).
+    struct Outcome {
+        std::size_t pending{1};  // the loop below holds one until it is done
+        bool forwarded{false};
+        bool refused{false};
+    };
+    auto outcome = std::make_shared<Outcome>();
+    const auto settle = [this, outcome] {
+        if (--outcome->pending != 0) {
+            return;
+        }
+        const std::scoped_lock lock{_inbox_mutex};
+        if (outcome->refused) {
+            ++_stats.tunnel_peer_sets_refused;
+        } else if (outcome->forwarded) {
+            ++_stats.tunnel_peer_sets_forwarded;
+        } else {
+            ++_stats.tunnel_peer_sets_held;
+        }
+    };
     if (_keyring.store_peers(peers.peers, peers.frame) == PeersOutcome::stored) {
         for (auto& [n, slot] : _slots) {
             if (!is_net(*slot) || slot->keys_pending ||
                 !std::ranges::equal(slot->inventory->vtep, peers.peers.vtep)) {
                 continue;  // a role still waiting for its key gets the set with it
             }
-            if (slot->link->tunnel_peers(peers.frame)) {
-                forwarded = true;
-            } else {
-                refused = true;
-            }
+            ++outcome->pending;
+            slot->link->send_frame(mctp::VendorType::tunnel_peers, peers.frame,
+                                   [outcome, settle](const auto& r) {
+                                       (r ? outcome->forwarded : outcome->refused) = true;
+                                       settle();
+                                   });
         }
     }
-    const std::scoped_lock lock{_inbox_mutex};
-    if (refused) {
-        ++_stats.tunnel_peer_sets_refused;
-    } else if (forwarded) {
-        ++_stats.tunnel_peer_sets_forwarded;
-    } else {
-        ++_stats.tunnel_peer_sets_held;
-    }
+    settle();
 }
 
 auto HelmDaemon::rotate_tunnel_key(const proto::RotateVtepKey& request) -> void {
@@ -1110,7 +1161,8 @@ auto HelmDaemon::forward_layout(LayoutFrame& layout) -> void {
     const bool to_blk = layout.attached || was_attached;
     for (auto& [n, slot] : _slots) {
         if ((to_khold && is_khold(*slot)) || (to_blk && is_blk(*slot))) {
-            count_layout_refusal(slot->link->volume_layout(layout.frame));
+            slot->link->send_frame(mctp::VendorType::volume_layout, layout.frame,
+                                   [this](const auto& r) { count_layout_refusal(r); });
         }
     }
     if (!layout.member && !layout.attached) {
@@ -1151,25 +1203,44 @@ auto HelmDaemon::forward_self_test(const proto::SelfTest& request) -> void {
 }
 
 auto HelmDaemon::apply_map(MapFrame& map) -> void {
-    bool any = false;
-    bool all_ok = true;
+    // Applied once every network role has taken it; a large map is a bulk
+    // transfer, so that can be a few passes later.
+    struct Outcome {
+        std::size_t pending{1};  // the loop below holds one until it is done
+        bool any{false};
+        bool all_ok{true};
+        std::uint32_t vni{0};
+        std::uint64_t version{0};
+    };
+    auto outcome = std::make_shared<Outcome>();
+    outcome->vni = map.vni;
+    outcome->version = map.map_version;
+    const auto settle = [this, outcome] {
+        if (--outcome->pending != 0) {
+            return;
+        }
+        const bool applied = outcome->any && outcome->all_ok;
+        {
+            const std::scoped_lock lock{_inbox_mutex};
+            ++(applied ? _stats.maps_applied : _stats.maps_refused);
+        }
+        if (applied) {
+            _router.on_map_applied(outcome->vni, outcome->version);
+        }
+    };
     for (auto& [n, slot] : _slots) {
         if (!slot->link || !slot->inventory || slot->inventory->role != oar::Role::net) {
             continue;
         }
-        any = true;
-        if (!slot->link->map_update(map.frame)) {
-            all_ok = false;
-        }
+        outcome->any = true;
+        ++outcome->pending;
+        slot->link->send_frame(mctp::VendorType::map_update, map.frame,
+                               [outcome, settle](const auto& r) {
+                                   outcome->all_ok = outcome->all_ok && r.has_value();
+                                   settle();
+                               });
     }
-    const bool applied = any && all_ok;
-    {
-        const std::scoped_lock lock{_inbox_mutex};
-        ++(applied ? _stats.maps_applied : _stats.maps_refused);
-    }
-    if (applied) {
-        _router.on_map_applied(map.vni, map.map_version);
-    }
+    settle();
 }
 
 auto HelmDaemon::report(proto::ReportBody body) -> void {

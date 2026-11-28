@@ -688,6 +688,15 @@ struct Rig {
         return c;
     }
 
+    // Runs passes until no bulk transfer is queued: a multi-chunk frame
+    // goes one chunk per pass (fleet-scale-networking task 11).
+    auto drain() -> void {
+        for (int i = 0; i < 10000 && daemon.bulk_pending(); ++i) {
+            daemon.run_once(0ms);
+        }
+        BOOST_REQUIRE(!daemon.bulk_pending());
+    }
+
     template<typename T> [[nodiscard]] auto count() const -> std::size_t {
         return static_cast<std::size_t>(std::ranges::count_if(
             reports, [](const proto::ReportBody& b) { return std::holds_alternative<T>(b); }));
@@ -946,6 +955,8 @@ BOOST_AUTO_TEST_CASE(vpc_configs_reach_net_roles_and_follow_a_restart) {
     BOOST_REQUIRE(frame3.size() > 2 * oar::max_body_size);
     r.daemon.on_vpc_config(v3, frame3);
     r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.stats().vpc_configs_refused == 0U);  // one chunk per pass
+    r.drain();
     BOOST_TEST(r.daemon.stats().vpc_configs_refused == 1U);
     BOOST_TEST((r.net.role.vpc_configs().back() == frame3));
     r.net.role.vpc_status = oar::Status::ok;
@@ -1805,6 +1816,39 @@ auto revocations_frame(std::uint32_t cell, std::uint64_t version, std::size_t en
     return {.list = std::move(l), .frame = std::move(*bytes)};
 }
 
+// fleet-scale-networking task 11 (Requirement 6.4): a lease grant reaches
+// its role while a 131 KiB revocation list is still crossing to the
+// network role a chunk per pass, rather than after it.
+BOOST_AUTO_TEST_CASE(a_lease_grant_never_waits_behind_a_bulk_transfer) {
+    Rig r{link_timeout, nullptr, true};
+    r.net.role.tunnel = true;
+    (void)r.daemon.boot();
+    const auto [c2, f2] = hold_config(2);
+    r.daemon.on_replica_config(c2, f2);
+    r.daemon.run_once(0ms);
+    const auto big = revocations_frame(1, 1, 8192);
+    BOOST_REQUIRE(big.frame.size() > 128U * 1024U);
+    r.daemon.on_credential_revocations(big.list, big.frame);
+    r.daemon.run_once(0ms);
+    BOOST_TEST(r.daemon.bulk_pending());
+    BOOST_TEST(r.daemon.stats().bulk_chunks == 1U);
+
+    // The grant arrives mid-transfer and goes out on the next pass.
+    r.daemon.on_lease_grant({.server_id = server, .volume_id = 0x100, .epoch = 2});
+    r.daemon.run_once(0ms);
+    BOOST_REQUIRE(r.hold.role.grants().size() == 1U);
+    BOOST_TEST(r.net.role.revocation_lists().empty());
+    BOOST_TEST(r.daemon.bulk_pending());
+    BOOST_TEST(r.daemon.stats().bulk_chunks == 2U);
+
+    // The list still arrives whole, over many passes.
+    r.drain();
+    BOOST_REQUIRE(r.net.role.revocation_lists().size() == 1U);
+    BOOST_TEST((r.net.role.revocation_lists()[0] == big.frame));
+    BOOST_TEST(r.daemon.stats().bulk_chunks >= big.frame.size() / oar::max_map_chunk);
+    BOOST_TEST(r.daemon.stats().credential_revocations_refused == 0U);
+}
+
 BOOST_AUTO_TEST_CASE(net_roles_get_credentials_for_their_current_key) {
     constexpr std::uint64_t life = 86'400;
     const std::uint64_t t0 = wall_now.load();
@@ -1851,6 +1895,10 @@ BOOST_AUTO_TEST_CASE(net_roles_get_credentials_for_their_current_key) {
     r.daemon.on_credential_revocations(old_list.list, old_list.frame);
     r.daemon.on_credential_revocations(other_cell.list, other_cell.frame);
     r.daemon.run_once(0ms);
+    // The large list goes a chunk a pass, and the small one waits behind
+    // it: lists reach the role in the order helm took them.
+    BOOST_TEST(r.net.role.revocation_lists().empty());
+    r.drain();
     BOOST_REQUIRE(r.net.role.revocation_lists().size() == 2U);
     BOOST_TEST((r.net.role.revocation_lists()[0] == big.frame));
     BOOST_TEST((r.net.role.revocation_lists()[1] == other_cell.frame));

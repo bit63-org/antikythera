@@ -313,6 +313,9 @@ struct DaemonStats {
     std::uint64_t credential_revocations{0};          // lists kept: newer for their cell
     std::uint64_t credential_revocations_stale{0};    // not newer: dropped
     std::uint64_t credential_revocations_refused{0};  // a network role refused one
+    // OarLink scheduling (fleet-scale-networking task 11): chunks of bulk
+    // transfers sent, one per link per pass.
+    std::uint64_t bulk_chunks{0};
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -367,6 +370,9 @@ public:
     // The health a network role last reported (loop thread); empty for
     // other roles, or before the first answer.
     [[nodiscard]] auto role_health(SlotNumber slot) const -> std::optional<oar::Health>;
+    // Whether any link still has a bulk transfer queued; run_once does not
+    // wait for the inbox while one does.
+    [[nodiscard]] auto bulk_pending() const -> bool;
     [[nodiscard]] auto group_usage() const noexcept -> const GroupUsageStats& {
         return _groups.stats();
     }
@@ -561,6 +567,8 @@ private:
     auto enqueue(Item item) -> void;
     auto handle(Item& item) -> void;
     auto apply_map(MapFrame& map) -> void;
+    // One chunk of each link's oldest bulk transfer.
+    auto pump_bulk() -> void;
     // VPC configs: kept per VNI, to every attached net role (with or
     // without a VTEP).
     [[nodiscard]] static auto is_net_role(const SlotState& slot) -> bool;

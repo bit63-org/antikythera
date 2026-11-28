@@ -355,6 +355,7 @@ auto role_usage() -> int {
     std::println(stderr,
                  "usage: {} {} ADDR {} N {} N [{} N] {} ID:HEX [...] {} PATH {} A {} A {} E {} E "
                  "{} SOCKET [...] [{} P] [{} N] [{} IFINDEX] [{} TUN]\n"
+                 "       [--serial TEXT [--firmware TEXT]]\n"
                  "   or: {} {} PATH {} ID {} MAC ({} N | {} N [{} N]) [{} IFNAME]",
                  role_log, arg_vtep, arg_server_id, arg_underlay_mtu, arg_tunnel_overhead,
                  arg_controller_key, arg_sideband, arg_addr, arg_helm_addr, arg_eid, arg_helm_eid,
@@ -428,7 +429,9 @@ struct RoleOptions {
     std::uint64_t port{net::geneve::udp_port};
     std::uint64_t source_ports{0};
     std::uint64_t scope{0};
-    std::optional<std::string> metadata;  // the TUN's name
+    std::optional<std::string> metadata;   // the TUN's name
+    ak::helm::oar::RoleIdentity identity;  // --serial, --firmware, --drive-serial
+    bool has_identity{false};
 };
 
 auto parse_role(int argc, char** argv) -> std::optional<RoleOptions> {
@@ -484,9 +487,19 @@ auto parse_role(int argc, char** argv) -> std::optional<RoleOptions> {
                 return std::nullopt;
             }
             o.metadata = value;
+        } else if (const auto taken =
+                       ak::helm::oar::parse_identity_option(arg, value, o.identity)) {
+            if (!*taken) {
+                return std::nullopt;
+            }
+            o.has_identity = true;
         } else {
             return std::nullopt;
         }
+    }
+    // An identity needs at least --serial.
+    if (o.has_identity && !ak::helm::oar::valid_role_identity(o.identity)) {
+        return std::nullopt;
     }
     if (!o.vtep || !o.server_id || *o.server_id == 0 || !o.underlay_mtu || o.keys.empty() ||
         o.sideband.empty() || !o.addr || !o.helm_addr || !o.eid || !o.helm_eid ||
@@ -612,6 +625,9 @@ auto run_role(const RoleOptions& opts) -> int {
     if (!role) {
         std::println(stderr, "{}: {}", role_log, role.error());
         return EXIT_FAILURE;
+    }
+    if (opts.has_identity) {
+        (*role)->set_identity(opts.identity);
     }
 
     remove_stale_socket(opts.sideband);

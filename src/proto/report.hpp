@@ -566,13 +566,16 @@ enum class ExitReason : std::uint8_t {
     vmm_failure = 3,
 };
 
-// helm::mailbox::FaultCode.
+// helm::mailbox::FaultCode, and codes only helm raises after them.
 enum class FaultCode : std::uint16_t {
     iommu_fault = 1,
     machine_check = 2,
     agent_restarted = 3,
     device_lost = 4,
     resources_exhausted = 5,
+    // helm's: the hardware identity differs from the one recorded at
+    // enrollment (.kiro/specs/server-provisioning/ Requirement 6.2)
+    hardware_changed = 6,
 };
 
 struct InventoryFunction {
@@ -1004,7 +1007,7 @@ namespace detail {
     return r >= ExitReason::guest_shutdown && r <= ExitReason::vmm_failure;
 }
 [[nodiscard]] constexpr auto known(FaultCode c) noexcept -> bool {
-    return c >= FaultCode::iommu_fault && c <= FaultCode::resources_exhausted;
+    return c >= FaultCode::iommu_fault && c <= FaultCode::hardware_changed;
 }
 [[nodiscard]] constexpr auto known(ReplicaState s) noexcept -> bool {
     return s >= ReplicaState::in_sync && s <= ReplicaState::stale;

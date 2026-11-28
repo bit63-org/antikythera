@@ -66,6 +66,7 @@
 //                          attaching khold volumes (kythira khold-block-service
 //                          Requirement 11.5) or a khold role serving them
 //   self_test           (empty)
+//   role_identity       (empty)
 //   instance_secrets    0  total u32 | 4  offset u32 | 8  chunk (as map_update): one
 //                          InstanceSecrets frame (below), for the net role
 //   group_membership    0  cursor u16 | 2  flags u16 (bit 0: `since` is set)
@@ -216,6 +217,11 @@
 //   cert_request        2  role u8 (Role: blk, hold or khold) | 3  reserved u8 | 4  csr_len u16
 //                       6  csr [csr_len] (0..max_csr bytes)
 //   eject               2  state u8 (EjectState) | 3  reserved u8
+//   role_identity       2  reserved u16 | 4  count u16 | 6  reserved u16
+//                       8  serial [32] | 40 firmware [32] (proto::IdentityText:
+//                          printable ASCII, zero-padded; serial non-empty)
+//                       72 count x { serial [32] (non-empty) | size_bytes u64 (non-zero) },
+//                          at most max_role_drives, strictly increasing serial
 //   copy_volume         2  state u8 (CopyVolumeState) | 3  failure u8 (CopyVolumeFailure)
 //                       4  reserved [6] | 10 total_bytes u64 | 18 done_bytes u64
 //                       26 written_bytes u64 (done, written <= total)
@@ -250,6 +256,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -258,6 +265,7 @@
 #include "helm/mctp.hpp"
 #include "helm/scoped_key.hpp"
 #include "helm/secure_element.hpp"
+#include "proto/report.hpp"
 #include "proto/standing_set.hpp"
 
 namespace ak::helm::oar {
@@ -501,6 +509,7 @@ enum class BodyError : std::uint8_t {
     bad_csr,            // a certificate request longer than max_csr
     bad_group,          // a membership's family is not 4 or 6, or an IPv4 group has a tail
     bad_secret,         // a secret name invalid or out of order, or a value empty or too long
+    bad_text,           // an identity text not printable ASCII, or a required one empty
 };
 
 [[nodiscard]] auto to_string(BodyError e) noexcept -> const char*;
@@ -1027,6 +1036,43 @@ struct InstanceSecrets {
     -> std::expected<InstanceSecrets, BodyError>;
 // Wipes every value and empties the list.
 auto wipe(InstanceSecrets& s) noexcept -> void;
+
+// A board's identity (.kiro/specs/server-provisioning/ Requirement 6.1):
+// its serial and firmware, and for a storage role each drive it serves.
+// helm puts them in its hardware_identity report.
+inline constexpr std::size_t role_identity_fixed_size = 6 + (2 * proto::identity_text_size);
+inline constexpr std::size_t role_drive_size = proto::identity_text_size + 8;
+inline constexpr std::size_t max_role_drives = proto::max_identity_drives;
+
+struct RoleDrive {
+    proto::IdentityText serial{};
+    std::uint64_t size_bytes{0};
+    friend auto operator==(const RoleDrive&, const RoleDrive&) -> bool = default;
+};
+
+struct RoleIdentity {
+    proto::IdentityText serial{};
+    proto::IdentityText firmware{};
+    std::vector<RoleDrive> drives;  // strictly increasing serial
+    friend auto operator==(const RoleIdentity&, const RoleIdentity&) -> bool = default;
+};
+
+[[nodiscard]] auto encode_role_identity(const RoleIdentity& identity)
+    -> std::expected<std::vector<std::byte>, BodyError>;
+[[nodiscard]] auto decode_role_identity(std::span<const std::byte> body)
+    -> std::expected<RoleIdentity, BodyError>;
+
+// A role process's identity options, shared by every role's command line:
+//   --serial TEXT         the board's serial (required for an identity)
+//   --firmware TEXT       its firmware version
+//   --drive-serial SERIAL:BYTES  a drive the role serves (repeatable)
+// Empty when `flag` is none of them; false when its value is bad; true
+// when it was taken into `out`.
+[[nodiscard]] auto parse_identity_option(std::string_view flag, std::string_view value,
+                                         RoleIdentity& out) -> std::optional<bool>;
+// An identity a role can answer with: a serial, valid text, drives in
+// serial order (what parse_identity_option builds once --serial is given).
+[[nodiscard]] auto valid_role_identity(const RoleIdentity& identity) -> bool;
 
 [[nodiscard]] auto encode_health(const Health& h)
     -> std::expected<std::vector<std::byte>, BodyError>;

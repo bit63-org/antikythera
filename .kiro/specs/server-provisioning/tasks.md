@@ -52,8 +52,27 @@ and 16 there). Each task is one PR unless noted.
     clearing, persisted resume
   - _Requirements: 5.1-5.5_
 
-- [ ] 6. Hardware identity report
+- [x] 6. Hardware identity report
   - _Requirements: 6.1-6.2_
+  - Built: `HardwareIdentityTracker` (`src/helm/hardware_identity.hpp`)
+    and the sideband `role_identity` request (oar vendor type 0x20).
+    Each role process takes `--serial`, `--firmware` and (storage roles)
+    `--drive-serial SERIAL:BYTES` and answers with them; one without
+    answers `unsupported` and is left out of the report. ak-helm's
+    `board-serial` / `board-firmware` directives turn the report on.
+    helm sends `hardware_identity` when the identity changes (first at
+    start) and a `hardware_changed` host fault (fault code 6) when it
+    differs from the baseline. The baseline is the first report taken
+    once every slot has answered, kept in the sealed store as
+    `helm.identity-baseline` and dropped by a rolled-back or degraded
+    store. Host facts from hull complete the baseline rather than change
+    it. Until then the report says they are absent, and only the rest is
+    compared.
+  - Left: hull reporting Secure Boot, IOMMU, memory and CPUs to helm
+    (`HardwareIdentityTracker::set_host`; hull has no mailbox event for
+    them yet); the EK hash is the secure element's transport key until
+    task 2 brings the TPM's; enrollment and decommission
+    (`clear_baseline`) resetting the baseline are tasks 2 and 5.
 
 - [ ] 7. Harbor lifecycle run (Clark's go, on tikhov)
   - _Requirements: 7.3_

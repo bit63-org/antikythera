@@ -167,6 +167,7 @@
 #include "helm/key_store.hpp"
 #include "helm/mailbox.hpp"
 #include "helm/oar_link.hpp"
+#include "helm/hardware_identity.hpp"
 #include "helm/host_boot.hpp"
 #include "helm/image_cache.hpp"
 #include "helm/power_on.hpp"
@@ -239,6 +240,12 @@ struct DaemonConfig {
     // alone with the controller present (host_power; server-provisioning
     // Requirement 3.1). Null: they are refused. Not owned.
     const RecordVerifier* controller_keys{nullptr};
+    // The hardware identity (server-provisioning Requirement 6): each
+    // slot's role is asked for its board identity when its sideband
+    // opens, and a hardware_identity report goes out whenever the identity
+    // changes, with a hardware_changed host fault when it no longer
+    // matches the enrollment baseline. Null: no identity reports. Not owned.
+    HardwareIdentityTracker* identity{nullptr};
     // Keeps the controller's boot_image assignment (cold-start Requirement
     // 2.1). Null: boot_image records are dropped and counted. Not owned.
     BootImageKeeper* boot_images{nullptr};
@@ -333,6 +340,10 @@ struct DaemonStats {
     // host_power records (server-provisioning Requirement 3).
     std::uint64_t host_power{0};          // applied
     std::uint64_t host_power_refused{0};  // unsigned, stale, VMs running, or the backplane failed
+    // Hardware identity (server-provisioning Requirement 6).
+    std::uint64_t identity_reports{0};   // hardware_identity reports sent
+    std::uint64_t hardware_changes{0};   // reports that differed from the baseline
+    std::uint64_t identity_failures{0};  // a role's identity could not be read (not unsupported)
 };
 
 class HelmDaemon final : public ControllerSink, public ReportSink, public SequencerObserver {
@@ -583,6 +594,8 @@ private:
         std::unique_ptr<OarLink> link;  // set while attached
         std::optional<oar::Inventory> inventory;
         bool pending{false};  // link-ready, attach failed: retried on check
+        // The role has answered (or refused) role_identity at least once.
+        bool identity_read{false};
         // The certificate request last reported for this slot, and when.
         std::vector<std::byte> reported_csr;
         Clock::time_point reported_at{};
@@ -635,6 +648,10 @@ private:
     auto watch_host_start() -> void;
     // The agent came up, or its time ran out: the fallback (once).
     auto check_host_start() -> void;
+    // Asks a slot's role for its board identity (server-provisioning 6.1).
+    auto read_identity(SlotState& slot) -> void;
+    // Sends a hardware_identity report when the identity changed.
+    auto report_identity() -> void;
     // A host_power record: verified, sequenced, applied, reported.
     auto apply_host_power(const proto::HostPower& order, std::span<const std::byte> frame)
         -> proto::CommandStatus;

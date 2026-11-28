@@ -178,6 +178,23 @@ BOOST_AUTO_TEST_CASE(boot_function_directives_parse) {
     BOOST_TEST(contains(error_of(base + "host-start-timeout-ms 0\n"), "bad milliseconds"));
 }
 
+// server-provisioning Requirement 6: the board's own identity.
+BOOST_AUTO_TEST_CASE(board_identity_directives) {
+    const auto plain = helm::parse_helm_config(base);
+    BOOST_REQUIRE(plain.has_value());
+    BOOST_TEST(plain->board_serial.empty());  // no identity reported
+
+    auto c = helm::parse_helm_config(base + "board-serial HELM-0042\nboard-firmware 1.4.2\n");
+    BOOST_REQUIRE_MESSAGE(c.has_value(), (c ? std::string{} : c.error()));
+    BOOST_TEST(c->board_serial == "HELM-0042");
+    BOOST_TEST(c->board_firmware == "1.4.2");
+
+    BOOST_TEST(
+        contains(error_of(base + "board-firmware 1.0\n"), "board-firmware without board-serial"));
+    BOOST_TEST(contains(error_of(base + "board-serial " + std::string(33, 'x') + "\n"),
+                        "at most 32 printable"));
+}
+
 BOOST_AUTO_TEST_CASE(ipv6_controllers_use_brackets) {
     std::string text = base;
     text.replace(text.find("10.0.0.1:7443"), std::string_view{"10.0.0.1:7443"}.size(),

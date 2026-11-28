@@ -206,6 +206,9 @@ public:
     // Asks a khold role to run its storage self-test; the results come
     // back as a capacity report through hold_reports.
     auto self_test() -> std::expected<void, LinkError>;
+    // The board's serial, firmware and drives (server-provisioning
+    // Requirement 6.1); unsupported from a role that has none configured.
+    auto role_identity() -> std::expected<oar::RoleIdentity, LinkError>;
 
     [[nodiscard]] auto stats() const noexcept -> const LinkStats& { return _stats; }
 
@@ -251,6 +254,15 @@ public:
     // A whole, reassembled MapUpdate frame, not yet decoded or verified.
     virtual auto map_update(std::span<const std::byte> frame) -> oar::Status = 0;
     virtual auto health() -> std::expected<oar::Health, oar::Status> = 0;
+    // The board's identity: the one set_identity() gave (a role process's
+    // --serial, --firmware and --drive options), else unsupported.
+    virtual auto role_identity() -> std::expected<oar::RoleIdentity, oar::Status> {
+        if (!_identity) {
+            return std::unexpected(oar::Status::unsupported);
+        }
+        return *_identity;
+    }
+    auto set_identity(oar::RoleIdentity identity) -> void { _identity = std::move(identity); }
     // The volume store, which only the storage role keeps; every other
     // role answers unsupported. request.wrapped_key is valid only during
     // the call.
@@ -365,6 +377,9 @@ public:
         -> std::expected<oar::CopyAnswer, oar::Status> {
         return std::unexpected(oar::Status::unsupported);
     }
+
+private:
+    std::optional<oar::RoleIdentity> _identity;
 };
 
 class OarEndpoint {

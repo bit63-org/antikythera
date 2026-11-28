@@ -11,6 +11,7 @@
 
 #include "helm/mctp.hpp"
 #include "helm/sealed_store.hpp"
+#include "proto/report.hpp"
 
 namespace ak::helm {
 
@@ -19,6 +20,13 @@ namespace {
 constexpr int hex_base = 16;
 constexpr int dec_base = 10;
 constexpr std::size_t slot_fixed_words = 7;  // slot N SOCKET ADDR PEER EID PEER_EID
+
+// A non-empty identity text field: at most identity_text_size printable
+// characters.
+auto identity_text_ok(std::string_view v) -> bool {
+    return !v.empty() && v.size() <= proto::identity_text_size &&
+           proto::detail::valid_text(proto::identity_text(v));
+}
 
 auto split(std::string_view line) -> std::vector<std::string_view> {
     if (const auto hash = line.find('#'); hash != std::string_view::npos) {
@@ -147,6 +155,9 @@ public:
         if (_config.boot_function && !_config.store) {
             return std::unexpected("boot-function without store");
         }
+        if (!_config.board_firmware.empty() && _config.board_serial.empty()) {
+            return std::unexpected("board-firmware without board-serial");
+        }
         if (_config.boot_layer && !_config.boot_function) {
             return std::unexpected("boot-layer without boot-function");
         }
@@ -224,6 +235,11 @@ private:
             _config.boot_layer = std::filesystem::path{value};
         } else if (name == "host-start-timeout-ms") {
             return millis(value, _config.host_start_timeout);
+        } else if (name == "board-serial" || name == "board-firmware") {
+            if (!identity_text_ok(value)) {
+                return fail(std::string{name} + " must be at most 32 printable characters");
+            }
+            (name == "board-serial" ? _config.board_serial : _config.board_firmware) = value;
         } else if (name == "power-on-policy") {
             if (value != "apply" && value != "skip") {
                 return fail("power-on-policy must be apply or skip");

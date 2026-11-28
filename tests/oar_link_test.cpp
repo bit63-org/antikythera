@@ -887,6 +887,28 @@ BOOST_AUTO_TEST_CASE(volume_layouts_are_forwarded_in_chunks) {
     BOOST_TEST((refused.error().status == oar::Status::unsupported));
 }
 
+BOOST_AUTO_TEST_CASE(role_identity_is_answered_once_set) {
+    auto [helm_b, oar_b] = InProcessBinding::make_pair();
+    FakeOar role;
+    OarEndpoint endpoint{*oar_b, oar_config()};
+    OarLink link{*helm_b, config()};
+    const Server server{endpoint, role};
+    // No identity configured: unsupported, which helm leaves out.
+    const auto none = link.role_identity();
+    BOOST_REQUIRE(!none.has_value());
+    BOOST_TEST((none.error().code == LinkErrc::refused));
+    BOOST_TEST((none.error().status == oar::Status::unsupported));
+
+    oar::RoleIdentity id{.serial = ak::proto::identity_text("NET-0"),
+                         .firmware = ak::proto::identity_text("fw"),
+                         .drives = {}};
+    id.drives.push_back({.serial = ak::proto::identity_text("D-1"), .size_bytes = 1U << 20});
+    role.set_identity(id);
+    const auto got = link.role_identity();
+    BOOST_REQUIRE(got.has_value());
+    BOOST_TEST((*got == id));
+}
+
 BOOST_AUTO_TEST_CASE(instance_metadata_is_forwarded_in_chunks) {
     auto [helm_b, oar_b] = InProcessBinding::make_pair();
     MeterRole role;

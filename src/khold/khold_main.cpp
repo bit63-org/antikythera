@@ -99,6 +99,8 @@ struct Options {
     std::string link_if;
     std::uint32_t link_mbps{0};
     std::vector<std::string> node;
+    ak::helm::oar::RoleIdentity identity;  // --serial, --firmware, --drive-serial
+    bool has_identity{false};
 };
 
 constexpr std::uint64_t max_bus_addr = 0x7F;
@@ -107,14 +109,16 @@ constexpr std::size_t key_hex_digits = 2 * ak::hull::ed25519_public_key_size;
 constexpr int base_hex = 16;
 
 auto usage() -> int {
-    std::println(stderr,
-                 "usage: ak-khold --server-id N --address IP --run-dir DIR\n"
-                 "                --ca FILE --cert FILE --key FILE\n"
-                 "                --sideband PATH --addr A --helm-addr A --eid E --helm-eid E\n"
-                 "                --controller-key ID:HEX [--controller-key ID:HEX ...]\n"
-                 "                --drive N:DIR [--drive N:DIR ...]\n"
-                 "                [--link-if IF | --link-mbps M]\n"
-                 "                -- NODE [NODE-ARGS ...]");
+    std::println(
+        stderr,
+        "usage: ak-khold --server-id N --address IP --run-dir DIR\n"
+        "                --ca FILE --cert FILE --key FILE\n"
+        "                --sideband PATH --addr A --helm-addr A --eid E --helm-eid E\n"
+        "                --controller-key ID:HEX [--controller-key ID:HEX ...]\n"
+        "                --drive N:DIR [--drive N:DIR ...]\n"
+        "                [--link-if IF | --link-mbps M]\n"
+        "                [--serial TEXT [--firmware TEXT] [--drive-serial SERIAL:BYTES ...]]\n"
+        "                -- NODE [NODE-ARGS ...]");
     return 2;
 }
 
@@ -252,9 +256,19 @@ auto parse(int argc, char** argv) -> std::optional<Options> {
                 return std::nullopt;
             }
             o.link_mbps = static_cast<std::uint32_t>(*m);
+        } else if (const auto taken =
+                       ak::helm::oar::parse_identity_option(flag, value, o.identity)) {
+            if (!*taken) {
+                return std::nullopt;
+            }
+            o.has_identity = true;
         } else {
             return std::nullopt;
         }
+    }
+    // An identity needs at least --serial.
+    if (o.has_identity && !ak::helm::oar::valid_role_identity(o.identity)) {
+        return std::nullopt;
     }
     for (; i < args.size(); ++i) {
         o.node.emplace_back(args[i]);
@@ -378,6 +392,9 @@ auto main(int argc, char** argv) -> int {
         [verifier](std::span<const std::byte> msg, std::span<const std::byte, 64> sig,
                    std::uint16_t key_id) { return verifier->verify(msg, sig, key_id).has_value(); },
         random_seq(), [test] { return ak::khold::run_self_test(test); }};
+    if (opts->has_identity) {
+        role.set_identity(opts->identity);
+    }
     ak::helm::RoleEnrollment enrollment{identity, ak::helm::oar::Role::khold, ak::tls::Role::server,
                                         [&node](const ak::tls::Config& /*cfg*/) {
                                             node.reload();  // the node reads the new files

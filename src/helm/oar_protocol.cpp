@@ -4,6 +4,8 @@
 #include "helm/oar_protocol.hpp"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <tuple>
 #include <utility>
 
@@ -1693,6 +1695,8 @@ auto to_string(BodyError e) noexcept -> const char* {
             return "bad_group";
         case BodyError::bad_secret:
             return "bad_secret";
+        case BodyError::bad_text:
+            return "bad_text";
         case BodyError::status_with_body:
             return "status_with_body";
     }
@@ -1806,6 +1810,149 @@ auto wipe(InstanceSecrets& s) noexcept -> void {
         secure_zero(e.value);
     }
     s.secrets.clear();
+}
+
+// ---- Role identity ----------------------------------------------------------
+
+namespace {
+
+auto check_role_identity(const RoleIdentity& id) -> std::expected<void, BodyError> {
+    if (!proto::detail::valid_text(id.serial) || proto::detail::empty_text(id.serial) ||
+        !proto::detail::valid_text(id.firmware)) {
+        return std::unexpected(BodyError::bad_text);
+    }
+    if (id.drives.size() > max_role_drives) {
+        return std::unexpected(BodyError::too_many_entries);
+    }
+    for (std::size_t i = 0; i < id.drives.size(); ++i) {
+        const auto& d = id.drives[i];
+        if (!proto::detail::valid_text(d.serial) || proto::detail::empty_text(d.serial)) {
+            return std::unexpected(BodyError::bad_text);
+        }
+        if (d.size_bytes == 0) {
+            return std::unexpected(BodyError::bad_geometry);
+        }
+        if (i > 0 && id.drives[i - 1].serial >= d.serial) {
+            return std::unexpected(BodyError::not_increasing);
+        }
+    }
+    return {};
+}
+
+auto read_text(wire::Reader& r) -> proto::IdentityText {
+    proto::IdentityText t{};
+    const auto bytes = r.bytes(t.size()).value_or(std::span<const std::byte>{});
+    std::ranges::transform(bytes, t.begin(), [](std::byte b) { return static_cast<char>(b); });
+    return t;
+}
+
+auto write_text(wire::Writer& w, const proto::IdentityText& t) -> void {
+    std::array<std::byte, proto::identity_text_size> bytes{};
+    std::ranges::transform(t, bytes.begin(), [](char c) { return static_cast<std::byte>(c); });
+    w.bytes(bytes);
+}
+
+}  // namespace
+
+auto encode_role_identity(const RoleIdentity& identity)
+    -> std::expected<std::vector<std::byte>, BodyError> {
+    if (auto ok = check_role_identity(identity); !ok) {
+        return std::unexpected(ok.error());
+    }
+    std::vector<std::byte> out;
+    out.reserve(role_identity_fixed_size + (identity.drives.size() * role_drive_size));
+    wire::Writer w{out};
+    w.le16(0);
+    w.le16(static_cast<std::uint16_t>(identity.drives.size()));
+    w.le16(0);
+    write_text(w, identity.serial);
+    write_text(w, identity.firmware);
+    for (const auto& d : identity.drives) {
+        write_text(w, d.serial);
+        w.le64(d.size_bytes);
+    }
+    return out;
+}
+
+auto decode_role_identity(std::span<const std::byte> body)
+    -> std::expected<RoleIdentity, BodyError> {
+    if (body.size() < role_identity_fixed_size) {
+        return std::unexpected(BodyError::truncated);
+    }
+    wire::Reader r{body};
+    const auto reserved1 = r.le16().value_or(0);
+    const auto count = r.le16().value_or(0);
+    const auto reserved2 = r.le16().value_or(0);
+    if (reserved1 != 0 || reserved2 != 0) {
+        return std::unexpected(BodyError::reserved_not_zero);
+    }
+    if (count > max_role_drives) {
+        return std::unexpected(BodyError::too_many_entries);
+    }
+    const auto want = role_identity_fixed_size + (std::size_t{count} * role_drive_size);
+    if (body.size() < want) {
+        return std::unexpected(BodyError::truncated);
+    }
+    if (body.size() > want) {
+        return std::unexpected(BodyError::trailing_bytes);
+    }
+    RoleIdentity id;
+    id.serial = read_text(r);
+    id.firmware = read_text(r);
+    id.drives.resize(count);
+    for (auto& d : id.drives) {
+        d.serial = read_text(r);
+        d.size_bytes = r.le64().value_or(0);
+    }
+    if (auto ok = check_role_identity(id); !ok) {
+        return std::unexpected(ok.error());
+    }
+    return id;
+}
+
+auto parse_identity_option(std::string_view flag, std::string_view value, RoleIdentity& out)
+    -> std::optional<bool> {
+    const auto text = [](std::string_view v, proto::IdentityText& t) {
+        if (v.size() > proto::identity_text_size) {
+            return false;
+        }
+        t = proto::identity_text(v);
+        return proto::detail::valid_text(t);
+    };
+    if (flag == "--serial") {
+        return text(value, out.serial) && !proto::detail::empty_text(out.serial);
+    }
+    if (flag == "--firmware") {
+        return text(value, out.firmware);
+    }
+    if (flag == "--drive-serial") {
+        const auto colon = value.rfind(':');
+        if (colon == std::string_view::npos) {
+            return false;
+        }
+        RoleDrive d;
+        const auto size = value.substr(colon + 1);
+        const auto [p, ec] = std::from_chars(size.data(), size.data() + size.size(), d.size_bytes);
+        if (ec != std::errc{} || p != size.data() + size.size() || d.size_bytes == 0 ||
+            !text(value.substr(0, colon), d.serial) || proto::detail::empty_text(d.serial)) {
+            return false;
+        }
+        // Kept in serial order, as the response needs them.
+        const auto at = std::ranges::lower_bound(out.drives, d.serial, {}, &RoleDrive::serial);
+        if (at != out.drives.end() && at->serial == d.serial) {
+            return false;
+        }
+        if (out.drives.size() >= max_role_drives) {
+            return false;
+        }
+        out.drives.insert(at, d);
+        return true;
+    }
+    return std::nullopt;
+}
+
+auto valid_role_identity(const RoleIdentity& identity) -> bool {
+    return check_role_identity(identity).has_value();
 }
 
 }  // namespace ak::helm::oar

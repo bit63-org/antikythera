@@ -52,6 +52,7 @@
 #include "helm/helm_daemon.hpp"
 #include "helm/key_store.hpp"
 #include "helm/power_on.hpp"
+#include "helm/standing_set_keeper.hpp"
 #include "helm/power_sequencer.hpp"
 #include "helm/sealed_store.hpp"
 #include "helm/secure_element.hpp"
@@ -259,6 +260,15 @@ auto run(const helm::HelmConfig& cfg) -> int {
         std::println(stderr, "{}: stored power policy: {}", log_name, helm::to_string(loaded));
     }
     daemon_config.power_policy = &power_policy;
+    // The standing set (cold-start Requirement 4): the pinned instances
+    // helm starts after its power returns, with no controller.
+    helm::StandingSetKeeper standing_set{cfg.server_id, store ? &*store : nullptr, anchor.get(),
+                                         verifier.get()};
+    if (const auto v = standing_set.load();
+        v != helm::StandingVerdict::kept && v != helm::StandingVerdict::none) {
+        std::println(stderr, "{}: stored standing set: {}", log_name, helm::to_string(v));
+    }
+    daemon_config.standing_set = &standing_set;
     // The time floor (cold-start Requirement 7): the newest stored, raised
     // by the stored policy's; certificates are checked against
     // max(RTC, floor).
@@ -268,6 +278,9 @@ auto run(const helm::HelmConfig& cfg) -> int {
     }
     if (power_policy.from_record()) {
         (void)time_floor.observe(power_policy.current().time_floor);
+    }
+    if (standing_set.current()) {
+        (void)time_floor.observe(standing_set.current()->time_floor);
     }
     const auto started_at = helm::TimeFloor::rtc_now();
     const bool rtc_below_floor = !time_floor.rtc_trusted(started_at);
@@ -289,24 +302,17 @@ auto run(const helm::HelmConfig& cfg) -> int {
                             helm::HostPowerOverride::none, helm::draw_jitter(policy.max_jitter_ms));
 
     // The boot cache's state behind every inventory (cold-start Requirement
-    // 8.2). The standing set (task 6) does not exist yet, so its
-    // generation is the anchor's counter as it stands; the LKG and previous
-    // images (task 4) are none.
-    std::uint64_t standing_generation = 0;
-    if (anchor) {
-        if (auto g = anchor->counter(helm::Counter::standing_generation); g) {
-            standing_generation = *g;
-        }
-    }
-    daemon_config.boot_cache = [&power_policy, &store, standing_generation] {
-        return helm::make_boot_cache({}, standing_generation, power_policy,
+    // 8.2). The LKG and previous images (task 4) are none.
+    daemon_config.boot_cache = [&power_policy, &standing_set, &store] {
+        return helm::make_boot_cache({}, standing_set.generation(), power_policy,
                                      store ? &*store : nullptr);
     };
     // After the power-on wait: one cold_start report per power return
     // (Requirement 8.1), queued so it goes out on the first connection.
     std::unique_ptr<helm::ControllerLink> link;
+    helm::HelmDaemon* daemon_ptr = nullptr;  // set once the daemon exists
     const bool power_returned = returned.value_or(true);
-    daemon_config.on_boot = [&link, &time_floor, &store, power_returned, started_at,
+    daemon_config.on_boot = [&link, &daemon_ptr, &time_floor, &store, power_returned, started_at,
                              rtc_below_floor, waited = plan.wait](const helm::BootResult& booted) {
         std::println(stderr, "{}: boot: {} slot(s) ready, {} faulted, host {}", log_name,
                      booted.ready.size(), booted.faulted.size(),
@@ -314,15 +320,29 @@ auto run(const helm::HelmConfig& cfg) -> int {
         if (!power_returned || !link) {
             return;
         }
-        // hull comes from the boot layer until the boot cache exists (task
-        // 4); standing starts arrive with the standing set (task 6).
-        (void)link->report(helm::make_cold_start({.power_return_time = started_at,
-                                                  .time_floor = time_floor.floor(),
-                                                  .waited = waited,
-                                                  .boot_source = ak::proto::BootSource::netboot,
-                                                  .rtc_below_floor = rtc_below_floor,
-                                                  .standing = {}},
-                                                 store ? &*store : nullptr));
+        // hull comes from the boot layer until the boot cache exists (task 4).
+        auto send = [&link, &time_floor, &store, started_at, rtc_below_floor,
+                     waited](std::vector<ak::proto::StandingStartResult> standing) {
+            (void)link->report(helm::make_cold_start({.power_return_time = started_at,
+                                                      .time_floor = time_floor.floor(),
+                                                      .waited = waited,
+                                                      .boot_source = ak::proto::BootSource::netboot,
+                                                      .rtc_below_floor = rtc_below_floor,
+                                                      .standing = std::move(standing)},
+                                                     store ? &*store : nullptr));
+        };
+        // Standing starts go before any envelope (Requirement 4.4); the
+        // report waits for their first round, so it lists every one.
+        const bool standing =
+            daemon_ptr != nullptr &&
+            daemon_ptr->expect_standing([send](const std::vector<helm::StandingAttempt>& round) {
+                std::println(stderr, "{}: standing starts: {} instance(s) tried", log_name,
+                             round.size());
+                send(helm::standing_results(round));
+            });
+        if (!standing) {
+            send({});
+        }
     };
 
     DetachedHostPort host;
@@ -347,6 +367,8 @@ auto run(const helm::HelmConfig& cfg) -> int {
                 (void)link->report(std::move(body));
             }
         }};
+
+    daemon_ptr = &daemon;
 
     helm::ControllerSession session{cfg.server_id, *boot_id,
                                     [&daemon] { return daemon.inventory(); }, daemon};

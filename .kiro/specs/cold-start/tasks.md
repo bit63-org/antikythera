@@ -34,7 +34,7 @@ and `helm-control-plane`. Pairs with kythira's
     defaults with no policy
   - _Requirements: 3.1-3.6_
 
-- [ ] 6. Standing sets and standing starts in helm and hull
+- [x] 6. Standing sets and standing starts in helm and hull
   - Verify and store sets by generation with the monotonic counter;
     deliver standing starts before any live envelope; hull acceptance
     rules; retries and reports; empty set unpins
@@ -42,7 +42,14 @@ and `helm-control-plane`. Pairs with kythira's
   - Built: hull's half. helm sends the set as unsigned STANDING_CHUNK
     mailbox commands and starts each instance with STANDING_START;
     hull's `StandingStarts` verifies the whole set and applies 4.5.
-    helm's half (keeping the set, delivering starts, retries) is next.
+    helm's `StandingSetKeeper` verifies each set, stores the newest and
+    anchors its generation in the secure element; `CommandRouter`
+    holds envelopes until hull's agent is up, uploads the set, prepares
+    each instance's resources and sends its STANDING_START, retrying
+    a failed start with backoff (1 s doubling to 30 s) until the first
+    envelope arrives. The `cold_start` report carries the round's
+    results. Feeding stored replica configs, keys and network frames
+    into the prepare is task 7.
 
 - [ ] 7. Volumes, NICs and secrets of standing instances
   - Stored `ReplicaConfig` and volume keys to oar-blk; stored network

@@ -247,6 +247,15 @@ auto HelmDaemon::boot() -> BootResult {
     return result;
 }
 
+auto HelmDaemon::expect_standing(StandingRoundDone done) -> bool {
+    if (_config.standing_set == nullptr || _config.standing_set->pinned() == 0) {
+        return false;
+    }
+    _router.expect_standing(_config.standing_set->frame(), *_config.standing_set->current(),
+                            std::move(done));
+    return _router.standing();
+}
+
 auto HelmDaemon::schedule_boot(Clock::time_point at) -> void {
     if (!_booted) {
         _boot_at = at;
@@ -416,6 +425,11 @@ auto HelmDaemon::on_power_policy(const proto::PowerPolicy& policy, std::span<con
     enqueue(PowerPolicyFrame{.policy = policy, .frame = {frame.begin(), frame.end()}});
 }
 
+auto HelmDaemon::on_standing_set(const proto::StandingSet& /*set*/,
+                                 std::span<const std::byte> frame) -> void {
+    enqueue(StandingSetFrame{.frame = {frame.begin(), frame.end()}});
+}
+
 auto HelmDaemon::on_instance_metadata(const proto::InstanceMetadata& metadata,
                                       std::span<const std::byte> frame) -> void {
     enqueue(MetadataFrame{.nic_id = metadata.nic_id,
@@ -536,6 +550,19 @@ auto HelmDaemon::handle(Item& item) -> void {
         }
         const std::scoped_lock lock{_inbox_mutex};
         ++(kept ? _stats.power_policies : _stats.power_policies_refused);
+    } else if (const auto* standing = std::get_if<StandingSetFrame>(&item)) {
+        // Verified, kept and anchored for the next time helm's power
+        // returns (cold-start Requirement 4.2); it starts nothing now.
+        const auto verdict = _config.standing_set != nullptr
+                                 ? _config.standing_set->offer(standing->frame)
+                                 : StandingVerdict::store_failed;
+        const bool kept =
+            verdict == StandingVerdict::kept || verdict == StandingVerdict::anchor_failed;
+        if (kept && _config.time_floor != nullptr) {
+            (void)_config.time_floor->observe(_config.standing_set->current()->time_floor);
+        }
+        const std::scoped_lock lock{_inbox_mutex};
+        ++(kept ? _stats.standing_sets : _stats.standing_sets_refused);
     }
 }
 

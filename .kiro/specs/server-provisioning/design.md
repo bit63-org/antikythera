@@ -53,12 +53,13 @@ in, with the provisioning file passed as an extra initrd.
 Numbers taken elsewhere: link types 17-18 (khold), 19 (`security_policy`,
 vpc-security-groups) and 20 (`edge_mapping`, vpc-internet-gateways
 draft); report kinds 21 (`security_usage`) and 22-24 (internet gateways
-draft). This spec takes link types 21-22 and report kinds 25-26.
+draft). This spec takes link types 21-22 and 25 and report kinds 25-26.
 
 | Record | Direction | Body | Signed |
 |---|---|---|---|
 | `host_power` (21) | controller → helm | `magic 'AKHP' \| version u16 \| key_id u16 \| server_id u64 \| seq u64 \| action u8 (on, off, cycle, hold) \| force u8 \| rsvd [6] \| sig [64]` | yes, Ed25519 by the controller key, like an envelope |
 | `decommission` (22) | controller → helm | `magic 'AKDC' \| version u16 \| key_id u16 \| server_id u64 \| seq u64 \| rsvd [8] \| sig [64]` | yes |
+| `boot_image` (25) | controller → helm | `magic 'AKBI' \| version u16 \| key_id u16 \| server_id u64 \| assignment_version u64 \| rsvd [8] \| HostImage descriptor [0x80] \| sig [64]` | yes, and the descriptor by an image key |
 
 | Report | Kind | Body |
 |---|---|---|
@@ -91,6 +92,19 @@ image_cache.hpp`): `staged` (assigned and fetched, not yet trusted),
 `lkg` and `previous`, as 1 MiB chunks named by digest so releases share
 what they have in common. Each is checked when stored and again, from
 the chunks read back, before it is booted.
+
+The controller assigns an image with a `boot_image` record
+(`src/proto/boot_image.hpp`), which neither this spec nor cold-start
+named before: it carries the image's descriptor under the controller's
+signature, so helm boots only an image both the release pipeline and
+the controller chose, and an `assignment_version` that only grows, so a
+captured assignment cannot roll a server back. helm keeps the newest in
+its sealed store (dropped, like the power policy, if the store opens
+rolled back). Before every host boot (`src/helm/host_boot.hpp`) it
+boots the assigned image from its cache, or fetches it by digest from
+the boot layer within 30 s and stages it; failing that, the LKG; failing
+that, the previous image. An image that just failed to start is
+skipped. A staged image with no assignment naming it is never booted.
 
 ### Decommission order
 

@@ -90,6 +90,7 @@ add_library(ak_helm
   helm/flash.cpp
   helm/helm_config.cpp
   helm/helm_daemon.cpp
+  helm/host_boot.cpp
   helm/hpke.cpp
   helm/image_cache.cpp
   helm/key_store.cpp
@@ -114,7 +115,7 @@ add_library(ak_helm
   helm/volume_key_seal.cpp)
 add_library(ak::helm ALIAS ak_helm)
 target_link_libraries(ak_helm
-  PUBLIC ak::common ak::proto ak::tls
+  PUBLIC ak::common ak::proto ak::tls ak::objstore
   PRIVATE OpenSSL::Crypto ak::warnings ak::hardening)
 
 # ak-helm: the helm daemon as harbor runs it (board processes, socket

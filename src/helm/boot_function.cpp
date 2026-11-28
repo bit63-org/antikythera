@@ -381,4 +381,32 @@ auto write_boot_disk(Flash& target, std::span<const std::byte> uki,
     return {};
 }
 
+auto write_boot_disk_file(const std::filesystem::path& path, std::span<const std::byte> uki,
+                          const proto::Provisioning& provisioning, BootArch arch)
+    -> std::expected<void, BootDiskError> {
+    if (uki.empty()) {
+        return std::unexpected(BootDiskError::empty_uki);
+    }
+    auto temp = path;
+    temp += ".new";
+    std::error_code ec;
+    std::filesystem::remove(temp, ec);
+    {
+        auto flash = FileFlash::open(temp, boot_disk_size(uki.size()));
+        if (!flash) {
+            return std::unexpected(BootDiskError::flash);
+        }
+        if (auto ok = write_boot_disk(**flash, uki, provisioning, arch); !ok) {
+            std::filesystem::remove(temp, ec);
+            return ok;
+        }
+    }
+    std::filesystem::rename(temp, path, ec);
+    if (ec) {
+        std::filesystem::remove(temp, ec);
+        return std::unexpected(BootDiskError::flash);
+    }
+    return {};
+}
+
 }  // namespace ak::helm

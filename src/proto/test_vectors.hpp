@@ -358,4 +358,21 @@ inline constexpr std::string_view host_image21_signature =
     "505fd85ff32b1876af956e0a2aa0c85c0599bf59f74fe9477fe4d5ebe16be58711fc5452a4bb37d9a7883bce"
     "19371599a7607d84a2bc7cece0edcd1e8bf52c0e";
 
+// Vector 22: a BootImage (link type 25) assigning vector 21's image to
+// server 7, assignment_version 3, signed by the controller with key 1
+// (key_id 1).
+inline constexpr std::uint64_t boot_image22_server_id = 7;
+inline constexpr std::uint16_t boot_image22_key_id = 1;
+inline constexpr std::uint64_t boot_image22_assignment_version = 3;
+inline constexpr std::string_view boot_image22 =
+    "414b424901000100070000000000000003000000000000000000000000000000414b4849010001000c000000"
+    "0000000000000003000000000100000000000000c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4"
+    "c4c4c4c4c4c4c4c4505fd85ff32b1876af956e0a2aa0c85c0599bf59f74fe9477fe4d5ebe16be58711fc5452"
+    "a4bb37d9a7883bce19371599a7607d84a2bc7cece0edcd1e8bf52c0e09ddac69cd5d8304fa1b38f62e9c1c49"
+    "276d0c012336c68278c098e837670ea14c7090f93de317870505723e1197fdbc777abcbc739b368c6e6374b1"
+    "c4c32b07";
+inline constexpr std::string_view boot_image22_signature =
+    "09ddac69cd5d8304fa1b38f62e9c1c49276d0c012336c68278c098e837670ea14c7090f93de317870505723e"
+    "1197fdbc777abcbc739b368c6e6374b1c4c32b07";
+
 }  // namespace ak::proto::vectors

@@ -21,6 +21,7 @@
 #include "ed25519_test_support.hpp"
 #include "helm/mailbox.hpp"
 #include "hull/signature_verifier.hpp"
+#include "proto/boot_image.hpp"
 #include "proto/envelope.hpp"
 #include "proto/map_update.hpp"
 #include "proto/host_image.hpp"
@@ -464,6 +465,23 @@ BOOST_AUTO_TEST_CASE(host_image21_reproduces_and_verifies) {
         [](std::span<const std::byte> b) { return proto::decode_host_image(b); },
         [](std::span<const std::byte> b) { return proto::host_image_signed_bytes(b); },
         [](std::span<std::byte> b, const auto& sig) { proto::set_host_image_signature(b, sig); });
+}
+
+BOOST_AUTO_TEST_CASE(boot_image22_reproduces_and_verifies) {
+    proto::BootImage fields{.key_id = vec::boot_image22_key_id,
+                            .server_id = vec::boot_image22_server_id,
+                            .assignment_version = vec::boot_image22_assignment_version,
+                            .image = {},
+                            .signature = {}};
+    auto image = proto::decode_host_image(from_hex(vec::host_image21));
+    BOOST_REQUIRE(image.has_value());
+    fields.image = *image;
+    check_signed_vector(
+        vec::boot_image22, vec::boot_image22_signature, fields, TestSigner{vec::key1_secret},
+        [](const proto::BootImage& b) { return proto::encode_boot_image(b); },
+        [](std::span<const std::byte> b) { return proto::decode_boot_image(b); },
+        [](std::span<const std::byte> b) { return proto::boot_image_signed_bytes(b); },
+        [](std::span<std::byte> b, const auto& sig) { proto::set_boot_image_signature(b, sig); });
 }
 
 BOOST_AUTO_TEST_CASE(standing14_reproduces_and_verifies) {

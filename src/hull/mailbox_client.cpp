@@ -9,6 +9,7 @@
 #include <variant>
 
 #include "common/wire.hpp"
+#include "hull/standing_starts.hpp"
 
 namespace ak::hull {
 
@@ -35,10 +36,10 @@ struct Claimed {
 auto known_command(std::uint16_t raw) -> std::optional<mb::Type> {
     using enum mb::Type;
     static constexpr std::array commands{
-        create_vm,      destroy_vm,     list_vms,       vm_status,
-        attach_device,  detach_device,  create_volume,  delete_volume,
-        attach_volume,  detach_volume,  rewrap_volume,  withdraw_detach,
-        convert_volume, create_network, delete_network, gpu_vf_config};
+        create_vm,     destroy_vm,      list_vms,       vm_status,      attach_device,
+        detach_device, create_volume,   delete_volume,  attach_volume,  detach_volume,
+        rewrap_volume, withdraw_detach, convert_volume, create_network, delete_network,
+        gpu_vf_config, standing_chunk,  standing_start};
     const auto* const it = std::ranges::find(commands, static_cast<mb::Type>(raw));
     if (it == commands.end()) {
         return std::nullopt;
@@ -126,6 +127,12 @@ auto MailboxClient::service() -> bool {
     _last_doorbell = doorbell;
     const mb::Slot slot = copy_command_slot();  // the only read of the slot
 
+    if (const auto helm_msg = mb::decode(slot);
+        helm_msg && mb::is_helm_command(helm_msg->header.type)) {
+        service_helm_command(*helm_msg);
+        return true;
+    }
+
     const auto msg = authenticate(slot, _server_id, *_verifier, *_sequence);
     if (!msg) {
         const auto status = status_for(msg.error().failure);
@@ -147,6 +154,12 @@ auto MailboxClient::service() -> bool {
         return true;
     }
 
+    // A signed command was accepted: this boot's standing starts are over
+    // (cold-start Requirement 4.5).
+    if (_standing != nullptr) {
+        _standing->close();
+    }
+
     const auto body = mb::decode_body(*msg);
     if (!body) {
         const bool reserved = body.error() == mb::BodyError::reserved_type;
@@ -160,6 +173,34 @@ auto MailboxClient::service() -> bool {
     ++_stats.commands;
     respond(msg->header.seq, msg->header.type, _handler->handle(*msg, *body));
     return true;
+}
+
+auto MailboxClient::service_helm_command(const mb::Message& msg) -> void {
+    const auto reply = [&](mb::Status status) {
+        respond(msg.header.seq, msg.header.type, {.status = status, .payload = {}});
+    };
+    if (msg.header.server_id != _server_id) {
+        ++_stats.wrong_server;
+        reply(mb::Status::wrong_server);
+        return;
+    }
+    const auto body = mb::decode_body(msg);
+    if (!body) {
+        ++_stats.malformed;
+        reply(mb::Status::malformed);
+        return;
+    }
+    if (_standing == nullptr) {
+        ++_stats.unsupported;
+        reply(mb::Status::unsupported);
+        return;
+    }
+    ++_stats.commands;
+    if (const auto* chunk = std::get_if<mb::StandingChunk>(&*body)) {
+        reply(_standing->chunk(*chunk));
+    } else {
+        reply(_standing->start(std::get<mb::StandingStart>(*body), *_handler));
+    }
 }
 
 auto MailboxClient::respond(std::uint64_t in_reply_to, mb::Type command,

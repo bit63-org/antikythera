@@ -43,6 +43,7 @@ constexpr std::size_t vm_exited_body_len = 14;
 constexpr std::size_t device_released_body_len = 14;
 constexpr std::size_t host_fault_body_len = 12;
 constexpr std::size_t scrub_done_body_len = 6;
+constexpr std::size_t standing_start_body_len = 16;
 constexpr std::uint8_t reserved_byte = 0;
 
 constexpr auto known_type(std::uint16_t raw) noexcept -> bool {
@@ -63,6 +64,8 @@ constexpr auto known_type(std::uint16_t raw) noexcept -> bool {
         case Type::create_network:
         case Type::delete_network:
         case Type::gpu_vf_config:
+        case Type::standing_chunk:
+        case Type::standing_start:
         case Type::response:
         case Type::vm_exited:
         case Type::device_released:
@@ -73,9 +76,10 @@ constexpr auto known_type(std::uint16_t raw) noexcept -> bool {
     return false;
 }
 
-// Commands must name their signing key; unsigned messages must not.
+// Controller commands must name their signing key; helm's own commands,
+// responses and events are unsigned and must not.
 auto key_id_fits(Type type, KeyId key_id) noexcept -> bool {
-    return is_command(type) ? key_id != no_key_id : key_id == no_key_id;
+    return is_command(type) && !is_helm_command(type) ? key_id != no_key_id : key_id == no_key_id;
 }
 
 // Commands must name the server they are for; unsigned messages must not.
@@ -486,6 +490,47 @@ auto decode_scrub_done(const Message& msg) noexcept -> std::expected<ScrubDone, 
     return out;
 }
 
+auto decode_standing_chunk(const Message& msg) noexcept -> std::expected<StandingChunk, BodyError> {
+    if (msg.header.type != Type::standing_chunk) {
+        return std::unexpected(BodyError::wrong_type);
+    }
+    if (msg.header.body_len <= standing_chunk_fixed_size) {
+        return std::unexpected(BodyError::wrong_length);
+    }
+    wire::Reader r{msg.body_bytes()};
+    StandingChunk out;
+    out.total = *r.le32();
+    out.offset = *r.le32();
+    out.len = *r.le16();
+    const std::uint16_t rsvd = *r.le16();
+    const auto bytes = r.rest();
+    if (bytes.size() != out.len) {
+        return std::unexpected(BodyError::wrong_length);
+    }
+    // len <= max_standing_chunk follows from body_len <= max_body.
+    if (rsvd != 0 || out.total == 0 || out.total > max_standing_transfer ||
+        out.offset > out.total || out.len > out.total - out.offset) {
+        return invalid();
+    }
+    std::ranges::copy(bytes, out.bytes.begin());
+    return out;
+}
+
+auto decode_standing_start(const Message& msg) noexcept -> std::expected<StandingStart, BodyError> {
+    auto r = check_shape(msg, Type::standing_start, standing_start_body_len);
+    if (!r) {
+        return std::unexpected(r.error());
+    }
+    StandingStart out;
+    out.generation = *r->le64();
+    out.index = *r->le16();
+    const auto rsvd = *r->bytes(6);
+    if (out.generation == 0 || out.index >= max_standing_index || !all_zero(rsvd)) {
+        return invalid();
+    }
+    return out;
+}
+
 // Widens expected<T> to expected<Body>.
 template<typename T>
 auto to_body(std::expected<T, BodyError> r) noexcept -> std::expected<Body, BodyError> {
@@ -503,6 +548,10 @@ template<typename... F> struct Overloaded : F... {
 
 auto is_command(Type t) noexcept -> bool {
     return std::to_underlying(t) < std::to_underlying(Type::response);
+}
+
+auto is_helm_command(Type t) noexcept -> bool {
+    return t == Type::standing_chunk || t == Type::standing_start;
 }
 
 auto to_string(DecodeError e) noexcept -> const char* {
@@ -580,9 +629,13 @@ auto decode(const Slot& slot) noexcept -> std::expected<Message, DecodeError> {
     if (!all_zero(body_region.subspan(msg.header.body_len))) {
         return std::unexpected(DecodeError::reserved_not_zero);
     }
+    const auto signature = std::span{slot}.subspan(signature_offset, signature_size);
+    // helm's own commands are unsigned: no bytes hide where a signature goes.
+    if (is_helm_command(msg.header.type) && !all_zero(signature)) {
+        return std::unexpected(DecodeError::reserved_not_zero);
+    }
     std::ranges::copy(body_region, msg.body.begin());
-    std::ranges::copy(std::span{slot}.subspan(signature_offset, signature_size),
-                      msg.signature.begin());
+    std::ranges::copy(signature, msg.signature.begin());
     return msg;
 }
 
@@ -600,6 +653,9 @@ auto encode(const Header& header, std::span<const std::byte> body,
     }
     if (!server_id_fits(header.type, header.server_id)) {
         return std::unexpected(DecodeError::bad_server_id);
+    }
+    if (is_helm_command(header.type) && !all_zero(signature)) {
+        return std::unexpected(DecodeError::reserved_not_zero);
     }
     Slot slot{};
     wire::SpanWriter w{slot};
@@ -693,6 +749,10 @@ auto decode_body(const Message& msg) noexcept -> std::expected<Body, BodyError> 
             return to_body(decode_network<DeleteNetwork>(msg, Type::delete_network));
         case Type::gpu_vf_config:
             return std::unexpected(BodyError::reserved_type);
+        case Type::standing_chunk:
+            return to_body(decode_standing_chunk(msg));
+        case Type::standing_start:
+            return to_body(decode_standing_start(msg));
         case Type::response:
             return to_body(decode_response(msg));
         case Type::vm_exited:
@@ -730,6 +790,8 @@ auto type_of(const Body& body) noexcept -> Type {
                           [](const DeviceReleased&) { return Type::device_released; },
                           [](const HostFault&) { return Type::host_fault; },
                           [](const ScrubDone&) { return Type::scrub_done; },
+                          [](const StandingChunk&) { return Type::standing_chunk; },
+                          [](const StandingStart&) { return Type::standing_start; },
                       },
                       body);
 }
@@ -840,6 +902,18 @@ auto encode_body(const Body& body) -> std::vector<std::byte> {
                        write_device(w, b.device);
                        w.u8(std::to_underlying(b.result));
                        w.u8(reserved_byte);
+                   },
+                   [&](const StandingChunk& b) {
+                       w.le32(b.total);
+                       w.le32(b.offset);
+                       w.le16(b.len);
+                       w.le16(0);
+                       w.bytes(b.chunk_bytes());
+                   },
+                   [&](const StandingStart& b) {
+                       w.le64(b.generation);
+                       w.le16(b.index);
+                       w.bytes(std::array<std::byte, 6>{});
                    },
                },
                body);

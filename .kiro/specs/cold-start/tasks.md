@@ -39,6 +39,10 @@ and `helm-control-plane`. Pairs with kythira's
     deliver standing starts before any live envelope; hull acceptance
     rules; retries and reports; empty set unpins
   - _Requirements: 4.1-4.7_
+  - Built: hull's half. helm sends the set as unsigned STANDING_CHUNK
+    mailbox commands and starts each instance with STANDING_START;
+    hull's `StandingStarts` verifies the whole set and applies 4.5.
+    helm's half (keeping the set, delivering starts, retries) is next.
 
 - [ ] 7. Volumes, NICs and secrets of standing instances
   - Stored `ReplicaConfig` and volume keys to oar-blk; stored network

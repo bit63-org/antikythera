@@ -20,7 +20,7 @@ namespace ak::hull {
 
 enum class AuthFailure : std::uint8_t {
     malformed,       // mailbox::decode rejected the slot; see AuthError::decode
-    not_a_command,   // a well-formed response or event type in the command slot
+    not_a_command,   // a response, event or helm's own command (not a signed command)
     wrong_server,    // the slot names another server (mailbox protocol v3)
     unknown_key,     // no compiled-in key has the slot's key ID
     bad_signature,   // the signature does not verify

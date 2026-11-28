@@ -137,6 +137,7 @@ add_library(ak_hull
   hull/resource_allocator.cpp
   hull/sequence_tracker.cpp
   hull/signature_verifier.cpp
+  hull/standing_starts.cpp
   hull/vfio_mailbox.cpp
   hull/vm_cgroup.cpp
   hull/vm_supervisor.cpp

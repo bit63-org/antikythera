@@ -51,7 +51,8 @@ auto authenticate(const mb::Slot& slot, mb::ServerId server_id, const SignatureV
     if (!msg) {
         return std::unexpected(AuthError{.failure = AuthFailure::malformed, .decode = msg.error()});
     }
-    if (!mb::is_command(msg->header.type)) {
+    // helm's own commands are unsigned; StandingStarts takes them, never this.
+    if (!mb::is_command(msg->header.type) || mb::is_helm_command(msg->header.type)) {
         return std::unexpected(AuthError{.failure = AuthFailure::not_a_command});
     }
     // decode() already refused no_server_id on a command, so a hull that was
